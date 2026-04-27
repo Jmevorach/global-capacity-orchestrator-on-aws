@@ -99,13 +99,31 @@ jobs:
           # Color threshold matches the --cov-fail-under value (85%) from
           # the pytest step above: anything below that would have already
           # failed CI, so the badge only has two meaningful states.
-          PCT=$(python3 -c 'import json; d=json.load(open("coverage.json")); print(f"{d[\"totals\"][\"percent_covered\"]:.1f}")')
-          if awk "BEGIN{exit !($PCT >= 85)}"; then COLOR=brightgreen
-          else COLOR=red
-          fi
-          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$COLOR" > htmlcov/coverage-badge.json
+          #
+          # The JSON write is done entirely in Python rather than handed
+          # back to the shell. An earlier version of this step used
+          # `PCT=$(python3 -c '...')` then interpolated $PCT into a shell
+          # `printf`, but Python's f-string syntax disallows backslash
+          # escapes inside `{ }` expressions, and the quoting gymnastics
+          # needed to pass `d["totals"]` through shell -> Python -> f-string
+          # without escaping were brittle. Heredoc + json.dump sidesteps
+          # the whole quoting stack.
+          python3 <<'PY'
+          import json
+          with open("coverage.json") as f:
+              pct = json.load(f)["totals"]["percent_covered"]
+          color = "brightgreen" if pct >= 85 else "red"
+          badge = {
+              "schemaVersion": 1,
+              "label": "coverage",
+              "message": f"{pct:.1f}%",
+              "color": color,
+          }
+          with open("htmlcov/coverage-badge.json", "w") as f:
+              json.dump(badge, f)
+          print(f"Coverage: {pct:.1f}% ({color})")
+          PY
           cp htmlcov/coverage-badge.json coverage-badge.json
-          echo "Coverage: $PCT% ($COLOR)"
       - name: Publish htmlcov to gh-pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v4
