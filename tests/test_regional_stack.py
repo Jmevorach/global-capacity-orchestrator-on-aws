@@ -961,13 +961,9 @@ class TestAwsCustomResourceSharedRole:
         )
         policies = template.find_resources("AWS::IAM::Policy")
         shared_policies = [
-            (lid, r)
-            for lid, r in policies.items()
-            if lid.startswith("AwsCustomResourceRole")
+            (lid, r) for lid, r in policies.items() if lid.startswith("AwsCustomResourceRole")
         ]
-        assert shared_policies, (
-            "The shared role should have an attached inline policy"
-        )
+        assert shared_policies, "The shared role should have an attached inline policy"
         # At least one of the attached policies must grant
         # eks:UpdateAddon and eks:DescribeAddon.
         found_eks_statement = False
@@ -979,9 +975,7 @@ class TestAwsCustomResourceSharedRole:
                 if "eks:UpdateAddon" in actions and "eks:DescribeAddon" in actions:
                     found_eks_statement = True
                     break
-        assert found_eks_statement, (
-            "Shared role must allow eks:UpdateAddon and eks:DescribeAddon"
-        )
+        assert found_eks_statement, "Shared role must allow eks:UpdateAddon and eks:DescribeAddon"
 
     def test_shared_role_has_ssm_get_parameter_policy(self):
         """The shared role must allow ssm:GetParameter for the endpoint group ARN lookup."""
@@ -990,9 +984,7 @@ class TestAwsCustomResourceSharedRole:
         )
         policies = template.find_resources("AWS::IAM::Policy")
         shared_policies = [
-            (lid, r)
-            for lid, r in policies.items()
-            if lid.startswith("AwsCustomResourceRole")
+            (lid, r) for lid, r in policies.items() if lid.startswith("AwsCustomResourceRole")
         ]
         found_ssm_statement = False
         for _lid, policy in shared_policies:
@@ -1012,9 +1004,7 @@ class TestAwsCustomResourceSharedRole:
         )
         policies = template.find_resources("AWS::IAM::Policy")
         shared_policies = [
-            (lid, r)
-            for lid, r in policies.items()
-            if lid.startswith("AwsCustomResourceRole")
+            (lid, r) for lid, r in policies.items() if lid.startswith("AwsCustomResourceRole")
         ]
         # Collect all PassRole statements and check any of them references
         # the EFS CSI role by Fn::GetAtt.
@@ -1043,9 +1033,7 @@ class TestAwsCustomResourceSharedRole:
         )
         policies = template.find_resources("AWS::IAM::Policy")
         shared_policies = [
-            (lid, r)
-            for lid, r in policies.items()
-            if lid.startswith("AwsCustomResourceRole")
+            (lid, r) for lid, r in policies.items() if lid.startswith("AwsCustomResourceRole")
         ]
         passrole_targets: list = []
         for _lid, policy in shared_policies:
@@ -1071,9 +1059,7 @@ class TestAwsCustomResourceSharedRole:
         )
         policies = template.find_resources("AWS::IAM::Policy")
         shared_policies = [
-            (lid, r)
-            for lid, r in policies.items()
-            if lid.startswith("AwsCustomResourceRole")
+            (lid, r) for lid, r in policies.items() if lid.startswith("AwsCustomResourceRole")
         ]
         passrole_targets: list = []
         for _lid, policy in shared_policies:
@@ -1130,9 +1116,7 @@ class TestAwsCustomResourceSharedRole:
         role now eliminates. Keeping it would add meaningless
         serialization and slow down cold creates for no benefit.
         """
-        template = self._synth_regional_stack(
-            fsx_enabled=True, logical_name="test-no-cr-cr-chain"
-        )
+        template = self._synth_regional_stack(fsx_enabled=True, logical_name="test-no-cr-cr-chain")
         crs = template.find_resources("Custom::AWS")
 
         _cw_id, cw_resource = self._find_by_logical_prefix(crs, "UpdateCloudWatchAddonRole")
