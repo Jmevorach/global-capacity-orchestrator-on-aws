@@ -1,0 +1,46 @@
+# Aurora pgvector ConfigMap — provides the database endpoint, port, and
+# secret ARN to pods via configMapKeyRef.
+# Only applied when Aurora pgvector is enabled (cdk.json aurora_pgvector.enabled = true).
+# The handler automatically skips this file when placeholders are unreplaced.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gco-aurora-pgvector
+  namespace: gco-system
+  labels:
+    app: gco
+    project: gco
+data:
+  endpoint: "{{AURORA_PGVECTOR_ENDPOINT}}"
+  port: "{{AURORA_PGVECTOR_PORT}}"
+  secret_arn: "{{AURORA_PGVECTOR_SECRET_ARN}}"
+  database: "gco_vectors"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gco-aurora-pgvector
+  namespace: gco-jobs
+  labels:
+    app: gco
+    project: gco
+data:
+  endpoint: "{{AURORA_PGVECTOR_ENDPOINT}}"
+  port: "{{AURORA_PGVECTOR_PORT}}"
+  secret_arn: "{{AURORA_PGVECTOR_SECRET_ARN}}"
+  database: "gco_vectors"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gco-aurora-pgvector
+  namespace: gco-inference
+  labels:
+    app: gco
+    project: gco
+data:
+  endpoint: "{{AURORA_PGVECTOR_ENDPOINT}}"
+  port: "{{AURORA_PGVECTOR_PORT}}"
+  secret_arn: "{{AURORA_PGVECTOR_SECRET_ARN}}"
+  database: "gco_vectors"

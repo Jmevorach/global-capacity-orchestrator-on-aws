@@ -646,6 +646,28 @@ class ConfigLoader:
         valkey_config: dict[str, Any] = valkey_ctx if isinstance(valkey_ctx, dict) else {}
         return {**default_config, **valkey_config}
 
+    def get_aurora_pgvector_config(self) -> dict[str, Any]:
+        """Get Aurora Serverless v2 + pgvector vector database configuration.
+
+        Returns:
+            Aurora pgvector configuration dictionary with the following keys:
+            - enabled: Whether Aurora pgvector is enabled (default: False)
+            - min_acu: Minimum Aurora Capacity Units (default: 0.5, scales to zero)
+            - max_acu: Maximum Aurora Capacity Units (default: 16)
+            - backup_retention_days: Number of days to retain automated backups (default: 7)
+            - deletion_protection: Whether deletion protection is enabled (default: False)
+        """
+        default_config: dict[str, Any] = {
+            "enabled": False,
+            "min_acu": 0.5,
+            "max_acu": 16,
+            "backup_retention_days": 7,
+            "deletion_protection": False,
+        }
+        aurora_ctx = self.app.node.try_get_context("aurora_pgvector")
+        aurora_config: dict[str, Any] = aurora_ctx if isinstance(aurora_ctx, dict) else {}
+        return {**default_config, **aurora_config}
+
     def get_tags(self) -> dict[str, str]:
         """Get common tags from configuration"""
         return self.app.node.try_get_context("tags") or {}
