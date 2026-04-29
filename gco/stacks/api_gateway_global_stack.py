@@ -47,6 +47,8 @@ from aws_cdk import aws_secretsmanager as secretsmanager
 from aws_cdk import aws_wafv2 as wafv2
 from constructs import Construct
 
+from gco.stacks.constants import LAMBDA_PYTHON_RUNTIME
+
 
 class GCOApiGatewayGlobalStack(Stack):
     """
@@ -188,7 +190,7 @@ class GCOApiGatewayGlobalStack(Stack):
         rotation_lambda = lambda_.Function(
             self,
             "SecretRotationFunction",
-            runtime=lambda_.Runtime.PYTHON_3_14,
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("lambda/secret-rotation"),
             timeout=Duration.seconds(30),
@@ -256,7 +258,7 @@ class GCOApiGatewayGlobalStack(Stack):
         proxy_lambda = lambda_.Function(
             self,
             "ApiGatewayProxyFunction",
-            runtime=lambda_.Runtime.PYTHON_3_14,
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("lambda/api-gateway-proxy"),
             timeout=Duration.seconds(29),
@@ -335,7 +337,7 @@ class GCOApiGatewayGlobalStack(Stack):
         aggregator_lambda = lambda_.Function(
             self,
             "CrossRegionAggregatorFunction",
-            runtime=lambda_.Runtime.PYTHON_3_14,
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("lambda/cross-region-aggregator"),
             timeout=Duration.seconds(29),

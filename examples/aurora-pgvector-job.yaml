@@ -24,6 +24,7 @@ spec:
   template:
     spec:
       serviceAccountName: gco-service-account
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -145,11 +146,21 @@ spec:
               name: gco-aurora-pgvector
               key: database
         - name: AWS_REGION
-          value: "{{REGION}}"
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: region
         - name: AWS_ROLE_ARN
-          value: "{{SERVICE_ACCOUNT_ROLE_ARN}}"
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: role_arn
         - name: AWS_WEB_IDENTITY_TOKEN_FILE
           value: "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"
+        volumeMounts:
+        - name: aws-iam-token
+          mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+          readOnly: true
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: false
@@ -163,5 +174,13 @@ spec:
           limits:
             cpu: "1"
             memory: "1Gi"
+      volumes:
+      - name: aws-iam-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: sts.amazonaws.com
+              expirationSeconds: 86400
+              path: token
       restartPolicy: Never
   backoffLimit: 2

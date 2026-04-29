@@ -125,6 +125,9 @@ class MockConfigLoader:
     def get_valkey_config(self):
         return {"enabled": False}
 
+    def get_aurora_pgvector_config(self):
+        return {"enabled": False}
+
 
 class TestRegionalStackImports:
     """Tests for regional stack imports and class structure."""
@@ -1751,3 +1754,198 @@ class TestQueueProcessorConfig:
         assert qp["failed_jobs_history"] == 10
         assert policy["resource_quotas"]["max_cpu_per_manifest"] == "10"
         assert policy["resource_quotas"]["max_memory_per_manifest"] == "32Gi"
+
+
+class TestAuroraPgvector:
+    """Tests for Aurora Serverless v2 pgvector integration.
+
+    Validates that the regional stack correctly creates (or skips) the
+    Aurora Serverless v2 PostgreSQL cluster with pgvector based on the
+    ``aurora_pgvector.enabled`` flag in cdk.json.
+    """
+
+    @staticmethod
+    def _mock_helm_installer(stack):
+        """Set up mock attributes for helm installer."""
+        stack.helm_installer_lambda = MagicMock()
+        stack.helm_installer_provider = MagicMock()
+        stack.helm_installer_provider.service_token = (
+            "arn:aws:lambda:us-east-1:123456789012:function:mock"  # nosec B106
+        )
+
+    def _synth(self, aurora_enabled: bool, logical_name: str):
+        """Synthesize the regional stack with Aurora enabled or disabled."""
+        from gco.stacks.regional_stack import GCORegionalStack
+
+        class AuroraConfig(MockConfigLoader):
+            def __init__(self, app, aurora_on):
+                super().__init__(app)
+                self._aurora_on = aurora_on
+
+            def get_aurora_pgvector_config(self):
+                if self._aurora_on:
+                    return {
+                        "enabled": True,
+                        "min_acu": 0,
+                        "max_acu": 16,
+                        "backup_retention_days": 7,
+                        "deletion_protection": False,
+                    }
+                return {"enabled": False}
+
+        app = cdk.App()
+        config = AuroraConfig(app, aurora_on=aurora_enabled)
+
+        with (
+            patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
+            patch.object(
+                GCORegionalStack,
+                "_create_helm_installer_lambda",
+                self._mock_helm_installer,
+            ),
+        ):
+            mock_image = MagicMock()
+            mock_image.image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
+            mock_docker.return_value = mock_image
+
+            stack = GCORegionalStack(
+                app,
+                logical_name,
+                config=config,
+                region="us-east-1",
+                auth_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:test-secret",  # nosec B106
+                env=cdk.Environment(account="123456789012", region="us-east-1"),
+            )
+
+            return stack, assertions.Template.from_stack(stack)
+
+    def test_aurora_cluster_created_when_enabled(self):
+        """Aurora Serverless v2 cluster is created when aurora_pgvector.enabled=true."""
+        _stack, template = self._synth(aurora_enabled=True, logical_name="test-aurora-enabled")
+        template.resource_count_is("AWS::RDS::DBCluster", 1)
+        template.has_resource_properties(
+            "AWS::RDS::DBCluster",
+            {
+                "Engine": "aurora-postgresql",
+                "DatabaseName": "gco_vectors",
+                "StorageEncrypted": True,
+                "EnableIAMDatabaseAuthentication": True,
+                "EnableCloudwatchLogsExports": ["postgresql"],
+            },
+        )
+
+    def test_no_aurora_when_disabled(self):
+        """No Aurora resources are created when aurora_pgvector.enabled=false."""
+        _stack, template = self._synth(aurora_enabled=False, logical_name="test-aurora-disabled")
+        template.resource_count_is("AWS::RDS::DBCluster", 0)
+        template.resource_count_is("AWS::RDS::DBInstance", 0)
+
+    def test_aurora_security_group_allows_5432_from_eks(self):
+        """Aurora security group allows PostgreSQL (5432) from EKS cluster SG only."""
+        _stack, template = self._synth(aurora_enabled=True, logical_name="test-aurora-sg")
+        sgs = template.find_resources("AWS::EC2::SecurityGroup")
+        aurora_sgs = {lid: r for lid, r in sgs.items() if lid.startswith("AuroraPgvectorSG")}
+        assert aurora_sgs, "AuroraPgvectorSG security group not found in template"
+
+        # Verify ingress rule on port 5432 — should reference the EKS cluster
+        # security group (not a CIDR block)
+        ingress_rules = template.find_resources("AWS::EC2::SecurityGroupIngress")
+        found_5432_from_eks = False
+        for _lid, rule in ingress_rules.items():
+            props = rule.get("Properties", {})
+            if (
+                props.get("FromPort") == 5432
+                and props.get("ToPort") == 5432
+                and ("SourceSecurityGroupId" in props or "GroupId" in props)
+            ):
+                found_5432_from_eks = True
+                break
+        # Also check inline SecurityGroupIngress on the SG itself
+        if not found_5432_from_eks:
+            for _lid, sg in aurora_sgs.items():
+                for ingress in sg.get("Properties", {}).get("SecurityGroupIngress", []):
+                    if (
+                        ingress.get("FromPort") == 5432
+                        and ingress.get("ToPort") == 5432
+                        and "SourceSecurityGroupId" in ingress
+                    ):
+                        found_5432_from_eks = True
+                        break
+        assert found_5432_from_eks, (
+            "Aurora security group should allow port 5432 from the EKS cluster "
+            "security group (not a CIDR block)"
+        )
+
+    def test_aurora_ssm_parameter_created(self):
+        """SSM parameter is created for Aurora endpoint discovery."""
+        _stack, template = self._synth(aurora_enabled=True, logical_name="test-aurora-ssm")
+        ssm_params = template.find_resources("AWS::SSM::Parameter")
+        aurora_params = {
+            lid: r for lid, r in ssm_params.items() if lid.startswith("AuroraPgvectorEndpoint")
+        }
+        assert aurora_params, (
+            "AuroraPgvectorEndpointParam SSM parameter not found. "
+            f"Available SSM params: {sorted(ssm_params)[:10]}"
+        )
+
+    def test_service_account_role_has_secret_read_access(self):
+        """ServiceAccountRole has read access to the Aurora secret."""
+        _stack, template = self._synth(
+            aurora_enabled=True, logical_name="test-aurora-secret-access"
+        )
+        policies = template.find_resources("AWS::IAM::Policy")
+        sa_policies = {
+            lid: res
+            for lid, res in policies.items()
+            if lid.startswith("ServiceAccountRoleDefaultPolicy")
+        }
+        assert sa_policies, "ServiceAccountRole DefaultPolicy not found"
+
+        # Check that at least one statement grants secretsmanager:GetSecretValue
+        # or secretsmanager:DescribeSecret on the Aurora cluster secret
+        found_secret_grant = False
+        for _lid, policy in sa_policies.items():
+            for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+                actions = statement.get("Action", [])
+                if isinstance(actions, str):
+                    actions = [actions]
+                if any("secretsmanager" in a for a in actions):
+                    found_secret_grant = True
+                    break
+        assert found_secret_grant, (
+            "ServiceAccountRole must have Secrets Manager access for the "
+            "Aurora pgvector credentials secret."
+        )
+
+    def test_aurora_enhanced_monitoring_enabled(self):
+        """Aurora writer instance has enhanced monitoring enabled (60s interval)."""
+        _stack, template = self._synth(aurora_enabled=True, logical_name="test-aurora-monitoring")
+        instances = template.find_resources("AWS::RDS::DBInstance")
+        assert instances, "No RDS DBInstance found — writer instance missing"
+        for _lid, instance in instances.items():
+            props = instance.get("Properties", {})
+            interval = props.get("MonitoringInterval")
+            assert (
+                interval == 60
+            ), f"Writer instance MonitoringInterval should be 60, got {interval}"
+
+    def test_aurora_has_reader_instance(self):
+        """Aurora cluster has both a writer and a reader instance for HA."""
+        _stack, template = self._synth(aurora_enabled=True, logical_name="test-aurora-reader")
+        instances = template.find_resources("AWS::RDS::DBInstance")
+        assert len(instances) >= 2, (
+            f"Aurora cluster should have at least 2 instances (writer + reader), "
+            f"found {len(instances)}: {sorted(instances)}"
+        )
+        # Verify at least one is a reader (PromotionTier > 0 or no PromotionTier for writer)
+        writer_count = 0
+        reader_count = 0
+        for _lid, instance in instances.items():
+            props = instance.get("Properties", {})
+            tier = props.get("PromotionTier", 0)
+            if tier == 0:
+                writer_count += 1
+            else:
+                reader_count += 1
+        assert writer_count >= 1, "Should have at least 1 writer instance"
+        assert reader_count >= 1, "Should have at least 1 reader instance"

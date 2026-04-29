@@ -786,3 +786,95 @@ class TestConfigValidationEdgeCases:
             ConfigValidationError, match="job_validation_policy configuration is required"
         ):
             ConfigLoader(app)
+
+
+class TestAuroraPgvectorConfig:
+    """Tests for Aurora pgvector configuration."""
+
+    def test_get_aurora_pgvector_config_defaults(self):
+        """Test getting Aurora pgvector config with defaults."""
+        app = MockApp({})
+        config = ConfigLoader(app)
+        aurora_config = config.get_aurora_pgvector_config()
+
+        assert aurora_config["enabled"] is False
+        assert aurora_config["min_acu"] == 0
+        assert aurora_config["max_acu"] == 16
+        assert aurora_config["backup_retention_days"] == 7
+        assert aurora_config["deletion_protection"] is False
+
+    def test_get_aurora_pgvector_config_enabled(self, valid_context):
+        """Test getting Aurora pgvector config when enabled."""
+        valid_context["aurora_pgvector"] = {
+            "enabled": True,
+            "min_acu": 0,
+            "max_acu": 32,
+            "backup_retention_days": 14,
+            "deletion_protection": True,
+        }
+        app = MockApp(valid_context)
+        config = ConfigLoader(app)
+        aurora_config = config.get_aurora_pgvector_config()
+
+        assert aurora_config["enabled"] is True
+        assert aurora_config["min_acu"] == 0
+        assert aurora_config["max_acu"] == 32
+        assert aurora_config["backup_retention_days"] == 14
+        assert aurora_config["deletion_protection"] is True
+
+    def test_get_aurora_pgvector_config_partial_override(self, valid_context):
+        """Test that partial overrides merge with defaults."""
+        valid_context["aurora_pgvector"] = {
+            "enabled": True,
+            "max_acu": 64,
+        }
+        app = MockApp(valid_context)
+        config = ConfigLoader(app)
+        aurora_config = config.get_aurora_pgvector_config()
+
+        assert aurora_config["enabled"] is True
+        assert aurora_config["max_acu"] == 64
+        # Defaults should still be present
+        assert aurora_config["min_acu"] == 0
+        assert aurora_config["backup_retention_days"] == 7
+        assert aurora_config["deletion_protection"] is False
+
+    def test_get_aurora_pgvector_config_min_acu_zero_for_scale_to_zero(self):
+        """Test that min_acu=0 is the default for scale-to-zero support."""
+        app = MockApp({})
+        config = ConfigLoader(app)
+        aurora_config = config.get_aurora_pgvector_config()
+
+        assert aurora_config["min_acu"] == 0, (
+            "Default min_acu should be 0 to enable Aurora Serverless v2 "
+            "scale-to-zero (auto-pause). Set to 0.5+ to keep always warm."
+        )
+
+    def test_get_aurora_pgvector_config_min_acu_half_disables_autopause(self, valid_context):
+        """Test that min_acu=0.5 disables auto-pause."""
+        valid_context["aurora_pgvector"] = {
+            "enabled": True,
+            "min_acu": 0.5,
+        }
+        app = MockApp(valid_context)
+        config = ConfigLoader(app)
+        aurora_config = config.get_aurora_pgvector_config()
+
+        assert aurora_config["min_acu"] == 0.5
+
+    def test_get_aurora_pgvector_config_non_dict_context_uses_defaults(self):
+        """Test that non-dict context value falls back to defaults."""
+        app = MockApp({"aurora_pgvector": "invalid"})
+        config = ConfigLoader(app)
+        aurora_config = config.get_aurora_pgvector_config()
+
+        assert aurora_config["enabled"] is False
+        assert aurora_config["min_acu"] == 0
+
+    def test_get_aurora_pgvector_config_disabled_by_default(self):
+        """Test that Aurora pgvector is disabled by default."""
+        app = MockApp({})
+        config = ConfigLoader(app)
+        aurora_config = config.get_aurora_pgvector_config()
+
+        assert aurora_config["enabled"] is False

@@ -120,8 +120,10 @@ After updating any dependency version in `pyproject.toml`, regenerate the lockfi
 
 ```bash
 pip install pip-tools
-pip-compile --no-emit-index-url --strip-extras -o requirements-lock.txt pyproject.toml
+pip-compile --no-emit-index-url --strip-extras --all-extras -o requirements-lock.txt pyproject.toml
 ```
+
+Remove any `gco-cli @ file:///...` line from the output if present — the Dockerfile installs the project separately with `pip install --no-deps .`.
 
 Commit the updated `requirements-lock.txt` alongside your `pyproject.toml` changes. The lockfile pins all transitive dependencies to ensure reproducible builds across environments.
 
@@ -360,7 +362,7 @@ pytest tests/test_nag_compliance.py -n auto
 python scripts/test_cdk_synthesis.py
 
 # Regenerate the lockfile (after dependency changes)
-pip-compile --no-emit-index-url --strip-extras -o requirements-lock.txt pyproject.toml
+pip-compile --no-emit-index-url --strip-extras --all-extras -o requirements-lock.txt pyproject.toml
 ```
 
 #### Debugging a failing check
@@ -499,7 +501,7 @@ After releasing, update CHANGELOG.md and deploy to production environments.
 Dependency drift is tracked through three layers:
 
 1. **Dependabot (weekly PRs)** — GitHub Actions and Docker only. See `.github/dependabot.yml`. Python packages are intentionally excluded because `requirements-lock.txt` is managed through `pip-compile` and bumped intentionally.
-2. **`deps-scan` workflow (monthly issue)** — runs on the 1st of each month at 09:00 UTC. Checks Python packages, Docker images, Helm charts, and EKS add-on versions. If anything is out of date, it opens a GitHub issue labeled `dependencies, automated`. The scan logic lives in [`.github/scripts/dependency-scan.sh`](.github/scripts/dependency-scan.sh) — see [`.github/CI.md`](.github/CI.md#dependency-scan-script) for the full reference (surfaces checked, inputs, outputs, extension points, failure modes).
+2. **`deps-scan` workflow (monthly issue)** — runs on the 1st of each month at 09:00 UTC. Checks Python packages, Docker images, Helm charts, EKS add-on versions, and Aurora PostgreSQL engine versions. If anything is out of date, it opens a GitHub issue labeled `dependencies, automated`. The scan logic lives in [`.github/scripts/dependency-scan.sh`](.github/scripts/dependency-scan.sh) — see [`.github/CI.md`](.github/CI.md#dependency-scan-script) for the full reference (surfaces checked, inputs, outputs, extension points, failure modes). Pinned versions are centralised in [`gco/stacks/constants.py`](gco/stacks/constants.py).
 3. **`cve-scan` workflow (weekly job)** — runs Mondays at 09:00 UTC. Re-runs Trivy against the latest CVE databases. A red run is the signal; the per-push `security.yml` workflow will catch the same issue on the next PR.
 
 #### What Gets Checked by `deps-scan`

@@ -279,6 +279,113 @@ class TestPersistentVolumeHandling:
         assert mock_v1.create_persistent_volume.call_count == 2
 
 
+class TestPersistentVolumeClaimHandling:
+    """Tests for PVC Lost-state recovery.
+
+    When a PV is deleted and recreated (e.g. FSx file system replaced),
+    the bound PVC goes into ``Lost`` state because its binding UID no
+    longer matches. The handler must detect this and delete+recreate
+    the PVC so it binds to the new PV.
+    """
+
+    def test_pvc_patch_when_healthy(self, handler_module, tmp_path):
+        """Existing healthy PVC is patched (normal update path)."""
+        from kubernetes.client.rest import ApiException
+
+        pvc_doc = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "gco-fsx-storage", "namespace": "gco-jobs"},
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "storageClassName": "fsx-sc",
+                "resources": {"requests": {"storage": "1200Gi"}},
+            },
+        }
+        (tmp_path / "21-pvc.yaml").write_text(yaml.dump(pvc_doc))
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_v1 = MagicMock()
+            mock_client.CoreV1Api.return_value = mock_v1
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_client.CustomObjectsApi.return_value = MagicMock()
+
+            # create raises 409 (already exists)
+            mock_v1.create_namespaced_persistent_volume_claim.side_effect = ApiException(status=409)
+
+            # existing PVC is Bound (healthy)
+            existing_pvc = MagicMock()
+            existing_pvc.status.phase = "Bound"
+            mock_v1.read_namespaced_persistent_volume_claim.return_value = existing_pvc
+
+            result = handler_module.apply_manifests("test-cluster", "us-east-1", str(tmp_path), {})
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        # Should patch, not delete
+        mock_v1.patch_namespaced_persistent_volume_claim.assert_called_once()
+        mock_v1.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+    def test_pvc_recreate_when_lost(self, handler_module, tmp_path):
+        """Lost PVC is deleted and recreated to bind to the new PV."""
+        from kubernetes.client.rest import ApiException
+
+        pvc_doc = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "gco-fsx-storage", "namespace": "gco-jobs"},
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "storageClassName": "fsx-sc",
+                "resources": {"requests": {"storage": "1200Gi"}},
+            },
+        }
+        (tmp_path / "21-pvc.yaml").write_text(yaml.dump(pvc_doc))
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_v1 = MagicMock()
+            mock_client.CoreV1Api.return_value = mock_v1
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_client.CustomObjectsApi.return_value = MagicMock()
+
+            # First create raises 409 (already exists)
+            # Second create (after delete) succeeds
+            mock_v1.create_namespaced_persistent_volume_claim.side_effect = [
+                ApiException(status=409),
+                None,
+            ]
+
+            # Existing PVC is Lost
+            existing_pvc = MagicMock()
+            existing_pvc.status.phase = "Lost"
+            mock_v1.read_namespaced_persistent_volume_claim.side_effect = [
+                existing_pvc,  # first read (check status)
+                ApiException(status=404),  # second read (wait loop — PVC gone)
+            ]
+
+            result = handler_module.apply_manifests("test-cluster", "us-east-1", str(tmp_path), {})
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        # Should have deleted and recreated
+        mock_v1.delete_namespaced_persistent_volume_claim.assert_called_once_with(
+            "gco-fsx-storage", "gco-jobs"
+        )
+        assert mock_v1.create_namespaced_persistent_volume_claim.call_count == 2
+        # Should NOT have patched
+        mock_v1.patch_namespaced_persistent_volume_claim.assert_not_called()
+
+
 class TestPostHelmPassNoRestarts:
     """Tests that the post-helm pass doesn't restart deployments or verify credentials."""
 

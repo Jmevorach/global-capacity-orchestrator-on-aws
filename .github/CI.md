@@ -159,7 +159,8 @@ Ecosystems tracked:
 | Python packages | `pip list --outdated` against the editable install of the current repo | Compares installed pins against the latest on PyPI |
 | Docker image tags | `image: …:<tag>` references in `.github/workflows/*.yml`, `lambda/kubectl-applier-simple/manifests/`, `examples/`, and `lambda/helm-installer/charts.yaml` | Queries the original registry (Docker Hub, Quay, GHCR, GCR, ECR Public, registry.k8s.io) via `skopeo`; only semver tags |
 | Helm charts | `lambda/helm-installer/charts.yaml` | Uses `helm show chart` for OCI charts and `helm search repo` for traditional repos |
-| EKS add-ons | `addon_name`/`addon_version` pairs extracted from `gco/stacks/regional_stack.py` | Requires AWS credentials (via OIDC). The script pre-flights `sts get-caller-identity`; without valid creds the add-on section is explicitly **skipped** and the report notes why — everything else still runs |
+| EKS add-ons | `addon_name`/`addon_version` pairs extracted from `gco/stacks/constants.py` | Requires AWS credentials (via OIDC). The script pre-flights `sts get-caller-identity`; without valid creds the add-on section is explicitly **skipped** and the report notes why — everything else still runs |
+| Aurora PostgreSQL engine | `AURORA_POSTGRES_VERSION_DISPLAY` from `gco/stacks/constants.py` | Requires AWS credentials (via OIDC). Queries `rds describe-db-engine-versions` for the latest minor release within the same major line |
 
 Images matching `gco/*` are skipped (we build those). Non-semver tags (`latest`, branch names, SHAs) are ignored.
 
@@ -197,7 +198,8 @@ The console output shows each surface's drift inline. To trigger the exact workf
 
 - **New Docker image source** — add a `grep … >> "$ALL_IMAGES"` block alongside the existing ones. Anything with a semver tag is picked up automatically.
 - **New Helm chart** — nothing to change; the script walks every entry in `lambda/helm-installer/charts.yaml`.
-- **New EKS add-on** — add the `addon_name=…, addon_version=…` pair in `gco/stacks/regional_stack.py` (the regex in the script picks it up).
+- **New EKS add-on** — add the constant in `gco/stacks/constants.py` and reference it in `regional_stack.py`. The scanner imports from the constants module.
+- **New Aurora engine version** — update `AURORA_POSTGRES_VERSION` and `AURORA_POSTGRES_VERSION_DISPLAY` in `gco/stacks/constants.py`.
 
 #### Failure modes & debugging
 

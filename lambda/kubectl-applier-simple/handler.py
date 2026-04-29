@@ -647,9 +647,37 @@ def apply_manifests(
                             v1.create_namespaced_persistent_volume_claim(namespace, body=doc)
                         except ApiException as e:
                             if e.status == 409:
-                                v1.patch_namespaced_persistent_volume_claim(
-                                    name, namespace, body=doc
+                                # Check if the PVC is in Lost state (bound PV was recreated).
+                                # A Lost PVC can't be patched back to health — it must be
+                                # deleted and recreated so it binds to the new PV.
+                                existing_pvc = v1.read_namespaced_persistent_volume_claim(
+                                    name, namespace
                                 )
+                                if existing_pvc.status.phase == "Lost":
+                                    logger.info(
+                                        f"PVC {namespace}/{name} is Lost (bound PV was "
+                                        f"recreated), deleting and recreating"
+                                    )
+                                    v1.delete_namespaced_persistent_volume_claim(name, namespace)
+                                    import time as _time
+
+                                    for _wait in range(30):
+                                        try:
+                                            v1.read_namespaced_persistent_volume_claim(
+                                                name, namespace
+                                            )
+                                            _time.sleep(1)
+                                        except ApiException as read_e:
+                                            if read_e.status == 404:
+                                                break
+                                            raise
+                                    v1.create_namespaced_persistent_volume_claim(
+                                        namespace, body=doc
+                                    )
+                                else:
+                                    v1.patch_namespaced_persistent_volume_claim(
+                                        name, namespace, body=doc
+                                    )
                             else:
                                 raise
 

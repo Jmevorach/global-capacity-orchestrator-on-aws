@@ -1,5 +1,5 @@
-# Aurora pgvector ConfigMap — provides the database endpoint, port, and
-# secret ARN to pods via configMapKeyRef.
+# Aurora pgvector ConfigMap — provides the database endpoint, port, secret
+# ARN, region, and service account role ARN to pods via configMapKeyRef.
 # Only applied when Aurora pgvector is enabled (cdk.json aurora_pgvector.enabled = true).
 # The handler automatically skips this file when placeholders are unreplaced.
 ---
@@ -13,9 +13,12 @@ metadata:
     project: gco
 data:
   endpoint: "{{AURORA_PGVECTOR_ENDPOINT}}"
+  reader_endpoint: "{{AURORA_PGVECTOR_READER_ENDPOINT}}"
   port: "{{AURORA_PGVECTOR_PORT}}"
   secret_arn: "{{AURORA_PGVECTOR_SECRET_ARN}}"
   database: "gco_vectors"
+  region: "{{REGION}}"
+  role_arn: "{{SERVICE_ACCOUNT_ROLE_ARN}}"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -27,9 +30,12 @@ metadata:
     project: gco
 data:
   endpoint: "{{AURORA_PGVECTOR_ENDPOINT}}"
+  reader_endpoint: "{{AURORA_PGVECTOR_READER_ENDPOINT}}"
   port: "{{AURORA_PGVECTOR_PORT}}"
   secret_arn: "{{AURORA_PGVECTOR_SECRET_ARN}}"
   database: "gco_vectors"
+  region: "{{REGION}}"
+  role_arn: "{{SERVICE_ACCOUNT_ROLE_ARN}}"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -41,6 +47,9 @@ metadata:
     project: gco
 data:
   endpoint: "{{AURORA_PGVECTOR_ENDPOINT}}"
+  reader_endpoint: "{{AURORA_PGVECTOR_READER_ENDPOINT}}"
   port: "{{AURORA_PGVECTOR_PORT}}"
   secret_arn: "{{AURORA_PGVECTOR_SECRET_ARN}}"
   database: "gco_vectors"
+  region: "{{REGION}}"
+  role_arn: "{{SERVICE_ACCOUNT_ROLE_ARN}}"

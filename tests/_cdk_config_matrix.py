@@ -113,7 +113,7 @@ CONFIGS: list[tuple[str, dict[str, Any]]] = [
         {
             "aurora_pgvector": {
                 "enabled": True,
-                "min_acu": 0.5,
+                "min_acu": 0,
                 "max_acu": 16,
                 "backup_retention_days": 7,
                 "deletion_protection": False,
@@ -171,6 +171,13 @@ CONFIGS.extend(
                     "import_path": None,
                     "export_path": None,
                     "auto_import_policy": "NEW_CHANGED_DELETED",
+                },
+                "aurora_pgvector": {
+                    "enabled": True,
+                    "min_acu": 0,
+                    "max_acu": 16,
+                    "backup_retention_days": 7,
+                    "deletion_protection": False,
                 },
                 "eks_cluster": {"endpoint_access": "PUBLIC_AND_PRIVATE"},
             },

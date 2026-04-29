@@ -213,6 +213,7 @@ detect_features() {
     SLURM_ENABLED=$(jq -r '.context.helm.slurm.enabled // false' "$cdk")
     FSX_ENABLED=$(jq -r '.context.fsx_lustre.enabled // false' "$cdk")
     VALKEY_ENABLED=$(jq -r '.context.valkey.enabled // false' "$cdk")
+    AURORA_PGVECTOR_ENABLED=$(jq -r '.context.aurora_pgvector.enabled // false' "$cdk")
 }
 
 detect_region() {

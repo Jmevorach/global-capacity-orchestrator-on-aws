@@ -44,6 +44,7 @@ from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 from gco.config.config_loader import ConfigLoader
+from gco.stacks.constants import LAMBDA_PYTHON_RUNTIME
 
 
 class GCORegionalApiGatewayStack(Stack):
@@ -147,7 +148,7 @@ class GCORegionalApiGatewayStack(Stack):
             self,
             "RegionalProxyFunction",
             function_name=f"{project_name}-regional-proxy-{self.deployment_region}",
-            runtime=lambda_.Runtime.PYTHON_3_14,
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("lambda/regional-api-proxy"),
             timeout=Duration.seconds(29),

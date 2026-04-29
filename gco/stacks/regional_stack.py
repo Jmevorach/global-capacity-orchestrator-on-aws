@@ -53,6 +53,15 @@ from aws_cdk import custom_resources as cr
 from constructs import Construct
 
 from gco.config.config_loader import ConfigLoader
+from gco.stacks.constants import (
+    AURORA_POSTGRES_VERSION,
+    EKS_ADDON_CLOUDWATCH_OBSERVABILITY,
+    EKS_ADDON_EFS_CSI_DRIVER,
+    EKS_ADDON_FSX_CSI_DRIVER,
+    EKS_ADDON_METRICS_SERVER,
+    EKS_ADDON_POD_IDENTITY_AGENT,
+    LAMBDA_PYTHON_RUNTIME,
+)
 
 
 class GCORegionalStack(Stack):
@@ -739,7 +748,7 @@ class GCORegionalStack(Stack):
             "PodIdentityAgentAddon",
             cluster=self.cluster,  # type: ignore[arg-type]
             addon_name="eks-pod-identity-agent",
-            addon_version="v1.3.10-eksbuild.3",
+            addon_version=EKS_ADDON_POD_IDENTITY_AGENT,
             preserve_on_delete=False,
             configuration_values={
                 "tolerations": self._ADDON_NODE_TOLERATIONS,
@@ -764,7 +773,7 @@ class GCORegionalStack(Stack):
             "MetricsServerAddon",
             cluster=self.cluster,  # type: ignore[arg-type]
             addon_name="metrics-server",
-            addon_version="v0.8.1-eksbuild.6",
+            addon_version=EKS_ADDON_METRICS_SERVER,
             preserve_on_delete=False,
             configuration_values={
                 "tolerations": self._ADDON_NODE_TOLERATIONS,
@@ -801,7 +810,7 @@ class GCORegionalStack(Stack):
             "EfsCsiDriverAddon",
             cluster=self.cluster,  # type: ignore[arg-type]
             addon_name="aws-efs-csi-driver",
-            addon_version="v3.0.0-eksbuild.1",
+            addon_version=EKS_ADDON_EFS_CSI_DRIVER,
             preserve_on_delete=False,
             configuration_values={
                 "node": {
@@ -909,7 +918,7 @@ class GCORegionalStack(Stack):
             "CloudWatchObservabilityAddon",
             cluster=self.cluster,  # type: ignore[arg-type]
             addon_name="amazon-cloudwatch-observability",
-            addon_version="v5.3.1-eksbuild.1",
+            addon_version=EKS_ADDON_CLOUDWATCH_OBSERVABILITY,
             preserve_on_delete=False,
             configuration_values={
                 "tolerations": self._ADDON_NODE_TOLERATIONS,
@@ -1473,7 +1482,7 @@ class GCORegionalStack(Stack):
             self,
             "KubectlApplierFunction",
             function_name=self.kubectl_lambda_function_name,
-            runtime=lambda_.Runtime.PYTHON_3_14,
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("lambda/kubectl-applier-simple-build"),
             timeout=Duration.minutes(15),  # Max Lambda timeout
@@ -1731,6 +1740,9 @@ class GCORegionalStack(Stack):
             image_replacements["{{AURORA_PGVECTOR_ENDPOINT}}"] = (
                 self.aurora_cluster.cluster_endpoint.hostname
             )
+            image_replacements["{{AURORA_PGVECTOR_READER_ENDPOINT}}"] = (
+                self.aurora_cluster.cluster_read_endpoint.hostname
+            )
             image_replacements["{{AURORA_PGVECTOR_PORT}}"] = str(
                 self.aurora_cluster.cluster_endpoint.port
             )
@@ -1891,7 +1903,7 @@ class GCORegionalStack(Stack):
         ga_registration_lambda = lambda_.Function(
             self,
             "GaRegistrationFunction",
-            runtime=lambda_.Runtime.PYTHON_3_14,
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("lambda/ga-registration"),
             timeout=Duration.minutes(15),  # Max Lambda timeout; handler uses 14 min budget
@@ -2537,7 +2549,7 @@ class GCORegionalStack(Stack):
 
         project_name = self.config.get_project_name()
 
-        # Security group for Aurora (allow PostgreSQL access from VPC)
+        # Security group for Aurora (allow PostgreSQL access from EKS cluster only)
         aurora_sg = ec2.SecurityGroup(
             self,
             "AuroraPgvectorSG",
@@ -2546,9 +2558,9 @@ class GCORegionalStack(Stack):
             allow_all_outbound=False,
         )
         aurora_sg.add_ingress_rule(
-            ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            self.cluster.cluster_security_group,
             ec2.Port.tcp(5432),
-            "Allow PostgreSQL access from VPC",
+            "Allow PostgreSQL access from EKS cluster",
         )
 
         # Subnet group for Aurora (private subnets only)
@@ -2565,14 +2577,21 @@ class GCORegionalStack(Stack):
             self,
             "AuroraPgvectorCluster",
             engine=rds.DatabaseClusterEngine.aurora_postgres(
-                version=rds.AuroraPostgresEngineVersion.VER_16_6,
+                version=getattr(rds.AuroraPostgresEngineVersion, AURORA_POSTGRES_VERSION),
             ),
-            serverless_v2_min_capacity=aurora_config.get("min_acu", 0.5),
+            serverless_v2_min_capacity=aurora_config.get("min_acu", 0),
             serverless_v2_max_capacity=aurora_config.get("max_acu", 16),
             writer=rds.ClusterInstance.serverless_v2(
                 "Writer",
                 auto_minor_version_upgrade=True,
             ),
+            readers=[
+                rds.ClusterInstance.serverless_v2(
+                    "Reader",
+                    auto_minor_version_upgrade=True,
+                    scale_with_writer=True,
+                ),
+            ],
             vpc=self.vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
             subnet_group=subnet_group,
@@ -2584,7 +2603,60 @@ class GCORegionalStack(Stack):
             deletion_protection=aurora_config.get("deletion_protection", False),
             removal_policy=RemovalPolicy.DESTROY,
             storage_encrypted=True,
+            iam_authentication=True,
+            cloudwatch_logs_exports=["postgresql"],
+            monitoring_interval=Duration.seconds(60),
             cluster_identifier=f"{project_name}-pgvector-{self.deployment_region}",
+        )
+
+        # Construct-level cdk-nag suppressions for Aurora pgvector
+        from cdk_nag import NagPackSuppression, NagSuppressions
+
+        NagSuppressions.add_resource_suppressions(
+            self.aurora_cluster,
+            [
+                NagPackSuppression(
+                    id="AwsSolutions-RDS10",
+                    reason=(
+                        "Deletion protection is intentionally disabled for dev/test deployments. "
+                        "Production deployments should set aurora_pgvector.deletion_protection=true "
+                        "in cdk.json."
+                    ),
+                ),
+                NagPackSuppression(
+                    id="AwsSolutions-SMG4",
+                    reason=(
+                        "Aurora manages credential rotation via the RDS integration with Secrets "
+                        "Manager. Manual Secrets Manager rotation is not required. "
+                        "See: https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/rds-secrets-manager.html"
+                    ),
+                ),
+                NagPackSuppression(
+                    id="HIPAA.Security-RDSInstanceDeletionProtectionEnabled",
+                    reason=(
+                        "Deletion protection is intentionally disabled for dev/test deployments. "
+                        "Production deployments should set aurora_pgvector.deletion_protection=true "
+                        "in cdk.json."
+                    ),
+                ),
+                NagPackSuppression(
+                    id="NIST.800.53.R5-RDSInstanceDeletionProtectionEnabled",
+                    reason=(
+                        "Deletion protection is intentionally disabled for dev/test deployments. "
+                        "Production deployments should set aurora_pgvector.deletion_protection=true "
+                        "in cdk.json."
+                    ),
+                ),
+                NagPackSuppression(
+                    id="PCI.DSS.321-SecretsManagerUsingKMSKey",
+                    reason=(
+                        "Aurora Serverless v2 credentials in Secrets Manager are encrypted with "
+                        "AWS-managed keys by default. Customer-managed KMS can be enabled if "
+                        "required for PCI compliance."
+                    ),
+                ),
+            ],
+            apply_to_children=True,
         )
 
         # Outputs
@@ -2592,7 +2664,13 @@ class GCORegionalStack(Stack):
             self,
             "AuroraPgvectorEndpoint",
             value=self.aurora_cluster.cluster_endpoint.hostname,
-            description="Aurora pgvector cluster endpoint",
+            description="Aurora pgvector cluster writer endpoint",
+        )
+        CfnOutput(
+            self,
+            "AuroraPgvectorReaderEndpoint",
+            value=self.aurora_cluster.cluster_read_endpoint.hostname,
+            description="Aurora pgvector cluster reader endpoint",
         )
         CfnOutput(
             self,
@@ -2693,7 +2771,7 @@ class GCORegionalStack(Stack):
             "FsxCsiDriverAddon",
             cluster=self.cluster,  # type: ignore[arg-type]
             addon_name="aws-fsx-csi-driver",
-            addon_version="v1.8.0-eksbuild.2",
+            addon_version=EKS_ADDON_FSX_CSI_DRIVER,
             preserve_on_delete=False,
             configuration_values={
                 "node": {
@@ -2838,7 +2916,7 @@ class GCORegionalStack(Stack):
         drift_lambda = lambda_.Function(
             self,
             "DriftDetectionFunction",
-            runtime=lambda_.Runtime.PYTHON_3_14,
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("lambda/drift-detection"),
             timeout=Duration.minutes(14),  # Leave headroom under Lambda 15-min cap
