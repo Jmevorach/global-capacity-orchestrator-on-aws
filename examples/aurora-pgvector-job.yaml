@@ -1,0 +1,186 @@
+# Aurora pgvector Example Job
+# Demonstrates connecting to the regional Aurora Serverless v2 PostgreSQL
+# cluster with pgvector for vector similarity search (RAG, semantic search).
+#
+# The Aurora endpoint and credentials are injected automatically via the
+# gco-aurora-pgvector ConfigMap and AWS Secrets Manager — no need to
+# hardcode connection strings. The same manifest works in any region.
+#
+# Prerequisites:
+#   - aurora_pgvector.enabled = true in cdk.json
+#   - The regional stack deployed with Aurora enabled
+#
+# Submit with:
+#   gco jobs submit-direct examples/aurora-pgvector-job.yaml -r us-east-1
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aurora-pgvector-example
+  namespace: gco-jobs
+  labels:
+    app: aurora-pgvector-example
+    project: gco
+spec:
+  template:
+    spec:
+      serviceAccountName: gco-service-account
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+      - name: pgvector-worker
+        image: python:3.14-slim
+        command:
+        - python
+        - -c
+        - |
+          import os, subprocess, sys, json
+
+          # Install dependencies
+          subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                 "--target", "/tmp/pylib",
+                                 "psycopg2-binary", "boto3", "-q"])
+          sys.path.insert(0, "/tmp/pylib")
+
+          import boto3
+          import psycopg2
+
+          # Retrieve credentials from Secrets Manager
+          secret_arn = os.environ["AURORA_SECRET_ARN"]
+          region = os.environ.get("AWS_REGION", "us-east-1")
+          sm = boto3.client("secretsmanager", region_name=region)
+          secret = json.loads(sm.get_secret_value(SecretId=secret_arn)["SecretString"])
+
+          endpoint = os.environ["AURORA_ENDPOINT"]
+          port = int(os.environ.get("AURORA_PORT", "5432"))
+          database = os.environ.get("AURORA_DATABASE", "gco_vectors")
+
+          print(f"Connecting to Aurora pgvector at {endpoint}:{port}/{database}")
+
+          conn = psycopg2.connect(
+              host=endpoint, port=port, dbname=database,
+              user=secret["username"], password=secret["password"],
+              sslmode="require",
+          )
+          conn.autocommit = True
+          cur = conn.cursor()
+
+          # Enable pgvector extension
+          cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+          print("pgvector extension enabled")
+
+          # Create embeddings table
+          cur.execute("""
+              CREATE TABLE IF NOT EXISTS embeddings (
+                  id SERIAL PRIMARY KEY,
+                  content TEXT NOT NULL,
+                  embedding vector(384)
+              );
+          """)
+          print("Embeddings table created")
+
+          # Insert sample vectors (384-dim, simulating a small embedding model)
+          import random
+          random.seed(42)
+          samples = [
+              ("How to deploy ML models on Kubernetes", [random.gauss(0, 1) for _ in range(384)]),
+              ("Best practices for GPU scheduling", [random.gauss(0, 1) for _ in range(384)]),
+              ("Aurora pgvector for RAG applications", [random.gauss(0, 1) for _ in range(384)]),
+              ("Multi-region inference with Global Accelerator", [random.gauss(0, 1) for _ in range(384)]),
+              ("Prompt caching with Valkey", [random.gauss(0, 1) for _ in range(384)]),
+          ]
+          for content, vec in samples:
+              cur.execute(
+                  "INSERT INTO embeddings (content, embedding) VALUES (%s, %s)",
+                  (content, str(vec)),
+              )
+          print(f"Inserted {len(samples)} sample embeddings")
+
+          # Create HNSW index for fast similarity search
+          cur.execute("""
+              CREATE INDEX IF NOT EXISTS embeddings_hnsw_idx
+              ON embeddings USING hnsw (embedding vector_cosine_ops)
+              WITH (m = 16, ef_construction = 64);
+          """)
+          print("HNSW index created")
+
+          # Similarity search — find the 3 most similar documents to a query
+          query_vec = [random.gauss(0, 1) for _ in range(384)]
+          cur.execute("""
+              SELECT content, 1 - (embedding <=> %s::vector) AS similarity
+              FROM embeddings
+              ORDER BY embedding <=> %s::vector
+              LIMIT 3;
+          """, (str(query_vec), str(query_vec)))
+
+          print("\nTop 3 similar documents:")
+          for row in cur.fetchall():
+              print(f"  similarity={row[1]:.4f}  content={row[0]}")
+
+          # Clean up
+          cur.execute("DROP TABLE IF EXISTS embeddings;")
+          cur.close()
+          conn.close()
+          print("\nAurora pgvector operations completed successfully!")
+        env:
+        - name: AURORA_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: endpoint
+        - name: AURORA_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: port
+        - name: AURORA_SECRET_ARN
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: secret_arn
+        - name: AURORA_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: database
+        - name: AWS_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: region
+        - name: AWS_ROLE_ARN
+          valueFrom:
+            configMapKeyRef:
+              name: gco-aurora-pgvector
+              key: role_arn
+        - name: AWS_WEB_IDENTITY_TOKEN_FILE
+          value: "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"
+        volumeMounts:
+        - name: aws-iam-token
+          mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+          readOnly: true
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+              - ALL
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+      volumes:
+      - name: aws-iam-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: sts.amazonaws.com
+              expirationSeconds: 86400
+              path: token
+      restartPolicy: Never
+  backoffLimit: 2

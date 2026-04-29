@@ -108,6 +108,18 @@ CONFIGS: list[tuple[str, dict[str, Any]]] = [
     ("fsx-disabled", {"fsx_lustre": {"enabled": False}}),
     ("endpoint-private", {"eks_cluster": {"endpoint_access": "PRIVATE"}}),
     ("endpoint-public-private", {"eks_cluster": {"endpoint_access": "PUBLIC_AND_PRIVATE"}}),
+    (
+        "aurora-pgvector-enabled",
+        {
+            "aurora_pgvector": {
+                "enabled": True,
+                "min_acu": 0,
+                "max_acu": 16,
+                "backup_retention_days": 7,
+                "deletion_protection": False,
+            }
+        },
+    ),
 ]
 
 CONFIGS.extend(
@@ -159,6 +171,13 @@ CONFIGS.extend(
                     "import_path": None,
                     "export_path": None,
                     "auto_import_policy": "NEW_CHANGED_DELETED",
+                },
+                "aurora_pgvector": {
+                    "enabled": True,
+                    "min_acu": 0,
+                    "max_acu": 16,
+                    "backup_retention_days": 7,
+                    "deletion_protection": False,
                 },
                 "eks_cluster": {"endpoint_access": "PUBLIC_AND_PRIVATE"},
             },
@@ -315,6 +334,7 @@ _NAG_CONFIG_NAMES = {
     "fsx-enabled",
     "all-features-enabled",
     "three-regions",
+    "aurora-pgvector-enabled",
 }
 
 NAG_CONFIGS: list[tuple[str, dict[str, Any]]] = [

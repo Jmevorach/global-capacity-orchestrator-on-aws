@@ -35,9 +35,9 @@ aws-cdk-asset-node-proxy-agent-v6==2.1.1
     # via aws-cdk-lib
 aws-cdk-aws-cognito-identitypool-alpha==2.186.0a0
     # via aws-pdk
-aws-cdk-cloud-assembly-schema==53.18.0
+aws-cdk-cloud-assembly-schema==53.19.0
     # via aws-cdk-lib
-aws-cdk-lib==2.248.0
+aws-cdk-lib==2.251.0
     # via
     #   aws-cdk-aws-cognito-identitypool-alpha
     #   aws-pdk

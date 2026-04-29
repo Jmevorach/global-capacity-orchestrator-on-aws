@@ -253,13 +253,14 @@ spacer
 narrate "This live demonstration walks through GCO's core capabilities."
 narrate "The script auto-detects which features are enabled in your deployment."
 spacer
-echo "  ${BOLD}Region:${RESET}       $REGION"
-echo "  ${BOLD}Volcano:${RESET}      $(feature_status "$VOLCANO_ENABLED")"
-echo "  ${BOLD}Kueue:${RESET}        $(feature_status "$KUEUE_ENABLED")"
-echo "  ${BOLD}YuniKorn:${RESET}     $(feature_status "$YUNIKORN_ENABLED")"
-echo "  ${BOLD}Slurm:${RESET}        $(feature_status "$SLURM_ENABLED")"
-echo "  ${BOLD}FSx Lustre:${RESET}   $(feature_status "$FSX_ENABLED")"
-echo "  ${BOLD}Valkey:${RESET}       $(feature_status "$VALKEY_ENABLED")"
+echo "  ${BOLD}Region:${RESET}          $REGION"
+echo "  ${BOLD}Volcano:${RESET}         $(feature_status "$VOLCANO_ENABLED")"
+echo "  ${BOLD}Kueue:${RESET}           $(feature_status "$KUEUE_ENABLED")"
+echo "  ${BOLD}YuniKorn:${RESET}        $(feature_status "$YUNIKORN_ENABLED")"
+echo "  ${BOLD}Slurm:${RESET}           $(feature_status "$SLURM_ENABLED")"
+echo "  ${BOLD}FSx Lustre:${RESET}      $(feature_status "$FSX_ENABLED")"
+echo "  ${BOLD}Valkey:${RESET}          $(feature_status "$VALKEY_ENABLED")"
+echo "  ${BOLD}Aurora pgvector:${RESET} $(feature_status "$AURORA_PGVECTOR_ENABLED")"
 spacer
 
 pause_for_audience
@@ -659,11 +660,88 @@ pause_for_audience
 fi  # VALKEY
 
 # ═════════════════════════════════════════════════════════════════════════════
+# SECTION: Aurora pgvector
+# ═════════════════════════════════════════════════════════════════════════════
+# Aurora Serverless v2 with pgvector provides a fully managed vector database
+# for RAG, semantic search, and embedding storage. This section only runs if
+# Aurora pgvector is enabled in cdk.json.
+
+if [ "$AURORA_PGVECTOR_ENABLED" = "true" ]; then
+
+SECTION=$((SECTION + 1)); section_header "$SECTION" "AURORA PGVECTOR — Serverless Vector Database" "$BLUE"
+
+narrate "For RAG, semantic search, and embedding storage, GCO can deploy"
+narrate "Aurora Serverless v2 with pgvector in each region. It auto-scales"
+narrate "capacity and requires no instance management."
+narrate "Credentials are in Secrets Manager — pods discover them via ConfigMap."
+spacer
+
+highlight "Submitting a job that exercises Aurora pgvector"
+run_cmd "gco jobs submit-direct examples/aurora-pgvector-job.yaml -r $REGION -n gco-jobs" || true
+
+highlight "Watching the Aurora pgvector job"
+wait_for_job "aurora-pgvector-example" "gco-jobs"
+run_cmd "kubectl get pods -n gco-jobs -l app=aurora-pgvector-example --no-headers 2>/dev/null || echo '  (pod scheduling...)'"
+
+highlight "Aurora pgvector job output"
+run_cmd "kubectl logs job/aurora-pgvector-example -n gco-jobs --all-containers=true --tail=20 2>/dev/null || kubectl logs -n gco-jobs -l app=aurora-pgvector-example --all-containers=true --tail=20 2>/dev/null || echo '  (no logs yet)'"
+
+success "Serverless Aurora pgvector: vector search with zero management."
+# Release resource-quota reservations before the next section.
+kubectl delete job aurora-pgvector-example -n gco-jobs --ignore-not-found=true >/dev/null 2>&1 || true
+narrate "pgvector supports HNSW and IVFFlat indexes for fast similarity search."
+
+pause_for_audience
+
+fi  # AURORA_PGVECTOR
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION: EFS Shared Storage
+# ═════════════════════════════════════════════════════════════════════════════
+# EFS (Elastic File System) is always deployed — it's the default shared
+# storage for job outputs. This section always runs because EFS is a core
+# feature, not optional.
+
+SECTION=$((SECTION + 1)); section_header "$SECTION" "EFS — Persistent Shared Storage" "$BLUE"
+
+narrate "When a Kubernetes pod terminates, its local data vanishes."
+narrate "GCO mounts Amazon EFS into every cluster so job outputs,"
+narrate "model checkpoints, and training artifacts persist beyond pod lifetime."
+narrate "You can download results even after the job is long gone."
+spacer
+
+highlight "Submitting a job that writes results to shared EFS storage"
+run_cmd "gco jobs submit-direct examples/efs-output-job.yaml -r $REGION -n gco-jobs" || true
+
+highlight "Watching the EFS job"
+wait_for_job "efs-output-example" "gco-jobs"
+run_cmd "kubectl get pods -n gco-jobs -l example=efs-output --no-headers 2>/dev/null || echo '  (pod scheduling...)'"
+
+highlight "Job logs — results written to /outputs on EFS"
+run_cmd "kubectl logs job/efs-output-example -n gco-jobs --all-containers=true --tail=15 2>/dev/null || kubectl logs -n gco-jobs -l example=efs-output --all-containers=true --tail=15 2>/dev/null || echo '  (no logs yet)'"
+
+spacer
+narrate "The pod is gone, but the data lives on. Let's prove it."
+spacer
+
+highlight "Listing files on shared EFS storage"
+run_cmd "gco files ls -r $REGION" || true
+
+highlight "Downloading results to local machine"
+run_cmd "gco files download efs-output-example /tmp/gco-demo-results -r $REGION && cat /tmp/gco-demo-results/results.json"
+
+success "Persistent storage that survives pod termination."
+narrate "Critical for ML checkpoints, training artifacts, and audit trails."
+
+pause_for_audience
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SECTION: Inference Endpoint
 # ═════════════════════════════════════════════════════════════════════════════
 # The inference endpoint was deployed at the start of the demo (before costs)
 # so the GPU node could provision in the background. By now it should be
 # ready. We just need to wait for readiness, invoke it, and clean up.
+# Placed at the end to give the GPU node maximum time to provision.
 # Skippable with SKIP_INFERENCE=1 (useful if no GPU quota is available).
 
 if [ "${SKIP_INFERENCE:-}" != "1" ]; then
@@ -740,46 +818,6 @@ pause_for_audience
 fi  # SKIP_INFERENCE
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION: EFS Shared Storage
-# ═════════════════════════════════════════════════════════════════════════════
-# EFS (Elastic File System) is always deployed — it's the default shared
-# storage for job outputs. This section always runs because EFS is a core
-# feature, not optional.
-
-SECTION=$((SECTION + 1)); section_header "$SECTION" "EFS — Persistent Shared Storage" "$BLUE"
-
-narrate "When a Kubernetes pod terminates, its local data vanishes."
-narrate "GCO mounts Amazon EFS into every cluster so job outputs,"
-narrate "model checkpoints, and training artifacts persist beyond pod lifetime."
-narrate "You can download results even after the job is long gone."
-spacer
-
-highlight "Submitting a job that writes results to shared EFS storage"
-run_cmd "gco jobs submit-direct examples/efs-output-job.yaml -r $REGION -n gco-jobs" || true
-
-highlight "Watching the EFS job"
-wait_for_job "efs-output-example" "gco-jobs"
-run_cmd "kubectl get pods -n gco-jobs -l example=efs-output --no-headers 2>/dev/null || echo '  (pod scheduling...)'"
-
-highlight "Job logs — results written to /outputs on EFS"
-run_cmd "kubectl logs job/efs-output-example -n gco-jobs --all-containers=true --tail=15 2>/dev/null || kubectl logs -n gco-jobs -l example=efs-output --all-containers=true --tail=15 2>/dev/null || echo '  (no logs yet)'"
-
-spacer
-narrate "The pod is gone, but the data lives on. Let's prove it."
-spacer
-
-highlight "Listing files on shared EFS storage"
-run_cmd "gco files ls -r $REGION" || true
-
-highlight "Downloading results to local machine"
-run_cmd "gco files download efs-output-example /tmp/gco-demo-results -r $REGION && cat /tmp/gco-demo-results/results.json"
-
-success "Persistent storage that survives pod termination."
-narrate "Critical for ML checkpoints, training artifacts, and audit trails."
-
-pause_for_audience
-
-# ═════════════════════════════════════════════════════════════════════════════
 # SECTION: Wrap-up
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary of everything we covered, plus an optional cleanup step.
@@ -815,10 +853,13 @@ fi
 if [ "$VALKEY_ENABLED" = "true" ]; then
     echo "  ${GREEN}✓${RESET} Valkey serverless in-memory cache"
 fi
+if [ "$AURORA_PGVECTOR_ENABLED" = "true" ]; then
+    echo "  ${GREEN}✓${RESET} Aurora pgvector serverless vector database"
+fi
+echo "  ${GREEN}✓${RESET} EFS persistent shared storage"
 if [ "${SKIP_INFERENCE:-}" != "1" ]; then
     echo "  ${GREEN}✓${RESET} Inference endpoint deploy, invoke, and teardown"
 fi
-echo "  ${GREEN}✓${RESET} EFS persistent shared storage"
 
 spacer
 echo "  ${BOLD}All of this runs on a single platform, deployed with one command:${RESET}"
@@ -845,6 +886,7 @@ case "$cleanup" in
         # Delete specific jobs that may not have the project label
         kubectl delete job -n gco-jobs efs-output-example --ignore-not-found=true 2>/dev/null || true
         kubectl delete job -n gco-jobs valkey-cache-example --ignore-not-found=true 2>/dev/null || true
+        kubectl delete job -n gco-jobs aurora-pgvector-example --ignore-not-found=true 2>/dev/null || true
         kubectl delete job -n gco-jobs kueue-sample-job --ignore-not-found=true 2>/dev/null || true
         kubectl delete job -n gco-jobs kueue-gpu-job --ignore-not-found=true 2>/dev/null || true
         kubectl delete job -n gco-jobs yunikorn-sample-job --ignore-not-found=true 2>/dev/null || true

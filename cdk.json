@@ -105,6 +105,13 @@
       "max_ecpu_per_second": 5000,
       "snapshot_retention_limit": 1
     },
+    "aurora_pgvector": {
+      "enabled": false,
+      "min_acu": 0,
+      "max_acu": 16,
+      "backup_retention_days": 7,
+      "deletion_protection": false
+    },
     "helm": {
       "keda": { "enabled": true },
       "nvidia_gpu_operator": { "enabled": true },

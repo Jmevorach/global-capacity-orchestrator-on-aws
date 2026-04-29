@@ -48,7 +48,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cdk = [
-    "aws-cdk-lib==2.248.0",
+    "aws-cdk-lib==2.251.0",
     "aws-pdk==0.26.15",
     "cdk-nag==2.37.55",
     "constructs==10.6.0",

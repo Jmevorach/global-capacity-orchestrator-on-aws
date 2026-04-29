@@ -645,6 +645,122 @@ def add_backup_suppressions(stack: Stack) -> None:
     )
 
 
+def add_aurora_pgvector_suppressions(stack: Stack) -> None:
+    """Add suppressions for Aurora pgvector-related cdk-nag findings.
+
+    Aurora Serverless v2 with pgvector triggers several compliance findings
+    that are intentionally accepted for this deployment pattern.
+    """
+    NagSuppressions.add_stack_suppressions(
+        stack,
+        [
+            # Secrets Manager KMS key — Aurora secret uses AWS-managed encryption
+            NagPackSuppression(
+                id="HIPAA.Security-SecretsManagerUsingKMSKey",
+                reason=(
+                    "Aurora Serverless v2 credentials in Secrets Manager are encrypted with "
+                    "AWS-managed keys by default. Customer-managed KMS can be enabled if required."
+                ),
+            ),
+            NagPackSuppression(
+                id="NIST.800.53.R5-SecretsManagerUsingKMSKey",
+                reason=(
+                    "Aurora Serverless v2 credentials in Secrets Manager are encrypted with "
+                    "AWS-managed keys by default."
+                ),
+            ),
+            # Secrets Manager rotation — Aurora manages rotation via RDS integration
+            NagPackSuppression(
+                id="HIPAA.Security-SecretsManagerRotationEnabled",
+                reason=(
+                    "Aurora manages credential rotation via the RDS integration with Secrets "
+                    "Manager. Manual rotation configuration is not required."
+                ),
+            ),
+            NagPackSuppression(
+                id="NIST.800.53.R5-SecretsManagerRotationEnabled",
+                reason=(
+                    "Aurora manages credential rotation via the RDS integration with Secrets "
+                    "Manager. Manual rotation configuration is not required."
+                ),
+            ),
+            # RDS in backup plan — Aurora has built-in continuous backups
+            NagPackSuppression(
+                id="HIPAA.Security-RDSInBackupPlan",
+                reason=(
+                    "Aurora Serverless v2 has built-in continuous backups with point-in-time "
+                    "recovery. AWS Backup integration is optional and can be enabled if required."
+                ),
+            ),
+            NagPackSuppression(
+                id="NIST.800.53.R5-RDSInBackupPlan",
+                reason=(
+                    "Aurora Serverless v2 has built-in continuous backups with point-in-time "
+                    "recovery. AWS Backup integration is optional."
+                ),
+            ),
+            # RDS logging enabled — covered by cloudwatch_logs_exports=["postgresql"]
+            # but some frameworks check for additional log types
+            NagPackSuppression(
+                id="HIPAA.Security-RDSLoggingEnabled",
+                reason=(
+                    "PostgreSQL logs are exported to CloudWatch via cloudwatch_logs_exports. "
+                    "Aurora Serverless v2 does not support all log types available on provisioned instances."
+                ),
+            ),
+            NagPackSuppression(
+                id="NIST.800.53.R5-RDSLoggingEnabled",
+                reason=(
+                    "PostgreSQL logs are exported to CloudWatch via cloudwatch_logs_exports. "
+                    "Aurora Serverless v2 does not support all log types available on provisioned instances."
+                ),
+            ),
+            NagPackSuppression(
+                id="PCI.DSS.321-RDSLoggingEnabled",
+                reason=(
+                    "PostgreSQL logs are exported to CloudWatch via cloudwatch_logs_exports. "
+                    "Aurora Serverless v2 does not support all log types available on provisioned instances."
+                ),
+            ),
+            # CloudWatch Log Group encryption for Aurora logs
+            NagPackSuppression(
+                id="HIPAA.Security-CloudWatchLogGroupEncrypted",
+                reason=(
+                    "CloudWatch Logs for Aurora PostgreSQL are encrypted by default with "
+                    "AWS-managed keys. Customer-managed KMS can be enabled if required."
+                ),
+            ),
+            NagPackSuppression(
+                id="NIST.800.53.R5-CloudWatchLogGroupEncrypted",
+                reason=(
+                    "CloudWatch Logs for Aurora PostgreSQL are encrypted by default with "
+                    "AWS-managed keys."
+                ),
+            ),
+            NagPackSuppression(
+                id="PCI.DSS.321-CloudWatchLogGroupEncrypted",
+                reason=(
+                    "CloudWatch Logs for Aurora PostgreSQL are encrypted by default with "
+                    "AWS-managed keys."
+                ),
+            ),
+            # Enhanced monitoring IAM role uses AWS managed policy
+            NagPackSuppression(
+                id="AwsSolutions-IAM4",
+                reason=(
+                    "Aurora enhanced monitoring requires the AWS managed policy "
+                    "AmazonRDSEnhancedMonitoringRole for publishing OS-level metrics to CloudWatch. "
+                    "This is the AWS-recommended policy for RDS enhanced monitoring. "
+                    "See: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_Monitoring.OS.Enabling.html"
+                ),
+                applies_to=[
+                    "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole",
+                ],
+            ),
+        ],
+    )
+
+
 def apply_all_suppressions(
     stack: Stack,
     stack_type: str = "regional",
@@ -669,6 +785,7 @@ def apply_all_suppressions(
         add_vpc_suppressions(stack)
         add_storage_suppressions(stack)
         add_sqs_suppressions(stack)
+        add_aurora_pgvector_suppressions(stack)
 
     elif stack_type == "global":
         add_backup_suppressions(stack)

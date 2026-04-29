@@ -251,6 +251,7 @@ See [Architecture Details](docs/ARCHITECTURE.md) for the full deep dive.
 - **EFS**: Shared elastic storage for job outputs that persist after pod termination
 - **FSx for Lustre**: Optional high-performance parallel file system for ML training (toggle on/off)
 - **Valkey cache**: Optional serverless key-value cache for prompt caching and session state
+- **Aurora pgvector**: Optional serverless vector database for RAG, semantic search, and embedding storage
 
 ### Operations
 - **Cost visibility**: Track spend by service, region, and workload via Cost Explorer integration
@@ -320,6 +321,7 @@ docker run -it --rm -v ~/.aws:/root/.aws:ro -v $(pwd):/workspace -w /workspace g
 │   ├── models/                          # Data models for k8s clusters, health monitor, inference monitor and manifest processor
 │   ├── services/                        # K8s services (health monitor, inference monitor, manifest processor, queue processor)
 │   └── stacks/                          # CDK stacks (global, regional, API gateway, monitoring)
+│       └── constants.py                 # Pinned versions: EKS addons, Lambda runtime, Aurora engine
 │
 ├── lambda/                              # Lambda functions
 │   ├── alb-header-validator/            # ALB header validation for auth tokens

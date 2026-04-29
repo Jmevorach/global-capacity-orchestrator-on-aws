@@ -44,6 +44,11 @@ This guide shows you how to customize GCO (Global Capacity Orchestrator on AWS) 
   - [Enable FSx](#enable-fsx)
   - [Configure FSx Storage](#configure-fsx-storage)
   - [Using FSx in Jobs](#using-fsx-in-jobs)
+- [Configure Valkey Cache](#configure-valkey-cache)
+  - [Using Valkey in Jobs](#using-valkey-in-jobs)
+- [Configure Aurora pgvector](#configure-aurora-pgvector)
+  - [Using Aurora pgvector in Jobs](#using-aurora-pgvector-in-jobs)
+- [Infrastructure Version Constants](#infrastructure-version-constants)
 - [CDK-nag Compliance](#cdk-nag-compliance)
   - [Enabled Frameworks](#enabled-frameworks)
   - [Customizing Suppressions](#customizing-suppressions)
@@ -1139,6 +1144,93 @@ The same manifest works in any region — the ConfigMap resolves to the local Va
 For use outside the cluster (scripts, Lambda functions), the endpoint is also stored in SSM at `/{project}/valkey-endpoint-{region}`.
 
 See `examples/valkey-cache-job.yaml` for a complete working example.
+
+### Configure Aurora pgvector
+
+GCO can deploy an Aurora Serverless v2 PostgreSQL cluster with the pgvector extension in each regional stack for vector similarity search. Use cases include RAG (retrieval-augmented generation), semantic search, embedding storage, and similarity queries for AI/ML workloads.
+
+Aurora Serverless v2 supports scaling to 0 ACU — the cluster automatically pauses after a period of inactivity and resumes in ~15 seconds on the first connection. You pay only for storage while paused. This is ideal for dev/test environments and workloads that can tolerate a brief cold start.
+
+Edit `cdk.json` to enable:
+
+```json
+{
+  "context": {
+    "aurora_pgvector": {
+      "enabled": true,
+      "min_acu": 0,
+      "max_acu": 16,
+      "backup_retention_days": 7,
+      "deletion_protection": false
+    }
+  }
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Enable/disable Aurora pgvector |
+| `min_acu` | 0 | Minimum Aurora Capacity Units (0 = scale to zero / auto-pause) |
+| `max_acu` | 16 | Maximum Aurora Capacity Units |
+| `backup_retention_days` | 7 | Number of days to retain automated backups |
+| `deletion_protection` | `false` | Enable deletion protection (recommended for production) |
+
+Set `min_acu` to `0.5` or higher to disable auto-pause and keep the cluster always warm.
+
+After enabling, redeploy the regional stack:
+
+```bash
+gco stacks deploy gco-us-east-1 -y
+```
+
+### Using Aurora pgvector in Jobs
+
+When Aurora pgvector is enabled, GCO creates a `gco-aurora-pgvector` ConfigMap in each namespace with the endpoint, port, secret ARN, and database name. Reference it in your pod spec:
+
+```yaml
+env:
+- name: AURORA_ENDPOINT
+  valueFrom:
+    configMapKeyRef:
+      name: gco-aurora-pgvector
+      key: endpoint
+- name: AURORA_PORT
+  valueFrom:
+    configMapKeyRef:
+      name: gco-aurora-pgvector
+      key: port
+- name: AURORA_SECRET_ARN
+  valueFrom:
+    configMapKeyRef:
+      name: gco-aurora-pgvector
+      key: secret_arn
+- name: AURORA_DATABASE
+  valueFrom:
+    configMapKeyRef:
+      name: gco-aurora-pgvector
+      key: database
+```
+
+Credentials are stored in AWS Secrets Manager. Pods retrieve them using the ServiceAccountRole's IRSA permissions — no static credentials needed. The same manifest works in any region because the ConfigMap resolves to the local Aurora endpoint automatically.
+
+The cluster includes both a writer and a reader instance for high availability. The reader auto-scales with the writer. Use the `reader_endpoint` for read-heavy workloads (similarity searches, embedding lookups) and the `endpoint` for writes (inserts, DDL).
+
+For use outside the cluster (scripts, Lambda functions), the endpoint is also stored in SSM at `/{project}/aurora-pgvector-endpoint-{region}`.
+
+See `examples/aurora-pgvector-job.yaml` for a complete working example that creates the pgvector extension, an embeddings table with an HNSW index, and runs a similarity search.
+
+## Infrastructure Version Constants
+
+All pinned infrastructure versions — EKS add-on versions, Lambda runtime, Aurora PostgreSQL engine version — are centralised in `gco/stacks/constants.py`. This is the single source of truth for version-pinned components.
+
+When updating a version:
+
+1. Edit the constant in `gco/stacks/constants.py`
+2. Run `pytest tests/test_regional_stack.py` to verify synthesis
+3. Run `pytest tests/test_nag_compliance.py` to verify compliance
+4. Redeploy with `gco stacks deploy-all -y`
+
+The monthly `deps-scan` workflow (`.github/scripts/dependency-scan.sh`) checks these constants against the latest available versions and opens a GitHub issue when updates are available.
 
 ## CDK-nag Compliance
 

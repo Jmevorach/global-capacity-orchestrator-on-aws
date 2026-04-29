@@ -26,7 +26,12 @@
 set -uo pipefail
 
 WORKFLOWS_DIR="${WORKFLOWS_DIR:-.github/workflows}"
-REPORT_FILE="$(mktemp --suffix=.md)"
+REPORT_FILE="$(mktemp -t dep-scan-XXXXXX.md 2>/dev/null || mktemp --suffix=.md)"
+
+# Source shared functions (also used by BATS tests)
+SCAN_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.github/scripts/lib_dependency_scan.sh
+source "${SCAN_SCRIPT_DIR}/lib_dependency_scan.sh"
 
 # ---------------------------------------------------------------------------
 # Python packages
@@ -59,29 +64,18 @@ check_image() {
   local current_tag="$2"
 
   # Only handle semver tags
-  if ! echo "$current_tag" | grep -qE "^v?[0-9]+\.[0-9]+(\.[0-9]+)?"; then
+  if ! is_semver_tag "$current_tag"; then
     return
   fi
   # Skip images we build in this project
-  if echo "$image" | grep -q "^gco/"; then
+  if is_project_image "$image"; then
     return
   fi
 
-  local registry="" repo=""
-  case "$image" in
-    nvcr.io/*|gcr.io/*|quay.io/*|ghcr.io/*|registry.k8s.io/*|public.ecr.aws/*)
-      registry="$(echo "$image" | cut -d'/' -f1)"
-      repo="$(echo "$image" | cut -d'/' -f2-)"
-      ;;
-    */*)
-      registry="docker.io"
-      repo="$image"
-      ;;
-    *)
-      registry="docker.io"
-      repo="library/$image"
-      ;;
-  esac
+  local parsed registry repo
+  parsed="$(parse_image_registry "$image")"
+  registry="$(echo "$parsed" | cut -d'|' -f1)"
+  repo="$(echo "$parsed" | cut -d'|' -f2)"
 
   local tags=""
   tags="$(skopeo list-tags "docker://${registry}/${repo}" 2>/dev/null \
@@ -91,17 +85,12 @@ check_image() {
 
   [ -z "$tags" ] && return
 
-  local latest_tag current_ver latest_ver newer
+  local latest_tag
   latest_tag="$(echo "$tags" | tail -1)"
-  current_ver="${current_tag#v}"
-  latest_ver="${latest_tag#v}"
 
-  if [ "$current_ver" != "$latest_ver" ]; then
-    newer="$(printf '%s\n%s' "$current_ver" "$latest_ver" | sort -V | tail -1)"
-    if [ "$newer" = "$latest_ver" ]; then
-      echo "  - ${image}:${current_tag} -> ${latest_tag}"
-      echo "${image}|${current_tag}|${latest_tag}" >> "$DOCKER_RESULTS"
-    fi
+  if [ "$(compare_semver "$current_tag" "$latest_tag")" = "newer" ]; then
+    echo "  - ${image}:${current_tag} -> ${latest_tag}"
+    echo "${image}|${current_tag}|${latest_tag}" >> "$DOCKER_RESULTS"
   fi
 }
 
@@ -229,22 +218,13 @@ echo "=== Checking EKS add-on versions ==="
 
 ADDON_RESULTS="$(mktemp)"
 ADDON_SKIP_REASON=""
-K8S_VERSION="$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['kubernetes_version'])" 2>/dev/null || echo "1.35")"
+K8S_VERSION="$(extract_k8s_version "")"
 
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
   ADDON_SKIP_REASON="No AWS credentials available (scan needs eks:DescribeAddonVersions). Configure OIDC to enable."
   echo "  $ADDON_SKIP_REASON"
 else
-  python3 - <<'PY' | while IFS='|' read -r addon_name current_version; do
-import re
-try:
-    with open('gco/stacks/regional_stack.py') as f:
-        text = f.read()
-except FileNotFoundError:
-    raise SystemExit(0)
-for m in re.finditer(r'addon_name="([^"]+)".*?addon_version="([^"]+)"', text, re.DOTALL):
-    print(f'{m.group(1)}|{m.group(2)}')
-PY
+  extract_eks_addons "gco/stacks/regional_stack.py" | while IFS='|' read -r addon_name current_version; do
       [ -z "$addon_name" ] && continue
       latest="$(aws eks describe-addon-versions \
         --addon-name "$addon_name" \
@@ -263,6 +243,46 @@ ADDON_COUNT="$(wc -l < "$ADDON_RESULTS" 2>/dev/null | tr -d ' ')"
 [ -z "$ADDON_COUNT" ] && ADDON_COUNT=0
 
 # ---------------------------------------------------------------------------
+# Aurora PostgreSQL engine versions (best-effort — requires AWS credentials)
+#
+# Checks whether the Aurora PostgreSQL engine version pinned in
+# regional_stack.py has a newer minor or major release available.
+# Uses the same credential gate as the EKS add-on check above.
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Checking Aurora PostgreSQL engine versions ==="
+
+AURORA_RESULTS="$(mktemp)"
+AURORA_SKIP_REASON=""
+
+if ! aws sts get-caller-identity >/dev/null 2>&1; then
+  AURORA_SKIP_REASON="No AWS credentials available (scan needs rds:DescribeDBEngineVersions). Configure OIDC to enable."
+  echo "  $AURORA_SKIP_REASON"
+else
+  # Extract pinned Aurora PostgreSQL versions from regional_stack.py
+  # Pattern: AuroraPostgresEngineVersion.VER_XX_Y
+  extract_aurora_versions "gco/stacks/regional_stack.py" | while read -r current_ver; do
+    [ -z "$current_ver" ] && continue
+    major="$(echo "$current_ver" | cut -d. -f1)"
+
+    # Query the latest available engine version for this major line
+    latest="$(aws rds describe-db-engine-versions \
+      --engine aurora-postgresql \
+      --query "DBEngineVersions[?starts_with(EngineVersion, '${major}.')].EngineVersion" \
+      --output text 2>/dev/null \
+      | tr '\t' '\n' | sort -V | tail -1)" || true
+
+    if [ -n "$latest" ] && [ "$current_ver" != "$latest" ]; then
+      echo "  - aurora-postgresql: ${current_ver} -> ${latest}"
+      echo "aurora-postgresql|${current_ver}|${latest}" >> "$AURORA_RESULTS"
+    fi
+  done
+fi
+
+AURORA_COUNT="$(wc -l < "$AURORA_RESULTS" 2>/dev/null | tr -d ' ')"
+[ -z "$AURORA_COUNT" ] && AURORA_COUNT=0
+
+# ---------------------------------------------------------------------------
 # Summary + Markdown report
 # ---------------------------------------------------------------------------
 echo ""
@@ -275,16 +295,30 @@ if [ -n "$ADDON_SKIP_REASON" ]; then
 else
   echo "EKS add-ons outdated:     $ADDON_COUNT"
 fi
+if [ -n "$AURORA_SKIP_REASON" ]; then
+  echo "Aurora PostgreSQL:        (skipped)"
+else
+  echo "Aurora PostgreSQL:        $AURORA_COUNT"
+fi
 
 if [ "$PYTHON_COUNT" -eq 0 ] && [ "$DOCKER_COUNT" -eq 0 ] \
-   && [ "$HELM_COUNT" -eq 0 ] && [ "$ADDON_COUNT" -eq 0 ]; then
+   && [ "$HELM_COUNT" -eq 0 ] && [ "$ADDON_COUNT" -eq 0 ] \
+   && [ "$AURORA_COUNT" -eq 0 ]; then
   echo ""
+  SKIP_NOTES=""
   if [ -n "$ADDON_SKIP_REASON" ]; then
-    echo "All scanned surfaces are up to date (EKS add-ons skipped: $ADDON_SKIP_REASON)"
+    SKIP_NOTES="EKS add-ons skipped: $ADDON_SKIP_REASON"
+  fi
+  if [ -n "$AURORA_SKIP_REASON" ]; then
+    [ -n "$SKIP_NOTES" ] && SKIP_NOTES="$SKIP_NOTES; "
+    SKIP_NOTES="${SKIP_NOTES}Aurora engine skipped: $AURORA_SKIP_REASON"
+  fi
+  if [ -n "$SKIP_NOTES" ]; then
+    echo "All scanned surfaces are up to date ($SKIP_NOTES)"
   else
     echo "All dependencies are up to date."
   fi
-  rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS"
+  rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$AURORA_RESULTS"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "has_drift=false" >> "$GITHUB_OUTPUT"
   fi
@@ -344,6 +378,24 @@ fi
     echo ""
   fi
 
+  if [ "$AURORA_COUNT" -gt 0 ]; then
+    echo "## Aurora PostgreSQL Engine"
+    echo ""
+    echo "| Engine | Current | Latest |"
+    echo "|--------|---------|--------|"
+    while IFS='|' read -r engine cur lat; do
+      echo "| $engine | $cur | $lat |"
+    done < "$AURORA_RESULTS"
+    echo ""
+  fi
+
+  if [ -n "$AURORA_SKIP_REASON" ]; then
+    echo "## Aurora PostgreSQL Engine (skipped)"
+    echo ""
+    echo "> $AURORA_SKIP_REASON"
+    echo ""
+  fi
+
   echo "## Action Required"
   echo ""
   echo "1. Review changelogs for breaking changes"
@@ -356,7 +408,7 @@ fi
   echo "_Automatically created by the \`deps-scan\` workflow._"
 } > "$REPORT_FILE"
 
-rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS"
+rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$AURORA_RESULTS"
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "has_drift=true"            >> "$GITHUB_OUTPUT"
