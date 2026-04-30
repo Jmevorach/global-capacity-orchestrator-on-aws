@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 # Ensure mcp/ is importable
 sys.path.insert(0, str(Path(__file__).parent.parent / "mcp"))
 
+import cli_runner
 import run_mcp
 
 
@@ -28,9 +29,9 @@ class TestRunCli:
     """Tests for the _run_cli helper function."""
 
     def test_successful_command(self):
-        with patch("run_mcp.subprocess.run") as mock_run:
+        with patch("cli_runner.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout='{"jobs": []}', stderr="")
-            result = run_mcp._run_cli("jobs", "list")
+            result = cli_runner._run_cli("jobs", "list")
             assert result == '{"jobs": []}'
             mock_run.assert_called_once()
             cmd = mock_run.call_args[0][0]
@@ -39,49 +40,49 @@ class TestRunCli:
             assert "json" in cmd
 
     def test_empty_stdout_returns_ok(self):
-        with patch("run_mcp.subprocess.run") as mock_run:
+        with patch("cli_runner.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            result = run_mcp._run_cli("stacks", "list")
+            result = cli_runner._run_cli("stacks", "list")
             assert json.loads(result) == {"status": "ok"}
 
     def test_nonzero_exit_returns_error(self):
-        with patch("run_mcp.subprocess.run") as mock_run:
+        with patch("cli_runner.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Stack not found")
-            result = run_mcp._run_cli("stacks", "status", "bad-stack")
+            result = cli_runner._run_cli("stacks", "status", "bad-stack")
             parsed = json.loads(result)
             assert parsed["error"] == "Stack not found"
             assert parsed["exit_code"] == 1
 
     def test_nonzero_exit_falls_back_to_stdout(self):
-        with patch("run_mcp.subprocess.run") as mock_run:
+        with patch("cli_runner.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="some output", stderr="")
-            result = run_mcp._run_cli("jobs", "get", "missing")
+            result = cli_runner._run_cli("jobs", "get", "missing")
             parsed = json.loads(result)
             assert parsed["error"] == "some output"
 
     def test_timeout_returns_error(self):
-        with patch("run_mcp.subprocess.run") as mock_run:
+        with patch("cli_runner.subprocess.run") as mock_run:
             import subprocess
 
             mock_run.side_effect = subprocess.TimeoutExpired(
                 cmd="gco", timeout=120
             )  # nosemgrep: dangerous-subprocess-use-audit - test fixture: mocking TimeoutExpired with static string, not a real subprocess call
-            result = run_mcp._run_cli("stacks", "deploy-all")
+            result = cli_runner._run_cli("stacks", "deploy-all")
             parsed = json.loads(result)
             assert "timed out" in parsed["error"].lower()
 
     def test_cli_not_found_returns_error(self):
-        with patch("run_mcp.subprocess.run") as mock_run:
+        with patch("cli_runner.subprocess.run") as mock_run:
             mock_run.side_effect = FileNotFoundError()
-            result = run_mcp._run_cli("jobs", "list")
+            result = cli_runner._run_cli("jobs", "list")
             parsed = json.loads(result)
             assert "not found" in parsed["error"].lower()
 
     def test_passes_cwd_as_project_root(self):
-        with patch("run_mcp.subprocess.run") as mock_run:
+        with patch("cli_runner.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-            run_mcp._run_cli("stacks", "list")
-            assert mock_run.call_args[1]["cwd"] == str(run_mcp.PROJECT_ROOT)
+            cli_runner._run_cli("stacks", "list")
+            assert mock_run.call_args[1]["cwd"] == str(cli_runner.PROJECT_ROOT)
 
 
 class TestServerMetadata:
@@ -111,7 +112,7 @@ class TestServerMetadata:
         from ``VERSION`` (e.g. ``bump_version.py`` only wrote to ``VERSION``
         and the Python mirror was forgotten).
         """
-        version_file = run_mcp.PROJECT_ROOT / "VERSION"
+        version_file = cli_runner.PROJECT_ROOT / "VERSION"
         if not version_file.is_file():
             import pytest
 
@@ -201,14 +202,14 @@ class TestJobTools:
     """Tests for job management tools."""
 
     def test_list_jobs_all_regions(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout='{"jobs":[]}', stderr="")
             run_mcp.list_jobs()
             cmd = mock.call_args[0][0]
             assert "--all-regions" in cmd
 
     def test_list_jobs_specific_region(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout='{"jobs":[]}', stderr="")
             run_mcp.list_jobs(region="us-east-1")
             cmd = mock.call_args[0][0]
@@ -217,7 +218,7 @@ class TestJobTools:
             assert "--all-regions" not in cmd
 
     def test_list_jobs_with_filters(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_jobs(namespace="ml-jobs", status="running")
             cmd = mock.call_args[0][0]
@@ -227,7 +228,7 @@ class TestJobTools:
             assert "running" in cmd
 
     def test_submit_job_sqs(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout='{"status":"queued"}', stderr="")
             run_mcp.submit_job_sqs("job.yaml", "us-east-1")
             cmd = mock.call_args[0][0]
@@ -236,7 +237,7 @@ class TestJobTools:
             assert "us-east-1" in cmd
 
     def test_submit_job_sqs_with_options(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.submit_job_sqs("job.yaml", "us-west-2", namespace="ml", priority=50)
             cmd = mock.call_args[0][0]
@@ -246,7 +247,7 @@ class TestJobTools:
             assert "50" in cmd
 
     def test_submit_job_api(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.submit_job_api("job.yaml", namespace="test")
             cmd = mock.call_args[0][0]
@@ -255,7 +256,7 @@ class TestJobTools:
             assert "test" in cmd
 
     def test_get_job(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.get_job("my-job", "us-east-1")
             cmd = mock.call_args[0][0]
@@ -263,7 +264,7 @@ class TestJobTools:
             assert "my-job" in cmd
 
     def test_get_job_logs(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="log output", stderr="")
             run_mcp.get_job_logs("my-job", "us-east-1", tail=500)
             cmd = mock.call_args[0][0]
@@ -271,7 +272,7 @@ class TestJobTools:
             assert "500" in cmd
 
     def test_delete_job(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.delete_job("old-job", "us-east-1")
             cmd = mock.call_args[0][0]
@@ -279,21 +280,21 @@ class TestJobTools:
             assert "-y" in cmd
 
     def test_get_job_events(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.get_job_events("my-job", "us-east-1")
             cmd = mock.call_args[0][0]
             assert "events" in cmd
 
     def test_cluster_health_all(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.cluster_health()
             cmd = mock.call_args[0][0]
             assert "--all-regions" in cmd
 
     def test_cluster_health_region(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.cluster_health(region="us-east-1")
             cmd = mock.call_args[0][0]
@@ -301,7 +302,7 @@ class TestJobTools:
             assert "--all-regions" not in cmd
 
     def test_queue_status(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.queue_status()
             cmd = mock.call_args[0][0]
@@ -312,7 +313,7 @@ class TestCapacityTools:
     """Tests for capacity tools."""
 
     def test_check_capacity(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.check_capacity("g4dn.xlarge", "us-east-1")
             cmd = mock.call_args[0][0]
@@ -320,35 +321,35 @@ class TestCapacityTools:
             assert "us-east-1" in cmd
 
     def test_capacity_status(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.capacity_status()
             cmd = mock.call_args[0][0]
             assert "status" in cmd
 
     def test_recommend_region_gpu(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.recommend_region(gpu=True)
             cmd = mock.call_args[0][0]
             assert "--gpu" in cmd
 
     def test_recommend_region_instance(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.recommend_region(instance_type="p4d.24xlarge")
             cmd = mock.call_args[0][0]
             assert "p4d.24xlarge" in cmd
 
     def test_spot_prices(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.spot_prices("g5.xlarge", "us-west-2")
             cmd = mock.call_args[0][0]
             assert "spot-prices" in cmd
 
     def test_ai_recommend_basic(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.ai_recommend(workload="Fine-tuning a 20B parameter LLM")
             cmd = mock.call_args[0][0]
@@ -357,7 +358,7 @@ class TestCapacityTools:
             assert "Fine-tuning a 20B parameter LLM" in cmd
 
     def test_ai_recommend_with_options(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.ai_recommend(
                 workload="Training job",
@@ -382,7 +383,7 @@ class TestCapacityTools:
             assert "--max-cost" in cmd
 
     def test_list_reservations(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_reservations(instance_type="p5.48xlarge", region="us-east-1")
             cmd = mock.call_args[0][0]
@@ -391,14 +392,14 @@ class TestCapacityTools:
             assert "-r" in cmd
 
     def test_list_reservations_no_filters(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_reservations()
             cmd = mock.call_args[0][0]
             assert "reservations" in cmd
 
     def test_reservation_check(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.reservation_check("p4d.24xlarge", region="us-east-1", block_duration=48)
             cmd = mock.call_args[0][0]
@@ -409,7 +410,7 @@ class TestCapacityTools:
             assert "48" in cmd
 
     def test_reservation_check_no_blocks(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.reservation_check("g5.48xlarge", include_blocks=False)
             cmd = mock.call_args[0][0]
@@ -422,7 +423,7 @@ class TestCapacityTools:
         import importlib
 
         importlib.reload(run_mcp)
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.reserve_capacity("cb-0123456789abcdef0", "us-east-1", dry_run=True)
             cmd = mock.call_args[0][0]
@@ -436,7 +437,7 @@ class TestCapacityTools:
         import importlib
 
         importlib.reload(run_mcp)
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.reserve_capacity("cb-0123456789abcdef0", "us-east-1")
             cmd = mock.call_args[0][0]
@@ -448,7 +449,7 @@ class TestInferenceTools:
     """Tests for inference endpoint tools."""
 
     def test_deploy_inference_basic(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.deploy_inference("my-llm", "vllm/vllm-openai:v0.17.0")
             cmd = mock.call_args[0][0]
@@ -457,7 +458,7 @@ class TestInferenceTools:
             assert "vllm/vllm-openai:v0.17.0" in cmd
 
     def test_deploy_inference_with_options(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.deploy_inference(
                 "my-llm",
@@ -475,7 +476,7 @@ class TestInferenceTools:
             assert "MODEL=llama3" in cmd
 
     def test_list_inference_endpoints(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_inference_endpoints(state="running")
             cmd = mock.call_args[0][0]
@@ -483,7 +484,7 @@ class TestInferenceTools:
             assert "running" in cmd
 
     def test_inference_status(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.inference_status("my-llm")
             cmd = mock.call_args[0][0]
@@ -491,7 +492,7 @@ class TestInferenceTools:
             assert "my-llm" in cmd
 
     def test_scale_inference(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.scale_inference("my-llm", 5)
             cmd = mock.call_args[0][0]
@@ -499,7 +500,7 @@ class TestInferenceTools:
             assert "5" in cmd
 
     def test_update_inference_image(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.update_inference_image("my-llm", "img:v2")
             cmd = mock.call_args[0][0]
@@ -507,7 +508,7 @@ class TestInferenceTools:
             assert "img:v2" in cmd
 
     def test_stop_inference(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.stop_inference("my-llm")
             cmd = mock.call_args[0][0]
@@ -515,14 +516,14 @@ class TestInferenceTools:
             assert "-y" in cmd
 
     def test_start_inference(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.start_inference("my-llm")
             cmd = mock.call_args[0][0]
             assert "start" in cmd
 
     def test_delete_inference(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.delete_inference("my-llm")
             cmd = mock.call_args[0][0]
@@ -530,7 +531,7 @@ class TestInferenceTools:
             assert "-y" in cmd
 
     def test_canary_deploy(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.canary_deploy("my-llm", "img:v2", weight=25)
             cmd = mock.call_args[0][0]
@@ -538,7 +539,7 @@ class TestInferenceTools:
             assert "25" in cmd
 
     def test_promote_canary(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.promote_canary("my-llm")
             cmd = mock.call_args[0][0]
@@ -546,7 +547,7 @@ class TestInferenceTools:
             assert "-y" in cmd
 
     def test_rollback_canary(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.rollback_canary("my-llm")
             cmd = mock.call_args[0][0]
@@ -554,7 +555,7 @@ class TestInferenceTools:
             assert "-y" in cmd
 
     def test_invoke_inference_basic(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout='{"choices":[]}', stderr="")
             run_mcp.invoke_inference("my-llm", "Hello world")
             cmd = mock.call_args[0][0]
@@ -564,7 +565,7 @@ class TestInferenceTools:
             assert "Hello world" in cmd
 
     def test_invoke_inference_with_options(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.invoke_inference(
                 "my-llm", "test", max_tokens=200, api_path="/v1/completions", region="us-east-1"
@@ -577,14 +578,14 @@ class TestInferenceTools:
             assert "us-east-1" in cmd
 
     def test_invoke_inference_with_stream(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.invoke_inference("my-llm", "test", stream=True)
             cmd = mock.call_args[0][0]
             assert "--stream" in cmd
 
     def test_chat_inference_basic(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.chat_inference("my-llm", [{"role": "user", "content": "Hi"}])
             cmd = mock.call_args[0][0]
@@ -594,7 +595,7 @@ class TestInferenceTools:
             assert "/v1/chat/completions" in cmd
 
     def test_chat_inference_with_options(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.chat_inference(
                 "my-llm",
@@ -619,7 +620,7 @@ class TestInferenceTools:
             assert len(body["messages"]) == 2
 
     def test_chat_inference_with_stream(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.chat_inference(
                 "my-llm",
@@ -635,7 +636,7 @@ class TestInferenceTools:
             assert body["stream"] is True
 
     def test_inference_health(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.inference_health("my-llm")
             cmd = mock.call_args[0][0]
@@ -643,7 +644,7 @@ class TestInferenceTools:
             assert "my-llm" in cmd
 
     def test_inference_health_with_region(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.inference_health("my-llm", region="us-east-1")
             cmd = mock.call_args[0][0]
@@ -651,7 +652,7 @@ class TestInferenceTools:
             assert "us-east-1" in cmd
 
     def test_list_endpoint_models(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_endpoint_models("my-llm")
             cmd = mock.call_args[0][0]
@@ -659,7 +660,7 @@ class TestInferenceTools:
             assert "my-llm" in cmd
 
     def test_list_endpoint_models_with_region(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_endpoint_models("my-llm", region="eu-west-1")
             cmd = mock.call_args[0][0]
@@ -671,7 +672,7 @@ class TestCostTools:
     """Tests for cost tracking tools."""
 
     def test_cost_summary(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.cost_summary(days=7)
             cmd = mock.call_args[0][0]
@@ -679,14 +680,14 @@ class TestCostTools:
             assert "7" in cmd
 
     def test_cost_by_region(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.cost_by_region()
             cmd = mock.call_args[0][0]
             assert "regions" in cmd
 
     def test_cost_trend(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.cost_trend(days=7)
             cmd = mock.call_args[0][0]
@@ -694,7 +695,7 @@ class TestCostTools:
             assert "7" in cmd
 
     def test_cost_forecast(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.cost_forecast(days_ahead=60)
             cmd = mock.call_args[0][0]
@@ -706,7 +707,7 @@ class TestInfraTools:
     """Tests for infrastructure tools."""
 
     def test_list_stacks(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="stacks", stderr="")
             run_mcp.list_stacks()
             cmd = mock.call_args[0][0]
@@ -714,7 +715,7 @@ class TestInfraTools:
             assert "list" in cmd
 
     def test_stack_status(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.stack_status("gco-us-east-1", "us-east-1")
             cmd = mock.call_args[0][0]
@@ -722,7 +723,7 @@ class TestInfraTools:
             assert "us-east-1" in cmd
 
     def test_fsx_status(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.fsx_status()
             cmd = mock.call_args[0][0]
@@ -734,7 +735,7 @@ class TestStorageTools:
     """Tests for storage tools."""
 
     def test_list_storage_contents(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_storage_contents("us-east-1")
             cmd = mock.call_args[0][0]
@@ -742,14 +743,14 @@ class TestStorageTools:
             assert "us-east-1" in cmd
 
     def test_list_storage_contents_with_path(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_storage_contents("us-east-1", path="/outputs")
             cmd = mock.call_args[0][0]
             assert "/outputs" in cmd
 
     def test_list_file_systems(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_file_systems()
             cmd = mock.call_args[0][0]
@@ -760,7 +761,7 @@ class TestModelTools:
     """Tests for model weight tools."""
 
     def test_list_models(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             run_mcp.list_models()
             cmd = mock.call_args[0][0]
@@ -768,7 +769,7 @@ class TestModelTools:
             assert "list" in cmd
 
     def test_get_model_uri(self):
-        with patch("run_mcp.subprocess.run") as mock:
+        with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="s3://bucket/model", stderr="")
             result = run_mcp.get_model_uri("llama3-8b")
             cmd = mock.call_args[0][0]
@@ -783,12 +784,13 @@ class TestResourceRegistration:
     def test_static_resource_count(self):
         resources = asyncio.run(run_mcp.mcp.list_resources())
         # docs://index, docs://README, docs://QUICKSTART, docs://CONTRIBUTING,
-        # docs://examples/README, source://index,
+        # docs://examples/README, docs://examples/guide, source://index,
         # k8s://manifests/index, iam://policies/index,
         # infra://index, infra://helm/charts.yaml,
         # demos://index, clients://index, scripts://index,
-        # ci://index
-        assert len(resources) == 14
+        # ci://index, tests://index,
+        # config://index, config://cdk.json, config://feature-toggles, config://env-vars
+        assert len(resources) == 20
 
     def test_static_resource_uris(self):
         resources = asyncio.run(run_mcp.mcp.list_resources())
@@ -798,6 +800,7 @@ class TestResourceRegistration:
         assert "docs://gco/QUICKSTART" in uris
         assert "docs://gco/CONTRIBUTING" in uris
         assert "docs://gco/examples/README" in uris
+        assert "docs://gco/examples/guide" in uris
         assert "source://gco/index" in uris
         assert "k8s://gco/manifests/index" in uris
         assert "iam://gco/policies/index" in uris
@@ -806,6 +809,11 @@ class TestResourceRegistration:
         assert "clients://gco/index" in uris
         assert "scripts://gco/index" in uris
         assert "ci://gco/index" in uris
+        assert "tests://gco/index" in uris
+        assert "config://gco/index" in uris
+        assert "config://gco/cdk.json" in uris
+        assert "config://gco/feature-toggles" in uris
+        assert "config://gco/env-vars" in uris
 
     def test_resource_template_count(self):
         templates = asyncio.run(run_mcp.mcp.list_resource_templates())
@@ -813,8 +821,9 @@ class TestResourceRegistration:
         # k8s/manifests/{filename}, iam/policies/{filename}, infra/dockerfiles/{filename},
         # demos/{filename}, clients/{filename}, scripts/{filename},
         # ci/workflows, ci/actions, ci/scripts, ci/templates,
-        # ci/codeql, ci/kind, ci/config
-        assert len(templates) == 17
+        # ci/codeql, ci/kind, ci/config,
+        # tests/{filepath}
+        assert len(templates) == 18
 
     def test_resource_template_uris(self):
         templates = asyncio.run(run_mcp.mcp.list_resource_templates())

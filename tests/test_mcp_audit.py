@@ -228,7 +228,7 @@ class TestAuditLoggedOnRealTools:
     def test_list_jobs_is_audit_logged(self, caplog):
         with (
             caplog.at_level(logging.INFO, logger="gco.mcp.audit"),
-            patch("run_mcp.subprocess.run") as mock,
+            patch("cli_runner.subprocess.run") as mock,
         ):
             mock.return_value = MagicMock(returncode=0, stdout='{"jobs":[]}', stderr="")
             run_mcp.list_jobs(region="us-east-1")
@@ -242,7 +242,7 @@ class TestAuditLoggedOnRealTools:
     def test_get_model_uri_is_audit_logged(self, caplog):
         with (
             caplog.at_level(logging.INFO, logger="gco.mcp.audit"),
-            patch("run_mcp.subprocess.run") as mock,
+            patch("cli_runner.subprocess.run") as mock,
         ):
             mock.return_value = MagicMock(returncode=0, stdout="s3://bucket/model", stderr="")
             run_mcp.get_model_uri(model_name="llama3")

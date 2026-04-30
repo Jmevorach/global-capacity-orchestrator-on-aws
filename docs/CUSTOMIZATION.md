@@ -1427,10 +1427,12 @@ See `examples/efa-distributed-training.yaml` for a complete example.
 
 | Instance Type | EFA Networking | GPUs (Total GPU Memory) | Use Case |
 |--------------|---------------|------------------------|----------|
-| `p4d.24xlarge` | 400 Gbps (4x 100 Gbps EFA) | 8x A100 (320 GB HBM2e) | Distributed training, fine-tuning |
-| `p5.48xlarge` | 3.2 Tbps (32x 100 Gbps EFA) | 8x H100 (640 GB HBM3) | Large-scale training, high-performance inference |
-| `p6-b200.48xlarge` | 3.2 Tbps (8x 400 Gbps EFA) | 8x B200 (1,432 GB HBM3e) | Large-scale training and inference |
-| `p6-b300.48xlarge` | 6.4 Tbps EFA | 8x B300 Ultra (2,144 GB HBM3e) | Large-scale training and inference |
+| `p4d.24xlarge` | 400 Gbps (4x EFA) | 8x A100 (320 GB HBM2e) | Distributed training, fine-tuning |
+| `p5.48xlarge` | 3,200 Gbps (32x EFA) | 8x H100 (640 GB HBM3) | Large-scale training, high-performance inference |
+| `p5e.48xlarge` | 3,200 Gbps (32x EFA) | 8x H200 (1,128 GB HBM3e) | Large-scale training, high-performance inference |
+| `p6-b200.48xlarge` | 3.2 Tbps (8x EFAv4) | 8x B200 (1,432 GB HBM3e) | Large-scale training and inference |
+| `p6-b300.48xlarge` | 6.4 Tbps EFAv4 | 8x B300 Ultra (2,144 GB HBM3e) | Large-scale training and inference |
+| `p6e-gb200` | 28.8 Tbps (EFAv4 UltraServer) | GB200 NVL72 | Largest-scale training and inference |
 
 ### NIXL Support
 
@@ -1455,7 +1457,7 @@ GCO includes built-in support for AWS Trainium and Inferentia accelerators. Thes
 | `inf2.24xlarge` | 6 (Inferentia2) | 12 | 192 GB | Multi-model inference |
 | `inf2.48xlarge` | 12 (Inferentia2) | 24 | 384 GB | Large model inference |
 | `trn1.2xlarge` | 1 (Trainium) | 2 | 32 GB | Small-scale training |
-| `trn1.32xlarge` | 16 (Trainium) | 32 | 512 GB | Distributed training (800 Gbps EFA) |
+| `trn1.32xlarge` | 16 (Trainium) | 32 | 512 GB | Distributed training (1,600 Gbps EFA) |
 | `trn2.3xlarge` | 1 (Trainium2) | 8 | 96 GB | Medium-scale training |
 | `trn2.48xlarge` | 16 (Trainium2) | 128 | 1.5 TB | Large-scale training (3.2 Tbps EFA) |
 
