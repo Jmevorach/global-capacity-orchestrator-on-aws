@@ -1,158 +1,177 @@
 # Kubernetes Manifest Examples
 
-This directory contains example Kubernetes manifests you can use with GCO (Global Capacity Orchestrator on AWS).
+This directory contains example Kubernetes manifests you can use with GCO (Global Capacity Orchestrator on AWS). Each example is self-contained and ready to submit.
 
-## Available Examples
+## Table of Contents
 
-### 1. Simple Job (`simple-job.yaml`)
+- [Quick Reference](#quick-reference)
+- [Examples](#examples)
+  - [Aurora pgvector Job](#aurora-pgvector-job)
+  - [DAG Pipeline](#dag-pipeline)
+  - [EFA Distributed Training](#efa-distributed-training)
+  - [EFS Output Job](#efs-output-job)
+  - [FSx for Lustre Job](#fsx-for-lustre-job)
+  - [GPU Job](#gpu-job)
+  - [GPU Time-Slicing Job](#gpu-time-slicing-job)
+  - [Inference Frameworks](#inference-frameworks)
+  - [Inferentia Job](#inferentia-job)
+  - [KEDA Autoscaled Job](#keda-autoscaled-job)
+  - [Kueue Job Queueing](#kueue-job-queueing)
+  - [MegaTrain SFT Job](#megatrain-sft-job)
+  - [Model Download Job](#model-download-job)
+  - [Multi-GPU Distributed Training](#multi-gpu-distributed-training)
+  - [Ray Cluster](#ray-cluster)
+  - [Simple Job](#simple-job)
+  - [Slurm Cluster Job](#slurm-cluster-job)
+  - [SQS Job Submission](#sqs-job-submission)
+  - [Trainium Job](#trainium-job)
+  - [Valkey Cache Job](#valkey-cache-job)
+  - [Volcano Gang Scheduling](#volcano-gang-scheduling)
+  - [YuniKorn Hierarchical Queues](#yunikorn-hierarchical-queues)
+- [Customizing Examples](#customizing-examples)
+- [Best Practices](#best-practices)
+- [Troubleshooting](#troubleshooting)
+- [Testing Your Manifests](#testing-your-manifests)
+- [Cleaning Up](#cleaning-up)
+- [Additional Resources](#additional-resources)
 
-A basic Kubernetes Job that runs a simple command and completes.
+## Quick Reference
 
-**Usage:**
-```bash
-kubectl apply -f examples/simple-job.yaml
-kubectl get jobs
-kubectl logs job/hello-gco
-```
+| Example | File | Category | GPU | Opt-in |
+|---------|------|----------|-----|--------|
+| [Aurora pgvector](#aurora-pgvector-job) | `aurora-pgvector-job.yaml` | Database | — | Aurora |
+| [DAG Preprocess](#dag-pipeline) | `dag-step-preprocess.yaml` | Pipeline | — | — |
+| [DAG Train](#dag-pipeline) | `dag-step-train.yaml` | Pipeline | — | — |
+| [EFA Training](#efa-distributed-training) | `efa-distributed-training.yaml` | Jobs | ✅ | — |
+| [EFS Output](#efs-output-job) | `efs-output-job.yaml` | Storage | — | — |
+| [FSx Lustre](#fsx-for-lustre-job) | `fsx-lustre-job.yaml` | Storage | — | FSx |
+| [GPU Job](#gpu-job) | `gpu-job.yaml` | Jobs | ✅ | — |
+| [GPU Time-Slicing](#gpu-time-slicing-job) | `gpu-timeslicing-job.yaml` | Jobs | ✅ | ConfigMap |
+| [Inferentia](#inferentia-job) | `inferentia-job.yaml` | Accelerator | Inferentia | — |
+| [SGLang](#inference-frameworks) | `inference-sglang.yaml` | Inference | ✅ | — |
+| [TGI](#inference-frameworks) | `inference-tgi.yaml` | Inference | ✅ | — |
+| [TorchServe](#inference-frameworks) | `inference-torchserve.yaml` | Inference | ✅ | — |
+| [Triton](#inference-frameworks) | `inference-triton.yaml` | Inference | ✅ | — |
+| [vLLM](#inference-frameworks) | `inference-vllm.yaml` | Inference | ✅ | — |
+| [KEDA Scaled](#keda-autoscaled-job) | `keda-scaled-job.yaml` | Scheduler | — | — |
+| [Kueue](#kueue-job-queueing) | `kueue-job.yaml` | Scheduler | Optional | — |
+| [MegaTrain SFT](#megatrain-sft-job) | `megatrain-sft-job.yaml` | Jobs | ✅ | — |
+| [Model Download](#model-download-job) | `model-download-job.yaml` | Jobs | — | — |
+| [Multi-GPU Training](#multi-gpu-distributed-training) | `multi-gpu-training.yaml` | Jobs | ✅ | — |
+| [Pipeline DAG](#dag-pipeline) | `pipeline-dag.yaml` | Pipeline | — | — |
+| [Ray Cluster](#ray-cluster) | `ray-cluster.yaml` | Distributed | — | — |
+| [Simple Job](#simple-job) | `simple-job.yaml` | Jobs | — | — |
+| [Slurm](#slurm-cluster-job) | `slurm-cluster-job.yaml` | Scheduler | — | Slurm |
+| [SQS Submission](#sqs-job-submission) | `sqs-job-submission.yaml` | Jobs | Optional | — |
+| [Trainium](#trainium-job) | `trainium-job.yaml` | Accelerator | Trainium | — |
+| [Valkey Cache](#valkey-cache-job) | `valkey-cache-job.yaml` | Caching | — | Valkey |
+| [Volcano Gang](#volcano-gang-scheduling) | `volcano-gang-job.yaml` | Scheduler | — | — |
+| [YuniKorn](#yunikorn-hierarchical-queues) | `yunikorn-job.yaml` | Scheduler | — | YuniKorn |
 
-**When to use:**
-- Testing cluster connectivity
-- Running one-off tasks
-- Batch processing
+**Legend:** GPU = requires GPU/accelerator nodes. Opt-in = requires enabling a feature in `cdk.json` before deploying.
 
 ---
 
-### 2. GPU Job (`gpu-job.yaml`)
+## Examples
 
-A job that requests GPU resources and runs on GPU-enabled nodes.
+### Aurora pgvector Job
+
+**File:** `aurora-pgvector-job.yaml`
+
+Connects to the regional Aurora Serverless v2 PostgreSQL cluster with pgvector for vector similarity search (RAG, semantic search). Credentials are injected automatically via the `gco-aurora-pgvector` ConfigMap and AWS Secrets Manager.
+
+**Prerequisites:** Enable Aurora in `cdk.json`: `"aurora_pgvector": { "enabled": true }` and redeploy.
 
 **Usage:**
 ```bash
-kubectl apply -f examples/gpu-job.yaml
-kubectl get jobs
-kubectl logs job/gpu-test-job
+gco jobs submit-direct examples/aurora-pgvector-job.yaml -r us-east-1
 ```
 
-**Requirements:**
-- GPU nodepools must be configured (included by default)
-- NVIDIA device plugin must be running (included by default)
+**Demonstrates:** pgvector extension setup, HNSW index creation, vector similarity search, embedding storage and retrieval.
 
-**When to use:**
-- ML model training
-- GPU-accelerated workloads
-- Testing GPU availability
+**When to use:** RAG applications, semantic search, vector similarity workloads, storing and querying embeddings.
 
 ---
 
-### 3. GPU Time-Slicing Job (`gpu-timeslicing-job.yaml`)
+### DAG Pipeline
 
-A job that uses a fractional GPU via NVIDIA time-slicing. Multiple pods share a single physical GPU by taking turns, letting you run lightweight GPU workloads without dedicating a full GPU to each pod.
+**Files:** `pipeline-dag.yaml`, `dag-step-preprocess.yaml`, `dag-step-train.yaml`
 
-**Prerequisites:**
-
-Time-slicing must be enabled by applying a ConfigMap to the NVIDIA device plugin. See the comments in the manifest for setup instructions.
+A multi-step pipeline with dependency ordering. The preprocess step generates training data on shared EFS, then the train step reads it and produces model artifacts. Steps only run after their dependencies complete successfully.
 
 **Usage:**
 ```bash
-kubectl apply -f examples/gpu-timeslicing-job.yaml
-kubectl get jobs -n gco-jobs
-kubectl logs job/gpu-timeslice-job -n gco-jobs
+# Validate the DAG
+gco dag validate examples/pipeline-dag.yaml
+
+# Dry run (shows execution plan without running)
+gco dag run examples/pipeline-dag.yaml --dry-run
+
+# Run the pipeline
+gco dag run examples/pipeline-dag.yaml -r us-east-1
 ```
 
-**Requirements:**
-- GPU nodepools must be configured (included by default)
-- NVIDIA device plugin with time-slicing ConfigMap applied (not enabled by default — see manifest comments for setup)
-
-**When to use:**
-- Inference workloads that don't need a full GPU
-- Dev/test GPU workloads
-- Running multiple lightweight GPU jobs on a single node
-- Reducing GPU costs by sharing hardware
+**When to use:** Multi-step ML pipelines, data processing workflows with dependencies, any workload where steps must execute in order.
 
 ---
 
-### 4. EFS Output Job (`efs-output-job.yaml`)
+### EFA Distributed Training
 
-A job that writes output to shared EFS storage, demonstrating how to persist job results.
+**File:** `efa-distributed-training.yaml`
+
+Uses Elastic Fabric Adapter (EFA) for high-bandwidth inter-node communication — up to 3.2 Tbps on P5/Trn2 instances and up to 28.8 Tbps on P6e-GB200 UltraServers. Critical for large-scale distributed training.
 
 **Usage:**
 ```bash
-# Submit the job
+gco jobs submit-direct examples/efa-distributed-training.yaml -r us-east-1
+```
+
+**Requirements:** EFA-capable instances (p4d.24xlarge, p5.48xlarge, p5e.48xlarge, p6, trn1.32xlarge, trn2.48xlarge). EFA is enabled by default via the NVIDIA Network Operator Helm chart.
+
+**When to use:** Large-scale distributed training requiring high inter-node bandwidth, NCCL-based multi-node GPU communication.
+
+---
+
+### EFS Output Job
+
+**File:** `efs-output-job.yaml`
+
+Writes output to shared EFS storage, demonstrating how to persist job results that survive pod termination.
+
+**Usage:**
+```bash
 gco jobs submit-direct examples/efs-output-job.yaml --region us-east-1 -n gco-jobs
-
-# Check job status
-kubectl get jobs -n gco-jobs
-
-# View logs
-kubectl logs job/efs-output-example -n gco-jobs
-
-# List what's on EFS storage (discover output directories)
 gco files ls -r us-east-1
-
-# Download outputs (works even after job pod is deleted)
 gco files download efs-output-example ./efs-results -r us-east-1
-
-# View the downloaded results
 cat ./efs-results/results.json
 ```
 
-**Features:**
-- Mounts shared EFS storage at `/outputs`
-- Creates output directory using job name (not pod name)
-- Results persist after job completion
-- Other pods can read the outputs
+**Features:** Mounts shared EFS at `/outputs`, creates output directory using job name, results persist after job completion, other pods can read the outputs.
 
-**When to use:**
-- ML model training with checkpoint saving
-- Data processing pipelines
-- Any job that needs to persist outputs
-- Sharing data between jobs
+**When to use:** ML training with checkpoint saving, data processing pipelines, sharing data between jobs.
 
 ---
 
-### 5. FSx for Lustre Job (`fsx-lustre-job.yaml`)
+### FSx for Lustre Job
 
-A job that uses FSx for Lustre high-performance storage for I/O-intensive workloads.
+**File:** `fsx-lustre-job.yaml`
+
+Uses FSx for Lustre high-performance parallel storage for I/O-intensive workloads.
 
 **Prerequisites:**
 ```bash
-# Enable FSx for Lustre
 gco stacks fsx enable -y
-
-# Redeploy the stack
 gco stacks deploy gco-us-east-1 -y
 ```
 
 **Usage:**
 ```bash
-# Submit the job
 gco jobs submit-direct examples/fsx-lustre-job.yaml --region us-east-1 -n gco-jobs
-
-# Check job status
-kubectl get jobs -n gco-jobs
-
-# View logs
-kubectl logs job/fsx-lustre-example -n gco-jobs
-
-# Download outputs (works even after job pod is deleted)
 gco files download fsx-lustre-example ./fsx-results -r us-east-1 -t fsx
 ```
 
-**Features:**
-- High-throughput parallel file system (hundreds of GB/s)
-- Low-latency access (sub-millisecond)
-- Ideal for large datasets and HPC workloads
-- Supports checkpointing for long-running jobs
-- Can integrate with S3 for data import/export
-
-**When to use:**
-- Large-scale ML training with big datasets
-- High-performance computing (HPC) workloads
-- Jobs requiring high I/O throughput
-- Checkpoint/restart for long-running jobs
-- Processing large files (videos, genomics, etc.)
-
 **FSx vs EFS:**
+
 | Feature | EFS | FSx for Lustre |
 |---------|-----|----------------|
 | Throughput | Up to 10 GB/s | Up to 1000+ GB/s |
@@ -160,19 +179,57 @@ gco files download fsx-lustre-example ./fsx-results -r us-east-1 -t fsx
 | Cost | Pay per GB stored | Pay per GB provisioned |
 | Best for | General purpose | HPC, ML training |
 
+**When to use:** Large-scale ML training with big datasets, HPC workloads, jobs requiring high I/O throughput, checkpoint/restart for long-running jobs.
+
 ---
 
-### 6. Inference Examples
+### GPU Job
+
+**File:** `gpu-job.yaml`
+
+A job that requests GPU resources and runs on GPU-enabled nodes.
+
+**Usage:**
+```bash
+gco jobs submit-sqs examples/gpu-job.yaml --region us-east-1
+kubectl logs job/gpu-test-job
+```
+
+**Requirements:** GPU nodepools (included by default), NVIDIA device plugin (included by default).
+
+**When to use:** ML model training, GPU-accelerated workloads, testing GPU availability.
+
+---
+
+### GPU Time-Slicing Job
+
+**File:** `gpu-timeslicing-job.yaml`
+
+Uses a fractional GPU via NVIDIA time-slicing. Multiple pods share a single physical GPU by taking turns, letting you run lightweight GPU workloads without dedicating a full GPU to each pod.
+
+**Usage:**
+```bash
+kubectl apply -f examples/gpu-timeslicing-job.yaml
+kubectl logs job/gpu-timeslice-job -n gco-jobs
+```
+
+**Requirements:** GPU nodepools (default), NVIDIA device plugin with time-slicing ConfigMap applied (not enabled by default — see manifest comments for setup).
+
+**When to use:** Inference workloads that don't need a full GPU, dev/test GPU workloads, reducing GPU costs by sharing hardware.
+
+---
+
+### Inference Frameworks
 
 GCO includes example manifests for multiple inference frameworks. Each creates a Deployment and Service in the `gco-inference` namespace.
 
-| Example | Framework | Description |
-|---------|-----------|-------------|
-| `inference-vllm.yaml` | vLLM | OpenAI-compatible LLM serving |
-| `inference-tgi.yaml` | TGI | HuggingFace optimized inference |
-| `inference-triton.yaml` | Triton | NVIDIA multi-framework serving |
-| `inference-torchserve.yaml` | TorchServe | PyTorch model serving |
-| `inference-sglang.yaml` | SGLang | High-throughput serving with RadixAttention |
+| Example | Framework | Description | Docs |
+|---------|-----------|-------------|------|
+| `inference-sglang.yaml` | SGLang | High-throughput serving with RadixAttention | [Inference Guide](../docs/INFERENCE.md) |
+| `inference-tgi.yaml` | TGI | HuggingFace optimized inference | [Inference Guide](../docs/INFERENCE.md) |
+| `inference-torchserve.yaml` | TorchServe | PyTorch model serving | [Inference Guide](../docs/INFERENCE.md) |
+| `inference-triton.yaml` | Triton | NVIDIA multi-framework serving (PyTorch, TensorFlow, ONNX) | [Inference Guide](../docs/INFERENCE.md) |
+| `inference-vllm.yaml` | vLLM | OpenAI-compatible LLM serving with PagedAttention | [Inference Guide](../docs/INFERENCE.md) |
 
 **Deploy via CLI (recommended for multi-region):**
 ```bash
@@ -184,33 +241,15 @@ gco inference deploy my-llm -i vllm/vllm-openai:v0.19.1 --gpu-count 1
 gco jobs submit-direct examples/inference-vllm.yaml -r us-east-1
 ```
 
----
-
-### 7. Trainium Job (`trainium-job.yaml`)
-
-A job that runs on an AWS Trainium instance using the Neuron SDK. Trainium is a purpose-built ML accelerator designed by AWS, offering lower cost than GPU instances for training workloads.
-
-**Usage:**
-```bash
-gco jobs submit examples/trainium-job.yaml --region us-east-1
-gco jobs logs trainium-test -r us-east-1
-```
-
-**Requirements:**
-- Neuron device plugin (installed by default via Helm chart)
-- Neuron nodepool (applied by default)
-- Container images built with the Neuron SDK (not CUDA)
-
-**When to use:**
-- Cost-optimized model training
-- Inference workloads on Neuron-supported models
-- Distributed training with EFA on trn1.32xlarge or trn2.48xlarge
+See the [Inference Guide](../docs/INFERENCE.md) for canary deployments, scaling, health checks, and multi-region routing.
 
 ---
 
-### 8. Inferentia Job (`inferentia-job.yaml`)
+### Inferentia Job
 
-A job that runs on an AWS Inferentia2 instance using the Neuron SDK. Inferentia is optimized for low-cost, high-throughput inference.
+**File:** `inferentia-job.yaml`
+
+Runs on an AWS Inferentia2 instance using the Neuron SDK. Inferentia is optimized for low-cost, high-throughput inference.
 
 **Usage:**
 ```bash
@@ -218,21 +257,149 @@ gco jobs submit examples/inferentia-job.yaml --region us-east-1
 gco jobs logs inferentia-test -r us-east-1
 ```
 
-**Requirements:**
-- Neuron device plugin (installed by default via Helm chart)
-- Neuron nodepool (applied by default)
-- Container images built with the Neuron SDK (not CUDA)
+**Requirements:** Neuron device plugin (installed by default), Neuron nodepool (applied by default), container images built with the Neuron SDK (not CUDA).
 
-**When to use:**
-- Cost-optimized inference serving
-- High-throughput batch inference
-- Deploying Neuron-compiled models (HuggingFace, PyTorch)
+**When to use:** Cost-optimized inference serving, high-throughput batch inference, deploying Neuron-compiled models.
 
 ---
 
-### 9. Slurm Cluster Job (`slurm-cluster-job.yaml`)
+### KEDA Autoscaled Job
 
-A self-contained Kubernetes Job that writes a Slurm batch script into the login pod, submits it via `sbatch`, waits for completion, and prints the output. Just `kubectl apply` and watch the logs.
+**File:** `keda-scaled-job.yaml`
+
+A custom SQS-triggered ScaledJob using KEDA. Scales job replicas based on SQS queue depth. Note: GCO ships with a built-in SQS consumer — use this example as a starting point for custom SQS-triggered workloads.
+
+**Usage:**
+```bash
+# Edit the manifest to set your JOB_QUEUE_URL and REGION, then:
+kubectl apply -f examples/keda-scaled-job.yaml
+```
+
+**Requirements:** KEDA (enabled by default). See [KEDA docs](../docs/KEDA.md).
+
+**When to use:** Custom SQS-triggered processing, event-driven autoscaling, scaling workloads based on external metrics.
+
+---
+
+### Kueue Job Queueing
+
+**File:** `kueue-job.yaml`
+
+Demonstrates job queueing with resource quotas and fair-sharing. Creates ClusterQueue, LocalQueue, ResourceFlavors, and sample CPU + GPU jobs. Jobs are queued and scheduled based on available cluster resources.
+
+**Usage:**
+```bash
+kubectl apply -f examples/kueue-job.yaml
+kubectl get clusterqueue
+kubectl get localqueue -n gco-jobs
+kubectl get workloads -n gco-jobs
+```
+
+**Requirements:** Kueue (enabled by default). See [Kueue docs](../docs/KUEUE.md).
+
+**When to use:** Multi-tenant clusters with resource quotas, fair-sharing between teams, priority-based job scheduling.
+
+---
+
+### MegaTrain SFT Job
+
+**File:** `megatrain-sft-job.yaml`
+
+Runs SFT fine-tuning of Qwen2.5-1.5B on a single GPU using [MegaTrain](https://github.com/DLYuanGod/MegaTrain). An init container downloads model weights to shared EFS (skipped if already cached), then the main container trains on the built-in alpaca demo dataset. Change the `MODEL_NAME` env var to target a different HuggingFace model.
+
+**Usage:**
+```bash
+gco jobs submit-direct examples/megatrain-sft-job.yaml -r us-east-1
+gco jobs logs megatrain-sft -r us-east-1 -f
+```
+
+**Requirements:** GPU node with large CPU RAM, shared EFS storage.
+
+**When to use:** SFT fine-tuning of large HuggingFace models, full-precision training on a single GPU.
+
+---
+
+### Model Download Job
+
+**File:** `model-download-job.yaml`
+
+Pre-downloads model weights from HuggingFace to shared EFS so inference endpoints can mount them instantly. Downloads `facebook/opt-125m` by default — change the `MODEL_ID` env var for other models. For gated models (Llama, Mistral), uncomment the `HF_TOKEN` env var.
+
+**Usage:**
+```bash
+kubectl apply -f examples/model-download-job.yaml
+# After completion, deploy inference with the cached model:
+gco inference deploy my-model -i vllm/vllm-openai:v0.19.1 --model-path /models/opt-125m
+```
+
+**When to use:** Pre-caching model weights before inference deployment, avoiding repeated downloads across pods.
+
+---
+
+### Multi-GPU Distributed Training
+
+**File:** `multi-gpu-training.yaml`
+
+Distributed training across multiple GPUs using PyTorch DistributedDataParallel (DDP). Creates indexed pods with a headless service for DNS-based peer discovery.
+
+**Usage:**
+```bash
+kubectl apply -f examples/multi-gpu-training.yaml
+kubectl get pods -n gco-jobs -l job-name=pytorch-ddp-training
+kubectl logs -f job/pytorch-ddp-training -n gco-jobs
+```
+
+**Requirements:** GPU nodes available, NVIDIA GPU Operator (enabled by default).
+
+**When to use:** Multi-node distributed training, PyTorch DDP workloads, scaling training across GPUs.
+
+---
+
+### Ray Cluster
+
+**File:** `ray-cluster.yaml`
+
+Creates a Ray cluster for distributed computing — training, hyperparameter tuning, and model serving. Includes a head node and auto-scaling CPU worker group (1–5 replicas).
+
+**Usage:**
+```bash
+kubectl apply -f examples/ray-cluster.yaml
+kubectl get raycluster -n gco-jobs
+# Port-forward to Ray dashboard:
+kubectl port-forward svc/ray-cluster-head-svc 8265:8265 -n gco-jobs
+# Submit a Ray job:
+ray job submit --address http://localhost:8265 -- python -c "import ray; ray.init(); print(ray.cluster_resources())"
+```
+
+**Requirements:** KubeRay operator (enabled by default). See [KubeRay docs](../docs/KUBERAY.md).
+
+**When to use:** Distributed training, hyperparameter tuning, Ray Serve for model serving, any workload using the Ray framework.
+
+---
+
+### Simple Job
+
+**File:** `simple-job.yaml`
+
+A basic Kubernetes Job that runs a simple command and completes. Start here to verify your cluster is working.
+
+**Usage:**
+```bash
+gco jobs submit-sqs examples/simple-job.yaml --region us-east-1
+# or directly:
+kubectl apply -f examples/simple-job.yaml
+kubectl logs job/hello-gco
+```
+
+**When to use:** Testing cluster connectivity, running one-off tasks, batch processing.
+
+---
+
+### Slurm Cluster Job
+
+**File:** `slurm-cluster-job.yaml`
+
+A self-contained Kubernetes Job that writes a Slurm batch script into the login pod, submits it via `sbatch`, waits for completion, and prints the output.
 
 **Usage:**
 ```bash
@@ -240,18 +407,88 @@ kubectl apply -f examples/slurm-cluster-job.yaml
 kubectl logs job/slurm-test -n gco-jobs -f
 ```
 
-**Requirements:**
-- Slinky Slurm Operator + Slurm cluster (opt-in — enable in `cdk.json`: `"helm": { "slurm": { "enabled": true } }`)
-- cert-manager (installed by default via Helm chart)
+**Requirements:** Slinky Slurm Operator + Slurm cluster (opt-in — enable in `cdk.json`: `"helm": { "slurm": { "enabled": true } }`), cert-manager (installed by default). See [Slurm docs](../docs/SLURM_OPERATOR.md).
 
-**When to use:**
-- Verifying the Slurm cluster is working end-to-end
-- HPC workloads that need Slurm's deterministic scheduling
-- Teams migrating from on-premises Slurm clusters
+**When to use:** HPC workloads needing Slurm's deterministic scheduling, teams migrating from on-premises Slurm clusters.
 
 ---
 
-### 10. YuniKorn Job (`yunikorn-job.yaml`)
+### SQS Job Submission
+
+**File:** `sqs-job-submission.yaml`
+
+Demonstrates the recommended SQS-based submission path. Contains two example jobs (CPU and GPU) that you submit via the SQS queue. The built-in KEDA consumer automatically picks up messages and applies manifests to the cluster.
+
+**Usage:**
+```bash
+gco jobs submit-sqs examples/sqs-job-submission.yaml --region us-east-1
+gco jobs submit-sqs examples/sqs-job-submission.yaml --auto-region
+gco jobs submit-sqs examples/sqs-job-submission.yaml --priority 10
+```
+
+**Why SQS:** Decoupled (returns immediately), fault-tolerant (DLQ after 3 retries), auto-scaling (KEDA scales consumers based on queue depth), priority support.
+
+---
+
+### Trainium Job
+
+**File:** `trainium-job.yaml`
+
+Runs on an AWS Trainium instance using the Neuron SDK. Trainium is a purpose-built ML accelerator designed by AWS, offering lower cost than GPU instances for training workloads.
+
+**Usage:**
+```bash
+gco jobs submit examples/trainium-job.yaml --region us-east-1
+gco jobs logs trainium-test -r us-east-1
+```
+
+**Requirements:** Neuron device plugin (installed by default), Neuron nodepool (applied by default), container images built with the Neuron SDK (not CUDA).
+
+**When to use:** Cost-optimized model training, distributed training with EFA on trn1.32xlarge or trn2.48xlarge.
+
+---
+
+### Valkey Cache Job
+
+**File:** `valkey-cache-job.yaml`
+
+Connects to the regional Valkey Serverless cache for K/V caching, session state, or feature stores. The Valkey endpoint is injected automatically via the `gco-valkey` ConfigMap — the same manifest works in any region.
+
+**Prerequisites:** Enable Valkey in `cdk.json`: `"valkey": { "enabled": true }` and redeploy.
+
+**Usage:**
+```bash
+gco jobs submit-direct examples/valkey-cache-job.yaml -r us-east-1
+```
+
+**Demonstrates:** Prompt caching, feature embedding storage, session state management, TTL-based expiry.
+
+**When to use:** LLM prompt caching, feature stores, session state, any workload needing low-latency key-value access.
+
+---
+
+### Volcano Gang Scheduling
+
+**File:** `volcano-gang-job.yaml`
+
+Demonstrates gang scheduling for distributed training — all pods must be scheduled together or none at all. Creates a master + 2 workers with automatic restart policies.
+
+**Usage:**
+```bash
+kubectl apply -f examples/volcano-gang-job.yaml
+kubectl get vcjob -n gco-jobs
+kubectl get pods -n gco-jobs -l volcano.sh/job-name=distributed-training
+```
+
+**Requirements:** Volcano (enabled by default). See [Volcano docs](../docs/VOLCANO.md).
+
+**When to use:** Distributed training requiring all workers to start simultaneously, jobs with master-worker topology.
+
+---
+
+### YuniKorn Hierarchical Queues
+
+**File:** `yunikorn-job.yaml`
 
 Demonstrates Apache YuniKorn's app-aware scheduling with hierarchical queues, gang scheduling, and GPU queue placement.
 
@@ -259,45 +496,15 @@ Demonstrates Apache YuniKorn's app-aware scheduling with hierarchical queues, ga
 ```bash
 kubectl apply -f examples/yunikorn-job.yaml
 kubectl get pods -n gco-jobs -l app=yunikorn-demo -w
-
-# Access the YuniKorn web UI
+# Access the YuniKorn web UI:
 kubectl port-forward svc/yunikorn-service -n yunikorn 9889:9889
-# Open http://localhost:9889
 ```
 
-**Requirements:**
-- Apache YuniKorn (opt-in — enable in `cdk.json`: `"helm": { "yunikorn": { "enabled": true } }`)
+**Requirements:** YuniKorn (opt-in — enable in `cdk.json`: `"helm": { "yunikorn": { "enabled": true } }`). See [YuniKorn docs](../docs/YUNIKORN.md).
 
-**When to use:**
-- Multi-tenant clusters with competing teams
-- Hierarchical resource quota management
-- Fair-sharing with preemption for high-priority jobs
-- Gang scheduling for distributed training
+**When to use:** Multi-tenant clusters with competing teams, hierarchical resource quota management, fair-sharing with preemption.
 
----
-
-### 11. MegaTrain SFT Job (`megatrain-sft-job.yaml`)
-
-Runs SFT fine-tuning of Qwen2.5-1.5B on a single GPU using [MegaTrain](https://github.com/DLYuanGod/MegaTrain). An init container downloads model weights to shared EFS (skipped if already cached), then the main container installs MegaTrain, builds its CUDA extension, and trains on the built-in alpaca demo dataset. Change the `MODEL_NAME` env var to target a different HuggingFace model.
-
-**Usage:**
-```bash
-# Submit the MegaTrain training job (model downloads automatically)
-gco jobs submit-direct examples/megatrain-sft-job.yaml -r us-east-1
-
-# Monitor training
-gco jobs logs megatrain-sft -r us-east-1 -f
-```
-
-**Requirements:**
-- GPU node with large CPU RAM
-- Shared EFS storage for model weights and checkpoints
-
-**When to use:**
-- Training very large models (14B–120B+) on a single GPU
-- Full-precision training without model parallelism
-- When multi-node distributed training is not available or cost-effective
-- SFT fine-tuning of large HuggingFace models
+For a detailed comparison of all schedulers, see the [Schedulers Overview](../docs/SCHEDULERS.md).
 
 ---
 
@@ -525,11 +732,14 @@ kubectl delete all --all -n default
 
 ## Additional Resources
 
+- [GCO Documentation](../docs/README.md) — Full documentation index
+- [Inference Serving Guide](../docs/INFERENCE.md) — Deploy and manage inference endpoints
+- [Schedulers Overview](../docs/SCHEDULERS.md) — Compare all supported schedulers
+- [Customization Guide](../docs/CUSTOMIZATION.md) — Enable features like FSx, Valkey, Aurora
+- [CLI Reference](../docs/CLI.md) — Complete `gco` command reference
+- [Troubleshooting Guide](../docs/TROUBLESHOOTING.md) — Common issues and solutions
 - [Kubernetes Documentation](https://kubernetes.io/docs/)
-- [Kubernetes Best Practices](https://kubernetes.io/docs/concepts/configuration/overview/)
-- [GCO (Global Capacity Orchestrator on AWS) Documentation](../README.md)
-- [Inference Serving Guide](../docs/INFERENCE.md) — Full inference guide
 
 ---
 
-**Need help?** Check the [Troubleshooting Guide](../docs/TROUBLESHOOTING.md)
+**Need help?** Check the [Troubleshooting Guide](../docs/TROUBLESHOOTING.md) or connect the [MCP server](../mcp/) to your IDE and ask in natural language.

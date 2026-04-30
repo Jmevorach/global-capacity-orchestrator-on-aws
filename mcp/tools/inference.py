@@ -1,0 +1,273 @@
+"""Inference endpoint management MCP tools."""
+
+import json
+from typing import Any
+
+from audit import audit_logged
+import cli_runner
+from server import mcp
+
+
+@mcp.tool()
+@audit_logged
+def deploy_inference(
+    name: str,
+    image: str,
+    gpu_count: int = 1,
+    replicas: int = 1,
+    port: int = 8000,
+    region: str | None = None,
+    env_vars: list[str] | None = None,
+) -> str:
+    """Deploy an inference endpoint across regions.
+
+    Args:
+        name: Endpoint name (e.g. my-llm).
+        image: Container image (e.g. vllm/vllm-openai:v0.19.1).
+        gpu_count: GPUs per replica.
+        replicas: Number of replicas per region.
+        port: Container port.
+        region: Target region(s). Omit for all deployed regions.
+        env_vars: Environment variables as KEY=VALUE strings.
+    """
+    args = [
+        "inference", "deploy", name, "-i", image,
+        "--gpu-count", str(gpu_count), "--replicas", str(replicas), "--port", str(port),
+    ]
+    if region:
+        args += ["-r", region]
+    for env in env_vars or []:
+        args += ["-e", env]
+    return cli_runner._run_cli(*args)
+
+
+@mcp.tool()
+@audit_logged
+def list_inference_endpoints(state: str | None = None, region: str | None = None) -> str:
+    """List all inference endpoints.
+
+    Args:
+        state: Filter by state (deploying, running, stopped, deleted).
+        region: Filter by region.
+    """
+    args = ["inference", "list"]
+    if state:
+        args += ["--state", state]
+    if region:
+        args += ["-r", region]
+    return cli_runner._run_cli(*args)
+
+
+@mcp.tool()
+@audit_logged
+def inference_status(name: str) -> str:
+    """Get detailed status of an inference endpoint including per-region breakdown.
+
+    Args:
+        name: Endpoint name.
+    """
+    return cli_runner._run_cli("inference", "status", name)
+
+
+@mcp.tool()
+@audit_logged
+def scale_inference(name: str, replicas: int) -> str:
+    """Scale an inference endpoint.
+
+    Args:
+        name: Endpoint name.
+        replicas: Target replica count.
+    """
+    return cli_runner._run_cli("inference", "scale", name, "--replicas", str(replicas))
+
+
+@mcp.tool()
+@audit_logged
+def update_inference_image(name: str, image: str) -> str:
+    """Rolling update of an inference endpoint's container image.
+
+    Args:
+        name: Endpoint name.
+        image: New container image.
+    """
+    return cli_runner._run_cli("inference", "update-image", name, "-i", image)
+
+
+@mcp.tool()
+@audit_logged
+def stop_inference(name: str) -> str:
+    """Stop an inference endpoint (scales to zero, keeps config).
+
+    Args:
+        name: Endpoint name.
+    """
+    return cli_runner._run_cli("inference", "stop", name, "-y")
+
+
+@mcp.tool()
+@audit_logged
+def start_inference(name: str) -> str:
+    """Start a stopped inference endpoint.
+
+    Args:
+        name: Endpoint name.
+    """
+    return cli_runner._run_cli("inference", "start", name)
+
+
+@mcp.tool()
+@audit_logged
+def delete_inference(name: str) -> str:
+    """Delete an inference endpoint.
+
+    Args:
+        name: Endpoint name.
+    """
+    return cli_runner._run_cli("inference", "delete", name, "-y")
+
+
+@mcp.tool()
+@audit_logged
+def canary_deploy(name: str, image: str, weight: int = 10) -> str:
+    """Start a canary deployment (A/B test a new image version).
+
+    Args:
+        name: Endpoint name.
+        image: New image to canary.
+        weight: Percentage of traffic to send to canary (1-99).
+    """
+    return cli_runner._run_cli("inference", "canary", name, "-i", image, "--weight", str(weight))
+
+
+@mcp.tool()
+@audit_logged
+def promote_canary(name: str) -> str:
+    """Promote canary to primary (100% traffic to new version).
+
+    Args:
+        name: Endpoint name.
+    """
+    return cli_runner._run_cli("inference", "promote", name, "-y")
+
+
+@mcp.tool()
+@audit_logged
+def rollback_canary(name: str) -> str:
+    """Rollback canary (remove canary, 100% traffic to primary).
+
+    Args:
+        name: Endpoint name.
+    """
+    return cli_runner._run_cli("inference", "rollback", name, "-y")
+
+
+@mcp.tool()
+@audit_logged
+def invoke_inference(
+    name: str,
+    prompt: str,
+    max_tokens: int = 100,
+    api_path: str | None = None,
+    stream: bool = False,
+    region: str | None = None,
+) -> str:
+    """Send a prompt to an inference endpoint and return the generated text.
+
+    Automatically discovers the endpoint's ingress path, detects the serving
+    framework (vLLM, TGI, Triton), and routes the request through the API
+    Gateway with SigV4 authentication.
+
+    Use this for single-turn text completions. For multi-turn conversations
+    with chat models, use chat_inference instead.
+
+    Args:
+        name: Endpoint name (e.g. my-llm).
+        prompt: Text prompt to send to the model.
+        max_tokens: Maximum tokens to generate (default: 100).
+        api_path: Override the API sub-path (default: auto-detect from framework).
+        stream: Enable streaming for lower time-to-first-token (default: false).
+        region: Target region for the request (default: nearest via Global Accelerator).
+    """
+    args = ["inference", "invoke", name, "-p", prompt, "--max-tokens", str(max_tokens)]
+    if api_path:
+        args += ["--path", api_path]
+    if stream:
+        args.append("--stream")
+    if region:
+        args += ["-r", region]
+    return cli_runner._run_cli(*args)
+
+
+@mcp.tool()
+@audit_logged
+def chat_inference(
+    name: str,
+    messages: list[dict[str, str]],
+    max_tokens: int = 256,
+    temperature: float | None = None,
+    stream: bool = False,
+    region: str | None = None,
+) -> str:
+    """Send a multi-turn chat conversation to an inference endpoint.
+
+    Sends an OpenAI-compatible /v1/chat/completions request. Works with
+    vLLM, TGI (with --api-protocol openai), and any OpenAI-compatible server.
+
+    Each message in the list should have 'role' (system/user/assistant) and
+    'content' keys.
+
+    Args:
+        name: Endpoint name (e.g. my-llm).
+        messages: List of chat messages, e.g. [{"role": "user", "content": "Hello"}].
+        max_tokens: Maximum tokens to generate (default: 256).
+        temperature: Sampling temperature (optional, server default if omitted).
+        stream: Enable streaming for lower time-to-first-token (default: false).
+        region: Target region for the request.
+    """
+    body: dict[str, Any] = {"messages": messages, "max_tokens": max_tokens, "stream": stream}
+    if temperature is not None:
+        body["temperature"] = temperature
+    data_str = json.dumps(body)
+    args = ["inference", "invoke", name, "-d", data_str, "--path", "/v1/chat/completions"]
+    if stream:
+        args.append("--stream")
+    if region:
+        args += ["-r", region]
+    return cli_runner._run_cli(*args)
+
+
+@mcp.tool()
+@audit_logged
+def inference_health(name: str, region: str | None = None) -> str:
+    """Check if an inference endpoint is healthy and ready to serve requests.
+
+    Hits the endpoint's health check path and returns status and latency.
+    Useful to verify readiness before sending inference requests.
+
+    Args:
+        name: Endpoint name.
+        region: Target region to check (default: nearest via Global Accelerator).
+    """
+    args = ["inference", "health", name]
+    if region:
+        args += ["-r", region]
+    return cli_runner._run_cli(*args)
+
+
+@mcp.tool()
+@audit_logged
+def list_endpoint_models(name: str, region: str | None = None) -> str:
+    """List models loaded on an inference endpoint.
+
+    Queries the endpoint's /v1/models path (OpenAI-compatible) to discover
+    which models are loaded, their context length, and other metadata.
+    Works with vLLM and other OpenAI-compatible servers.
+
+    Args:
+        name: Endpoint name.
+        region: Target region to query.
+    """
+    args = ["inference", "models", name]
+    if region:
+        args += ["-r", region]
+    return cli_runner._run_cli(*args)

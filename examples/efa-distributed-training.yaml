@@ -10,7 +10,7 @@
 #   gco jobs submit-direct examples/efa-distributed-training.yaml -r us-east-1
 #
 # Supported instance types: p4d.24xlarge (4x EFA), p5.48xlarge (32x EFA), p6 (B200/B300)
-# Each EFA interface provides 100 Gbps bandwidth
+# EFA bandwidth: P4d 400 Gbps, P5/P5e/P5en/Trn2 3,200 Gbps, P6-B200 3.2 Tbps, P6e-GB200 28.8 Tbps
 # EKS Auto Mode uses EKS-optimized AMIs which include host-level EFA components
 apiVersion: batch/v1
 kind: Job

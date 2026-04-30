@@ -86,7 +86,7 @@ class TestMCPProtocolTools:
         from fastmcp import Client
 
         async with Client(run_mcp.mcp) as client:
-            with patch("run_mcp._run_cli", return_value='{"status": "ok"}'):
+            with patch("cli_runner._run_cli", return_value='{"status": "ok"}'):
                 result = await client.call_tool("list_stacks", {}, raise_on_error=False)
                 assert result is not None
                 text = result.content[0].text if result.content else ""
@@ -99,7 +99,7 @@ class TestMCPProtocolTools:
         from fastmcp import Client
 
         async with Client(run_mcp.mcp) as client:
-            with patch("run_mcp._run_cli") as mock_cli:
+            with patch("cli_runner._run_cli") as mock_cli:
                 mock_cli.return_value = '{"region": "us-east-1"}'
                 await client.call_tool(
                     "check_capacity",
@@ -119,7 +119,7 @@ class TestMCPProtocolTools:
         from fastmcp import Client
 
         async with Client(run_mcp.mcp) as client:
-            with patch("run_mcp._run_cli") as mock_cli:
+            with patch("cli_runner._run_cli") as mock_cli:
                 mock_cli.return_value = '{"region": "us-west-2"}'
                 await client.call_tool(
                     "recommend_region",
@@ -150,7 +150,7 @@ class TestMCPProtocolTools:
         from fastmcp import Client
 
         async with Client(run_mcp.mcp) as client:
-            with patch("run_mcp._run_cli") as mock_cli:
+            with patch("cli_runner._run_cli") as mock_cli:
                 mock_cli.return_value = '{"error": "Stack not found", "exit_code": 1}'
                 result = await client.call_tool(
                     "stack_status",
@@ -167,7 +167,7 @@ class TestMCPProtocolTools:
         from fastmcp import Client
 
         async with Client(run_mcp.mcp) as client:
-            with patch("run_mcp._run_cli") as mock_cli:
+            with patch("cli_runner._run_cli") as mock_cli:
                 mock_cli.return_value = '{"prices": []}'
                 await client.call_tool(
                     "spot_prices",
@@ -186,7 +186,7 @@ class TestMCPProtocolTools:
         from fastmcp import Client
 
         async with Client(run_mcp.mcp) as client:
-            with patch("run_mcp._run_cli") as mock_cli:
+            with patch("cli_runner._run_cli") as mock_cli:
                 mock_cli.return_value = '{"regions": []}'
                 await client.call_tool("capacity_status", {}, raise_on_error=False)
                 args = mock_cli.call_args[0]
@@ -320,6 +320,199 @@ class TestMCPProtocolResources:
             result = await client.read_resource("source://gco/config/secrets.yaml")
             text = result[0].text if result else ""
             assert "not available" in text.lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_tests_index(self):
+        """Reading tests://gco/index should list test files."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("tests://gco/index")
+            text = result[0].text if result else ""
+            assert "Test Suite" in text
+            assert "test_mcp_server" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_tests_readme(self):
+        """Reading tests://gco/README should return the test suite docs."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("tests://gco/README")
+            text = result[0].text if result else ""
+            assert "GCO Test Suite" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_config_index(self):
+        """Reading config://gco/index should list configuration resources."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("config://gco/index")
+            text = result[0].text if result else ""
+            assert "config://gco/cdk.json" in text
+            assert "config://gco/feature-toggles" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_config_cdk_json(self):
+        """Reading config://gco/cdk.json should return the CDK config."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("config://gco/cdk.json")
+            text = result[0].text if result else ""
+            assert "{" in text
+            assert len(text) > 100
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_config_feature_toggles(self):
+        """Reading config://gco/feature-toggles should list toggles."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("config://gco/feature-toggles")
+            text = result[0].text if result else ""
+            assert "Feature Toggles" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_config_env_vars(self):
+        """Reading config://gco/env-vars should list environment variables."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("config://gco/env-vars")
+            text = result[0].text if result else ""
+            assert "GCO_MCP_ROLE_ARN" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_examples_guide(self):
+        """Reading docs://gco/examples/guide should return the manifest guide."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("docs://gco/examples/guide")
+            text = result[0].text if result else ""
+            assert "Example Manifest Guide" in text
+            assert "simple-job" in text
+            assert "Security Context" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_example_resource_includes_metadata_header(self):
+        """Example resources should include metadata before the YAML."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("docs://gco/examples/gpu-job")
+            text = result[0].text if result else ""
+            assert "# Example: gpu-job" in text
+            assert "# Category:" in text
+            assert "apiVersion:" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_docs_index_references_new_resource_groups(self):
+        """The docs index should cross-reference tests:// and config://."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("docs://gco/index")
+            text = result[0].text if result else ""
+            assert "tests://gco/index" in text
+            assert "config://gco/index" in text
+            assert "docs://gco/examples/guide" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_k8s_manifests_index(self):
+        """Reading k8s://gco/manifests/index should list cluster manifests."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("k8s://gco/manifests/index")
+            text = result[0].text if result else ""
+            assert "Kubernetes Cluster Manifests" in text
+            assert "k8s://gco/manifests/" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_iam_policies_index(self):
+        """Reading iam://gco/policies/index should list IAM policy templates."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("iam://gco/policies/index")
+            text = result[0].text if result else ""
+            assert "IAM Policy Templates" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_read_ci_index(self):
+        """Reading ci://gco/index should list CI/CD artefacts."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            result = await client.read_resource("ci://gco/index")
+            text = result[0].text if result else ""
+            assert "GitHub Actions" in text
+            assert "ci://gco/workflows/" in text
+
+
+class TestMCPProtocolToolSchemas:
+    """Test that tool input schemas are well-formed for LLM consumption."""
+
+    @pytest.mark.asyncio
+    async def test_all_tools_have_input_schemas(self):
+        """Every tool should have a non-empty inputSchema."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            tools = await client.list_tools()
+            for tool in tools:
+                assert tool.inputSchema is not None, f"Tool {tool.name} has no inputSchema"
+
+    @pytest.mark.asyncio
+    async def test_deploy_inference_has_required_params(self):
+        """deploy_inference should require name and image."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            tools = await client.list_tools()
+            deploy = next(t for t in tools if t.name == "deploy_inference")
+            required = deploy.inputSchema.get("required", [])
+            assert "name" in required
+            assert "image" in required
+
+    @pytest.mark.asyncio
+    async def test_submit_job_sqs_has_required_params(self):
+        """submit_job_sqs should require manifest_path and region."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            tools = await client.list_tools()
+            submit = next(t for t in tools if t.name == "submit_job_sqs")
+            required = submit.inputSchema.get("required", [])
+            assert "manifest_path" in required
+            assert "region" in required
+
+    @pytest.mark.asyncio
+    async def test_check_capacity_has_required_params(self):
+        """check_capacity should require instance_type and region."""
+        from fastmcp import Client
+
+        async with Client(run_mcp.mcp) as client:
+            tools = await client.list_tools()
+            check = next(t for t in tools if t.name == "check_capacity")
+            required = check.inputSchema.get("required", [])
+            assert "instance_type" in required
+            assert "region" in required
 
 
 # ---------------------------------------------------------------------------

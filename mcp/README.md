@@ -42,6 +42,8 @@ An MCP (Model Context Protocol) server that exposes the GCO CLI as tools for LLM
   - [Demos & Walkthroughs](#demos--walkthroughs-demos)
   - [API Client Examples](#api-client-examples-clients)
   - [Utility Scripts](#utility-scripts-scripts)
+  - [Test Suite](#test-suite-tests)
+  - [Configuration](#configuration-config)
 - [Getting Started with the MCP Server](#getting-started-with-the-mcp-server)
 - [Architecture](#architecture)
 - [Examples](#examples)
@@ -226,7 +228,8 @@ Beyond tools, the MCP server exposes documentation, source code, examples, and o
 | `docs://gco/CONTRIBUTING` | Contributing guide |
 | `docs://gco/docs/{name}` | Any doc by name (ARCHITECTURE, CLI, INFERENCE, CONCEPTS, etc.) |
 | `docs://gco/examples/README` | Examples overview with usage instructions |
-| `docs://gco/examples/{name}` | Example manifests (simple-job, inference-vllm, gpu-job, etc.) |
+| `docs://gco/examples/guide` | How to create new job manifests — patterns, metadata, submission methods |
+| `docs://gco/examples/{name}` | Example manifests with metadata headers (category, GPU, opt-in, submission) |
 
 ### Kubernetes Manifests (`k8s://`)
 
@@ -308,6 +311,23 @@ Source code resources cover `gco/`, `cli/`, `lambda/`, `mcp/`, `scripts/`, `demo
 | `scripts://gco/dump_nag_findings.py` | cdk-nag compliance debugging helper |
 | `scripts://gco/test_webhook_delivery.py` | Webhook dispatcher testing |
 
+### Test Suite (`tests://`)
+
+| Resource | Description |
+|----------|-------------|
+| `tests://gco/index` | Browse test files, infrastructure, and BATS shell tests |
+| `tests://gco/README` | Test suite overview, patterns, mocking guide, and coverage requirements |
+| `tests://gco/{filepath}` | Read any test file (e.g. `test_mcp_server.py`, `conftest.py`, `BATS/README.md`) |
+
+### Configuration (`config://`)
+
+| Resource | Description |
+|----------|-------------|
+| `config://gco/index` | Browse CDK configuration, feature toggles, and environment variables |
+| `config://gco/cdk.json` | Current CDK deployment configuration |
+| `config://gco/feature-toggles` | All feature toggles with their current values and defaults |
+| `config://gco/env-vars` | Environment variables used by the MCP server and services |
+
 ### Try it
 
 Ask your agent questions like:
@@ -342,7 +362,39 @@ From there, you can branch into job submission, inference deployments, or cost t
 
 ## Architecture
 
-The MCP server shells out to the `gco` CLI for each tool call. This approach:
+The MCP server is organized as a modular package under `mcp/`:
+
+```
+mcp/
+├── run_mcp.py         — Thin entrypoint (python mcp/run_mcp.py)
+├── server.py          — FastMCP instance and instructions
+├── audit.py           — Audit logging, sanitization, decorator
+├── iam.py             — IAM role assumption
+├── cli_runner.py      — _run_cli() subprocess wrapper
+├── version.py         — Project version management
+├── tools/             — MCP tool definitions (one file per domain)
+│   ├── jobs.py        — Job submission, listing, logs, events
+│   ├── capacity.py    — Capacity checking, recommendations, reservations
+│   ├── inference.py   — Inference deployment, scaling, canary, invocation
+│   ├── costs.py       — Cost tracking and forecasting
+│   ├── stacks.py      — CDK stack management
+│   ├── storage.py     — EFS/FSx file operations
+│   └── models.py      — Model weight management
+└── resources/         — MCP resource definitions (one file per scheme)
+    ├── docs.py        — docs:// (documentation + examples with metadata)
+    ├── source.py      — source:// (full source code browser)
+    ├── k8s.py         — k8s:// (cluster manifests)
+    ├── iam_policies.py — iam:// (IAM policy templates)
+    ├── infra.py       — infra:// (Dockerfiles, Helm, CI/CD)
+    ├── ci.py          — ci:// (GitHub Actions, workflows)
+    ├── demos.py       — demos:// (walkthroughs, scripts)
+    ├── clients.py     — clients:// (API client examples)
+    ├── scripts.py     — scripts:// (utility scripts)
+    ├── tests.py       — tests:// (test suite docs and patterns)
+    └── config.py      — config:// (CDK config, feature toggles, env vars)
+```
+
+Each tool shells out to the `gco` CLI. This approach:
 
 - Reuses all existing auth (SigV4), error handling, and retry logic
 - Stays in sync with CLI updates automatically
