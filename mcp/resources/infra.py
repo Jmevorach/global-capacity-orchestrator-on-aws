@@ -28,12 +28,21 @@ def infra_index() -> str:
     lines.append("- `source://gco/config/.gitlab-ci.yml` — GitLab CI pipeline (frozen reference)")
     lines.append("- `source://gco/config/.pre-commit-config.yaml` — Pre-commit hooks")
     lines.append("\n## Security & Linting")
-    for name in (".checkov.yaml", ".kics.yaml", ".gitleaks.toml", ".semgrepignore", ".flake8", ".yamllint.yml"):
+    for name in (
+        ".checkov.yaml",
+        ".kics.yaml",
+        ".gitleaks.toml",
+        ".semgrepignore",
+        ".flake8",
+        ".yamllint.yml",
+    ):
         lines.append(f"- `source://gco/config/{name}` — {name}")
     lines.append("\n## CDK Configuration")
     lines.append("- `source://gco/config/cdk.json` — CDK deployment configuration")
     lines.append("- `source://gco/config/app.py` — CDK app entry point")
-    lines.append("- `source://gco/config/pyproject.toml` — Python project metadata and dependencies")
+    lines.append(
+        "- `source://gco/config/pyproject.toml` — Python project metadata and dependencies"
+    )
     lines.append("\n## Related Resources")
     lines.append("- `scripts://gco/index` — Utility scripts for operations")
     lines.append("- `demos://gco/index` — Demo walkthroughs and scripts")

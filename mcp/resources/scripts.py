@@ -31,7 +31,8 @@ def script_resource(filename: str) -> str:
         path = SCRIPTS_DIR / f"{filename}.md"
     if not path.is_file():
         available = sorted(
-            f.name for f in SCRIPTS_DIR.iterdir()
+            f.name
+            for f in SCRIPTS_DIR.iterdir()
             if f.is_file() and f.suffix in (_SCRIPT_EXTENSIONS | {".md"})
         )
         return f"Script '{filename}' not found. Available:\n" + "\n".join(available)

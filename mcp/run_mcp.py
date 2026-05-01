@@ -69,7 +69,6 @@ from audit import (  # noqa: E402, F401
     audit_logger,
     emit_startup_log,
 )
-import cli_runner  # noqa: E402
 from iam import assume_mcp_role  # noqa: E402, F401
 from server import mcp  # noqa: E402, F401
 from version import get_project_version  # noqa: E402, F401
@@ -88,13 +87,17 @@ register_all_resources()
 # --- Re-export tool functions for backward compat with existing tests ---
 # Tests call e.g. run_mcp.list_jobs(), so we import them into this namespace.
 
+# Conditionally re-export reserve_capacity if it was registered.
+# contextlib.suppress is the idiomatic "swallow this exception" form.
+import contextlib as _contextlib  # noqa: E402
+
 from tools.capacity import (  # noqa: E402, F401
     ai_recommend,
     capacity_status,
     check_capacity,
     list_reservations,
-    reservation_check,
     recommend_region,
+    reservation_check,
     spot_prices,
 )
 from tools.costs import cost_by_region, cost_forecast, cost_summary, cost_trend  # noqa: E402, F401
@@ -127,19 +130,21 @@ from tools.jobs import (  # noqa: E402, F401
     submit_job_sqs,
 )
 from tools.models import get_model_uri, list_models  # noqa: E402, F401
-from tools.stacks import fsx_status, list_stacks, setup_cluster_access, stack_status  # noqa: E402, F401
+from tools.stacks import (  # noqa: E402, F401
+    fsx_status,
+    list_stacks,
+    setup_cluster_access,
+    stack_status,
+)
 from tools.storage import list_file_systems, list_storage_contents  # noqa: E402, F401
 
-# Conditionally re-export reserve_capacity if it was registered
-try:
+with _contextlib.suppress(ImportError):
     from tools.capacity import reserve_capacity  # noqa: F401
-except ImportError:
-    pass
 
 # Also make reserve_capacity available after module reload (tests use
 # importlib.reload with GCO_ENABLE_CAPACITY_PURCHASE=true)
-import importlib as _importlib
-import os as _os
+import importlib as _importlib  # noqa: E402
+import os as _os  # noqa: E402
 
 if _os.environ.get("GCO_ENABLE_CAPACITY_PURCHASE", "").lower() == "true":
     import tools.capacity as _cap_mod

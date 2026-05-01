@@ -1,7 +1,7 @@
 """Job management MCP tools."""
 
-from audit import audit_logged
 import cli_runner
+from audit import audit_logged
 from server import mcp
 
 
@@ -89,7 +89,9 @@ def get_job_logs(job_name: str, region: str, namespace: str = "gco-jobs", tail: 
         namespace: Kubernetes namespace.
         tail: Number of log lines to return.
     """
-    return cli_runner._run_cli("jobs", "logs", job_name, "-r", region, "-n", namespace, "--tail", str(tail))
+    return cli_runner._run_cli(
+        "jobs", "logs", job_name, "-r", region, "-n", namespace, "--tail", str(tail)
+    )
 
 
 @mcp.tool()

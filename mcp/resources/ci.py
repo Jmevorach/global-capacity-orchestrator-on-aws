@@ -15,8 +15,12 @@ GITHUB_CODEQL_DIR = GITHUB_DIR / "codeql"
 
 _CI_EXTENSIONS = {".yml", ".yaml", ".md", ".sh", ".json", ".toml"}
 _CI_CONFIG_FILES = {
-    "CI.md", "CODEOWNERS", "SECURITY.md", "dependabot.yml",
-    "release.yml", "pull_request_template.md",
+    "CI.md",
+    "CODEOWNERS",
+    "SECURITY.md",
+    "dependabot.yml",
+    "release.yml",
+    "pull_request_template.md",
 }
 
 
@@ -45,7 +49,8 @@ def ci_index() -> str:
 
     if GITHUB_WORKFLOWS_DIR.is_dir():
         workflow_files = sorted(
-            f for f in GITHUB_WORKFLOWS_DIR.iterdir()
+            f
+            for f in GITHUB_WORKFLOWS_DIR.iterdir()
             if f.is_file() and f.suffix in {".yml", ".yaml"}
         )
         if workflow_files:
@@ -81,7 +86,9 @@ def ci_index() -> str:
             if f.is_file() and f.suffix in {".md", ".yml", ".yaml"}:
                 template_entries.append(f"- `ci://gco/templates/{f.name}` — {f.stem}")
     if (GITHUB_DIR / "pull_request_template.md").is_file():
-        template_entries.append("- `ci://gco/templates/pull_request_template.md` — Pull request template")
+        template_entries.append(
+            "- `ci://gco/templates/pull_request_template.md` — Pull request template"
+        )
     if template_entries:
         lines.append(f"## Issue & PR Templates ({len(template_entries)})")
         lines.extend(template_entries)
@@ -107,7 +114,9 @@ def ci_index() -> str:
     if (GITHUB_DIR / "dependabot.yml").is_file():
         automation_entries.append("- `ci://gco/config/dependabot.yml` — Dependabot config")
     if (GITHUB_DIR / "release.yml").is_file():
-        automation_entries.append("- `ci://gco/config/release.yml` — Release notes auto-categorisation")
+        automation_entries.append(
+            "- `ci://gco/config/release.yml` — Release notes auto-categorisation"
+        )
     if automation_entries:
         lines.append("## Repo Automation")
         lines.extend(automation_entries)

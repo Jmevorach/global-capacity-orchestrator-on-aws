@@ -20,7 +20,13 @@ def demos_index() -> str:
             lines.append(f"- `demos://gco/{name}` — {name.replace('_', ' ').title()}")
     lines.append("\n- `demos://gco/README` — Demo starter kit overview")
     lines.append("\n## Live Demo Scripts")
-    for name in ("live_demo.sh", "lib_demo.sh", "record_demo.sh", "record_deploy.sh", "record_destroy.sh"):
+    for name in (
+        "live_demo.sh",
+        "lib_demo.sh",
+        "record_demo.sh",
+        "record_deploy.sh",
+        "record_destroy.sh",
+    ):
         path = DEMO_DIR / name
         if path.is_file():
             lines.append(f"- `demos://gco/{name}` — {name}")
@@ -38,7 +44,9 @@ def demo_resource(filename: str) -> str:
     if not path.is_file():
         path = DEMO_DIR / f"{filename}.md"
     if not path.is_file():
-        available = sorted(f.name for f in DEMO_DIR.iterdir() if f.is_file() and f.suffix in _DEMO_EXTENSIONS)
+        available = sorted(
+            f.name for f in DEMO_DIR.iterdir() if f.is_file() and f.suffix in _DEMO_EXTENSIONS
+        )
         return f"Demo file '{filename}' not found. Available:\n" + "\n".join(available)
     if path.suffix not in _DEMO_EXTENSIONS:
         return f"File type '{path.suffix}' not served. Allowed: {', '.join(_DEMO_EXTENSIONS)}"

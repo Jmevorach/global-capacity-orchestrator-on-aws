@@ -1180,10 +1180,7 @@ class GCOMonitoringStack(Stack):
         # Build (cache_name, region) pairs. cache_name is the literal
         # ``serverless_cache_name`` the regional stack passes to the
         # CfnServerlessCache.
-        cache_info = [
-            (f"gco-{region}", region)
-            for region in self.regions
-        ]
+        cache_info = [(f"gco-{region}", region) for region in self.regions]
 
         # ECPU consumption and cache size per region
         for cache_name, region in cache_info:
@@ -1283,9 +1280,7 @@ class GCOMonitoringStack(Stack):
             aurora = getattr(regional_stack, "aurora_cluster", None)
             if aurora is None:
                 continue
-            aurora_info.append(
-                (aurora.cluster_identifier, regional_stack.deployment_region)
-            )
+            aurora_info.append((aurora.cluster_identifier, regional_stack.deployment_region))
         if not aurora_info:
             return []
 
@@ -1457,9 +1452,9 @@ class GCOMonitoringStack(Stack):
                     left=[
                         cloudwatch.MathExpression(
                             expression=(
-                                'SEARCH(\'{AWS/ApplicationELB,LoadBalancer} '
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
                                 'MetricName="RequestCount" '
-                                "LoadBalancer=app/k8s-gco-', \"Sum\", 300)"
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
                             ),
                             label="Request Count",
                             period=Duration.minutes(5),
@@ -1479,18 +1474,18 @@ class GCOMonitoringStack(Stack):
                     left=[
                         cloudwatch.MathExpression(
                             expression=(
-                                'SEARCH(\'{AWS/ApplicationELB,LoadBalancer} '
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
                                 'MetricName="TargetResponseTime" '
-                                "LoadBalancer=app/k8s-gco-', \"Average\", 300)"
+                                'LoadBalancer=app/k8s-gco-\', "Average", 300)'
                             ),
                             label="Avg Response Time",
                             period=Duration.minutes(5),
                         ),
                         cloudwatch.MathExpression(
                             expression=(
-                                'SEARCH(\'{AWS/ApplicationELB,LoadBalancer} '
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
                                 'MetricName="TargetResponseTime" '
-                                "LoadBalancer=app/k8s-gco-', \"p99\", 300)"
+                                'LoadBalancer=app/k8s-gco-\', "p99", 300)'
                             ),
                             label="p99 Response Time",
                             period=Duration.minutes(5),
@@ -1510,9 +1505,9 @@ class GCOMonitoringStack(Stack):
                     left=[
                         cloudwatch.MathExpression(
                             expression=(
-                                'SEARCH(\'{AWS/ApplicationELB,LoadBalancer} '
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
                                 'MetricName="HTTPCode_Target_4XX_Count" '
-                                "LoadBalancer=app/k8s-gco-', \"Sum\", 300)"
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
                             ),
                             label="4XX Errors",
                             period=Duration.minutes(5),
@@ -1521,9 +1516,9 @@ class GCOMonitoringStack(Stack):
                     right=[
                         cloudwatch.MathExpression(
                             expression=(
-                                'SEARCH(\'{AWS/ApplicationELB,LoadBalancer} '
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
                                 'MetricName="HTTPCode_Target_5XX_Count" '
-                                "LoadBalancer=app/k8s-gco-', \"Sum\", 300)"
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
                             ),
                             label="5XX Errors",
                             period=Duration.minutes(5),
@@ -1543,9 +1538,9 @@ class GCOMonitoringStack(Stack):
                     left=[
                         cloudwatch.MathExpression(
                             expression=(
-                                'SEARCH(\'{AWS/ApplicationELB,LoadBalancer} '
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
                                 'MetricName="ActiveConnectionCount" '
-                                "LoadBalancer=app/k8s-gco-', \"Sum\", 300)"
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
                             ),
                             label="Active Connections",
                             period=Duration.minutes(5),

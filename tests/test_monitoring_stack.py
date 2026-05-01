@@ -535,7 +535,7 @@ class TestMonitoringStackOptionalDataServices:
         assert "gco-us-east-1" in body
         assert "gco-us-west-2" in body
         # Must not contain a SEARCH wildcard any more
-        assert 'SEARCH(' not in body or 'clusterId="gco-"' not in body
+        assert "SEARCH(" not in body or 'clusterId="gco-"' not in body
 
     def test_valkey_widgets_use_correct_metric_names(self):
         stack = self._build_stack(MockConfigLoader(valkey_enabled=True))
@@ -668,12 +668,8 @@ class TestMonitoringStackOptionalDataServices:
         stack = self._build_stack(
             MockConfigLoader(valkey_enabled=True),
             regional_stacks=[
-                create_mock_regional_stack(
-                    "us-east-1", fsx_enabled=True, aurora_enabled=True
-                ),
-                create_mock_regional_stack(
-                    "us-west-2", fsx_enabled=True, aurora_enabled=True
-                ),
+                create_mock_regional_stack("us-east-1", fsx_enabled=True, aurora_enabled=True),
+                create_mock_regional_stack("us-west-2", fsx_enabled=True, aurora_enabled=True),
             ],
         )
         body = self._dashboard_body(stack)
@@ -729,7 +725,7 @@ class TestMonitoringStackOptionalDataServices:
         import inspect
 
         src = inspect.getsource(GCOMonitoringStack.__init__)
-        assert 'cross_region_references' in src, (
+        assert "cross_region_references" in src, (
             "GCOMonitoringStack.__init__ must set cross_region_references=True "
             "so FSx file system IDs can flow across regions into dashboard widgets."
         )

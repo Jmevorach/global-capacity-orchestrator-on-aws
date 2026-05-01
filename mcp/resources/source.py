@@ -16,16 +16,30 @@ _SOURCE_DIRS = {
     "dockerfiles": PROJECT_ROOT / "dockerfiles",
 }
 _SKIP_DIRS = {
-    "__pycache__", ".git", "cdk.out", "node_modules",
-    "kubectl-applier-simple-build", "helm-installer-build",
+    "__pycache__",
+    ".git",
+    "cdk.out",
+    "node_modules",
+    "kubectl-applier-simple-build",
+    "helm-installer-build",
 }
 _SOURCE_EXTENSIONS = {".py", ".yaml", ".yml", ".json", ".txt", ".toml", ".cfg", ".sh", ".md"}
 
 _CONFIG_FILES = {
-    "pyproject.toml", "cdk.json", "app.py", "Dockerfile.dev",
-    ".gitlab-ci.yml", ".pre-commit-config.yaml", ".flake8",
-    ".yamllint.yml", ".checkov.yaml", ".kics.yaml", ".gitleaks.toml",
-    ".semgrepignore", ".dockerignore", ".gitignore",
+    "pyproject.toml",
+    "cdk.json",
+    "app.py",
+    "Dockerfile.dev",
+    ".gitlab-ci.yml",
+    ".pre-commit-config.yaml",
+    ".flake8",
+    ".yamllint.yml",
+    ".checkov.yaml",
+    ".kics.yaml",
+    ".gitleaks.toml",
+    ".semgrepignore",
+    ".dockerignore",
+    ".gitignore",
 }
 
 
