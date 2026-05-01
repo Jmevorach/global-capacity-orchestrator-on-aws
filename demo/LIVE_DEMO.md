@@ -60,12 +60,15 @@ The script pauses between sections. Press Enter to advance.
 Everything needed for `live_demo.sh` (see [Prerequisites](#prerequisites) above), plus:
 
 - `asciinema` — records the terminal session as a `.cast` file
+
   ```bash
   brew install asciinema     # macOS
   pip install asciinema      # pip
   apt install asciinema      # Debian/Ubuntu
   ```
+
 - `agg` — converts `.cast` to animated GIF (optional — skipped gracefully if missing)
+
   ```bash
   brew install agg           # macOS
   cargo install agg          # Rust/cargo
@@ -129,16 +132,21 @@ asciinema play demo/live_demo.cast
 ## Customization
 
 - **Skip sections:** Set environment variables to skip specific parts:
+
   ```bash
   SKIP_COSTS=1 bash demo/live_demo.sh         # Skip cost section
   SKIP_CAPACITY=1 bash demo/live_demo.sh      # Skip capacity section
   SKIP_SCHEDULERS=1 bash demo/live_demo.sh    # Skip all scheduler demos
   ```
+
 - **Region:** Override the auto-detected region:
+
   ```bash
   GCO_DEMO_REGION=eu-west-1 bash demo/live_demo.sh
   ```
+
 - **Speed:** Adjust the typing delay and pause duration:
+
   ```bash
   GCO_DEMO_FAST=1 bash demo/live_demo.sh      # Shorter pauses
   ```

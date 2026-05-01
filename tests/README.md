@@ -278,6 +278,7 @@ actually deploy anything, hit AWS, or spawn long-running subprocesses.
 ### General Guidelines
 
 1. **Use descriptive test names**: Test names should describe what is being tested and the expected outcome.
+
    ```python
    def test_submit_manifest_with_invalid_namespace_returns_403():
        ...
@@ -477,7 +478,7 @@ Strict flags enabled in `pyproject.toml` include `disallow_untyped_defs`,
 `disallow_untyped_defs` so fixture and helper signatures can stay concise.
 
 Prefer concrete types over `Any`. Runtime types from the installed packages
-(boto3, kubernetes, fastapi, click) are preferred over `Any` fallbacks —
+(boto3, Kubernetes, fastapi, click) are preferred over `Any` fallbacks —
 the CI typecheck jobs install the full runtime (`pip install -e ".[typecheck,mcp]"`)
 so stubs resolve properly.
 
