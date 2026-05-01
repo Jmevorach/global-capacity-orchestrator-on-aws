@@ -16,6 +16,9 @@ Dashboard Sections:
 - SQS Queues: Message counts, age, dead letter queue depth
 - DynamoDB Tables: Capacity, latency, throttles, errors
 - EKS Clusters: CPU/memory utilization per region
+- FSx for Lustre (when enabled): Throughput, IOPS, free storage
+- Valkey Serverless (when enabled): ECPU, hit rate, latency, bytes used
+- Aurora pgvector (when enabled): ACU utilization, connections, latency, CPU
 - ALBs: Request counts, response times, healthy hosts
 - Applications: Custom metrics from health monitor and manifest processor
 
@@ -82,6 +85,19 @@ class GCOMonitoringStack(Stack):
         api_gateway_stack: GCOApiGatewayGlobalStack | None = None,
         **kwargs: Any,
     ) -> None:
+        # Enable CDK's native cross-region references. The monitoring stack
+        # lives in the monitoring region (by default us-east-2) and needs
+        # resource identifiers from the regional stacks for dashboard
+        # dimensions — specifically the auto-generated FSx file system IDs,
+        # whose values aren't known until deploy time.
+        #
+        # CDK implements this by provisioning a small Lambda-backed custom
+        # resource in each source stack that writes the referenced value to
+        # an SSM parameter in the target region, plus a reader custom
+        # resource in the target stack. Cost is negligible (the Lambdas run
+        # once per deploy) and the pattern is the documented canonical
+        # answer for ``CrossRegionReferencesNotEnabled`` errors.
+        kwargs.setdefault("cross_region_references", True)
         super().__init__(scope, construct_id, **kwargs)
 
         self.config = config
@@ -149,6 +165,9 @@ class GCOMonitoringStack(Stack):
         dashboard.add_widgets(*self._create_dynamodb_widgets())
         dashboard.add_widgets(*self._create_eks_widgets())
         dashboard.add_widgets(*self._create_gpu_widgets())
+        dashboard.add_widgets(*self._create_fsx_widgets())
+        dashboard.add_widgets(*self._create_valkey_widgets())
+        dashboard.add_widgets(*self._create_aurora_pgvector_widgets())
         dashboard.add_widgets(*self._create_alb_widgets())
         dashboard.add_widgets(*self._create_application_widgets())
 
@@ -996,120 +1015,542 @@ class GCOMonitoringStack(Stack):
 
         return widgets
 
+    def _create_fsx_widgets(self) -> list[cloudwatch.IWidget]:
+        """Create FSx for Lustre monitoring widgets.
+
+        Only emits widgets for regions where the FSx file system is actually
+        provisioned (``regional_stack.fsx_file_system`` is non-None). The
+        dimension ``FileSystemId`` is the CDK-generated CloudFormation ref
+        from each regional stack — CDK's ``cross_region_references=True``
+        (enabled on this stack's constructor) plumbs the value across
+        regions via SSM + custom resources.
+
+        Returns an empty list if no region has FSx enabled — the dashboard
+        skips the section entirely.
+        """
+        # Collect (file_system_id, region) tuples for regions that have FSx on.
+        # fsx_file_system is either a CfnFileSystem or None; the local
+        # assignment + is-not-None check lets mypy narrow the type so
+        # ``.ref`` access typechecks cleanly (a list comprehension with
+        # the guard in the ``if`` clause does not narrow the value clause).
+        fsx_info: list[tuple[str, str]] = []
+        for regional_stack in self.regional_stacks:
+            fsx = getattr(regional_stack, "fsx_file_system", None)
+            if fsx is None:
+                continue
+            fsx_info.append((fsx.ref, regional_stack.deployment_region))
+        if not fsx_info:
+            return []
+
+        widgets: list[cloudwatch.IWidget] = []
+
+        # Section header
+        widgets.append(
+            cloudwatch.TextWidget(
+                markdown=(
+                    "# FSx for Lustre\n"
+                    "Parallel file system throughput, IOPS, and free storage "
+                    "capacity. Each line below is scoped to the exact GCO "
+                    "file system in its region — so unrelated FSx file "
+                    "systems in the same account do not appear on the "
+                    "dashboard."
+                ),
+                width=24,
+                height=1,
+            )
+        )
+
+        # Throughput: bytes read vs written
+        throughput_widget = cloudwatch.GraphWidget(
+            title="FSx - Throughput (Bytes/sec)",
+            left=[
+                cloudwatch.Metric(
+                    namespace="AWS/FSx",
+                    metric_name="DataReadBytes",
+                    dimensions_map={"FileSystemId": fs_id},
+                    statistic="Sum",
+                    period=Duration.minutes(1),
+                    label=f"{region} Read",
+                    region=region,
+                )
+                for fs_id, region in fsx_info
+            ],
+            right=[
+                cloudwatch.Metric(
+                    namespace="AWS/FSx",
+                    metric_name="DataWriteBytes",
+                    dimensions_map={"FileSystemId": fs_id},
+                    statistic="Sum",
+                    period=Duration.minutes(1),
+                    label=f"{region} Write",
+                    region=region,
+                )
+                for fs_id, region in fsx_info
+            ],
+            width=12,
+            height=6,
+        )
+        widgets.append(throughput_widget)
+
+        # IOPS: read vs write operations
+        iops_widget = cloudwatch.GraphWidget(
+            title="FSx - IOPS",
+            left=[
+                cloudwatch.Metric(
+                    namespace="AWS/FSx",
+                    metric_name="DataReadOperations",
+                    dimensions_map={"FileSystemId": fs_id},
+                    statistic="Sum",
+                    period=Duration.minutes(1),
+                    label=f"{region} Read",
+                    region=region,
+                )
+                for fs_id, region in fsx_info
+            ],
+            right=[
+                cloudwatch.Metric(
+                    namespace="AWS/FSx",
+                    metric_name="DataWriteOperations",
+                    dimensions_map={"FileSystemId": fs_id},
+                    statistic="Sum",
+                    period=Duration.minutes(1),
+                    label=f"{region} Write",
+                    region=region,
+                )
+                for fs_id, region in fsx_info
+            ],
+            width=12,
+            height=6,
+        )
+        widgets.append(iops_widget)
+
+        # Free storage capacity — the classic "running out of space" signal.
+        # FreeDataStorageCapacity is emitted in bytes.
+        free_storage_widget = cloudwatch.GraphWidget(
+            title="FSx - Free Storage Capacity (Bytes)",
+            left=[
+                cloudwatch.Metric(
+                    namespace="AWS/FSx",
+                    metric_name="FreeDataStorageCapacity",
+                    dimensions_map={"FileSystemId": fs_id},
+                    statistic="Minimum",
+                    period=Duration.minutes(5),
+                    label=region,
+                    region=region,
+                )
+                for fs_id, region in fsx_info
+            ],
+            width=24,
+            height=6,
+        )
+        widgets.append(free_storage_widget)
+
+        return widgets
+
+    def _create_valkey_widgets(self) -> list[cloudwatch.IWidget]:
+        """Create Valkey (ElastiCache Serverless) monitoring widgets.
+
+        Uses explicit ``clusterId`` dimension values (camelCase — the
+        ElastiCache Serverless variant; distinct from the node-based
+        ``CacheClusterId``). The regional stack names its cache
+        deterministically as ``gco-{deployment_region}``, so we reproduce
+        that name here and pin each widget to the exact cache in its
+        region. No SEARCH expression, so the dashboard ignores every
+        unrelated ElastiCache cluster in the account.
+        """
+        valkey_enabled = self.config.get_valkey_config().get("enabled", False)
+        if not valkey_enabled or not self.regions:
+            return []
+
+        widgets: list[cloudwatch.IWidget] = []
+
+        widgets.append(
+            cloudwatch.TextWidget(
+                markdown=(
+                    "# Valkey Serverless Cache\n"
+                    "ECPU consumption, storage, hit rate, and request "
+                    "latency — scoped to each region's ``gco-{region}`` "
+                    "cache exactly (no SEARCH)."
+                ),
+                width=24,
+                height=1,
+            )
+        )
+
+        # Build (cache_name, region) pairs. cache_name is the literal
+        # ``serverless_cache_name`` the regional stack passes to the
+        # CfnServerlessCache.
+        cache_info = [(f"gco-{region}", region) for region in self.regions]
+
+        # ECPU consumption and cache size per region
+        for cache_name, region in cache_info:
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"Valkey - ECPU & Cache Size ({region})",
+                    left=[
+                        cloudwatch.Metric(
+                            namespace="AWS/ElastiCache",
+                            metric_name="ElastiCacheProcessingUnits",
+                            dimensions_map={"clusterId": cache_name},
+                            statistic="Sum",
+                            period=Duration.minutes(1),
+                            label="ECPUs",
+                            region=region,
+                        ),
+                    ],
+                    right=[
+                        cloudwatch.Metric(
+                            namespace="AWS/ElastiCache",
+                            metric_name="BytesUsedForCache",
+                            dimensions_map={"clusterId": cache_name},
+                            statistic="Average",
+                            period=Duration.minutes(5),
+                            label="Bytes",
+                            region=region,
+                        ),
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
+            )
+
+        # Hit rate and p99 read/write latency per region
+        for cache_name, region in cache_info:
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"Valkey - Hit Rate & Latency ({region})",
+                    left=[
+                        cloudwatch.Metric(
+                            namespace="AWS/ElastiCache",
+                            metric_name="CacheHitRate",
+                            dimensions_map={"clusterId": cache_name},
+                            statistic="Average",
+                            period=Duration.minutes(5),
+                            label="Hit Rate %",
+                            region=region,
+                        ),
+                    ],
+                    right=[
+                        cloudwatch.Metric(
+                            namespace="AWS/ElastiCache",
+                            metric_name="SuccessfulReadRequestLatency",
+                            dimensions_map={"clusterId": cache_name},
+                            statistic="p99",
+                            period=Duration.minutes(1),
+                            label="Read p99 µs",
+                            region=region,
+                        ),
+                        cloudwatch.Metric(
+                            namespace="AWS/ElastiCache",
+                            metric_name="SuccessfulWriteRequestLatency",
+                            dimensions_map={"clusterId": cache_name},
+                            statistic="p99",
+                            period=Duration.minutes(1),
+                            label="Write p99 µs",
+                            region=region,
+                        ),
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
+            )
+
+        return widgets
+
+    def _create_aurora_pgvector_widgets(self) -> list[cloudwatch.IWidget]:
+        """Create Aurora Serverless v2 (pgvector) monitoring widgets.
+
+        Pins each widget to the exact Aurora cluster provisioned by the
+        regional stack via ``regional_stack.aurora_cluster.cluster_identifier``.
+        CDK-generated cluster IDs are CloudFormation tokens; the
+        ``cross_region_references=True`` flag on this stack handles
+        plumbing them from each regional stack into the monitoring stack
+        (us-east-2 by default) through SSM + custom resources.
+
+        Returns an empty list when every region has Aurora pgvector
+        disabled so the dashboard skips the section entirely.
+        """
+        # (cluster_identifier, region) pairs for regions with Aurora on.
+        # Use a guarded loop (not a comprehension) so mypy can narrow the
+        # Optional[DatabaseCluster] to a real cluster before dereferencing.
+        aurora_info: list[tuple[str, str]] = []
+        for regional_stack in self.regional_stacks:
+            aurora = getattr(regional_stack, "aurora_cluster", None)
+            if aurora is None:
+                continue
+            aurora_info.append((aurora.cluster_identifier, regional_stack.deployment_region))
+        if not aurora_info:
+            return []
+
+        widgets: list[cloudwatch.IWidget] = []
+
+        widgets.append(
+            cloudwatch.TextWidget(
+                markdown=(
+                    "# Aurora pgvector (Serverless v2)\n"
+                    "ACU utilization, database connections, query latency, "
+                    "and CPU utilization — pinned to each regional GCO "
+                    "Aurora cluster by ID. ACU utilization is the primary "
+                    "scale/cost signal for Serverless v2."
+                ),
+                width=24,
+                height=1,
+            )
+        )
+
+        # ACU utilization and capacity
+        for cluster_id, region in aurora_info:
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"Aurora - ACU Utilization & Capacity ({region})",
+                    left=[
+                        cloudwatch.Metric(
+                            namespace="AWS/RDS",
+                            metric_name="ACUUtilization",
+                            dimensions_map={"DBClusterIdentifier": cluster_id},
+                            statistic="Average",
+                            period=Duration.minutes(1),
+                            label="ACU %",
+                            region=region,
+                        ),
+                    ],
+                    right=[
+                        cloudwatch.Metric(
+                            namespace="AWS/RDS",
+                            metric_name="ServerlessDatabaseCapacity",
+                            dimensions_map={"DBClusterIdentifier": cluster_id},
+                            statistic="Average",
+                            period=Duration.minutes(1),
+                            label="ACUs",
+                            region=region,
+                        ),
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
+            )
+
+        # Database connections and CPU utilization
+        for cluster_id, region in aurora_info:
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"Aurora - Connections & CPU ({region})",
+                    left=[
+                        cloudwatch.Metric(
+                            namespace="AWS/RDS",
+                            metric_name="DatabaseConnections",
+                            dimensions_map={"DBClusterIdentifier": cluster_id},
+                            statistic="Average",
+                            period=Duration.minutes(1),
+                            label="Connections",
+                            region=region,
+                        ),
+                    ],
+                    right=[
+                        cloudwatch.Metric(
+                            namespace="AWS/RDS",
+                            metric_name="CPUUtilization",
+                            dimensions_map={"DBClusterIdentifier": cluster_id},
+                            statistic="Average",
+                            period=Duration.minutes(1),
+                            label="CPU %",
+                            region=region,
+                        ),
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
+            )
+
+        # Read and write latency p99
+        for cluster_id, region in aurora_info:
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"Aurora - Query Latency p99 ({region})",
+                    left=[
+                        cloudwatch.Metric(
+                            namespace="AWS/RDS",
+                            metric_name="ReadLatency",
+                            dimensions_map={"DBClusterIdentifier": cluster_id},
+                            statistic="p99",
+                            period=Duration.minutes(1),
+                            label="Read p99",
+                            region=region,
+                        ),
+                    ],
+                    right=[
+                        cloudwatch.Metric(
+                            namespace="AWS/RDS",
+                            metric_name="WriteLatency",
+                            dimensions_map={"DBClusterIdentifier": cluster_id},
+                            statistic="p99",
+                            period=Duration.minutes(1),
+                            label="Write p99",
+                            region=region,
+                        ),
+                    ],
+                    width=24,
+                    height=6,
+                    region=region,
+                )
+            )
+
+        return widgets
+
     def _create_alb_widgets(self) -> list[cloudwatch.IWidget]:
-        """Create ALB monitoring widgets.
+        """Create ALB monitoring widgets scoped to the GCO platform ALB.
 
-        Note: ALBs are created by the AWS Load Balancer Controller in Kubernetes
-        via Ingress resources, not by CDK. The controller uses a naming convention:
-        k8s-<namespace>-<ingress-name>-<hash>
+        ALBs are created by the AWS Load Balancer Controller at runtime
+        from an Ingress resource (not by CDK), so the exact ALB name
+        isn't known at synth time. We originally tried reading the ARN
+        off the regional stack's ``GaRegistration`` custom resource via
+        ``cross_region_references=True``, but that path races the
+        custom-resource response pipeline: CDK's cross-region
+        ``ExportsWriter`` executes ``Fn::GetAtt: [GaRegistration, AlbArn]``
+        before CloudFormation has the updated response data stored, and
+        errors with "Vendor response doesn't contain AlbArn attribute".
 
-        Since we can't know the exact ALB name at CDK synth time (includes a hash),
-        we use CloudWatch SEARCH expressions to dynamically find ALBs matching
-        the prefix pattern at dashboard render time.
+        Instead we use a SEARCH expression with a composite-token
+        filter. The ALB Controller names the platform ALB
+        ``k8s-gco-<hash>`` (the namespace is shortened because the
+        controller enforces a 32-char total name limit); CloudWatch's
+        ``LoadBalancer`` dimension is the ARN suffix ``app/<name>/<hash>``,
+        so an unquoted filter ``LoadBalancer=app/k8s-gco-`` performs a
+        composite-token match (the sequence ``app``, ``k``, ``8``, ``s``,
+        ``gco`` must appear consecutively in the dimension value).
+        Double-quoted filters would be exact matches and return nothing
+        because no ALB's dimension value is literally ``app/k8s-gco-``.
         """
         widgets: list[cloudwatch.IWidget] = []
 
         # Section header
         widgets.append(
             cloudwatch.TextWidget(
-                markdown="# Application Load Balancers\n"
-                "Request metrics and health status. "
-                "Uses CloudWatch SEARCH to dynamically find ALBs created by "
-                "AWS Load Balancer Controller.",
+                markdown=(
+                    "# Application Load Balancers\n"
+                    "Request metrics, response time, HTTP errors, and "
+                    "connection counts — scoped via SEARCH composite-token "
+                    "match to ALBs named ``app/k8s-gco-*`` so only the GCO "
+                    "platform ALB in each region appears. Inference ALBs "
+                    "(named per endpoint) and unrelated ALBs in the "
+                    "account are excluded."
+                ),
                 width=24,
                 height=1,
             )
         )
 
-        # Create one widget per region for ALB request count
+        # Per-region request count
         for region in self.regions:
-            request_count_widget = cloudwatch.GraphWidget(
-                title=f"ALB - Request Count ({region})",
-                left=[
-                    cloudwatch.MathExpression(
-                        expression=(
-                            'SEARCH(\'Namespace="AWS/ApplicationELB" '
-                            'MetricName="RequestCount"\', "Sum", 300)'
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"ALB - Request Count ({region})",
+                    left=[
+                        cloudwatch.MathExpression(
+                            expression=(
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
+                                'MetricName="RequestCount" '
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
+                            ),
+                            label="Request Count",
+                            period=Duration.minutes(5),
                         ),
-                        label="Request Count",
-                        period=Duration.minutes(5),
-                    )
-                ],
-                width=12,
-                height=6,
-                region=region,
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
             )
-            widgets.append(request_count_widget)
 
-        # Create one widget per region for ALB response time
+        # Per-region response time (average and p99)
         for region in self.regions:
-            response_time_widget = cloudwatch.GraphWidget(
-                title=f"ALB - Response Time ({region})",
-                left=[
-                    cloudwatch.MathExpression(
-                        expression=(
-                            'SEARCH(\'Namespace="AWS/ApplicationELB" '
-                            'MetricName="TargetResponseTime"\', "Average", 300)'
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"ALB - Response Time ({region})",
+                    left=[
+                        cloudwatch.MathExpression(
+                            expression=(
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
+                                'MetricName="TargetResponseTime" '
+                                'LoadBalancer=app/k8s-gco-\', "Average", 300)'
+                            ),
+                            label="Avg Response Time",
+                            period=Duration.minutes(5),
                         ),
-                        label="Avg Response Time",
-                        period=Duration.minutes(5),
-                    )
-                ],
-                width=12,
-                height=6,
-                region=region,
+                        cloudwatch.MathExpression(
+                            expression=(
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
+                                'MetricName="TargetResponseTime" '
+                                'LoadBalancer=app/k8s-gco-\', "p99", 300)'
+                            ),
+                            label="p99 Response Time",
+                            period=Duration.minutes(5),
+                        ),
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
             )
-            widgets.append(response_time_widget)
 
-        # Create one widget per region for ALB HTTP errors
+        # Per-region HTTP errors (4XX + 5XX from targets)
         for region in self.regions:
-            http_errors_widget = cloudwatch.GraphWidget(
-                title=f"ALB - HTTP Errors ({region})",
-                left=[
-                    cloudwatch.MathExpression(
-                        expression=(
-                            'SEARCH(\'Namespace="AWS/ApplicationELB" '
-                            'MetricName="HTTPCode_Target_4XX_Count"\', "Sum", 300)'
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"ALB - HTTP Errors ({region})",
+                    left=[
+                        cloudwatch.MathExpression(
+                            expression=(
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
+                                'MetricName="HTTPCode_Target_4XX_Count" '
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
+                            ),
+                            label="4XX Errors",
+                            period=Duration.minutes(5),
                         ),
-                        label="4XX Errors",
-                        period=Duration.minutes(5),
-                    )
-                ],
-                right=[
-                    cloudwatch.MathExpression(
-                        expression=(
-                            'SEARCH(\'Namespace="AWS/ApplicationELB" '
-                            'MetricName="HTTPCode_Target_5XX_Count"\', "Sum", 300)'
+                    ],
+                    right=[
+                        cloudwatch.MathExpression(
+                            expression=(
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
+                                'MetricName="HTTPCode_Target_5XX_Count" '
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
+                            ),
+                            label="5XX Errors",
+                            period=Duration.minutes(5),
                         ),
-                        label="5XX Errors",
-                        period=Duration.minutes(5),
-                    )
-                ],
-                width=12,
-                height=6,
-                region=region,
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
             )
-            widgets.append(http_errors_widget)
 
-        # Create one widget per region for ALB active connections
+        # Per-region active connections
         for region in self.regions:
-            connections_widget = cloudwatch.GraphWidget(
-                title=f"ALB - Active Connections ({region})",
-                left=[
-                    cloudwatch.MathExpression(
-                        expression=(
-                            'SEARCH(\'Namespace="AWS/ApplicationELB" '
-                            'MetricName="ActiveConnectionCount"\', "Sum", 300)'
+            widgets.append(
+                cloudwatch.GraphWidget(
+                    title=f"ALB - Active Connections ({region})",
+                    left=[
+                        cloudwatch.MathExpression(
+                            expression=(
+                                "SEARCH('{AWS/ApplicationELB,LoadBalancer} "
+                                'MetricName="ActiveConnectionCount" '
+                                'LoadBalancer=app/k8s-gco-\', "Sum", 300)'
+                            ),
+                            label="Active Connections",
+                            period=Duration.minutes(5),
                         ),
-                        label="Active Connections",
-                        period=Duration.minutes(5),
-                    )
-                ],
-                width=12,
-                height=6,
-                region=region,
+                    ],
+                    width=12,
+                    height=6,
+                    region=region,
+                )
             )
-            widgets.append(connections_widget)
 
         return widgets
 
@@ -1568,25 +2009,25 @@ class GCOMonitoringStack(Stack):
     def _create_alb_alarms(self) -> None:
         """Create ALB alarms.
 
-        Note: ALBs are created dynamically by the AWS Load Balancer Controller
-        in Kubernetes via Ingress resources. Since we can't know the exact ALB
-        name at CDK synth time (it includes a hash), we cannot create alarms
-        with specific ALB dimensions.
+        Status: no alarms created yet, even though we now have the ALB
+        ARN at deploy time via the GA registration custom resource (which
+        also feeds the dashboard widgets). Adding per-ALB alarms here is
+        a straightforward enhancement — derive the ``LoadBalancer``
+        dimension the same way ``_create_alb_widgets`` does
+        (``Fn.split(":loadbalancer/", alb_arn)[1]``) and wire it into
+        ``cloudwatch.Alarm`` constructs.
 
-        CloudWatch Alarms don't support SEARCH expressions like dashboards do,
-        so we skip ALB-specific alarms. Instead, rely on:
-        1. Dashboard widgets with SEARCH expressions for monitoring
+        For now we rely on:
+        1. Dashboard widgets pinned to each platform ALB (see
+           ``_create_alb_widgets``)
         2. EKS Container Insights alarms for pod/node health
         3. API Gateway alarms for request-level monitoring
-
-        If ALB-specific alarms are needed, consider:
-        - Using a custom resource to discover ALB names at deploy time
-        - Creating alarms via AWS CLI/SDK after deployment
-        - Using CloudWatch Anomaly Detection on the namespace level
         """
-        # ALB alarms are skipped because ALB names are not known at synth time
-        # The AWS Load Balancer Controller creates ALBs with names like:
-        # k8s-<namespace>-<ingress>-<hash>
+        # TODO: Add UnHealthyHostCount / 5XXCount alarms using the ARN
+        # returned by regional_stack.ga_registration.get_att_string("AlbArn").
+        # The test suite explicitly documents that the ALB alarm count is
+        # currently zero (test_alb_unhealthy_hosts_alarm_skipped); update
+        # that test when adding real alarms.
         pass
 
     def _create_application_alarms(self) -> None:

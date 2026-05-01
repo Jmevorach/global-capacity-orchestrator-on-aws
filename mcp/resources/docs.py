@@ -89,7 +89,7 @@ EXAMPLE_METADATA: dict[str, dict[str, str]] = {
         "summary": "vLLM OpenAI-compatible LLM serving with PagedAttention.",
         "gpu": "NVIDIA",
         "opt_in": "",
-        "submission": "gco inference deploy my-llm -i vllm/vllm-openai:v0.19.1 --gpu-count 1",
+        "submission": "gco inference deploy my-llm -i vllm/vllm-openai:v0.20.0 --gpu-count 1",
     },
     "inference-tgi": {
         "category": "Inference Serving",
@@ -228,7 +228,9 @@ def docs_index() -> str:
 
     sections.append("\n## Example Manifests")
     sections.append("- `docs://gco/examples/README` — Examples overview and usage guide")
-    sections.append("- `docs://gco/examples/guide` — How to create new job manifests (patterns & metadata)\n")
+    sections.append(
+        "- `docs://gco/examples/guide` — How to create new job manifests (patterns & metadata)\n"
+    )
 
     # Categorize examples
     categories: dict[str, list[str]] = {}
@@ -255,7 +257,9 @@ def docs_index() -> str:
     sections.append("- `clients://gco/index` — API client examples (Python, curl, AWS CLI)")
     sections.append("- `scripts://gco/index` — Utility scripts")
     sections.append("- `tests://gco/index` — Test suite documentation and patterns")
-    sections.append("- `config://gco/index` — CDK configuration, feature toggles, environment variables")
+    sections.append(
+        "- `config://gco/index` — CDK configuration, feature toggles, environment variables"
+    )
     return "\n".join(sections)
 
 
@@ -324,7 +328,9 @@ def examples_guide_resource() -> str:
 
     lines.append("\n## Common Patterns\n")
     lines.append("### Namespace")
-    lines.append("All GCO jobs use `namespace: gco-jobs`. Inference uses `namespace: gco-inference`.\n")
+    lines.append(
+        "All GCO jobs use `namespace: gco-jobs`. Inference uses `namespace: gco-inference`.\n"
+    )
     lines.append("### Security Context (required)")
     lines.append("```yaml")
     lines.append("securityContext:")
@@ -396,7 +402,9 @@ def example_resource(example_name: str) -> str:
             header_lines.append(f"# GPU/Accelerator: {meta['gpu']}")
         if meta.get("opt_in"):
             header_lines.append(f"# Opt-in required: {meta['opt_in']}")
-        header_lines.append(f"# Submit with: {meta.get('submission', 'kubectl apply -f examples/' + example_name + '.yaml')}")
+        header_lines.append(
+            f"# Submit with: {meta.get('submission', 'kubectl apply -f examples/' + example_name + '.yaml')}"
+        )
         header_lines.append("#")
         header_lines.append("# --- Manifest begins below ---\n")
 

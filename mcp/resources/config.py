@@ -19,7 +19,9 @@ def config_index() -> str:
     lines.append("## CDK Configuration")
     lines.append("- `config://gco/cdk.json` — Current CDK deployment configuration")
     lines.append("- `config://gco/feature-toggles` — All feature toggles and their defaults")
-    lines.append("- `config://gco/env-vars` — Environment variables used by the MCP server and services\n")
+    lines.append(
+        "- `config://gco/env-vars` — Environment variables used by the MCP server and services\n"
+    )
     lines.append("## Related")
     lines.append("- `source://gco/config/pyproject.toml` — Python project metadata")
     lines.append("- `source://gco/config/app.py` — CDK app entry point")

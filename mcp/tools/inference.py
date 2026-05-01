@@ -3,8 +3,8 @@
 import json
 from typing import Any
 
-from audit import audit_logged
 import cli_runner
+from audit import audit_logged
 from server import mcp
 
 
@@ -23,7 +23,7 @@ def deploy_inference(
 
     Args:
         name: Endpoint name (e.g. my-llm).
-        image: Container image (e.g. vllm/vllm-openai:v0.19.1).
+        image: Container image (e.g. vllm/vllm-openai:v0.20.0).
         gpu_count: GPUs per replica.
         replicas: Number of replicas per region.
         port: Container port.
@@ -31,8 +31,17 @@ def deploy_inference(
         env_vars: Environment variables as KEY=VALUE strings.
     """
     args = [
-        "inference", "deploy", name, "-i", image,
-        "--gpu-count", str(gpu_count), "--replicas", str(replicas), "--port", str(port),
+        "inference",
+        "deploy",
+        name,
+        "-i",
+        image,
+        "--gpu-count",
+        str(gpu_count),
+        "--replicas",
+        str(replicas),
+        "--port",
+        str(port),
     ]
     if region:
         args += ["-r", region]
