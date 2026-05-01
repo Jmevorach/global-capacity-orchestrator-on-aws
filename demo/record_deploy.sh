@@ -56,7 +56,7 @@ GIF_FILE="${SCRIPT_DIR}/deploy.gif"
 COLS="${DEMO_COLS:-160}"
 ROWS="${DEMO_ROWS:-40}"
 
-# Deploy takes 20-30 minutes — 10x speed makes the GIF watchable (~2-3 min)
+# Deploy takes up to an hour — 10x speed makes the GIF watchable (~5-6 min)
 SPEED="${DEMO_SPEED:-10}"
 THEME="${DEMO_THEME:-monokai}"
 
@@ -150,7 +150,7 @@ echo "Recording deploy (${COLS}x${ROWS})..."
 echo "Output: ${CAST_FILE}"
 echo ""
 echo "  ${YELLOW}${BOLD}This will run gco stacks deploy-all -y${RESET}"
-echo "  ${DIM}The deploy takes 20-30 minutes. The recording captures everything.${RESET}"
+echo "  ${DIM}The deploy can take up to an hour. The recording captures everything.${RESET}"
 echo ""
 
 rm -f "$CAST_FILE"

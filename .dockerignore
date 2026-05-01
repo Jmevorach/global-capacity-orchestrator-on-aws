@@ -18,5 +18,11 @@ cli/**/*.pyc
 gco/**/*.pyo
 cli/**/*.pyo
 
-# Exclude CDK stacks — not needed inside the container
-gco/stacks/
+# gco/stacks/ is intentionally NOT excluded. Earlier versions dropped it
+# from the container build context to keep service images slim and to
+# stabilise the CDK asset fingerprint against CDK-only edits, but that
+# also meant `gco stacks deploy-all` didn't work inside Dockerfile.dev —
+# which is the canonical place to run CDK commands from. The extra ~20
+# Python files cost negligible image size, and service containers never
+# import anything under gco.stacks at runtime, so the tradeoff is
+# worthwhile.
