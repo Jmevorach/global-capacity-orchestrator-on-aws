@@ -96,6 +96,18 @@ class MockConfigLoader:
             "tracing_enabled": True,
         }
 
+    # Optional regional data services — monitoring stack queries these to
+    # decide whether to render the corresponding dashboard sections. The
+    # Valkey widgets pin their ``clusterId`` dimension to the
+    # deterministic ``gco-{region}`` name, so they only need the
+    # feature-flag shape. FSx and Aurora are driven by regional stack
+    # attributes instead (see ``create_mock_regional_stack`` above).
+    def get_valkey_config(self):
+        return {"enabled": False}
+
+    def get_aurora_pgvector_config(self):
+        return {"enabled": False}
+
 
 class TestGlobalStackSynth:
     """Tests for Global Stack synthesis."""
@@ -240,6 +252,14 @@ class TestMonitoringStackSynth:
         mock_regional_stack.job_dlq.queue_name = "test-dlq"
         mock_regional_stack.kubectl_lambda_function_name = "test-kubectl"
         mock_regional_stack.helm_installer_lambda_function_name = "test-helm"
+        # Optional regional data services default to absent. The monitoring
+        # stack widget creators use ``getattr(..., None)`` on these and
+        # skip the section when all regions report None — mirroring the
+        # production shape where ``_create_fsx_lustre`` /
+        # ``_create_aurora_pgvector`` early-return without setting the
+        # attribute when the feature is disabled.
+        mock_regional_stack.fsx_file_system = None
+        mock_regional_stack.aurora_cluster = None
         mock_regional_stacks = [mock_regional_stack]
 
         stack = GCOMonitoringStack(

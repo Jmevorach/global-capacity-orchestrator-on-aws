@@ -310,6 +310,11 @@ class TestMonitoringStackMethods:
         mock_regional_stack.job_dlq.queue_name = "test-dlq"
         mock_regional_stack.kubectl_lambda_function_name = "test-kubectl"
         mock_regional_stack.helm_installer_lambda_function_name = "test-helm"
+        # Optional regional data services default to absent. The monitoring
+        # stack widget creators use ``getattr(..., None)`` on these and
+        # skip the section when all regions report None.
+        mock_regional_stack.fsx_file_system = None
+        mock_regional_stack.aurora_cluster = None
 
         return mock_global_stack, mock_api_gw_stack, [mock_regional_stack]
 
