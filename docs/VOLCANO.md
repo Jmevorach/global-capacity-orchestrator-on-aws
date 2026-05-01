@@ -207,7 +207,7 @@ GCO deploys Volcano, Kueue, and Slurm simultaneously. They operate at different 
 ### From kubectl
 
 ```bash
-kubectl get vcjob -n gco-jobs                    # Job status
+kubectl get vcjob -n gco-jobs                     # Job status
 kubectl get queue                                 # Queue status and capacity
 kubectl get podgroup -n gco-jobs                  # Gang scheduling groups
 kubectl describe vcjob <name> -n gco-jobs         # Detailed job info
