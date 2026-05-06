@@ -689,6 +689,18 @@ class StackManager:
         if not success and stack_name:
             self._diagnose_deploy_failure(stack_name)
 
+        # After deploying gco-analytics, automatically redeploy
+        # gco-api-gateway to wire in the /studio/* routes (the API gateway
+        # imports the Cognito pool ARN and presigned-URL Lambda ARN from
+        # the analytics stack).
+        if success and stack_name and "analytics" in stack_name and not all_stacks:
+            print("  Updating gco-api-gateway with analytics routes...")
+            self.deploy(
+                stack_name="gco-api-gateway",
+                require_approval=require_approval,
+                exclusively=True,
+            )
+
         return success
 
     def destroy(
@@ -700,28 +712,175 @@ class StackManager:
     ) -> bool:
         """Destroy CDK stacks.
 
+        If the target stack exists in CloudFormation but isn't in the CDK
+        app (e.g. because a toggle was disabled), temporarily enables the
+        toggle so CDK can synthesize and destroy the stack properly. This
+        ensures custom resource cleanup handlers (like the analytics
+        cleanup Lambda) fire during deletion.
+
         Args:
             stack_name: Name of the stack to destroy
             all_stacks: Destroy all stacks
             force: Skip confirmation prompts
             output_dir: Custom CDK output directory (for parallel deployments)
         """
+        # If destroying a specific stack that exists in CloudFormation but
+        # might not be in the CDK app, temporarily enable its toggle.
+        toggle_restored = False
+        if (
+            stack_name
+            and not all_stacks
+            and "analytics" in stack_name
+            and self._stack_exists_in_cloudformation(stack_name)
+        ):
+            toggle_restored = self._ensure_analytics_enabled_for_destroy()
+
+        # The analytics stack exports values (e.g. Cognito pool ARN) that
+        # gco-api-gateway imports. CloudFormation blocks deletion of stacks
+        # with consumed exports. To break the dependency, redeploy the API
+        # gateway with analytics disabled first, then destroy analytics.
+        if stack_name and not all_stacks and "analytics" in stack_name:
+            self._remove_api_gateway_analytics_dependency()
+
         cmd = ["destroy"]
 
         if all_stacks:
             cmd.append("--all")
         elif stack_name:
             cmd.append(stack_name)
+            # --exclusively prevents CDK from cascading the destroy to
+            # dependent stacks (e.g. destroying gco-analytics should not
+            # also destroy gco-api-gateway just because it references the
+            # presigned-URL Lambda ARN).
+            cmd.append("--exclusively")
 
         if force:
             cmd.append("--force")
 
-        # Use custom output directory for parallel deployments
         if output_dir:
             cmd.extend(["--output", output_dir])
 
         result = self._run_cdk(cmd)
+
+        # Restore the toggle if we changed it
+        if toggle_restored:
+            self._restore_analytics_disabled()
+
+        # If CDK still didn't delete it, fall back to CloudFormation directly
+        if (
+            result.returncode == 0
+            and stack_name
+            and not all_stacks
+            and self._stack_exists_in_cloudformation(stack_name)
+        ):
+            return self._cloudformation_delete_stack(stack_name)
+
         return result.returncode == 0
+
+    def _stack_exists_in_cloudformation(self, stack_name: str) -> bool:
+        """Check if a stack exists and is not in a deleted state."""
+        import boto3
+
+        region = self._get_destroy_region(stack_name)
+        cfn = boto3.client("cloudformation", region_name=region)
+        try:
+            resp = cfn.describe_stacks(StackName=stack_name)
+            status = resp["Stacks"][0]["StackStatus"]
+            return "DELETE" not in status
+        except Exception:
+            return False
+
+    def _cloudformation_delete_stack(self, stack_name: str) -> bool:
+        """Delete a stack directly via CloudFormation API."""
+        import boto3
+
+        region = self._get_destroy_region(stack_name)
+        cfn = boto3.client("cloudformation", region_name=region)
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            waiter = cfn.get_waiter("stack_delete_complete")
+            waiter.wait(
+                StackName=stack_name,
+                WaiterConfig={"Delay": 15, "MaxAttempts": 120},
+            )
+            return True
+        except Exception:
+            return False
+
+    def _get_destroy_region(self, stack_name: str) -> str:
+        """Determine the region for a stack based on its name."""
+        try:
+            region = self._get_deploy_region(stack_name)
+            return region or self.config.api_gateway_region
+        except Exception:
+            return self.config.api_gateway_region
+
+    def _ensure_analytics_enabled_for_destroy(self) -> bool:
+        """Temporarily enable analytics so CDK includes the stack for destroy."""
+        try:
+            current = get_analytics_config()
+            if not current.get("enabled"):
+                update_analytics_config({"enabled": True})
+                return True
+        except Exception as exc:
+            logger.debug(
+                "Failed to enable analytics toggle for destroy: %s",
+                exc,
+                exc_info=True,
+            )
+        return False
+
+    def _restore_analytics_disabled(self) -> None:
+        """Restore analytics toggle to disabled after destroy."""
+        try:
+            update_analytics_config({"enabled": False})
+        except Exception as exc:
+            logger.warning(
+                "Failed to restore analytics toggle to disabled after destroy: %s",
+                exc,
+                exc_info=True,
+            )
+
+    def _remove_api_gateway_analytics_dependency(self) -> None:
+        """Redeploy gco-api-gateway with analytics disabled to drop cross-stack imports.
+
+        The analytics stack exports values (Cognito pool ARN, presigned-URL
+        Lambda ARN) that gco-api-gateway imports for the /studio/* routes.
+        CloudFormation blocks deletion of stacks with consumed exports. By
+        disabling analytics and redeploying the API gateway, the /studio/*
+        routes are removed and the imports are dropped, unblocking the
+        analytics stack deletion.
+        """
+        try:
+            # Temporarily disable analytics so CDK drops the /studio/* routes.
+            current = get_analytics_config()
+            was_enabled = current.get("enabled", False)
+            if was_enabled:
+                update_analytics_config({"enabled": False})
+
+            print("  Updating gco-api-gateway to remove analytics routes...")
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp_out:
+                success = self.deploy(
+                    stack_name="gco-api-gateway",
+                    require_approval=False,
+                    exclusively=True,
+                    output_dir=tmp_out,
+                )
+            if not success:
+                logger.warning("Failed to redeploy gco-api-gateway before analytics destroy")
+
+            # Re-enable analytics so CDK can synthesize the analytics stack
+            # for the destroy operation (custom resources need to fire).
+            if was_enabled:
+                update_analytics_config({"enabled": True})
+        except Exception as exc:
+            logger.warning(
+                "Failed to remove API gateway analytics dependency: %s",
+                exc,
+                exc_info=True,
+            )
 
     def bootstrap(
         self,
@@ -807,6 +966,12 @@ class StackManager:
             return region
         if stack_name == "gco-monitoring":
             region = cdk_regions.get("monitoring") or self.config.monitoring_region
+            return region
+        if stack_name == "gco-analytics":
+            # The analytics stack shares the API gateway region so the
+            # presigned-URL Lambda can hook into the existing /studio/*
+            # routes on the same API Gateway.
+            region = cdk_regions.get("api_gateway") or self.config.api_gateway_region
             return region
 
         # Regional stacks: gco-{region}
@@ -1480,6 +1645,7 @@ def get_stack_deployment_order(stacks: list[str]) -> list[str]:
     global_priority = {
         "gco-global": 1,
         "gco-api-gateway": 2,
+        "gco-analytics": 2.5,
         "gco-monitoring": 3,
     }
 
@@ -1689,3 +1855,39 @@ def get_aurora_config(region: str | None = None) -> dict[str, Any]:
 def update_aurora_config(settings: dict[str, Any], region: str | None = None) -> None:
     """Update Aurora pgvector configuration in cdk.json."""
     _update_feature_config("aurora_pgvector", settings, _AURORA_DEFAULTS, region)
+
+
+# =============================================================================
+# Analytics environment configuration
+# =============================================================================
+
+_ANALYTICS_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "hyperpod": {"enabled": False},
+    "cognito": {"domain_prefix": None, "removal_policy": "destroy"},
+    "efs": {"removal_policy": "destroy"},
+    "studio": {"user_profile_name_prefix": None},
+}
+
+
+def get_analytics_config() -> dict[str, Any]:
+    """Get the analytics environment configuration from cdk.json.
+
+    The analytics stack is single-region by construction (lives in the
+    api-gateway region), so this helper does not accept a region argument.
+    Returned dict is the defaults merged with any operator overrides from
+    the ``context.analytics_environment`` block.
+    """
+    return _get_feature_config("analytics_environment", _ANALYTICS_DEFAULTS)
+
+
+def update_analytics_config(settings: dict[str, Any]) -> None:
+    """Update the analytics environment configuration in cdk.json.
+
+    Mirrors ``update_valkey_config`` / ``update_aurora_config``. Nested
+    keys under ``analytics_environment`` (``hyperpod``, ``cognito``,
+    ``efs``, ``studio``) are merged one level deep rather than replaced
+    wholesale — ``enable --hyperpod`` must not clobber
+    ``cognito.removal_policy``.
+    """
+    _update_feature_config("analytics_environment", settings, _ANALYTICS_DEFAULTS)

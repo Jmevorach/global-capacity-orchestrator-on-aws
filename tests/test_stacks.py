@@ -613,8 +613,12 @@ class TestStackManagerOperations:
         from cli.stacks import StackManager
 
         config = MagicMock()
+        config.api_gateway_region = "us-east-2"
 
-        with patch.object(StackManager, "_run_cdk") as mock_run:
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_stack_exists_in_cloudformation", return_value=False),
+        ):
             mock_run.return_value = MagicMock(returncode=0)
 
             manager = StackManager(config)
@@ -1961,8 +1965,12 @@ class TestStackManagerDestroyWithOptions:
         from cli.stacks import StackManager
 
         config = MagicMock()
+        config.api_gateway_region = "us-east-2"
 
-        with patch.object(StackManager, "_run_cdk") as mock_run:
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_stack_exists_in_cloudformation", return_value=False),
+        ):
             mock_run.return_value = MagicMock(returncode=0)
 
             manager = StackManager(config)
@@ -1991,6 +1999,216 @@ class TestStackManagerDestroyWithOptions:
             assert result is True
             call_args = mock_run.call_args[0][0]
             assert "--all" in call_args
+
+
+class TestStackManagerDestroyAnalyticsFallback:
+    """Tests for the analytics destroy fallback when the toggle is disabled."""
+
+    def test_destroy_enables_toggle_when_stack_exists(self):
+        """When analytics toggle is off but stack exists, destroy enables it first."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+        config.api_gateway_region = "us-east-2"
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(
+                StackManager, "_stack_exists_in_cloudformation", return_value=True
+            ) as mock_exists,
+            patch.object(
+                StackManager, "_ensure_analytics_enabled_for_destroy", return_value=True
+            ) as mock_enable,
+            patch.object(StackManager, "_restore_analytics_disabled") as mock_restore,
+        ):
+            # CDK destroy succeeds (because we enabled the toggle)
+            mock_run.return_value = MagicMock(returncode=0)
+            # After CDK destroy, stack no longer exists
+            mock_exists.side_effect = [True, False]
+
+            manager = StackManager(config)
+            result = manager.destroy(stack_name="gco-analytics", force=True)
+
+            assert result is True
+            mock_enable.assert_called_once()
+            mock_restore.assert_called_once()
+
+    def test_destroy_falls_back_to_cloudformation_when_cdk_doesnt_delete(self):
+        """If CDK destroy succeeds but stack still exists, use CloudFormation."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+        config.api_gateway_region = "us-east-2"
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_stack_exists_in_cloudformation") as mock_exists,
+            patch.object(StackManager, "_ensure_analytics_enabled_for_destroy", return_value=True),
+            patch.object(StackManager, "_restore_analytics_disabled"),
+            patch.object(
+                StackManager, "_cloudformation_delete_stack", return_value=True
+            ) as mock_cfn_delete,
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            # Stack still exists after CDK destroy
+            mock_exists.return_value = True
+
+            manager = StackManager(config)
+            result = manager.destroy(stack_name="gco-analytics", force=True)
+
+            assert result is True
+            mock_cfn_delete.assert_called_once_with("gco-analytics")
+
+    def test_destroy_skips_toggle_for_non_analytics_stacks(self):
+        """Non-analytics stacks don't trigger the toggle logic."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_stack_exists_in_cloudformation", return_value=False),
+            patch.object(StackManager, "_ensure_analytics_enabled_for_destroy") as mock_enable,
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+
+            manager = StackManager(config)
+            result = manager.destroy(stack_name="gco-us-east-1", force=True)
+
+            assert result is True
+            mock_enable.assert_not_called()
+
+
+class TestStackManagerDestroyExclusively:
+    """Tests for --exclusively flag and API gateway dependency removal."""
+
+    def test_destroy_passes_exclusively_flag(self):
+        """Destroy of a specific stack passes --exclusively to CDK."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+        config.api_gateway_region = "us-east-2"
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_stack_exists_in_cloudformation", return_value=False),
+            patch.object(StackManager, "_remove_api_gateway_analytics_dependency"),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+
+            manager = StackManager(config)
+            result = manager.destroy(stack_name="gco-analytics", force=True)
+
+            assert result is True
+            call_args = mock_run.call_args[0][0]
+            assert "--exclusively" in call_args
+            assert "gco-analytics" in call_args
+
+    def test_destroy_all_does_not_pass_exclusively(self):
+        """Destroy --all does not pass --exclusively."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+
+        with patch.object(StackManager, "_run_cdk") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+
+            manager = StackManager(config)
+            result = manager.destroy(all_stacks=True, force=True)
+
+            assert result is True
+            call_args = mock_run.call_args[0][0]
+            assert "--exclusively" not in call_args
+            assert "--all" in call_args
+
+    def test_destroy_analytics_calls_remove_api_gateway_dependency(self):
+        """Destroying analytics stack removes API gateway dependency first."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+        config.api_gateway_region = "us-east-2"
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_stack_exists_in_cloudformation", return_value=False),
+            patch.object(StackManager, "_remove_api_gateway_analytics_dependency") as mock_remove,
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+
+            manager = StackManager(config)
+            manager.destroy(stack_name="gco-analytics", force=True)
+
+            mock_remove.assert_called_once()
+
+    def test_destroy_non_analytics_skips_api_gateway_dependency(self):
+        """Non-analytics stacks don't trigger API gateway dependency removal."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_stack_exists_in_cloudformation", return_value=False),
+            patch.object(StackManager, "_remove_api_gateway_analytics_dependency") as mock_remove,
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+
+            manager = StackManager(config)
+            manager.destroy(stack_name="gco-us-east-1", force=True)
+
+            mock_remove.assert_not_called()
+
+
+class TestStackManagerDeployAnalyticsAutoApiGateway:
+    """Tests for auto-deploying API gateway after analytics deploy."""
+
+    def test_deploy_analytics_triggers_api_gateway_deploy(self):
+        """After deploying gco-analytics, gco-api-gateway is auto-deployed."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+        config.api_gateway_region = "us-east-2"
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_check_and_fix_stuck_stack"),
+            patch.object(StackManager, "ensure_bootstrapped", return_value=True),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+
+            manager = StackManager(config)
+            manager._lambda_packages_rebuilt = True
+            manager._lambda_sources_synced = True
+            result = manager.deploy(stack_name="gco-analytics", require_approval=False)
+
+            assert result is True
+            # Should be called twice: once for analytics, once for api-gateway.
+            assert mock_run.call_count == 2
+            second_call_args = mock_run.call_args_list[1][0][0]
+            assert "gco-api-gateway" in second_call_args
+
+    def test_deploy_non_analytics_does_not_trigger_api_gateway(self):
+        """Deploying a non-analytics stack does not auto-deploy API gateway."""
+        from cli.stacks import StackManager
+
+        config = MagicMock()
+        config.api_gateway_region = "us-east-2"
+
+        with (
+            patch.object(StackManager, "_run_cdk") as mock_run,
+            patch.object(StackManager, "_check_and_fix_stuck_stack"),
+            patch.object(StackManager, "ensure_bootstrapped", return_value=True),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+
+            manager = StackManager(config)
+            manager._lambda_packages_rebuilt = True
+            manager._lambda_sources_synced = True
+            result = manager.deploy(stack_name="gco-us-east-1", require_approval=False)
+
+            assert result is True
+            # Only called once (no follow-up API gateway deploy).
+            assert mock_run.call_count == 1
 
 
 class TestStackManagerOrchestratedParallel:
