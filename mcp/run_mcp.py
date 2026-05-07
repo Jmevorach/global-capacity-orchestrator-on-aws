@@ -20,12 +20,12 @@ This file is a thin entrypoint. The actual implementation lives in the
 ``mcp/`` directory:
 
     mcp/
-    ├── server.py          — FastMCP instance and instructions
-    ├── audit.py           — Audit logging, sanitization, decorator
-    ├── iam.py             — IAM role assumption
-    ├── cli_runner.py      — _run_cli() subprocess wrapper
-    ├── version.py         — Project version management
-    ├── tools/             — MCP tool definitions (one file per domain)
+    ├── server.py           — FastMCP instance and instructions
+    ├── audit.py            — Audit logging, sanitization, decorator
+    ├── iam.py              — IAM role assumption
+    ├── cli_runner.py       — _run_cli() subprocess wrapper
+    ├── version.py          — Project version management
+    ├── tools/              — MCP tool definitions (one file per domain)
     │   ├── jobs.py
     │   ├── capacity.py
     │   ├── inference.py
@@ -33,18 +33,18 @@ This file is a thin entrypoint. The actual implementation lives in the
     │   ├── stacks.py
     │   ├── storage.py
     │   └── models.py
-    └── resources/         — MCP resource definitions (one file per scheme)
-        ├── docs.py        — docs:// (documentation + examples with metadata)
-        ├── source.py      — source:// (full source code browser)
-        ├── k8s.py         — k8s:// (cluster manifests)
+    └── resources/          — MCP resource definitions (one file per scheme)
+        ├── docs.py         — docs:// (documentation + examples with metadata)
+        ├── source.py       — source:// (full source code browser)
+        ├── k8s.py          — k8s:// (cluster manifests)
         ├── iam_policies.py — iam:// (IAM policy templates)
-        ├── infra.py       — infra:// (Dockerfiles, Helm, CI/CD)
-        ├── ci.py          — ci:// (GitHub Actions, workflows)
-        ├── demos.py       — demos:// (walkthroughs, scripts)
-        ├── clients.py     — clients:// (API client examples)
-        ├── scripts.py     — scripts:// (utility scripts)
-        ├── tests.py       — tests:// (test suite docs and patterns)
-        └── config.py      — config:// (CDK config, feature toggles, env vars)
+        ├── infra.py        — infra:// (Dockerfiles, Helm, CI/CD)
+        ├── ci.py           — ci:// (GitHub Actions, workflows)
+        ├── demos.py        — demos:// (walkthroughs, scripts)
+        ├── clients.py      — clients:// (API client examples)
+        ├── scripts.py      — scripts:// (utility scripts)
+        ├── tests.py        — tests:// (test suite docs and patterns)
+        └── config.py       — config:// (CDK config, feature toggles, env vars)
 """
 
 import sys
