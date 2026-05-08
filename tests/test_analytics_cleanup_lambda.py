@@ -53,6 +53,18 @@ def _set_env(monkeypatch):
         monkeypatch.setenv(key, value)
 
 
+@pytest.fixture(autouse=True)
+def _fast_sleep(monkeypatch):
+    """Skip real waiting inside the handler so tests stay fast.
+
+    ``_delete_user_profiles`` and ``_delete_spaces`` now poll and sleep
+    while the SageMaker delete calls drain asynchronously. Tests use
+    paginators that return empty on the first re-list, so the loop exits
+    on the first iteration — but only if ``time.sleep`` is a no-op.
+    """
+    monkeypatch.setattr(_module.time, "sleep", lambda _: None)
+
+
 # ---------------------------------------------------------------------------
 # handler() top-level tests
 # ---------------------------------------------------------------------------
@@ -98,7 +110,7 @@ class TestHandler:
     @patch("analytics_cleanup_handler._delete_user_profiles", return_value=["err2"])
     @patch("analytics_cleanup_handler._delete_spaces", return_value=[])
     @patch("analytics_cleanup_handler._delete_apps", return_value=[])
-    def test_delete_returns_success_even_on_errors(
+    def test_delete_raises_on_critical_errors(
         self,
         mock_apps,
         mock_spaces,
@@ -108,7 +120,33 @@ class TestHandler:
         mock_efs,
         mock_sgs,
     ):
-        """Cleanup errors must not block stack deletion."""
+        """Errors draining apps/spaces/user-profiles must fail the custom
+        resource so CloudFormation doesn't proceed to a guaranteed-fail
+        domain delete.
+        """
+        with pytest.raises(RuntimeError, match="Analytics cleanup failed"):
+            handler({"RequestType": "Delete"}, None)
+
+    @patch("analytics_cleanup_handler._delete_sagemaker_security_groups", return_value=["sg-err"])
+    @patch("analytics_cleanup_handler._delete_sagemaker_managed_efs", return_value=["efs-err"])
+    @patch("analytics_cleanup_handler._get_sagemaker_home_efs_id", return_value="")
+    @patch("analytics_cleanup_handler._delete_efs_resource_policy")
+    @patch("analytics_cleanup_handler._delete_user_profiles", return_value=[])
+    @patch("analytics_cleanup_handler._delete_spaces", return_value=[])
+    @patch("analytics_cleanup_handler._delete_apps", return_value=[])
+    def test_delete_tolerates_non_critical_errors(
+        self,
+        mock_apps,
+        mock_spaces,
+        mock_profiles,
+        mock_efs_policy,
+        mock_get_sm_efs,
+        mock_efs,
+        mock_sgs,
+    ):
+        """EFS and SG cleanup errors are best-effort and must not block the
+        domain delete — they're logged but the handler still returns SUCCESS.
+        """
         result = handler({"RequestType": "Delete"}, None)
         assert result["Status"] == "SUCCESS"
 
@@ -122,13 +160,18 @@ class TestDeleteUserProfiles:
     def test_deletes_all_profiles(self):
         mock_sm = MagicMock()
         mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [
-            {
-                "UserProfiles": [
-                    {"UserProfileName": "alice"},
-                    {"UserProfileName": "bob"},
-                ]
-            }
+        # First paginate() call: enumerate profiles for deletion.
+        # Subsequent paginate() calls: poll loop — return empty to exit.
+        mock_paginator.paginate.side_effect = [
+            [
+                {
+                    "UserProfiles": [
+                        {"UserProfileName": "alice"},
+                        {"UserProfileName": "bob"},
+                    ]
+                }
+            ],
+            [{"UserProfiles": []}],
         ]
         mock_sm.get_paginator.return_value = mock_paginator
 
@@ -152,12 +195,57 @@ class TestDeleteUserProfiles:
         assert errors == []
         mock_sm.delete_user_profile.assert_not_called()
 
+    def test_waits_for_profiles_to_drain(self):
+        """Profiles in Deleting state are skipped for the delete call but
+        still gate the wait loop — we must not return until they're gone.
+        """
+        mock_sm = MagicMock()
+        mock_paginator = MagicMock()
+        # Initial list has 1 profile to delete.
+        # Wait loop sees it still Deleting, then gone.
+        mock_paginator.paginate.side_effect = [
+            [{"UserProfiles": [{"UserProfileName": "alice", "Status": "InService"}]}],
+            [{"UserProfiles": [{"UserProfileName": "alice", "Status": "Deleting"}]}],
+            [{"UserProfiles": []}],
+        ]
+        mock_sm.get_paginator.return_value = mock_paginator
+
+        with patch("boto3.client", return_value=mock_sm):
+            errors = _delete_user_profiles("us-east-2", "d-test123")
+
+        assert errors == []
+        mock_sm.delete_user_profile.assert_called_once_with(
+            DomainId="d-test123", UserProfileName="alice"
+        )
+
+    def test_timeout_reports_error(self, monkeypatch):
+        """If profiles never drain, the function must report an error so
+        the top-level handler can raise.
+        """
+        mock_sm = MagicMock()
+        mock_paginator = MagicMock()
+        # Always return a lingering profile — the wait loop will time out.
+        mock_paginator.paginate.return_value = [
+            {"UserProfiles": [{"UserProfileName": "alice", "Status": "Deleting"}]}
+        ]
+        mock_sm.get_paginator.return_value = mock_paginator
+
+        with patch("boto3.client", return_value=mock_sm):
+            errors = _delete_user_profiles("us-east-2", "d-test123")
+
+        assert len(errors) == 1
+        assert "Timed out" in errors[0]
+        assert "alice" in errors[0]
+
     def test_delete_failure_is_captured(self):
         from botocore.exceptions import ClientError
 
         mock_sm = MagicMock()
         mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [{"UserProfiles": [{"UserProfileName": "alice"}]}]
+        mock_paginator.paginate.side_effect = [
+            [{"UserProfiles": [{"UserProfileName": "alice"}]}],
+            [{"UserProfiles": []}],
+        ]
         mock_sm.get_paginator.return_value = mock_paginator
         mock_sm.delete_user_profile.side_effect = ClientError(
             {"Error": {"Code": "ValidationException", "Message": "in use"}},
@@ -167,8 +255,8 @@ class TestDeleteUserProfiles:
         with patch("boto3.client", return_value=mock_sm):
             errors = _delete_user_profiles("us-east-2", "d-test123")
 
-        assert len(errors) == 1
-        assert "alice" in errors[0]
+        assert len(errors) >= 1
+        assert any("alice" in e for e in errors)
 
     def test_list_failure_is_captured(self):
         from botocore.exceptions import ClientError
@@ -314,3 +402,143 @@ class TestDeleteSagemakerManagedEfs:
 
         assert len(errors) == 1
         assert "fsmt-001" in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# _delete_sagemaker_security_groups tests
+# ---------------------------------------------------------------------------
+
+_delete_sagemaker_security_groups = _module._delete_sagemaker_security_groups
+
+
+class TestDeleteSagemakerSecurityGroups:
+    """Cover the DependencyViolation retry behaviour for the NFS SGs."""
+
+    def _sg(self, group_id, group_name, ingress=None, egress=None):
+        return {
+            "GroupId": group_id,
+            "GroupName": group_name,
+            "IpPermissions": ingress or [],
+            "IpPermissionsEgress": egress or [],
+        }
+
+    def test_deletes_both_sgs_on_first_attempt(self):
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                self._sg("sg-in", "security-group-for-inbound-nfs-d-test"),
+                self._sg("sg-out", "security-group-for-outbound-nfs-d-test"),
+            ]
+        }
+
+        with patch("boto3.client", return_value=mock_ec2):
+            errors = _delete_sagemaker_security_groups("us-east-2", "d-test", "vpc-xyz")
+
+        assert errors == []
+        assert mock_ec2.delete_security_group.call_count == 2
+
+    def test_retries_on_dependency_violation_then_succeeds(self, monkeypatch):
+        """The outbound SG typically fails once with DependencyViolation
+        and clears within one backoff interval."""
+        from botocore.exceptions import ClientError
+
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                self._sg("sg-out", "security-group-for-outbound-nfs-d-test"),
+            ]
+        }
+        # First call: DependencyViolation. Second call: succeeds.
+        dep_violation = ClientError(
+            {
+                "Error": {
+                    "Code": "DependencyViolation",
+                    "Message": "has a dependent object",
+                }
+            },
+            "DeleteSecurityGroup",
+        )
+        mock_ec2.delete_security_group.side_effect = [dep_violation, None]
+
+        with patch("boto3.client", return_value=mock_ec2):
+            errors = _delete_sagemaker_security_groups("us-east-2", "d-test", "vpc-xyz")
+
+        assert errors == []
+        assert mock_ec2.delete_security_group.call_count == 2
+
+    def test_reports_error_after_exhausting_retries(self):
+        """If DependencyViolation persists across every attempt, emit
+        an actionable error so the caller can decide how to handle it."""
+        from botocore.exceptions import ClientError
+
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                self._sg("sg-out", "security-group-for-outbound-nfs-d-test"),
+            ]
+        }
+        mock_ec2.delete_security_group.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "DependencyViolation",
+                    "Message": "has a dependent object",
+                }
+            },
+            "DeleteSecurityGroup",
+        )
+
+        with patch("boto3.client", return_value=mock_ec2):
+            errors = _delete_sagemaker_security_groups("us-east-2", "d-test", "vpc-xyz")
+
+        assert len(errors) == 1
+        assert "sg-out" in errors[0]
+        assert "DependencyViolation did not clear" in errors[0]
+        # Every attempt was used.
+        assert mock_ec2.delete_security_group.call_count == _module.SG_DELETE_MAX_ATTEMPTS
+
+    def test_treats_already_deleted_as_success(self):
+        """An ``InvalidGroup.NotFound`` response means some other actor
+        (e.g. an operator recovering a prior failed destroy) has already
+        deleted the SG. Treat it as success, not an error."""
+        from botocore.exceptions import ClientError
+
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                self._sg("sg-in", "security-group-for-inbound-nfs-d-test"),
+            ]
+        }
+        mock_ec2.delete_security_group.side_effect = ClientError(
+            {"Error": {"Code": "InvalidGroup.NotFound", "Message": "gone"}},
+            "DeleteSecurityGroup",
+        )
+
+        with patch("boto3.client", return_value=mock_ec2):
+            errors = _delete_sagemaker_security_groups("us-east-2", "d-test", "vpc-xyz")
+
+        assert errors == []
+
+    def test_other_client_errors_are_surfaced_immediately(self):
+        """Errors other than ``DependencyViolation`` / ``InvalidGroup.NotFound``
+        surface on the first attempt without retrying — these are not
+        transient and retries would waste Lambda time."""
+        from botocore.exceptions import ClientError
+
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                self._sg("sg-in", "security-group-for-inbound-nfs-d-test"),
+            ]
+        }
+        mock_ec2.delete_security_group.side_effect = ClientError(
+            {"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}},
+            "DeleteSecurityGroup",
+        )
+
+        with patch("boto3.client", return_value=mock_ec2):
+            errors = _delete_sagemaker_security_groups("us-east-2", "d-test", "vpc-xyz")
+
+        assert len(errors) == 1
+        assert "sg-in" in errors[0]
+        # Only one attempt — no retry for non-DependencyViolation errors.
+        assert mock_ec2.delete_security_group.call_count == 1
