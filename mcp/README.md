@@ -24,6 +24,10 @@ An MCP (Model Context Protocol) server that exposes the GCO CLI as tools for LLM
   - [Screenshots](#screenshots)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
+  - [Kiro](#kiro)
+  - [Claude Desktop](#claude-desktop)
+  - [Cursor](#cursor)
+  - [Other MCP Clients](#other-mcp-clients)
 - [Available Tools](#available-tools)
   - [Job Management](#job-management)
   - [Capacity](#capacity)
@@ -46,6 +50,11 @@ An MCP (Model Context Protocol) server that exposes the GCO CLI as tools for LLM
 - [Getting Started with the MCP Server](#getting-started-with-the-mcp-server)
 - [Architecture](#architecture)
 - [Examples](#examples)
+- [Recommended Companion MCP Servers](#recommended-companion-mcp-servers)
+  - [AWS-focused](#aws-focused)
+  - [Development \& docs](#development--docs)
+  - [Reasoning \& workflow](#reasoning--workflow)
+  - [Utilities](#utilities)
 - [Troubleshooting](#troubleshooting)
 
 ## Overview
@@ -117,7 +126,42 @@ If you'd rather install on your host:
 
 ## Setup
 
-The most portable config — works across Cursor, Kiro, Claude Desktop, and anything else that speaks stdio MCP — passes the **absolute path** to `run_mcp.py` directly in `args`. This avoids relying on any client-specific `cwd` handling.
+The most portable config — works across Kiro, Claude Desktop, Cursor, and anything else that speaks stdio MCP — passes the **absolute path** to `run_mcp.py` directly in `args`. This avoids relying on any client-specific `cwd` handling.
+
+### Kiro
+
+Add to your MCP config at `~/.kiro/settings/mcp.json`. Kiro additionally honors a `cwd` field, so you can either use the absolute-path form below or the `cwd` shorthand:
+
+```json
+{
+  "mcpServers": {
+    "gco": {
+      "command": "python3",
+      "args": ["mcp/run_mcp.py"],
+      "cwd": "/path/to/global-capacity-orchestrator-on-aws"
+    }
+  }
+}
+```
+
+If the server fails to start in Kiro, switch to the absolute-path form — `cwd` handling differs between clients.
+
+### Claude Desktop
+
+Add to your MCP config at `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "gco": {
+      "command": "python3",
+      "args": ["/path/to/global-capacity-orchestrator-on-aws/mcp/run_mcp.py"]
+    }
+  }
+}
+```
+
+Replace `/path/to/global-capacity-orchestrator-on-aws` with the absolute path to your GCO clone, then fully quit and reopen Claude Desktop for the new server to be picked up.
 
 ### Cursor
 
@@ -135,24 +179,6 @@ Add to your MCP config at `~/.cursor/mcp.json`:
 ```
 
 Replace `/path/to/global-capacity-orchestrator-on-aws` with the absolute path to your GCO clone. After saving, hit the reload icon next to the `gco` server in Cursor → Settings → MCP so the tool descriptors get picked up.
-
-### Kiro
-
-Add to your MCP config at `~/.kiro/settings/mcp.json`. Kiro additionally honors a `cwd` field, so you can either use the absolute-path form above or the `cwd` shorthand:
-
-```json
-{
-  "mcpServers": {
-    "gco": {
-      "command": "python3",
-      "args": ["mcp/run_mcp.py"],
-      "cwd": "/path/to/global-capacity-orchestrator-on-aws"
-    }
-  }
-}
-```
-
-If the server fails to start in Kiro, switch to the absolute-path form — `cwd` handling differs between clients.
 
 ### Other MCP Clients
 
@@ -439,6 +465,131 @@ Once connected, you can interact naturally:
 - "What's my cost this month?"
 - "Scale my-llm endpoint to 3 replicas"
 - "Submit examples/simple-job.yaml to the region with the most capacity"
+
+## Recommended Companion MCP Servers
+
+These are MCP servers we've found genuinely useful while developing GCO and while operating it day-to-day. None of them are required — the GCO MCP server is fully functional on its own — but each one has earned its spot by coming up often enough that we'd rather have it installed than not.
+
+> **All of the servers listed below are free to use as of 2026-05-10** — no paid plans, API keys, or usage-based fees. A few (the AWS ones in particular) call APIs that themselves have free tiers / pay-per-call pricing on the AWS side, but the MCP servers wrapping them don't charge anything. Worth re-checking the upstream projects before relying on this for the long haul.
+
+Add any of them to your MCP config (e.g. `~/.kiro/settings/mcp.json`) the same way you added the `gco` server. A full example combining several of them is at the bottom of this section.
+
+### AWS-focused
+
+The most natural companions, since GCO is an AWS-native platform.
+
+| Server | Package | Why it pairs with GCO |
+|--------|---------|----------------------|
+| **AWS Documentation** | [`awslabs.aws-documentation-mcp-server`](https://awslabs.github.io/mcp/servers/aws-documentation-mcp-server/) | Look up AWS service docs (EKS, EC2 spot, FSx for Lustre, CDK, Bedrock) without leaving the chat. Helpful when an agent needs to verify an API option, a service quota, or a recently-released feature that isn't in its training data. |
+| **AWS Pricing** | [`awslabs.aws-pricing-mcp-server`](https://awslabs.github.io/mcp/servers/aws-pricing-mcp-server/) | Cross-check the output of `cost_summary` / `cost_forecast` against the published rate cards. Also useful for "what does running 12× `p5.48xlarge` for 6 hours cost across `us-east-1` vs `us-west-2`?" style planning questions before you submit a job. |
+| **EKS** | [`awslabs.eks-mcp-server`](https://awslabs.github.io/mcp/servers/eks-mcp-server/) | Drop down a layer when GCO's higher-level tools aren't enough — describe pods directly, tail logs from `kube-system`, inspect events on a NodePool, or apply a one-off manifest. Complements GCO's job/inference abstractions rather than replacing them. |
+
+### Development & docs
+
+For navigating code, docs, and the broader web while working on GCO itself.
+
+| Server | Package | Why it pairs with GCO |
+|--------|---------|----------------------|
+| **Filesystem** | [`@modelcontextprotocol/server-filesystem`](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem) | Read/write project files outside the GCO MCP's resource scopes — editing CI configs, scaffolding new example manifests, dropping scratch notes into the repo. Pair with `${workspaceFolder}` so it's scoped to the current project. |
+| **Fetch** | [`mcp-server-fetch`](https://github.com/modelcontextprotocol/servers/tree/main/src/fetch) | Pull a specific URL into context: a GitHub issue, an AWS release note, an external runbook, a CloudWatch console deep-link. Comes up constantly during incident analysis. |
+| **DuckDuckGo Search** | [`duckduckgo-mcp-server`](https://github.com/nickclyde/duckduckgo-mcp-server) | General-purpose web search for "is this a known issue?" / "what does this CloudFormation error code mean?" investigations. No API key required, unlike most other search MCPs. |
+| **DeepWiki** | [`mcp-deepwiki`](https://github.com/regenrek/deepwiki-mcp) | Ask questions against any public GitHub repo's DeepWiki — useful for digging into upstream projects GCO depends on (`fastmcp`, `aws-cdk`, EKS addons, vLLM, etc.) without cloning them. |
+| **Documentation** | [`@andrea9293/mcp-documentation-server`](https://github.com/andrea9293/mcp-documentation-server) | Index local or remote documentation into a small vector store the agent can search semantically. Handy for long-form internal docs that are awkward to grep. |
+| **Playwright** | [`@playwright/mcp`](https://github.com/microsoft/playwright-mcp) | Drive a browser for end-to-end testing of inference endpoints, exercising the AWS console, or scraping a page that doesn't expose a clean API. |
+
+### Reasoning & workflow
+
+These don't add new capabilities — they shape how the agent thinks and remembers.
+
+| Server | Package | Why it pairs with GCO |
+|--------|---------|----------------------|
+| **Sequential Thinking** | [`@modelcontextprotocol/server-sequential-thinking`](https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking) | Encourages the agent to break complex GCO workflows (multi-region rollouts, canary promotions, incident postmortems) into explicit steps before taking action. Noticeably reduces "fire-and-pray" tool calls. |
+| **Inner Monologue** | [`inner-monologue-mcp`](https://www.npmjs.com/package/inner-monologue-mcp) | Similar in spirit — gives the agent a scratchpad for reasoning when troubleshooting a stuck job or a failed deployment. |
+| **Memory** | [`@modelcontextprotocol/server-memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) | Persists facts across sessions: "we always deploy to these three regions", "our SLO is X", "this account uses Capacity Blocks, not regular spot". Saves re-stating context every chat. |
+| **MCP Tasks** | [`mcp-tasks`](https://www.npmjs.com/package/mcp-tasks) | Lightweight task list the agent can read/update while working through a multi-step plan — e.g. a full GCO bootstrap, a region cutover, or a long-running cost-optimization sweep. |
+
+### Utilities
+
+Small helpers that round out the toolbox.
+
+| Server | Package | Why it pairs with GCO |
+|--------|---------|----------------------|
+| **Shell** | [`mcp-shell-server`](https://github.com/tumf/mcp-shell-server) | Run a small allowlist of read-only shell commands (`ls`, `cat`, `pwd`, `grep`, `wc`, `find`, `touch`) when the agent needs to inspect the working tree itself. Keep `ALLOW_COMMANDS` tight — don't add destructive commands like `rm` or `git`. |
+| **Calculator** | [`mcp-server-calculator`](https://github.com/githejie/mcp-server-calculator) | Reliable arithmetic for cost / capacity math, e.g. "GPU-hours per month at 70% utilization for 12× H100s at the current `p5.48xlarge` spot price". Faster and more accurate than asking the model to do it in its head. |
+
+### Example combined config
+
+Here's a `~/.kiro/settings/mcp.json` that wires up the GCO MCP server alongside the companions above. Drop in only the ones you want and update the GCO path. The `gco` entry uses Kiro's `cwd` shorthand; the other clients (Claude Desktop, Cursor, etc.) need the absolute-path form shown earlier in [Setup](#setup) — everything else carries over as-is.
+
+```json
+{
+  "mcpServers": {
+    "gco": {
+      "command": "python3",
+      "args": ["mcp/run_mcp.py"],
+      "cwd": "/path/to/global-capacity-orchestrator-on-aws"
+    },
+    "aws-docs": {
+      "command": "uvx",
+      "args": ["awslabs.aws-documentation-mcp-server@latest"],
+      "env": { "FASTMCP_LOG_LEVEL": "ERROR" }
+    },
+    "awslabs.aws-pricing-mcp-server": {
+      "command": "uvx",
+      "args": ["awslabs.aws-pricing-mcp-server@latest"],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR",
+        "AWS_PROFILE": "your-aws-profile",
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "awslabs.eks-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "awslabs.eks-mcp-server@latest",
+        "--allow-write",
+        "--allow-sensitive-data-access"
+      ],
+      "env": { "FASTMCP_LOG_LEVEL": "ERROR" }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "${workspaceFolder}"
+      ]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "ddg-search": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"]
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    },
+    "shell": {
+      "command": "uvx",
+      "args": ["mcp-shell-server"],
+      "env": { "ALLOW_COMMANDS": "ls,cat,pwd,grep,wc,touch,find" }
+    },
+    "calculator": {
+      "command": "uvx",
+      "args": ["mcp-server-calculator"]
+    }
+  }
+}
+```
+
+> These are recommendations, not endorsements — each MCP server runs as a separate process with its own permissions. Review what a server does and which credentials it can see before you enable it, especially for anything with `--allow-write` or shell access.
 
 ## Troubleshooting
 
