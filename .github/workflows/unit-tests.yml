@@ -8,7 +8,7 @@
 #
 # Jobs (alphabetical by display name):
 #   - unit:bats:shell              — BATS shell tests
-#   - unit:cdk:config-matrix       — scripts/test_cdk_synthesis.py (config combos)
+#   - unit:cdk:config-matrix       — tests/test_cdk_synthesis_matrix.py (in-process, -n auto)
 #   - unit:cdk:nag-compliance      — cdk-nag compliance across full config matrix
 #   - unit:cdk:synth               — cdk synth of the default config
 #   - unit:cli:smoke               — gco --help and all subcommand help pages
@@ -36,6 +36,34 @@ permissions:
   contents: read
 
 jobs:
+  # --------------------------------------------------------------------------
+  # Path filter used by the lockfile / fresh-install jobs below. Both of those
+  # only exercise pyproject.toml + requirements-lock.txt (plus the workflow
+  # file itself), so running them on every docs- or code-only PR is waste —
+  # especially unit:fresh-install, which intentionally disables the pip cache.
+  #
+  # On push to main and workflow_dispatch the filter is skipped and the
+  # dependent jobs always run: we want at least one guaranteed green run per
+  # merge. On PRs, dorny/paths-filter queries the GitHub API (no checkout
+  # needed) for the changed files and gates the jobs via their `if:`.
+  # --------------------------------------------------------------------------
+  changes:
+    name: "changes"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    if: github.event_name == 'pull_request'
+    outputs:
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            deps:
+              - 'pyproject.toml'
+              - 'requirements-lock.txt'
+              - '.github/workflows/unit-tests.yml'
+
   unit-pytest-core:
     name: "unit:pytest:core"
     runs-on: ubuntu-latest
@@ -60,14 +88,26 @@ jobs:
           cache-dependency-path: "requirements-lock.txt"
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -e ".[dev,mcp]"
       - uses: ./.github/actions/build-lambda-package
       - name: Run pytest with coverage
+        # Parallelism (pytest-xdist -n auto) was attempted here but the
+        # CDK-heavy stack tests (test_regional_stack, test_stacks, etc.)
+        # race on CDK's in-process asset-staging cache: two workers both
+        # stage ``lambda/kubectl-applier-simple-build`` into the shared
+        # ``cdk.out/asset.<hash>/`` destination and one hits ENOENT on the
+        # source mid-copy. Neither ``--dist=loadfile`` nor ``--dist=loadscope``
+        # fixes it because the race is cross-file (multiple test modules
+        # instantiate GCORegionalStack, which uses the same asset). Running
+        # serially with ``-x`` preserves correctness at the cost of the
+        # xdist wall-clock speedup. The two dedicated CDK jobs
+        # (unit:cdk:config-matrix + unit:cdk:nag-compliance) do benefit
+        # from parallelism and are wired for it in their own workflows.
         run: |
           pytest tests/ -v \
             --ignore=tests/test_integration.py \
             --ignore=tests/test_nag_compliance.py \
+            --ignore=tests/test_cdk_synthesis_matrix.py \
             --cov=gco --cov=cli \
             --cov-report=xml --cov-report=html --cov-report=json \
             --cov-report=term-missing \
@@ -182,7 +222,6 @@ jobs:
           cache-dependency-path: "requirements-lock.txt"
       - name: Install CLI
         run: |
-          python -m pip install --upgrade pip
           pip install -e .
       - name: Exercise CLI surface
         run: |
@@ -211,7 +250,6 @@ jobs:
           cache-dependency-path: "requirements-lock.txt"
       - name: Install CDK + dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -e ".[cdk]"
           npm install -g aws-cdk
       - uses: ./.github/actions/build-lambda-package
@@ -244,39 +282,73 @@ jobs:
           python-version: "3.14"
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
-      - name: Install CDK + dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[cdk]"
-          npm install -g aws-cdk@2
+      - name: Install CDK + test dependencies
+        run: pip install -e ".[cdk,test]"
       - uses: ./.github/actions/build-lambda-package
       - name: Run config matrix
-        run: python3 scripts/test_cdk_synthesis.py --verbose
+        # tests/test_cdk_synthesis_matrix.py parametrizes across every
+        # entry in tests/_cdk_config_matrix.CONFIGS and runs ``app.synth()``
+        # in-process per config — no ``cdk synth`` subprocess, no cdk.json
+        # mutation. The Node.js/CDK CLI is no longer required, so the
+        # ``npm install -g aws-cdk`` step was dropped alongside the
+        # subprocess loop.
+        #
+        # Runs serially (no ``-n auto``) for the same reason as
+        # unit:pytest:core: every parametrized case stages the same
+        # ``lambda/kubectl-applier-simple-build`` tree into
+        # ``cdk.out/asset.<hash>/`` and CDK's in-process asset-staging
+        # cache races under xdist. The bulk of CDK-config parallelism
+        # lives in the sibling unit:cdk:nag-compliance job, which fans
+        # out one GitHub runner per config.
+        run: pytest tests/test_cdk_synthesis_matrix.py -v
+
+  unit-cdk-nag-compliance-matrix:
+    name: "unit:cdk:nag-compliance:list"
+    # Emits the NAG_CONFIGS list as a JSON array for the fan-out matrix
+    # below. Reading the Python list here (rather than hard-coding config
+    # names in YAML) keeps the workflow in lockstep with
+    # ``tests/_cdk_config_matrix.NAG_CONFIGS`` — add an entry there and
+    # the matrix automatically picks it up on the next run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      configs: ${{ steps.list.outputs.configs }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: list
+        run: |
+          python3 -c "
+          import json, sys
+          sys.path.insert(0, '.')
+          from tests._cdk_config_matrix import NAG_CONFIGS
+          names = [name for name, _ in NAG_CONFIGS]
+          print(f'configs={json.dumps(names)}')
+          " >> "$GITHUB_OUTPUT"
 
   unit-cdk-nag-compliance:
-    name: "unit:cdk:nag-compliance"
-    # Synthesizes every cdk.json configuration in the shared matrix
-    # (``tests/_cdk_config_matrix.CONFIGS``) through a full cdk-nag
-    # traversal and asserts zero unsuppressed findings. This is the
-    # hard gate against shipping an IAM-wildcard or similar cdk-nag
-    # error to a user's ``cdk deploy``: if the test is green, every
-    # configuration the user can pick from cdk.json has been validated
-    # against AwsSolutions, HIPAA Security, NIST 800-53 R5, PCI DSS
-    # 3.2.1, and Serverless rule packs in the same process that
-    # ``app.py`` uses for real deploys.
+    name: "unit:cdk:nag-compliance (${{ matrix.config }})"
+    # Fan out across ``NAG_CONFIGS`` so each configuration synthesizes
+    # and runs cdk-nag in its own runner — the per-config work (build
+    # global + API gateway + regional(s) + monitoring + optionally
+    # analytics, then walk five rule packs across the resource tree)
+    # is heavy enough that GitHub's free 4-vCPU arm64 runner beats
+    # cramming every config onto a 2-vCPU amd64 runner under xdist.
     #
-    # Runs in its own job with pytest-xdist parallelism (``-n auto``
-    # picks the core count via psutil). On an 8-core runner all 24
-    # configs complete in ~10 minutes. The tests are parallel-safe by
-    # construction — each config builds a fresh ``cdk.App`` with no
-    # shared module state.
-    #
-    # Separate from ``unit:pytest:core`` because the rest of the
-    # suite isn't parallel-safe and we don't want to either
-    # (a) pay the serial cost here, or (b) split a single pytest
-    # invocation across two --dist modes.
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Each matrix cell invokes pytest with ``-k <config_name>`` so it
+    # runs exactly the parametrized case matching that config. This is
+    # the same hard gate as before against shipping an IAM-wildcard or
+    # similar cdk-nag error to a user's ``cdk deploy``: if every matrix
+    # cell is green, every configuration the user can pick from cdk.json
+    # has been validated against AwsSolutions, HIPAA Security, NIST
+    # 800-53 R5, PCI DSS 3.2.1, and Serverless rule packs in the same
+    # process that ``app.py`` uses for real deploys.
+    needs: unit-cdk-nag-compliance-matrix
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.unit-cdk-nag-compliance-matrix.outputs.configs) }}
     env:
       AWS_DEFAULT_REGION: us-east-1
       AWS_REGION: us-east-1
@@ -291,26 +363,41 @@ jobs:
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,mcp]"
+        run: pip install -e ".[dev,mcp]"
       - uses: ./.github/actions/build-lambda-package
-      - name: Run cdk-nag compliance matrix
+      - name: Run cdk-nag compliance for ${{ matrix.config }}
+        # Select the exact parametrized test case by test ID. The
+        # parametrize call in tests/test_nag_compliance.py uses
+        # ``ids=[c[0] for c in CONFIGS]``, so the config name *is* the
+        # test ID — ``::`` rather than ``-k`` avoids substring
+        # collisions (e.g. ``analytics-enabled`` matching both
+        # ``analytics-enabled`` and ``analytics-enabled-hyperpod-canvas``).
         run: |
-          pytest tests/test_nag_compliance.py -n auto -v \
-            --junitxml=report-nag-compliance.xml
+          pytest -v \
+            "tests/test_nag_compliance.py::TestCdkNagCompliance::test_no_unsuppressed_findings[${{ matrix.config }}]" \
+            --junitxml=report-nag-compliance-${{ matrix.config }}.xml
       - name: Upload nag compliance report
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: nag-compliance-report
-          path: report-nag-compliance.xml
+          name: nag-compliance-report-${{ matrix.config }}
+          path: report-nag-compliance-${{ matrix.config }}.xml
           retention-days: 7
 
   unit-lockfile-freshness:
     name: "unit:lockfile:freshness"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Skip on PRs that don't touch pyproject.toml or the lockfile. The
+    # `needs: changes` only applies on pull_request (where the `changes`
+    # job itself runs) — on push/dispatch `changes` is skipped and this
+    # condition short-circuits to true so the job always runs.
+    needs: changes
+    if: |
+      always() && (
+        github.event_name != 'pull_request' ||
+        needs.changes.outputs.deps == 'true'
+      )
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -320,23 +407,21 @@ jobs:
           cache-dependency-path: "requirements-lock.txt"
       - name: Install pip-tools
         run: |
-          python -m pip install --upgrade pip
           pip install pip-tools
       - name: Verify lockfile is up to date
         # Pre-seed the candidate lockfile with the committed one so pip-compile
         # treats the existing pins as the current resolution state. Without
         # this, an unrelated transitive release between a local pip-compile
-        # and the CI run would falsely flag drift. See the comment block in
-        # the retired .gitlab-ci.yml for the full rationale.
+        # and the CI run would falsely flag drift.
         #
         # ``--all-extras`` pins every optional-dependency group (dev, test,
         # cdk, mcp, typecheck, lint, security, inference-monitor). Without
         # it, only the runtime ``dependencies`` list gets resolved and CI's
-        # own toolchain (pytest, pytest-xdist, moto, black, ruff, mypy,
-        # aws-cdk-lib, etc.) installs against live PyPI on every run. That
-        # means a transitive bump to pluggy or coverage between PR runs
-        # could silently change test behavior. Locking everything keeps
-        # every job reproducible against a known pinned tree.
+        # own toolchain (pytest, pytest-xdist, moto, ruff, mypy, aws-cdk-lib,
+        # etc.) installs against live PyPI on every run. That means a
+        # transitive bump to pluggy or coverage between PR runs could
+        # silently change test behavior. Locking everything keeps every job
+        # reproducible against a known pinned tree.
         env:
           # pip-compile invokes pip, which can hit interactive keyring prompts
           # on CI ("Unhandled exception: EOF when reading a line"). Disabling
@@ -364,6 +449,17 @@ jobs:
     name: "unit:fresh-install"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Same path-filter gate as unit:lockfile:freshness — the fresh install
+    # verifies a cold `pip install -e ".[cdk]"` succeeds and imports the
+    # expected modules. Only dependency/packaging changes can break it,
+    # and it's the most expensive small job in the workflow (no pip cache
+    # by design). Always runs on push to main / workflow_dispatch.
+    needs: changes
+    if: |
+      always() && (
+        github.event_name != 'pull_request' ||
+        needs.changes.outputs.deps == 'true'
+      )
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -375,7 +471,6 @@ jobs:
           # Intentionally no pip cache — this job verifies a cold install.
       - name: Fresh install
         run: |
-          python -m pip install --upgrade pip
           pip install -e ".[cdk]"
       - name: Verify imports
         run: |
@@ -397,7 +492,6 @@ jobs:
           cache-dependency-path: "requirements-lock.txt"
       - name: Install core + inference-monitor extras
         run: |
-          python -m pip install --upgrade pip
           pip install -e .
           pip install -e ".[inference-monitor]"
       - name: Import health-monitor + manifest-processor
