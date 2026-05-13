@@ -22,7 +22,7 @@ Usage:
 try:
     from gco._version import __version__
 except ImportError:
-    __version__ = "1.4.5"
+    __version__ = "1.4.6"
 
 from .analytics_user_mgmt import (
     discover_api_endpoint,
