@@ -13,13 +13,13 @@ WORKDIR ${LAMBDA_TASK_ROOT}
 # Install Helm
 # hadolint ignore=DL3041
 RUN dnf install -y tar gzip && \
-    curl -fsSL https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz | tar xz && \
+    curl -fsSL https://get.helm.sh/helm-v4.2.0-linux-amd64.tar.gz | tar xz && \
     mv linux-amd64/helm /usr/local/bin/helm && \
     rm -rf linux-amd64 && \
     dnf clean all
 
 # Install kubectl for cluster connectivity verification
-RUN curl -LO "https://dl.k8s.io/release/v1.35.4/bin/linux/amd64/kubectl" && \
+RUN curl -LO "https://dl.k8s.io/release/v1.35.5/bin/linux/amd64/kubectl" && \
     chmod +x kubectl && \
     mv kubectl /usr/local/bin/kubectl
 
