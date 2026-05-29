@@ -662,6 +662,39 @@ class TestAuditContextCapture:
         )
 
     @pytest.mark.asyncio
+    async def test_audit_captures_client_error(self, caplog):
+        """ctx.error() during a tool call lands in client_messages.
+
+        Exercises the ``_spy_error`` wrapper installed by
+        ``audit_middleware._install_context_patches``: the message must
+        be appended to the active capture buffer with ``level=error``
+        before the original ``Context.error`` runs.
+        """
+
+        test_mcp = FastMCP("audit-test-error")
+        test_mcp.add_middleware(AuditCaptureMiddleware())
+
+        @test_mcp.tool
+        @run_mcp.audit_logged
+        async def errorer() -> str:
+            """Tool that emits an error log line."""
+            ctx = get_context()
+            await ctx.error("something broke")
+            return "ok"
+
+        with caplog.at_level(logging.INFO, logger="gco.mcp.audit"):
+            async with Client(test_mcp) as client:
+                await client.call_tool("errorer", {})
+
+        entry = _last_invocation_entry(caplog)
+        assert entry["status"] == "success"
+        assert entry["tool"] == "errorer"
+        msgs = entry["client_messages"]
+        assert any(
+            m.get("level") == "error" and m.get("message") == "something broke" for m in msgs
+        ), msgs
+
+    @pytest.mark.asyncio
     async def test_audit_captures_elicitation_response(self, caplog):
         """ctx.elicit() returning accept lands in the elicitations field."""
 
@@ -793,3 +826,49 @@ class TestStartupLogNewFields:
         entry = _last_startup_entry(caplog)
         assert entry["tool_search"] == "bm25"
         assert "code_mode_experimental" not in entry
+
+    def test_emit_startup_log_includes_mission_enabled_when_set(self, caplog, monkeypatch):
+        """GCO_ENABLE_MISSION=true → mission_enabled: true in the startup entry.
+
+        Mirrors the all_tools_enabled / tool_search convention: the field is
+        only emitted when the gating flag is on. Audit consumers can use
+        this to detect whether the Mission loop is active for a given run
+        without inspecting env vars.
+        """
+        monkeypatch.delenv("GCO_ENABLE_ALL_TOOLS", raising=False)
+        monkeypatch.delenv("GCO_MCP_TOOL_SEARCH", raising=False)
+        monkeypatch.setenv("GCO_ENABLE_MISSION", "true")
+
+        with caplog.at_level(logging.INFO, logger="gco.mcp.audit"):
+            run_mcp.emit_startup_log()
+
+        entry = _last_startup_entry(caplog)
+        assert entry["mission_enabled"] is True
+
+    def test_emit_startup_log_includes_mission_enabled_via_umbrella(self, caplog, monkeypatch):
+        """GCO_ENABLE_ALL_TOOLS=true also flips mission_enabled on.
+
+        Per the established feature_flags.is_enabled semantics, the umbrella
+        flag enables every per-tool flag — the Mission flag included.
+        """
+        monkeypatch.delenv("GCO_ENABLE_MISSION", raising=False)
+        monkeypatch.delenv("GCO_MCP_TOOL_SEARCH", raising=False)
+        monkeypatch.setenv("GCO_ENABLE_ALL_TOOLS", "true")
+
+        with caplog.at_level(logging.INFO, logger="gco.mcp.audit"):
+            run_mcp.emit_startup_log()
+
+        entry = _last_startup_entry(caplog)
+        assert entry["mission_enabled"] is True
+
+    def test_emit_startup_log_omits_mission_enabled_when_unset(self, caplog, monkeypatch):
+        """GCO_ENABLE_MISSION unset → field omitted, matching all_tools_enabled."""
+        monkeypatch.delenv("GCO_ENABLE_ALL_TOOLS", raising=False)
+        monkeypatch.delenv("GCO_ENABLE_MISSION", raising=False)
+        monkeypatch.delenv("GCO_MCP_TOOL_SEARCH", raising=False)
+
+        with caplog.at_level(logging.INFO, logger="gco.mcp.audit"):
+            run_mcp.emit_startup_log()
+
+        entry = _last_startup_entry(caplog)
+        assert "mission_enabled" not in entry

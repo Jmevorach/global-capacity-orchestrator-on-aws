@@ -251,6 +251,7 @@ A handful of GCO MCP tools can incur AWS charges, mutate live infrastructure, de
 | `GCO_ENABLE_INFRASTRUCTURE_DEPLOY` | `false` | `deploy_stack`, `deploy_all`, `bootstrap_cdk` | Creates or updates CloudFormation stacks. A full `deploy_all` runs 30-60 minutes wall-clock and can provision EKS clusters, NodePools, and storage that incur ongoing charges. |
 | `GCO_ENABLE_INFRASTRUCTURE_DESTROY` | `false` | `destroy_stack`, `destroy_all` | Tears down CloudFormation stacks. Cancellation mid-flight can leave partial state behind that has to be cleaned up by hand. |
 | `GCO_ENABLE_DESTRUCTIVE_OPERATIONS` | `false` | `delete_job`, `delete_inference`, `delete_template`, `delete_webhook`, `delete_model`, `delete_nodepool`, `analytics_user_remove`, `cancel_queue_job`, `images_cleanup`, `images_prune`, `images_delete_tag`, `images_delete_repo` | Delete operations are irreversible — once data, jobs, models, or images are removed they can't be recovered without a backup. |
+| `GCO_ENABLE_MISSION` | `false` | `mission_start`, `mission_status`, `mission_iterate`, `mission_checkpoint`, `mission_complete`, `mission_abort`, `mission_resume`, `mission_history`, `mission_list` | Runs an autonomous goal-directed loop that can call any tool in its allowlist. Gated to prevent unattended autonomous execution. |
 
 ### Enabling a Flag
 
@@ -744,7 +745,25 @@ mcp/
 │   ├── analytics.py       — Analytics environment management
 │   ├── config.py          — Read-only access to cdk.json
 │   ├── examples.py        — find_examples discovery tool
-│   └── docs.py            — find_docs discovery tool
+│   ├── docs.py            — find_docs discovery tool
+│   ├── tasks.py           — Task management tools
+│   └── mission.py         — Mission goal-directed loop tools [gated by GCO_ENABLE_MISSION]
+├── mission/               — Mission engine package (goal-directed iteration loop)
+│   ├── __init__.py          — Package marker + SCHEMA_VERSION export
+│   ├── _engine_factory.py   — Shared engine factory (CLI + MCP tool surface)
+│   ├── _environment.py      — Live-signal gatherer (queue depth, GPU util, regions)
+│   ├── audit.py             — Mission-specific audit events (phase, verdict, sampling)
+│   ├── checkpoints.py       — Checkpoint cadence resolver
+│   ├── criteria_scaffold.py — Bedrock-driven criteria generation from directives
+│   ├── decide.py            — Pure deterministic verdict cascade
+│   ├── engine.py            — Five-phase iteration loop driver (MissionEngine)
+│   ├── final_report.py      — Final_Report builder (deterministic + sampled overlay)
+│   ├── predicate.py         — Restricted AST evaluator for predicate criteria
+│   ├── sampling.py          — Bedrock/MCP sampling backends + Strategy_Revision prompt
+│   ├── sandbox.py           — Script sandbox (MontySandboxProvider + AST validator)
+│   ├── state.py             — Persistence backends (filesystem, DynamoDB)
+│   ├── types.py             — TypedDict definitions (SessionState, Strategy, etc.)
+│   └── validation.py        — Input validators (criteria, budget, allowlist, cadence)
 └── resources/             — MCP resource definitions (one file per scheme)
     ├── docs.py            — docs:// (documentation + examples with metadata)
     ├── source.py          — source:// (full source code browser)
@@ -762,6 +781,8 @@ mcp/
     ├── inference.py       — gco://inference/{endpoint_name} (live endpoint state)
     ├── cluster.py         — gco://cluster/{region}/topology (NodePools + pending pods)
     ├── costs.py           — costs://gco/summary/{days_window} (cost summary cache)
+    ├── mission.py         — mission://sessions/{id} + mission://sessions/{id}/report
+    ├── self.py            — mcp://gco/* (server introspection resources)
     └── tasks.py           — tasks://gco/{task_id} (FastMCP background task status)
 ```
 

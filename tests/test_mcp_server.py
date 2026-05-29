@@ -977,8 +977,10 @@ class TestResourceRegistration:
         # demos://index, clients://index, scripts://index,
         # ci://index, tests://index,
         # config://index, config://cdk.json, config://feature-toggles, config://env-vars,
-        # images://index, images://replication/status
-        assert len(resources) == 22
+        # images://index, images://replication/status,
+        # plus three always-on self-introspection resources:
+        # mcp://gco/tools/index, mcp://gco/resources/index, mcp://gco/feature-flags.
+        assert len(resources) == 25
 
     def test_static_resource_uris(self):
         resources = asyncio.run(run_mcp.mcp.list_resources())
@@ -1017,8 +1019,14 @@ class TestResourceRegistration:
         # tests/{filepath}, images/{name}/tags, images/{name}/{tag},
         # gco://jobs/{job_name}, gco://inference/{endpoint_name},
         # gco://k8s/{namespace}/{kind}/{name}, gco://cluster/{region}/topology,
-        # costs://gco/summary/{days_window}, tasks://gco/{task_id}
-        assert len(templates) == 30
+        # costs://gco/summary/{days_window}, tasks://gco/{task_id},
+        # mcp://gco/tools/{tool_name} (always-on self-introspection template).
+        # mission://sessions/{session_id}, mission://sessions/{session_id}/report,
+        # and mission://sessions/{session_id}/audit-replay register only when
+        # GCO_ENABLE_MISSION (or the umbrella flag) is set; accept either count
+        # to avoid coupling this assertion to whichever gating env the rest of
+        # the suite happens to leave behind.
+        assert len(templates) in (31, 34)
 
     def test_resource_template_uris(self):
         templates = asyncio.run(run_mcp.mcp.list_resource_templates())
@@ -1382,6 +1390,39 @@ class TestInfraResources:
         result = asyncio.run(run_mcp.mcp.read_resource("infra://gco/dockerfiles/README.md"))
         content = result.contents[0].content
         assert len(content) > 10
+
+    def test_infra_dockerfile_unknown_filename_returns_available_list(self):
+        """Reading ``infra://gco/dockerfiles/<missing>`` returns the available list.
+
+        Pins the file-not-found branch in
+        ``mcp/resources/infra.py::dockerfile_resource``: the resource
+        returns ``"File 'X' not found. Available:\\n..."`` rather than
+        raising, so a tool-only client gets a guiding string body
+        rather than an opaque transport error.
+        """
+        result = asyncio.run(
+            run_mcp.mcp.read_resource("infra://gco/dockerfiles/nonexistent-zzz-file"),
+        )
+        content = result.contents[0].content
+        assert "not found" in content
+        assert "Available:" in content
+
+    def test_infra_helm_charts_resource_returns_real_yaml(self):
+        """``infra://gco/helm/charts.yaml`` reads the on-disk file verbatim.
+
+        Exercises the happy path of ``helm_charts_resource``. The
+        not-found branch (line 65) is untestable in this configuration
+        because the file ships with the repo, but the read path needed
+        coverage and was missing it.
+        """
+        result = asyncio.run(run_mcp.mcp.read_resource("infra://gco/helm/charts.yaml"))
+        content = result.contents[0].content
+        # The charts.yaml is real YAML keyed by chart name; assert
+        # loose shape rather than pinning specific chart names that
+        # could legitimately drift.
+        assert len(content) > 10
+        # Some line in the file must be valid YAML key syntax.
+        assert ":" in content
 
 
 class TestCIResources:
