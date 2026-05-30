@@ -6,6 +6,7 @@ Reusable GitHub Actions composite actions shared across multiple CI workflows. I
 
 - [Actions](#actions)
   - [`build-lambda-package`](#build-lambda-package)
+  - [`install-trivy`](#install-trivy)
   - [`upload-artifact-with-retry`](#upload-artifact-with-retry)
 - [Adding a New Action](#adding-a-new-action)
 
@@ -31,6 +32,38 @@ steps:
     with:
       python-version: "3.14"
   - uses: ./.github/actions/build-lambda-package
+```
+
+### `install-trivy`
+
+Installs a pinned Trivy binary by wrapping the official `aquasecurity/setup-trivy` installer. A thin shim so workflows reference one place and the installer version + pin live here, not duplicated across `security.yml` and `cve-scan.yml`.
+
+**Why wrap `setup-trivy` instead of `curl ... contrib/install.sh | sh`:**
+
+- **Supply chain** — `setup-trivy` SHA-pins the `aquasecurity/trivy` ref it pulls `install.sh` from, so the install script is itself pinned. A raw `curl | sh` from the upstream `main` branch runs whatever is there at runtime, unpinned.
+- **Reliability** — the previous raw-curl step intermittently failed when the `raw.githubusercontent.com` fetch was throttled or dropped mid-download (a hard exit 1 right after the version resolved). `setup-trivy` installs via a pinned `actions/checkout` + release download and caches the binary, so most runs restore it without touching that path.
+
+**Why `setup-trivy` (installer), not `trivy-action` (scanner):** our jobs run `trivy fs` / `trivy image` directly with a two-pass JSON+table pattern and flags (`--file-patterns`, dual `--exit-code`, `--skip-version-check`) that don't map onto `trivy-action`'s single-run model. This action only puts the pinned binary on `PATH`; the run steps stay in the workflows.
+
+**Inputs:**
+
+| Name | Default | Description |
+|------|---------|-------------|
+| `version` | (required) | Trivy version tag (e.g. `v0.70.0`). Pin in lockstep across all callers. |
+| `github-token` | `""` | Token forwarded to `setup-trivy` for the install-script checkout (authenticated API limit vs anonymous). Pass `${{ github.token }}`. |
+
+**Used by:** `security:trivy:filesystem`, `security:trivy:container-scan` (`security.yml`), and `cve-scan.yml`. Keep `TRIVY_VERSION` identical across all three. `setup-trivy` is pinned to its `v0.2.6` release tag in `action.yml`; bump that tag there after reviewing a newer release.
+
+**Usage:**
+
+```yaml
+- uses: actions/checkout@v6
+- name: Install pinned Trivy
+  uses: ./.github/actions/install-trivy
+  with:
+    version: "${{ env.TRIVY_VERSION }}"
+    github-token: "${{ github.token }}"
+- run: trivy fs --severity HIGH,CRITICAL .
 ```
 
 ### `upload-artifact-with-retry`

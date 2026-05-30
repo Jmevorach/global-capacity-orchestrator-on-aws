@@ -1,0 +1,52 @@
+name: "Install Trivy (pinned, cached)"
+description: |
+  Installs a pinned Trivy binary by wrapping the official
+  `aquasecurity/setup-trivy` installer. This is a thin shim so our workflows
+  reference one place - `uses: ./.github/actions/install-trivy` - and the
+  underlying installer, its version, and its pin are maintained here rather
+  than duplicated across security.yml and cve-scan.yml.
+
+  Why wrap `setup-trivy` rather than `curl ... contrib/install.sh | sh`:
+
+    - Supply chain - `setup-trivy` SHA-pins the `aquasecurity/trivy` ref it
+      pulls `install.sh` from, so the install script is itself pinned. A raw
+      `curl | sh` from the upstream `main` branch executes whatever is there
+      at runtime, unpinned.
+    - Reliability - the previous raw-curl step intermittently failed when the
+      `raw.githubusercontent.com` fetch was throttled or dropped mid-download
+      (a hard exit 1 right after the version resolved). `setup-trivy` installs
+      via a pinned `actions/checkout` + release download and caches the binary,
+      so most runs restore it without touching that path at all.
+
+  Why `setup-trivy` (the installer) and not `trivy-action` (the scanner): our
+  jobs run `trivy fs` / `trivy image` directly with a two-pass JSON+table
+  pattern and flags (`--file-patterns`, dual `--exit-code`, `--skip-version-check`)
+  that do not map onto `trivy-action`'s single-run model. This action only
+  puts the pinned binary on `PATH`; the run steps stay in the workflows.
+
+inputs:
+  version:
+    description: "Trivy version tag to install (e.g. v0.70.0). Pin in lockstep across all callers."
+    required: true
+  github-token:
+    description: >
+      Token forwarded to setup-trivy for checking out the Trivy repo when it
+      fetches the install script (uses the authenticated API limit rather than
+      the anonymous, shared-IP one). Pass the workflow's github token.
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    # setup-trivy handles the binary cache and adds it to $GITHUB_PATH itself.
+    - name: Install pinned Trivy
+      uses: aquasecurity/setup-trivy@v0.2.6
+      with:
+        version: "${{ inputs.version }}"
+        cache: "true"
+        token: "${{ inputs.github-token }}"
+
+    - name: Verify Trivy
+      shell: bash
+      run: trivy --version
