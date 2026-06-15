@@ -10,6 +10,7 @@ after refactors without needing a real AWS environment.
 """
 
 import aws_cdk as cdk
+import pytest
 from aws_cdk import assertions
 
 
@@ -140,6 +141,64 @@ class TestGlobalStackSynth:
 
         template = assertions.Template.from_stack(stack)
         template.resource_count_is("AWS::GlobalAccelerator::Listener", 1)
+
+    def test_listener_default_client_affinity_is_none(self):
+        """Listener defaults to NONE client affinity when knob is omitted."""
+        from gco.stacks.global_stack import GCOGlobalStack
+
+        app = cdk.App()
+        config = MockConfigLoader(app)
+
+        stack = GCOGlobalStack(app, "test-global-stack-affinity-default", config=config)
+
+        template = assertions.Template.from_stack(stack)
+        template.has_resource_properties(
+            "AWS::GlobalAccelerator::Listener",
+            {"ClientAffinity": "NONE"},
+        )
+
+    @pytest.mark.parametrize(
+        ("affinity_input", "expected"),
+        [
+            (None, "NONE"),
+            ("NONE", "NONE"),
+            ("SOURCE_IP", "SOURCE_IP"),
+            ("source_ip", "SOURCE_IP"),
+            ("none", "NONE"),
+        ],
+    )
+    def test_listener_client_affinity_synth_matrix(self, affinity_input, expected):
+        """Synthesize the global stack across every client_affinity input.
+
+        Each row drives a full ``Template.from_stack`` synthesis and asserts
+        the rendered ``AWS::GlobalAccelerator::Listener`` carries the expected
+        normalized ``ClientAffinity`` value. ``None`` exercises the
+        omitted-key path that falls back to NONE.
+        """
+        from gco.stacks.global_stack import GCOGlobalStack
+
+        class MatrixConfig(MockConfigLoader):
+            def get_global_accelerator_config(self):
+                cfg = super().get_global_accelerator_config()
+                if affinity_input is None:
+                    cfg.pop("client_affinity", None)
+                else:
+                    cfg["client_affinity"] = affinity_input
+                return cfg
+
+        app = cdk.App()
+        config = MatrixConfig(app)
+
+        # Construct IDs must be unique per stack within the same app run.
+        stack_id = f"test-ga-affinity-{affinity_input or 'omitted'}".replace("_", "-").lower()
+        stack = GCOGlobalStack(app, stack_id, config=config)
+
+        template = assertions.Template.from_stack(stack)
+        template.resource_count_is("AWS::GlobalAccelerator::Listener", 1)
+        template.has_resource_properties(
+            "AWS::GlobalAccelerator::Listener",
+            {"ClientAffinity": expected},
+        )
 
 
 class TestApiGatewayStackSynth:
