@@ -197,6 +197,12 @@
       }
     },
 
+    "_comment_volcano_image_mirror": "Optional credential-free fix for Volcano's docker.io-only images (volcanosh/vc-*), which on a cold cluster pull slowly / hit Docker Hub rate limits and can stall Volcano's helm install. When enabled, the regional stack redirects Volcano's basic.image_registry to <account>.dkr.ecr.<region>.amazonaws.com/<ecr_namespace> (which must start with gco/ so it inherits the project's gco/* node-pull access, replication, and trusted-registry allow-list), and 'gco stacks deploy' auto-mirrors the pinned images into that namespace before the regional Helm install (or run 'gco images mirror --region <region>' manually). The copy preserves the full multi-arch manifest list (docker buildx imagetools / Finch --all-platforms / skopeo). Unlike an ECR pull-through cache this needs no Docker Hub secret; it is a static mirror you refresh when the Volcano chart version changes. See docs/IMAGE_MIRROR.md.",
+    "volcano_image_mirror": {
+      "enabled": true,
+      "ecr_namespace": "gco/dockerhub"
+    },
+
     "_comment_storage": "Optional storage backends (disabled by default; flip enabled then 'gco stacks deploy-all').",
 
     "_comment_fsx_lustre": "FSx for Lustre filesystem mounted into job pods. enabled: master toggle. storage_capacity_gib: provisioned size. deployment_type: SCRATCH_1, SCRATCH_2 (recommended), or PERSISTENT_*. file_system_type_version: Lustre version. per_unit_storage_throughput: only relevant for PERSISTENT_* (MB/s/TiB). data_compression_type: NONE or LZ4. import_path / export_path: optional S3 data-repo URIs. auto_import_policy: which S3 events trigger metadata sync (NONE, NEW, NEW_CHANGED, NEW_CHANGED_DELETED). See docs/CUSTOMIZATION.md (Configure FSx Storage) and https://docs.aws.amazon.com/fsx/latest/LustreGuide/what-is.html.",
@@ -259,22 +265,7 @@
 
     "_comment_helm": "Helm chart installation toggles. Each key maps to one or more charts in lambda/helm-installer/charts.yaml; flip enabled=false to skip a chart. Charts install in dependency order with kueue last (its mutating webhook intercepts every Job/Deployment). Cross-scheduler coexistence is documented in docs/SCHEDULERS.md.",
     "helm": {
-      "_comment_keda": "KEDA — Kubernetes Event-Driven Autoscaling. Powers GCO's built-in SQS queue processor by scaling workloads on external event sources (SQS depth, CloudWatch metrics, etc.). See docs/KEDA.md.",
-      "keda": {
-        "enabled": true
-      },
-      "_comment_nvidia_gpu_operator": "NVIDIA GPU Operator — installs the GPU device plugin, MIG manager, DCGM exporter, and container toolkit so GPUs are schedulable as nvidia.com/gpu. Upstream: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/.",
-      "nvidia_gpu_operator": {
-        "enabled": true
-      },
-      "_comment_nvidia_dra_driver": "NVIDIA Dynamic Resource Allocation driver — fine-grained GPU scheduling (MIG slicing, MPS) via Kubernetes DRA APIs. Upstream: https://github.com/NVIDIA/k8s-dra-driver.",
-      "nvidia_dra_driver": {
-        "enabled": true
-      },
-      "_comment_nvidia_network_operator": "NVIDIA Network Operator — RDMA / GPUDirect over RoCE for multi-node training. Upstream: https://docs.nvidia.com/networking/display/cokan10/network+operator.",
-      "nvidia_network_operator": {
-        "enabled": true
-      },
+      "_comment_keda": "KEDA — Kubernetes Event-Driven Autoscaling. MANDATORY platform component (no toggle): it backs GCO's built-in SQS queue processor and is the metrics bridge (keda-metrics-apiserver serves external.metrics.k8s.io) that lets autoscalers consume GPU/CloudWatch metrics. KEDA is always installed and is intentionally not listed below — see docs/KEDA.md.",
       "_comment_aws_efa_device_plugin": "AWS EFA device plugin — exposes Elastic Fabric Adapter as a schedulable resource (vpc.amazonaws.com/efa) for HPC/ML jobs that need low-latency multi-node networking. Upstream: https://github.com/aws/eks-charts/tree/master/stable/aws-efa-k8s-device-plugin.",
       "aws_efa_device_plugin": {
         "enabled": true

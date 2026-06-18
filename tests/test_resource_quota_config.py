@@ -223,9 +223,9 @@ class TestManifestTemplatePlaceholderCoverage:
     CDK_STACK = Path("gco/stacks/regional_stack.py")
 
     # Placeholders that are intentionally only provided for specific
-    # features (FSx, Valkey, etc.) and may be absent when those features
-    # are disabled. The kubectl-applier's "skip on unreplaced placeholder"
-    # behavior is correct for these.
+    # features (FSx, Valkey, Mooncake store, etc.) and may be absent when
+    # those features are disabled. The kubectl-applier's "skip on unreplaced
+    # placeholder" behavior is correct for these.
     OPTIONAL_PLACEHOLDERS = frozenset(
         {
             "FSX_FILE_SYSTEM_ID",
@@ -237,6 +237,9 @@ class TestManifestTemplatePlaceholderCoverage:
             "VALKEY_PORT",
         }
     )
+    # Note: MOONCAKE_MASTER_IMAGE has a CDK replacement — it feeds the inference
+    # monitor's env, and the monitor creates the shared Mooncake master on
+    # demand (create-if-absent). There is no static master manifest.
 
     def _iter_placeholders(self):
         """Yield (filename, placeholder_name) for every {{NAME}} in every

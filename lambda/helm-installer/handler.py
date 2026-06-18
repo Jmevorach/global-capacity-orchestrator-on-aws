@@ -2,7 +2,7 @@
 Helm Installer Lambda Handler
 
 Installs and manages Helm charts on EKS clusters via CloudFormation Custom Resources.
-Supports KEDA, NVIDIA DRA Driver, and other Helm-based installations.
+Supports KEDA and other Helm-based installations.
 
 Features:
 - Automatic Helm repo management
@@ -64,6 +64,39 @@ HELM_INSTALL_MAX_RETRIES = 3
 # server throttling clearing) without dragging CloudFormation custom
 # resource completion beyond its 15-minute timeout.
 HELM_INSTALL_RETRY_DELAY_SECONDS = 30
+
+
+def _record_addon_status(chart_name: str, status: str, message: str) -> None:
+    """Record a single chart's install outcome to SSM (best-effort).
+
+    Writes ``/<project>/addons/<region>/<chart>`` as a small JSON blob so the
+    add-on layer's health is observable out-of-band — decoupled from the
+    CloudFormation rollback path. Read back via ``gco stacks addons-status``.
+    Failures here are swallowed: status reporting must never turn a successful
+    install into a failure (or vice versa).
+    """
+    project = os.environ.get("PROJECT_NAME")
+    region = os.environ.get("REGION")
+    if not project or not region:
+        return
+    import contextlib
+    import time as _time
+
+    with contextlib.suppress(Exception):
+        boto3.client("ssm").put_parameter(
+            Name=f"/{project}/addons/{region}/{chart_name}",
+            Value=json.dumps(
+                {
+                    "chart": chart_name,
+                    "status": status,
+                    "message": message[:1024],
+                    "updated_at": int(_time.time()),
+                }
+            ),
+            Type="String",
+            Overwrite=True,
+        )
+
 
 # Load default chart configurations
 CHARTS_CONFIG_PATH = Path(__file__).parent / "charts.yaml"
@@ -217,13 +250,22 @@ def run_helm(
 
     logger.info(f"Running: {' '.join(cmd)}")
 
+    # Subprocess wall-clock cap. This MUST be >= helm's own ``--timeout`` (10m)
+    # below, otherwise a legitimately-slow install (e.g. a cold NVIDIA operator
+    # image pull) gets SIGKILLed by Python before helm's own deadline and a
+    # would-succeed install is reported as a failure. Each chart now runs in its
+    # own Step Functions task / Lambda invocation, so this can safely approach
+    # the per-invocation Lambda limit; retries are handled at the state-machine
+    # level. Override with HELM_CMD_TIMEOUT_SECONDS.
+    cmd_timeout = int(os.environ.get("HELM_CMD_TIMEOUT_SECONDS", "780"))
+
     try:
         result = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - cmd is ["helm"] + static args list; helm_env is a controlled copy of os.environ, no shell=True
             cmd,
             capture_output=True,
             text=True,
             env=helm_env,
-            timeout=300,
+            timeout=cmd_timeout,
         )
     except subprocess.TimeoutExpired as exc:
         logger.warning(f"helm subprocess timed out after {exc.timeout}s: {' '.join(cmd)}")
@@ -249,10 +291,10 @@ def _clear_stuck_release(chart_name: str, namespace: str, kubeconfig: str) -> bo
     progress`` until the lock is cleared.
 
     ``helm rollback --wait`` would normally clear it, but it can hang
-    indefinitely when the target chart's own operator (e.g. the NVIDIA
-    gpu-operator's ClusterPolicy controller) is stuck reconciling the
-    half-applied state — which is exactly the failure mode that got us
-    here. Deleting the stuck secret is the reliable recovery: Helm's view
+    indefinitely when the target chart's own operator (e.g. a CRD
+    controller) is stuck reconciling the half-applied state — which is
+    exactly the failure mode that got us here. Deleting the stuck secret
+    is the reliable recovery: Helm's view
     of the release reverts to the previous ``deployed`` revision, and the
     next upgrade proceeds normally.
 
@@ -357,6 +399,23 @@ def install_chart(
     values = config.get("values", {})
     use_oci = config.get("use_oci", False)
 
+    # Per-chart readiness gate.
+    #   ``wait`` (default True)        -> ``helm --wait`` (block until the
+    #                                     release's resources report Ready).
+    #   ``wait_timeout`` (default 10m) -> ``helm --timeout``.
+    # A chart whose components converge asynchronously — e.g. one that pulls
+    # large images from a slow/rate-limited registry — can set ``wait: false``
+    # so the install returns as soon as manifests are applied instead of
+    # blocking the whole invocation on readiness. That keeps a single slow
+    # chart from burning the Lambda wall-clock guard (HELM_CMD_TIMEOUT_SECONDS)
+    # and lets the Step Functions state machine move on to the next chart; the
+    # release still converges in the background and its status is recorded to
+    # SSM either way. ``wait_timeout`` must stay below HELM_CMD_TIMEOUT_SECONDS
+    # (default 780s) or the subprocess guard SIGKILLs helm before its own
+    # deadline and a would-succeed install is reported as a failure.
+    wait = config.get("wait", True)
+    wait_timeout = config.get("wait_timeout", "10m")
+
     # Merge value overrides
     if value_overrides:
         values = deep_merge(values, value_overrides)
@@ -379,10 +438,14 @@ def install_chart(
         chart_ref,
         "--namespace",
         namespace,
-        "--wait",
         "--timeout",
-        "10m",
+        wait_timeout,
     ]
+
+    # ``--wait`` blocks until the release's resources are Ready. Opt-out per
+    # chart via ``wait: false`` for asynchronously-converging charts.
+    if wait:
+        args.append("--wait")
 
     if version:
         args.extend(["--version", version])
@@ -553,8 +616,101 @@ def _cleanup_stale_webhooks(kubeconfig: str) -> None:
         logger.warning(f"Webhook cleanup failed (non-fatal): {e}")
 
 
-def lambda_handler(event: dict[str, Any], context: Any) -> None:
-    """Main Lambda handler."""
+def handle_task(event: dict[str, Any]) -> dict[str, Any]:
+    """Step Functions task entrypoint: install or uninstall a single chart.
+
+    Each chart is its own state-machine task, so this performs exactly one
+    helm operation per invocation and raises on failure — retries and ordering
+    are owned by the state machine, not this function. That keeps every
+    invocation comfortably under the Lambda timeout and gives per-chart retry
+    and observability in the Step Functions console.
+
+    Event shape (from the state machine task payload)::
+
+        {
+          "Action": "install_chart" | "uninstall_chart",
+          "Chart": "<chart name as keyed in charts.yaml>",
+          "ClusterName": "...", "Region": "...",
+          "EnabledCharts": ["keda", ...],
+          "KedaOperatorRoleArn": "arn:...",   # optional
+          "Charts": { "<name>": { ...overrides... } }  # optional
+        }
+
+    Returns a small status dict on success; raises on failure so the state
+    machine's Retry/Catch handles it.
+    """
+    action = event["Action"]
+    chart_name = event["Chart"]
+    cluster_name = event.get("ClusterName") or os.environ["CLUSTER_NAME"]
+    region = event.get("Region") or os.environ["REGION"]
+    enabled_charts = event.get("EnabledCharts") or []
+    chart_overrides = event.get("Charts") or {}
+    keda_operator_role_arn = event.get("KedaOperatorRoleArn")
+
+    default_config = load_charts_config().get("charts", {})
+    config = dict(default_config.get(chart_name, {}))
+    if chart_name in chart_overrides:
+        config = deep_merge(config, chart_overrides[chart_name])
+
+    is_enabled = chart_name in enabled_charts
+
+    # Inject the KEDA operator IAM role ARN for IRSA, mirroring the legacy
+    # custom-resource path.
+    if chart_name == "keda" and keda_operator_role_arn:
+        keda_values = config.setdefault("values", {})
+        service_account = keda_values.setdefault("serviceAccount", {})
+        operator = service_account.setdefault("operator", {})
+        annotations = operator.setdefault("annotations", {})
+        annotations["eks.amazonaws.com/role-arn"] = keda_operator_role_arn
+
+    namespace = config.get("namespace", "default")
+    kubeconfig = configure_kubeconfig(cluster_name, region)
+    try:
+        if action == "uninstall_chart" or (action == "install_chart" and not is_enabled):
+            # Disabled chart on an install pass: ensure it's gone (idempotent).
+            success, message = uninstall_chart(chart_name, namespace, kubeconfig)
+            status = "uninstalled" if success else "absent"
+            _record_addon_status(chart_name, status, message)
+            return {
+                "chart": chart_name,
+                "status": status,
+                "message": message,
+            }
+
+        if action == "install_chart":
+            value_overrides = chart_overrides.get(chart_name, {}).get("values", {})
+            success, message = install_chart(chart_name, config, kubeconfig, value_overrides)
+            if not success:
+                _record_addon_status(chart_name, "failed", message)
+                # Raise so the state machine retries this single chart with
+                # backoff rather than failing the whole deploy.
+                raise RuntimeError(f"helm install {chart_name} failed: {message}")
+            _record_addon_status(chart_name, "installed", message)
+            return {"chart": chart_name, "status": "installed", "message": message}
+
+        raise ValueError(f"Unknown Action: {action!r}")
+    finally:
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            os.remove(kubeconfig)
+
+
+def lambda_handler(event: dict[str, Any], context: Any) -> Any:
+    """Main Lambda handler.
+
+    Two entrypoints share this function:
+
+    - **Step Functions task** (the current install path): the event carries an
+      ``Action`` key and is dispatched to :func:`handle_task`, which operates on
+      a single chart and raises on failure.
+    - **CloudFormation custom resource** (legacy/fallback): the event carries a
+      ``RequestType`` and the whole-chart-set loop below runs.
+    """
+    if event.get("Action"):
+        logger.info(f"Task event: {json.dumps(event)}")
+        return handle_task(event)
+
     logger.info(f"Received event: {json.dumps(event)}")
 
     request_type = event["RequestType"]

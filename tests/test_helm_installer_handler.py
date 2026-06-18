@@ -146,13 +146,13 @@ class TestInstallChartPreflight:
 
     def _minimal_config(self):
         return {
-            "repo_name": "nvidia",
-            "repo_url": "https://helm.ngc.nvidia.com/nvidia",
-            "chart": "gpu-operator",
-            "version": "v26.3.1",
-            "namespace": "gpu-operator",
+            "repo_name": "volcano-sh",
+            "repo_url": "https://volcano-sh.github.io/helm-charts",
+            "chart": "volcano",
+            "version": "1.15.0",
+            "namespace": "volcano-system",
             "create_namespace": True,
-            "values": {"toolkit": {"enabled": False}},
+            "values": {},
         }
 
     def test_preflight_runs_before_upgrade(self):
@@ -162,9 +162,9 @@ class TestInstallChartPreflight:
             patch.object(helm_handler, "_clear_stuck_release") as mock_clear,
             patch.object(helm_handler, "run_helm", return_value=(0, "ok", "")) as mock_run,
         ):
-            ok, _ = helm_handler.install_chart("nvidia-gpu-operator", config, "/tmp/kube", None)
+            ok, _ = helm_handler.install_chart("volcano", config, "/tmp/kube", None)
         assert ok is True
-        mock_clear.assert_called_once_with("nvidia-gpu-operator", "gpu-operator", "/tmp/kube")
+        mock_clear.assert_called_once_with("volcano", "volcano-system", "/tmp/kube")
         # Preflight must be called before run_helm(upgrade).
         assert mock_clear.call_count == 1
         assert mock_run.call_count == 1
@@ -184,9 +184,7 @@ class TestInstallChartPreflight:
                 (1, "", stuck_err),  # first upgrade attempt
                 (0, "ok", ""),  # retry after clearing
             ]
-            ok, message = helm_handler.install_chart(
-                "nvidia-gpu-operator", config, "/tmp/kube", None
-            )
+            ok, message = helm_handler.install_chart("volcano", config, "/tmp/kube", None)
         assert ok is True
         assert "after clearing stuck state" in message
         # Preflight + post-failure recovery = 2 clear calls.
@@ -212,7 +210,7 @@ class TestInstallChartPreflight:
                 (1, "", stuck_err),
                 (0, "ok", ""),
             ]
-            helm_handler.install_chart("nvidia-gpu-operator", config, "/tmp/kube", None)
+            helm_handler.install_chart("volcano", config, "/tmp/kube", None)
         invoked_args = [call.args[0] for call in mock_run.call_args_list]
         assert not any(args and args[0] == "rollback" for args in invoked_args)
 
@@ -225,8 +223,161 @@ class TestInstallChartPreflight:
             patch.object(helm_handler, "run_helm") as mock_run,
         ):
             mock_run.return_value = (1, "", "Error: invalid chart values")
-            ok, message = helm_handler.install_chart(
-                "nvidia-gpu-operator", config, "/tmp/kube", None
-            )
+            ok, message = helm_handler.install_chart("volcano", config, "/tmp/kube", None)
         assert ok is False
         assert "invalid chart values" in message
+
+
+class TestInstallChartWaitControl:
+    """``install_chart`` honors per-chart ``wait`` / ``wait_timeout`` config."""
+
+    def _config(self, **overrides):
+        config = {
+            "repo_name": "volcano-sh",
+            "repo_url": "https://volcano-sh.github.io/helm-charts",
+            "chart": "volcano",
+            "version": "1.15.0",
+            "namespace": "volcano-system",
+            "create_namespace": True,
+            "values": {},
+        }
+        config.update(overrides)
+        return config
+
+    def _upgrade_args(self, mock_run):
+        """Return the argv of the ``helm upgrade --install`` invocation."""
+        for call in mock_run.call_args_list:
+            args = call.args[0]
+            if args and args[0] == "upgrade":
+                return args
+        raise AssertionError("no `helm upgrade` invocation captured")
+
+    def test_defaults_include_wait_and_10m_timeout(self):
+        """Backward-compatible default: ``--wait --timeout 10m``."""
+        with (
+            patch.object(helm_handler, "add_helm_repo", return_value=True),
+            patch.object(helm_handler, "_clear_stuck_release"),
+            patch.object(helm_handler, "run_helm", return_value=(0, "ok", "")) as mock_run,
+        ):
+            ok, _ = helm_handler.install_chart("volcano", self._config(), "/tmp/kube", None)
+        assert ok is True
+        args = self._upgrade_args(mock_run)
+        assert "--wait" in args
+        assert "--timeout" in args
+        assert args[args.index("--timeout") + 1] == "10m"
+
+    def test_wait_false_omits_wait_flag(self):
+        """``wait: false`` drops ``--wait`` so the install returns after apply."""
+        with (
+            patch.object(helm_handler, "add_helm_repo", return_value=True),
+            patch.object(helm_handler, "_clear_stuck_release"),
+            patch.object(helm_handler, "run_helm", return_value=(0, "ok", "")) as mock_run,
+        ):
+            helm_handler.install_chart(
+                "volcano", self._config(wait=False, wait_timeout="8m"), "/tmp/kube", None
+            )
+        args = self._upgrade_args(mock_run)
+        assert "--wait" not in args
+        # ``--timeout`` is still passed (it also bounds pre-install hook waits).
+        assert args[args.index("--timeout") + 1] == "8m"
+
+    def test_custom_wait_timeout_is_passed_through(self):
+        with (
+            patch.object(helm_handler, "add_helm_repo", return_value=True),
+            patch.object(helm_handler, "_clear_stuck_release"),
+            patch.object(helm_handler, "run_helm", return_value=(0, "ok", "")) as mock_run,
+        ):
+            helm_handler.install_chart(
+                "volcano", self._config(wait_timeout="3m"), "/tmp/kube", None
+            )
+        args = self._upgrade_args(mock_run)
+        assert "--wait" in args  # wait defaults to True
+        assert args[args.index("--timeout") + 1] == "3m"
+
+
+class TestHandleTask:
+    """``handle_task`` performs exactly one helm op per call and raises on failure."""
+
+    _BASE_EVENT = {
+        "Action": "install_chart",
+        "Chart": "keda",
+        "ClusterName": "gco-us-east-1",
+        "Region": "us-east-1",
+        "EnabledCharts": ["keda"],
+        "Charts": {},
+        "KedaOperatorRoleArn": "arn:aws:iam::123456789012:role/keda",
+    }
+
+    def test_install_enabled_chart_calls_install(self):
+        with (
+            patch.object(helm_handler, "configure_kubeconfig", return_value="/tmp/kc"),
+            patch.object(
+                helm_handler, "install_chart", return_value=(True, "Successfully installed keda")
+            ) as mock_install,
+            patch.object(helm_handler.os, "remove"),
+        ):
+            result = helm_handler.handle_task(dict(self._BASE_EVENT))
+
+        assert result["status"] == "installed"
+        assert result["chart"] == "keda"
+        mock_install.assert_called_once()
+
+    def test_install_injects_keda_role_annotation(self):
+        captured = {}
+
+        def _capture(chart_name, config, kubeconfig, value_overrides):
+            captured["config"] = config
+            return (True, "Successfully installed keda")
+
+        with (
+            patch.object(helm_handler, "configure_kubeconfig", return_value="/tmp/kc"),
+            patch.object(helm_handler, "install_chart", side_effect=_capture),
+            patch.object(helm_handler.os, "remove"),
+        ):
+            helm_handler.handle_task(dict(self._BASE_EVENT))
+
+        ann = captured["config"]["values"]["serviceAccount"]["operator"]["annotations"]
+        assert ann["eks.amazonaws.com/role-arn"] == self._BASE_EVENT["KedaOperatorRoleArn"]
+
+    def test_disabled_chart_on_install_pass_uninstalls(self):
+        event = dict(self._BASE_EVENT)
+        event["EnabledCharts"] = []  # keda not enabled this pass
+        with (
+            patch.object(helm_handler, "configure_kubeconfig", return_value="/tmp/kc"),
+            patch.object(
+                helm_handler, "uninstall_chart", return_value=(True, "Successfully uninstalled")
+            ) as mock_uninstall,
+            patch.object(helm_handler, "install_chart") as mock_install,
+            patch.object(helm_handler.os, "remove"),
+        ):
+            result = helm_handler.handle_task(event)
+
+        assert result["status"] == "uninstalled"
+        mock_uninstall.assert_called_once()
+        mock_install.assert_not_called()
+
+    def test_install_failure_raises(self):
+        with (
+            patch.object(helm_handler, "configure_kubeconfig", return_value="/tmp/kc"),
+            patch.object(helm_handler, "install_chart", return_value=(False, "boom")),
+            patch.object(helm_handler.os, "remove"),
+            pytest.raises(RuntimeError, match="helm install keda failed"),
+        ):
+            helm_handler.handle_task(dict(self._BASE_EVENT))
+
+    def test_kubeconfig_always_removed(self):
+        with (
+            patch.object(helm_handler, "configure_kubeconfig", return_value="/tmp/kc"),
+            patch.object(helm_handler, "install_chart", return_value=(True, "Successfully ok")),
+            patch.object(helm_handler.os, "remove") as mock_remove,
+        ):
+            helm_handler.handle_task(dict(self._BASE_EVENT))
+        mock_remove.assert_called_once_with("/tmp/kc")
+
+    def test_lambda_handler_dispatches_action_events(self):
+        with patch.object(
+            helm_handler, "handle_task", return_value={"chart": "keda", "status": "installed"}
+        ) as mock_task:
+            out = helm_handler.lambda_handler(dict(self._BASE_EVENT), MagicMock())
+        assert out["status"] == "installed"
+        mock_task.assert_called_once()

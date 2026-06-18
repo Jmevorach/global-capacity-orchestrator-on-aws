@@ -1482,7 +1482,11 @@ class TestNewSchedulerChartIntegration:
         )
 
     def test_cdk_json_helm_section_has_all_chart_groups(self):
-        """The cdk.json helm section should have entries for all chart groups."""
+        """The cdk.json helm section should have entries for all togglable chart groups.
+
+        KEDA is exempt: it is a mandatory platform component with no toggle, so
+        it is intentionally absent from cdk.json.
+        """
         import json
 
         with open(PROJECT_ROOT / "cdk.json", encoding="utf-8") as f:
@@ -1490,10 +1494,6 @@ class TestNewSchedulerChartIntegration:
         helm_config = cdk_config["context"].get("helm", {})
 
         expected_keys = [
-            "keda",
-            "nvidia_gpu_operator",
-            "nvidia_dra_driver",
-            "nvidia_network_operator",
             "aws_efa_device_plugin",
             "aws_neuron_device_plugin",
             "volcano",
@@ -1505,6 +1505,9 @@ class TestNewSchedulerChartIntegration:
         ]
         missing = [k for k in expected_keys if k not in helm_config]
         assert not missing, f"cdk.json helm section missing keys: {missing}"
+
+        # KEDA must NOT be present — it is mandatory and not configurable.
+        assert "keda" not in helm_config
 
     # NOTE: test_cdk_json_helm_slurm_and_yunikorn_disabled was removed because
     # it asserted specific config values from the live cdk.json, which breaks
@@ -1520,9 +1523,6 @@ class TestGetEnabledHelmCharts:
         # This mirrors the logic in GCORegionalStack._get_enabled_helm_charts
         chart_map: list[tuple[str, list[str]]] = [
             ("keda", ["keda"]),
-            ("nvidia_gpu_operator", ["nvidia-gpu-operator"]),
-            ("nvidia_dra_driver", ["nvidia-dra-driver"]),
-            ("nvidia_network_operator", ["nvidia-network-operator"]),
             ("aws_efa_device_plugin", ["aws-efa-device-plugin"]),
             ("aws_neuron_device_plugin", ["aws-neuron-device-plugin"]),
             ("volcano", ["volcano"]),
@@ -1533,10 +1533,15 @@ class TestGetEnabledHelmCharts:
             ("kueue", ["kueue"]),
         ]
 
+        # KEDA is a mandatory platform component: it backs the SQS queue
+        # processor and is the only metrics bridge for GPU/CloudWatch-driven
+        # autoscaling, so its cdk.json toggle is ignored.
+        mandatory_chart_keys = {"keda"}
+
         enabled_charts = []
         for config_key, chart_names in chart_map:
             chart_config = helm_config.get(config_key, {})
-            if chart_config.get("enabled", True):
+            if config_key in mandatory_chart_keys or chart_config.get("enabled", True):
                 enabled_charts.extend(chart_names)
         return enabled_charts
 
@@ -1604,6 +1609,27 @@ class TestGetEnabledHelmCharts:
         assert "keda" in charts
         assert "kueue" in charts
 
+    def test_keda_cannot_be_disabled(self):
+        """KEDA is mandatory: it stays enabled even when explicitly disabled."""
+        charts = self._get_charts_for_config({"keda": {"enabled": False}})
+        assert "keda" in charts
+
+    def test_keda_present_when_other_charts_disabled(self):
+        """KEDA survives even when every other chart is explicitly turned off."""
+        all_off = {
+            "keda": {"enabled": False},
+            "aws_efa_device_plugin": {"enabled": False},
+            "aws_neuron_device_plugin": {"enabled": False},
+            "volcano": {"enabled": False},
+            "kuberay": {"enabled": False},
+            "cert_manager": {"enabled": False},
+            "slurm": {"enabled": False},
+            "yunikorn": {"enabled": False},
+            "kueue": {"enabled": False},
+        }
+        charts = self._get_charts_for_config(all_off)
+        assert charts == ["keda"]
+
     def test_kuberay_maps_to_kuberay_operator(self):
         """The 'kuberay' config key should map to 'kuberay-operator' chart name."""
         charts = self._get_charts_for_config({"kuberay": {"enabled": True}})
@@ -1611,19 +1637,21 @@ class TestGetEnabledHelmCharts:
         assert "kuberay" not in charts  # The chart name is kuberay-operator, not kuberay
 
     def test_all_chart_map_keys_present_in_cdk_json(self):
-        """Every key in the _get_enabled_helm_charts chart_map should exist in cdk.json helm section."""
+        """Every togglable chart_map key should exist in cdk.json's helm section.
+
+        KEDA is exempt: it is a mandatory platform component with no toggle, so
+        it is intentionally not listed in cdk.json.
+        """
         import json
 
         with open(PROJECT_ROOT / "cdk.json", encoding="utf-8") as f:
             cdk_config = json.load(f)
         helm_config = cdk_config["context"].get("helm", {})
 
-        # These are the config keys used in _get_enabled_helm_charts
+        # Togglable config keys used in _get_enabled_helm_charts. KEDA is
+        # mandatory (always installed regardless of config), so it is omitted
+        # from cdk.json and excluded here.
         chart_map_keys = [
-            "keda",
-            "nvidia_gpu_operator",
-            "nvidia_dra_driver",
-            "nvidia_network_operator",
             "aws_efa_device_plugin",
             "aws_neuron_device_plugin",
             "volcano",
@@ -1636,19 +1664,16 @@ class TestGetEnabledHelmCharts:
         missing = [k for k in chart_map_keys if k not in helm_config]
         assert not missing, f"cdk.json helm section missing keys from chart_map: {missing}"
 
+        # KEDA must NOT be present — it is mandatory and not configurable.
+        assert "keda" not in helm_config
+
     def test_disabling_all_gpu_charts(self):
         """Disabling all GPU-related charts should produce a list without any NVIDIA charts."""
         charts = self._get_charts_for_config(
             {
-                "nvidia_gpu_operator": {"enabled": False},
-                "nvidia_dra_driver": {"enabled": False},
-                "nvidia_network_operator": {"enabled": False},
                 "aws_efa_device_plugin": {"enabled": False},
             }
         )
-        assert "nvidia-gpu-operator" not in charts
-        assert "nvidia-dra-driver" not in charts
-        assert "nvidia-network-operator" not in charts
         assert "aws-efa-device-plugin" not in charts
         # Other charts should still be present
         assert "keda" in charts

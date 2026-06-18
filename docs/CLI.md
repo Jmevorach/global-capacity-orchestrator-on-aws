@@ -1598,11 +1598,16 @@ gco inference deploy ENDPOINT_NAME [OPTIONS]
 | `--label` | `-l` | Label (key=value), repeatable |
 | `--min-replicas` | | Autoscaling: minimum replicas |
 | `--max-replicas` | | Autoscaling: maximum replicas |
-| `--autoscale-metric` | | Autoscaling metric (e.g. `cpu:70`, `memory:80`), repeatable. Enables HPA. |
+| `--autoscale-metric` | | Autoscaling metric (e.g. `cpu:70`, `memory:80`, `gpu:60`), repeatable. CPU/memory use the native HPA; gpu/gpu_memory scale via KEDA + CloudWatch. |
 | `--capacity-type` | | Node capacity type: `on-demand` (default) or `spot` |
 | `--accelerator` | `nvidia` | Accelerator type: `nvidia` for GPU instances, `neuron` for Trainium/Inferentia |
 | `--node-selector` | | Node selector (key=value), repeatable. E.g. `eks.amazonaws.com/instance-family=inf2` |
 | `--extra-args` | | Extra arguments passed to the container (e.g. `--kv-transfer-config {...}`). Repeatable |
+| `--mooncake-mode` | | Mooncake serving mode: `disaggregated` (prefill/decode split), `store` (shared KV-cache), or `both` |
+| `--prefill-replicas` | | Number of prefill replicas (default: 1). Used with `--mooncake-mode disaggregated\|both` |
+| `--decode-replicas` | | Number of decode replicas (default: 1). Used with `--mooncake-mode disaggregated\|both` |
+| `--mooncake-autoscale` | | Per-role autoscaling as `ROLE:MIN:MAX[:METRIC:TARGET...]`. Repeatable. E.g. `prefill:1:8:gpu:70` |
+| `--no-rewrite-image` | | Disable automatic image rewriting to the regional ECR mirror |
 
 **Example:**
 
@@ -1913,6 +1918,27 @@ gco inference rollback ENDPOINT_NAME [OPTIONS]
 
 ```bash
 gco inference rollback my-llm -y
+```
+
+#### `gco inference set-topology`
+
+Resize a disaggregated endpoint's prefill/decode replica counts without redeploying.
+
+```bash
+gco inference set-topology ENDPOINT_NAME [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--prefill` | `-p` | New prefill replica count (required) |
+| `--decode` | `-d` | New decode replica count (required) |
+
+**Example:**
+
+```bash
+gco inference set-topology my-llm --prefill 3 --decode 6
 ```
 
 ---

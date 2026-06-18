@@ -30,7 +30,7 @@ Resources Created:
 
     Lambda Functions:
         - kubectl-applier: applies K8s manifests during deployment
-        - helm-installer: installs Helm charts (KEDA, Volcano, KubeRay, GPU Operator, etc.)
+        - helm-installer: installs Helm charts (KEDA, Volcano, KubeRay, etc.)
         - ga-registration: registers ALB with Global Accelerator
         - regional-api-proxy: proxies regional API Gateway to internal ALB
 
@@ -61,11 +61,13 @@ Modification Guide:
 
 from __future__ import annotations
 
-import time
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import aws_cdk.aws_eks_v2 as eks
+import yaml
 from aws_cdk import (
     CfnJson,
     CfnOutput,
@@ -88,9 +90,12 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sns as sns
 from aws_cdk import aws_sqs as sqs
 from aws_cdk import aws_ssm as ssm
+from aws_cdk import aws_stepfunctions as sfn
+from aws_cdk import aws_stepfunctions_tasks as sfn_tasks
 from aws_cdk import custom_resources as cr
 from constructs import Construct
 
@@ -104,6 +109,9 @@ from gco.stacks.constants import (
     EKS_ADDON_METRICS_SERVER,
     EKS_ADDON_POD_IDENTITY_AGENT,
     LAMBDA_PYTHON_RUNTIME,
+    MOONCAKE_MASTER_DEFAULT_IMAGE,
+    REGIONAL_SHARED_BUCKET_NAME_PREFIX,
+    REGIONAL_SHARED_SSM_PARAMETER_PREFIX,
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
@@ -181,6 +189,25 @@ def _augment_trusted_registries_with_project_ecr(
                 augmented.append(host)
                 seen.add(host)
     return augmented
+
+
+def _load_helm_chart_order() -> list[str]:
+    """Return helm chart names in their canonical install order.
+
+    Reads ``lambda/helm-installer/charts.yaml`` (the source of truth, in file
+    order) so the Step Functions state machine has exactly one task per chart,
+    in the same order every deploy — kueue stays last because its mutating
+    webhook intercepts every Job/Deployment. Falls back to an empty list if the
+    file can't be read (the synth-time tests assert it is non-empty).
+    """
+    charts_path = Path(__file__).resolve().parents[2] / "lambda" / "helm-installer" / "charts.yaml"
+    try:
+        with open(charts_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except OSError:
+        return []
+    charts = data.get("charts", {})
+    return list(charts.keys()) if isinstance(charts, dict) else []
 
 
 class GCORegionalStack(Stack):
@@ -325,6 +352,17 @@ class GCORegionalStack(Stack):
         # Create EKS cluster
         self._create_eks_cluster(cluster_config)
 
+        # Optional Volcano image mirror (cdk.json ``volcano_image_mirror``).
+        # When enabled this resolves ``self.volcano_mirror_registry`` — the
+        # gco/* ECR namespace that Volcano's ``basic.image_registry`` is
+        # redirected to, so its docker.io-only images are pulled from the
+        # project's own ECR (populated out-of-band by
+        # ``gco images mirror``) instead of rate-limited Docker
+        # Hub. Creates no CloudFormation resources; must run before
+        # ``_apply_kubernetes_manifests`` builds the ``HelmInstallCharts`` custom
+        # resource, which reads the override via ``_helm_chart_value_overrides()``.
+        self._configure_volcano_image_mirror()
+
         # Resolve the always-on Cluster_Shared_Bucket identity from SSM
         # (owned by GCOGlobalStack) and attach RW + KMS grants to the
         # job-pod role. Runs unconditionally — the ConfigMap and IAM
@@ -335,6 +373,12 @@ class GCORegionalStack(Stack):
         # replacements in the KubectlApplyManifests CustomResource).
         self.cluster_shared_identity = self._resolve_cluster_shared_bucket_from_ssm()
         self._grant_cluster_shared_bucket_to_job_role(self.cluster_shared_identity)
+
+        # Create the always-on general-purpose regional bucket (KMS key +
+        # access-logs bucket + primary bucket). Provisioned unconditionally —
+        # there is no cdk.json toggle and no feature flag gating its existence —
+        # in addition to the central buckets owned by GCOGlobalStack.
+        self._create_regional_shared_bucket()
 
         # Create EFS for shared storage
         self._create_efs()
@@ -1485,6 +1529,46 @@ class GCORegionalStack(Stack):
             )
         )
 
+        # CloudWatch read permissions for GPU-based autoscaling. The KEDA
+        # aws-cloudwatch scaler reads ContainerInsights GPU utilization metrics
+        # to scale inference roles that request GPUs — GPU is not a native HPA
+        # resource metric, so this is the only path that can drive GPU scaling.
+        # The CloudWatch read APIs do not support resource-level IAM scoping, so
+        # they are granted account-wide (read-only).
+        self.keda_operator_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "cloudwatch:GetMetricData",
+                    "cloudwatch:GetMetricStatistics",
+                    "cloudwatch:ListMetrics",
+                ],
+                resources=["*"],
+            )
+        )
+
+        # cdk-nag suppression: the CloudWatch metric-read APIs do not support
+        # resource-level IAM scoping — Resource: * is the only valid form.
+        from cdk_nag import NagSuppressions
+
+        NagSuppressions.add_resource_suppressions(
+            self.keda_operator_role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "The KEDA operator reads CloudWatch metrics "
+                        "(GetMetricData, GetMetricStatistics, ListMetrics) to "
+                        "drive GPU-based autoscaling. These APIs do not support "
+                        "resource-level IAM scoping — Resource: * is the only "
+                        "valid form. The grant is read-only."
+                    ),
+                    "appliesTo": ["Resource::*"],
+                },
+            ],
+            apply_to_children=True,
+        )
+
     def _create_pod_identity_associations(self) -> None:
         """Create EKS Pod Identity Associations for all service accounts.
 
@@ -1718,6 +1802,336 @@ class GCORegionalStack(Stack):
             apply_to_children=True,
         )
 
+    def _create_regional_shared_bucket(self) -> None:
+        """Create the always-on general-purpose regional bucket for this region.
+
+        Provisioned unconditionally — there is no ``cdk.json`` toggle and no
+        feature flag that can suppress it — in addition to the central buckets
+        owned by ``GCOGlobalStack`` (the model bucket and the cluster-shared
+        bucket). The bucket is general purpose: any in-region workload may use
+        it, and the per-region cold KV tier auto-targets it when cold-tier
+        storage is requested. Its existence is independent of any endpoint's
+        cold-tier choice.
+
+        Three constructs are created, mirroring the cluster-shared bucket
+        pattern in ``GCOGlobalStack``:
+
+        1. ``regional_shared_kms_key`` — a customer-managed KMS key with annual
+           rotation and a 7-day pending window on destroy. The key policy grants
+           the ``s3.amazonaws.com`` and ``logs.<region>.amazonaws.com`` service
+           principals encrypt/decrypt so S3 server-side encryption and access-log
+           delivery work without role-side grants.
+        2. ``regional_shared_access_logs_bucket`` — the dedicated S3 access-logs
+           destination for the primary bucket.
+        3. ``regional_shared_bucket`` — the primary bucket named
+           ``gco-regional-shared-<account>-<region>`` (the prefix
+           ``REGIONAL_SHARED_BUCKET_NAME_PREFIX`` is the stable ARN prefix used
+           by IAM policies and nag assertions). KMS-encrypted with
+           ``regional_shared_kms_key``, block-public-access on, SSL enforced,
+           versioned, destroy-on-teardown.
+
+        An explicit ``Deny`` for ``aws:SecureTransport=false`` is added to the
+        bucket policy independent of ``enforce_ssl=True`` so the deny is
+        verifiable in the synthesized template under a known SID.
+        """
+        # KMS key for the regional bucket. Matches the cluster-shared key
+        # posture: annual rotation, 7-day pending window, destroy-on-teardown.
+        self.regional_shared_kms_key = kms.Key(
+            self,
+            "RegionalSharedKmsKey",
+            description=(
+                "Customer-managed KMS key for the always-on general-purpose "
+                "regional bucket in this region's GCORegionalStack."
+            ),
+            enable_key_rotation=True,
+            pending_window=Duration.days(7),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # Key-policy grants for the service principals that encrypt/decrypt on
+        # behalf of the bucket (S3 server-side encryption) and the access-logs
+        # bucket (CloudWatch/S3 log delivery).
+        kms_actions = [
+            "kms:Encrypt",
+            "kms:Decrypt",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*",
+            "kms:DescribeKey",
+        ]
+
+        self.regional_shared_kms_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AllowS3ServiceEncryptDecrypt",
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ServicePrincipal("s3.amazonaws.com")],
+                actions=kms_actions,
+                resources=["*"],
+            )
+        )
+
+        self.regional_shared_kms_key.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AllowCloudWatchLogsEncryptDecrypt",
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ServicePrincipal(f"logs.{self.deployment_region}.amazonaws.com")],
+                actions=kms_actions,
+                resources=["*"],
+            )
+        )
+
+        # Retention for the access-logs bucket honors the same `s3_access_logs`
+        # context field used by the central buckets (default 90 days).
+        s3_access_logs_ctx = self.node.try_get_context("s3_access_logs") or {}
+        access_logs_retention_days = int(s3_access_logs_ctx.get("retention_days", 90))
+
+        # Dedicated access-logs bucket for the regional bucket, encrypted with
+        # the regional KMS key (its key policy grants the logs service principal
+        # encrypt/decrypt).
+        self.regional_shared_access_logs_bucket = s3.Bucket(
+            self,
+            "RegionalSharedAccessLogsBucket",
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=self.regional_shared_kms_key,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            versioned=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="ExpireAccessLogs",
+                    enabled=True,
+                    expiration=Duration.days(access_logs_retention_days),
+                )
+            ],
+        )
+
+        # Primary general-purpose regional bucket. The name uses the constant
+        # prefix so IAM allow-list assertions (arn:aws:s3:::gco-regional-shared-*)
+        # stay stable across refactors. `bucket_key_enabled=True` mirrors the
+        # central-bucket pattern to reduce per-object KMS request costs.
+        self.regional_shared_bucket = s3.Bucket(
+            self,
+            "RegionalSharedBucket",
+            bucket_name=(
+                f"{REGIONAL_SHARED_BUCKET_NAME_PREFIX}-{self.account}-{self.deployment_region}"
+            ),
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=self.regional_shared_kms_key,
+            bucket_key_enabled=True,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            versioned=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            server_access_logs_bucket=self.regional_shared_access_logs_bucket,
+            server_access_logs_prefix="regional-shared/",
+        )
+
+        # Explicit Deny for insecure transport. `enforce_ssl=True` already adds
+        # an equivalent statement, but duplicating it here makes the deny
+        # verifiable in the synthesized template under a known SID.
+        self.regional_shared_bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyInsecureTransport",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:*"],
+                resources=[
+                    self.regional_shared_bucket.bucket_arn,
+                    f"{self.regional_shared_bucket.bucket_arn}/*",
+                ],
+                conditions={"Bool": {"aws:SecureTransport": "false"}},
+            )
+        )
+
+        # Publish the bucket's identity as three SSM parameters in this
+        # region's own parameter store, mirroring how the model bucket and
+        # cluster-shared bucket publish theirs. In-region workloads and the
+        # regional upload surface resolve the always-on regional bucket by
+        # reading these back rather than reconstructing the name. Because the
+        # bucket is unconditional, these parameters are always present once the
+        # region's stack is deployed. The prefix
+        # ``REGIONAL_SHARED_SSM_PARAMETER_PREFIX`` is the single source of truth
+        # for the namespace.
+        ssm.StringParameter(
+            self,
+            "RegionalSharedBucketNameParam",
+            parameter_name=f"{REGIONAL_SHARED_SSM_PARAMETER_PREFIX}/name",
+            string_value=self.regional_shared_bucket.bucket_name,
+            description="Name of the always-on general-purpose regional bucket for this region.",
+        )
+
+        ssm.StringParameter(
+            self,
+            "RegionalSharedBucketArnParam",
+            parameter_name=f"{REGIONAL_SHARED_SSM_PARAMETER_PREFIX}/arn",
+            string_value=self.regional_shared_bucket.bucket_arn,
+            description="ARN of the always-on general-purpose regional bucket for this region.",
+        )
+
+        ssm.StringParameter(
+            self,
+            "RegionalSharedBucketRegionParam",
+            parameter_name=f"{REGIONAL_SHARED_SSM_PARAMETER_PREFIX}/region",
+            string_value=self.deployment_region,
+            description="Home region of the always-on general-purpose regional bucket.",
+        )
+
+        # CDK-nag suppressions scoped per-resource at the construct site,
+        # mirroring the central bucket pattern. Every suppression carries an
+        # explicit reason; no blanket bypasses.
+        from cdk_nag import NagSuppressions
+
+        regional_replication_reason = (
+            "The general-purpose regional bucket is a region-local store; "
+            "in-region workloads publish to their own region's bucket and there "
+            "is no durability requirement that warrants cross-region "
+            "replication. Access logs do not require replication for the same "
+            "reason."
+        )
+
+        NagSuppressions.add_resource_suppressions(
+            self.regional_shared_bucket,
+            [
+                {
+                    "id": "HIPAA.Security-S3BucketReplicationEnabled",
+                    "reason": regional_replication_reason,
+                },
+                {
+                    "id": "NIST.800.53.R5-S3BucketReplicationEnabled",
+                    "reason": regional_replication_reason,
+                },
+                {
+                    "id": "PCI.DSS.321-S3BucketReplicationEnabled",
+                    "reason": regional_replication_reason,
+                },
+            ],
+        )
+
+        access_logs_is_self_target_reason = (
+            "This is the server access logs destination bucket for the "
+            "general-purpose regional bucket."
+        )
+        NagSuppressions.add_resource_suppressions(
+            self.regional_shared_access_logs_bucket,
+            [
+                {
+                    "id": "AwsSolutions-S1",
+                    "reason": access_logs_is_self_target_reason,
+                },
+                {
+                    "id": "HIPAA.Security-S3BucketLoggingEnabled",
+                    "reason": access_logs_is_self_target_reason,
+                },
+                {
+                    "id": "NIST.800.53.R5-S3BucketLoggingEnabled",
+                    "reason": access_logs_is_self_target_reason,
+                },
+                {
+                    "id": "PCI.DSS.321-S3BucketLoggingEnabled",
+                    "reason": access_logs_is_self_target_reason,
+                },
+                {
+                    "id": "HIPAA.Security-S3BucketReplicationEnabled",
+                    "reason": regional_replication_reason,
+                },
+                {
+                    "id": "NIST.800.53.R5-S3BucketReplicationEnabled",
+                    "reason": regional_replication_reason,
+                },
+                {
+                    "id": "PCI.DSS.321-S3BucketReplicationEnabled",
+                    "reason": regional_replication_reason,
+                },
+            ],
+        )
+
+        # Grant the in-region pod role read/write on this bucket and use of its
+        # KMS key — and nothing else. The grant lives next to the bucket it
+        # scopes to, so the role's regional-bucket access stays exactly as wide
+        # as this one bucket and its key.
+        self._grant_regional_shared_bucket_to_service_account()
+
+    def _grant_regional_shared_bucket_to_service_account(self) -> None:
+        """Attach RW + KMS permissions on the regional bucket to the pod role.
+
+        Two ``iam.PolicyStatement``s are added to ``self.service_account_role``
+        (the EKS Pod Identity role used by every pod in ``gco-jobs``,
+        ``gco-system``, and ``gco-inference``):
+
+        1. S3 object + bucket-level actions (``GetObject``, ``PutObject``,
+           ``DeleteObject``, ``ListBucket``, ``GetBucketLocation``) scoped to
+           the literal ``regional_shared_bucket`` ARN and its ``<arn>/*``
+           object-key space — and to no other bucket.
+        2. KMS ``Decrypt`` / ``Encrypt`` / ``GenerateDataKey`` /
+           ``DescribeKey`` scoped to the literal ``regional_shared_kms_key``
+           ARN — and to no other key.
+
+        Because both resources are local constructs in this stack, each ARN is
+        a concrete reference rather than a wildcard, so the role gains access to
+        precisely this bucket and this key. The grant runs unconditionally as
+        part of provisioning the always-on regional bucket.
+        """
+        from cdk_nag import NagSuppressions
+
+        self.service_account_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation",
+                ],
+                resources=[
+                    self.regional_shared_bucket.bucket_arn,
+                    f"{self.regional_shared_bucket.bucket_arn}/*",
+                ],
+            )
+        )
+
+        self.service_account_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "kms:Decrypt",
+                    "kms:Encrypt",
+                    "kms:GenerateDataKey",
+                    "kms:DescribeKey",
+                ],
+                resources=[self.regional_shared_kms_key.key_arn],
+            )
+        )
+
+        # The S3 bucket-ARN resource uses a ``<arn>/*`` object-key wildcard
+        # which cdk-nag flags as a wildcard resource. The ARN itself is the
+        # literal regional bucket ARN created in this stack — the ``/*`` covers
+        # all object keys inside that single bucket, which is the intended
+        # semantic for the RW grant. The KMS statement carries no wildcard.
+        NagSuppressions.add_resource_suppressions(
+            self.service_account_role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "The regional bucket RW grant uses an <arn>/* "
+                        "object-key wildcard on the literal "
+                        "gco-regional-shared-<account>-<region> bucket ARN "
+                        "created in this stack. The wildcard covers object "
+                        "keys within a single bucket — this is the standard "
+                        "shape for a bucket-scoped RW grant and is what the "
+                        "allow-list assertion is written against."
+                    ),
+                    "appliesTo": [
+                        {"regex": r"/^Resource::<RegionalSharedBucket.*\.Arn>\/\*$/"},
+                    ],
+                },
+            ],
+            apply_to_children=True,
+        )
+
     def _create_kubectl_lambda(self) -> None:
         """Create Lambda function to apply Kubernetes manifests using Python client.
 
@@ -1758,6 +2172,19 @@ class GCORegionalStack(Stack):
             iam.PolicyStatement(actions=["sts:AssumeRole"], resources=["*"])
         )
 
+        # Allow the convergence apply tasks to record per-phase status to SSM
+        # (base-manifests / post-helm-manifests), mirroring the helm worker, so
+        # `gco stacks addons status` surfaces the apply passes alongside charts.
+        kubectl_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["ssm:PutParameter"],
+                resources=[
+                    f"arn:aws:ssm:{self.deployment_region}:{self.account}:"
+                    f"parameter/{project_name}/addons/*"
+                ],
+            )
+        )
+
         # Create security group for kubectl Lambda
         kubectl_lambda_sg = ec2.SecurityGroup(
             self,
@@ -1796,6 +2223,9 @@ class GCORegionalStack(Stack):
             environment={
                 "CLUSTER_NAME": self.cluster.cluster_name,
                 "REGION": self.deployment_region,
+                # Lets the convergence apply tasks record per-phase status to
+                # SSM (/<project>/addons/<region>/{base,post-helm}-manifests).
+                "PROJECT_NAME": project_name,
             },
             tracing=lambda_.Tracing.ACTIVE,
         )
@@ -1814,21 +2244,9 @@ class GCORegionalStack(Stack):
             ],
         )
 
-        # Create log group for kubectl provider
-        kubectl_provider_log_group = logs.LogGroup(
-            self,
-            "KubectlProviderLogGroup",
-            retention=logs.RetentionDays.ONE_WEEK,
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
-        # Create custom resource provider (stored for use in _apply_kubernetes_manifests)
-        self.kubectl_provider = cr.Provider(
-            self,
-            "KubectlProvider",
-            on_event_handler=self.kubectl_lambda,
-            log_group=kubectl_provider_log_group,
-        )
+        # No custom-resource provider needed: the kubectl-applier Lambda is now
+        # invoked directly by the convergence state machine (the base and
+        # post-Helm apply tasks), not through a CloudFormation custom resource.
 
         # cdk-nag suppression: the kubectl-applier Lambda requires broad
         # EKS and Kubernetes API access to apply arbitrary manifests.
@@ -1886,6 +2304,10 @@ class GCORegionalStack(Stack):
             "{{HEALTH_MONITOR_IMAGE}}": self.health_monitor_image.image_uri,
             "{{MANIFEST_PROCESSOR_IMAGE}}": self.manifest_processor_image.image_uri,
             "{{INFERENCE_MONITOR_IMAGE}}": self.inference_monitor_image.image_uri,
+            # External, pinned upstream image for the shared Mooncake master
+            # (bundles the mooncake_master binary). Same default as disaggregated
+            # role pods; per-endpoint spec.mooncake.store.master_image overrides.
+            "{{MOONCAKE_MASTER_IMAGE}}": MOONCAKE_MASTER_DEFAULT_IMAGE,
             "{{CLUSTER_NAME}}": self.cluster.cluster_name,
             "{{REGION}}": self.deployment_region,
             "{{AUTH_SECRET_ARN}}": self.auth_secret_arn,
@@ -2091,40 +2513,63 @@ class GCORegionalStack(Stack):
                 self.fsx_security_group.security_group_id
             )
 
-        kubectl_apply = CustomResource(
+        # ── Trigger the convergence pipeline (fire-and-forget) ───────────────
+        # A single custom resource starts the HelmInstallStateMachine, which now
+        # owns the WHOLE cluster convergence: apply base manifests -> install
+        # Helm charts -> apply post-Helm (CRD-dependent) manifests -> register
+        # the Ingress-created ALB with Global Accelerator. The resource returns
+        # as soon as the execution is *started* (no isComplete waiter), so the
+        # cluster's CloudFormation lifecycle is never bound to the multi-minute
+        # add-on convergence — a slow chart can't blow CloudFormation's ~1h
+        # custom-resource ceiling and roll back (destroy) the freshly-created
+        # cluster. Status lives in SSM and is surfaced via `gco stacks addons
+        # status`; re-converge out-of-band with `gco stacks addons install`.
+        #
+        # The execution input carries everything the state-machine tasks need:
+        # chart selection/overrides, the manifest ImageReplacements (for the base
+        # and post-Helm kubectl passes), and the Global Accelerator
+        # EndpointGroupArn (for the final GA-registration task).
+        converge_trigger = CustomResource(
             self,
-            "KubectlApplyManifests",
-            service_token=self.kubectl_provider.service_token,
+            "HelmInstallCharts",
+            service_token=self.helm_installer_provider.service_token,
             properties={
                 "ClusterName": self.cluster.cluster_name,
                 "Region": self.deployment_region,
-                "SkipDeletionOnStackDelete": "true",  # Don't delete resources on stack deletion
+                # Helm chart selection + per-chart value overrides (e.g. Volcano
+                # image_registry redirected to the ECR mirror when enabled).
+                "EnabledCharts": self._get_enabled_helm_charts(),
+                "Charts": self._helm_chart_value_overrides(),
+                "KedaOperatorRoleArn": self.keda_operator_role.role_arn,
+                # Template substitutions for the base + post-Helm kubectl passes.
                 "ImageReplacements": image_replacements,
-                # Include FSx file system ID directly to force update when FSx changes
-                "FsxFileSystemId": self.fsx_file_system.ref if self.fsx_file_system else "none",
-                # Force update on each deployment to trigger pod rollouts
+                # Endpoint group the final task registers the Ingress ALB with.
+                "EndpointGroupArn": self.endpoint_group_arn,
+                # Project name lets the orchestrator persist the execution input
+                # to SSM so `gco stacks addons install` can replay the whole
+                # pipeline without reconstructing chart/manifest config.
+                "ProjectName": self.config.get_project_name(),
+                # Force re-invocation on every deployment (new charts.yaml,
+                # manifest, or image) so convergence re-runs end to end.
                 "DeploymentTimestamp": deployment_timestamp,
             },
         )
 
-        # Ensure manifests are applied after cluster, EFS, and FSx are ready
-        # Note: ALB is created by EKS Auto Mode when Ingress is applied
-        kubectl_apply.node.add_dependency(self.cluster)
-        kubectl_apply.node.add_dependency(self.efs_file_system)
+        # The trigger (and therefore the whole convergence pipeline) must run
+        # after the cluster, shared storage, managed-addon IRSA patches, and Pod
+        # Identity associations exist: the base manifests reference their tokens,
+        # and the rollout-restarts at the end of the base pass need the patched
+        # service accounts (otherwise the mutating webhook can't inject
+        # AWS_ROLE_ARN and the controllers fail with "no EC2 IMDS role found" —
+        # PVCs stuck Pending, missing Container Insights metrics; see the
+        # UpdateEfsCsiAddonRole resource in _create_efs_csi_driver_addon). These
+        # gates previously sat on the synchronous KubectlApplyManifests custom
+        # resource; the base apply now lives in the state machine, so the gate
+        # moves to the trigger.
+        converge_trigger.node.add_dependency(self.cluster)
+        converge_trigger.node.add_dependency(self.efs_file_system)
         if self.fsx_file_system:
-            kubectl_apply.node.add_dependency(self.fsx_file_system)
-
-        # Wait for EKS to have patched the IRSA role ARN onto each managed
-        # addon's service account before the kubectl Lambda rollout-restarts
-        # the controllers at the end of this invocation. Otherwise the
-        # restart sees the old (annotation-less) SA, the mutating webhook
-        # can't inject AWS_ROLE_ARN, and the new pods are just as
-        # credential-less as the ones they replaced. The symptom is
-        # controller pods silently failing with "no EC2 IMDS role found" —
-        # for EFS/FSx that manifests as PVCs stuck Pending forever, for
-        # CloudWatch as missing Container Insights metrics. See the
-        # UpdateEfsCsiAddonRole custom resource in _create_efs_csi_driver_addon
-        # for the full rationale.
+            converge_trigger.node.add_dependency(self.fsx_file_system)
         for attr in (
             "_efs_csi_addon_role_update",
             "_fsx_csi_addon_role_update",
@@ -2132,89 +2577,9 @@ class GCORegionalStack(Stack):
         ):
             update_cr = getattr(self, attr, None)
             if update_cr is not None:
-                kubectl_apply.node.add_dependency(update_cr)
-
-        # Ensure Pod Identity associations exist before workloads start,
-        # so pods get IAM credentials on first launch
+                converge_trigger.node.add_dependency(update_cr)
         for assoc in self._pod_identity_associations:
-            kubectl_apply.node.add_dependency(assoc)
-
-        # Install Helm charts (KEDA, etc.) after base manifests are applied
-        # This ensures namespaces and RBAC are in place before Helm installations
-        helm_install = CustomResource(
-            self,
-            "HelmInstallCharts",
-            service_token=self.helm_installer_provider.service_token,
-            properties={
-                "ClusterName": self.cluster.cluster_name,
-                "Region": self.deployment_region,
-                # Enable core AI/ML infrastructure charts by default
-                # NVIDIA Network Operator toggled via cdk.json nvidia_network_operator.enabled
-                "EnabledCharts": self._get_enabled_helm_charts(),
-                # Override chart values if needed
-                "Charts": {},
-                # Pass IAM role ARNs for service account annotations
-                "KedaOperatorRoleArn": self.keda_operator_role.role_arn,
-                # Force re-invocation on every deployment to pick up charts.yaml changes
-                "DeploymentTimestamp": deployment_timestamp,
-            },
-        )
-
-        # Helm charts depend on kubectl manifests being applied first
-        helm_install.node.add_dependency(kubectl_apply)
-
-        # Apply CRD-dependent manifests after Helm installs the CRDs.
-        # KEDA ScaledJob/ScaledObject require the KEDA CRDs to exist first.
-        # This second kubectl pass runs after Helm and applies only those resources.
-        kubectl_apply_post_helm = CustomResource(
-            self,
-            "KubectlApplyPostHelmManifests",
-            service_token=self.kubectl_provider.service_token,
-            properties={
-                "ClusterName": self.cluster.cluster_name,
-                "Region": self.deployment_region,
-                "SkipDeletionOnStackDelete": "true",
-                "ImageReplacements": image_replacements,
-                "FsxFileSystemId": self.fsx_file_system.ref if self.fsx_file_system else "none",
-                "DeploymentTimestamp": deployment_timestamp,
-                # PostHelm: "true" tells the handler to apply only post-helm-* manifests
-                "PostHelm": "true",
-            },
-        )
-
-        # Must run after Helm has installed the CRDs
-        kubectl_apply_post_helm.node.add_dependency(helm_install)
-
-        # Create GA registration custom resource AFTER manifests are applied
-        # This waits for the Ingress to create the ALB and registers it with GA
-        #
-        # IMPORTANT: We include a deployment timestamp to force CloudFormation to
-        # re-invoke the Lambda on every deployment. This ensures the ALB is always
-        # registered with the Global Accelerator, even if other properties haven't changed.
-        # Without this, CloudFormation may skip the custom resource if it thinks
-        # nothing has changed, leaving the ALB unregistered after GA recreation.
-        deployment_timestamp = str(int(time.time()))
-
-        ga_registration = CustomResource(
-            self,
-            "GaRegistration",
-            service_token=self.ga_registration_provider.service_token,
-            properties={
-                "ClusterName": self.cluster.cluster_name,
-                "Region": self.deployment_region,
-                "EndpointGroupArn": self.endpoint_group_arn,
-                "IngressName": "gco-ingress",
-                "Namespace": "gco-system",
-                # Pass global region and project name for SSM storage
-                "GlobalRegion": self.config.get_global_region(),
-                "ProjectName": self.config.get_project_name(),
-                # Force re-invocation on every deployment
-                "DeploymentTimestamp": deployment_timestamp,
-            },
-        )
-
-        # GA registration must happen after manifests are applied
-        ga_registration.node.add_dependency(kubectl_apply)
+            converge_trigger.node.add_dependency(assoc)
 
     def _create_ga_registration_lambda(self) -> None:
         """Create Lambda function to register Ingress-created ALB with Global Accelerator.
@@ -2338,24 +2703,11 @@ class GCORegionalStack(Stack):
 
         endpoint_group_arn = get_endpoint_group_arn.get_response_field("Parameter.Value")
 
-        # Create log group for GA registration provider
-        ga_provider_log_group = logs.LogGroup(
-            self,
-            "GaRegistrationProviderLogGroup",
-            retention=logs.RetentionDays.ONE_WEEK,
-            removal_policy=RemovalPolicy.DESTROY,
-        )
+        # No custom-resource provider needed: the GA-registration Lambda is now
+        # invoked directly by the convergence state machine's final task.
 
-        # Create provider and custom resource
-        ga_provider = cr.Provider(
-            self,
-            "GaRegistrationProvider",
-            on_event_handler=ga_registration_lambda,
-            log_group=ga_provider_log_group,
-        )
-
-        # Store for use after kubectl apply
-        self.ga_registration_provider = ga_provider
+        # Store for use by the convergence state machine (the GA-registration task).
+        self.ga_registration_lambda = ga_registration_lambda
         self.endpoint_group_arn = endpoint_group_arn
 
         # cdk-nag suppression: the GA registration Lambda needs broad
@@ -2379,6 +2731,111 @@ class GCORegionalStack(Stack):
             apply_to_children=True,
         )
 
+    def _get_volcano_image_mirror_config(self) -> dict[str, Any]:
+        """Parse the ``volcano_image_mirror`` block from cdk.json.
+
+        Returns a normalized dict ``{enabled, ecr_namespace}``. Validation is
+        strict so a misconfiguration fails at synth rather than silently leaving
+        Volcano pointed at docker.io.
+
+        - ``enabled`` (default False) — master toggle.
+        - ``ecr_namespace`` (default ``"gco/dockerhub"``) — the ECR repository
+          namespace the mirrored Volcano images live under. Must start with
+          ``gco/`` so it inherits the project's existing ``gco/*`` machinery
+          (node pull access, replication rule, trusted-registry allow-list)
+          with no extra IAM, and must be a valid (possibly nested) ECR
+          repository path.
+        """
+        raw = self.node.try_get_context("volcano_image_mirror") or {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"volcano_image_mirror must be a mapping, got {type(raw).__name__}")
+
+        enabled = bool(raw.get("enabled", False))
+        ecr_namespace = str(raw.get("ecr_namespace", "gco/dockerhub")).strip().strip("/")
+
+        if not enabled:
+            return {"enabled": False, "ecr_namespace": ecr_namespace}
+
+        # Must live under the project prefix and be a valid nested ECR repo
+        # path (lowercase alphanumerics + . _ - per segment, slash-separated).
+        if not ecr_namespace.startswith("gco/"):
+            raise ValueError(
+                "volcano_image_mirror.ecr_namespace must start with 'gco/' so it "
+                "inherits the project's gco/* ECR access/replication, got "
+                f"{ecr_namespace!r}"
+            )
+        segment = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+        if not re.fullmatch(rf"{segment}(?:/{segment})+", ecr_namespace):
+            raise ValueError(
+                "volcano_image_mirror.ecr_namespace must be a valid ECR repository "
+                f"path (lowercase alphanumerics + . _ - per slash-separated segment), "
+                f"got {ecr_namespace!r}"
+            )
+
+        return {"enabled": True, "ecr_namespace": ecr_namespace}
+
+    def _configure_volcano_image_mirror(self) -> None:
+        """Resolve the optional Volcano image-mirror registry (no infra).
+
+        Volcano is the only default chart whose images live exclusively on
+        docker.io (``volcanosh/vc-*``). On a cold EKS Auto Mode cluster those
+        anonymous pulls are slow / rate-limited, so Volcano's blocking
+        ``helm --wait`` could never finish inside the installer Lambda's
+        wall-clock guard and the whole add-on batch looped on it.
+
+        The fix is to mirror Volcano's pinned images into the project's own ECR
+        under ``gco/*`` and point Volcano's ``basic.image_registry`` there, so
+        the cluster makes fast, same-account ECR pulls with the pull-only node
+        role it already has — no Docker Hub credential, no pull-through cache
+        rule, and no registry permissions policy. The mirror itself is populated
+        out-of-band (``gco images mirror``) before the add-ons
+        converge; this method only computes the registry override and creates no
+        CloudFormation resources.
+
+        Sets ``self.volcano_mirror_registry`` to
+        ``<account>.dkr.ecr.<region>.amazonaws.com/<ecr_namespace>`` that
+        ``_helm_chart_value_overrides`` feeds into Volcano's
+        ``basic.image_registry``; left ``None`` when disabled.
+        """
+        # Always define the attribute so downstream code can branch on it.
+        self.volcano_mirror_registry: str | None = None
+
+        cfg = self._get_volcano_image_mirror_config()
+        if not cfg["enabled"]:
+            return
+
+        ecr_namespace = cfg["ecr_namespace"]
+        self.volcano_mirror_registry = (
+            f"{self.account}.dkr.ecr.{self.deployment_region}.amazonaws.com/{ecr_namespace}"
+        )
+
+    def _helm_chart_value_overrides(self) -> dict[str, Any]:
+        """Per-chart helm value overrides injected into the install payload.
+
+        Returned dict is forwarded verbatim as the ``Charts`` property of the
+        ``HelmInstallCharts`` custom resource; the installer deep-merges each
+        chart's ``values`` over ``charts.yaml``. Currently used only to point
+        Volcano's ``basic.image_registry`` at the project's ECR image mirror
+        when enabled, so every Volcano image (controller, scheduler, admission
+        webhook, and the pre-install admission-init hook — all of which render
+        from ``basic.image_registry``) resolves from ECR instead of docker.io.
+        The upstream image names (``volcanosh/vc-*``) are preserved, so each
+        resolves to ``<mirror_registry>/volcanosh/vc-*`` — matching where
+        ``gco images mirror`` pushes them. Returns ``{}`` when
+        the mirror is disabled, preserving the prior behavior.
+        """
+        if not getattr(self, "volcano_mirror_registry", None):
+            return {}
+        return {
+            "volcano": {
+                "values": {
+                    "basic": {
+                        "image_registry": self.volcano_mirror_registry,
+                    }
+                }
+            }
+        }
+
     def _get_enabled_helm_charts(self) -> list[str]:
         """Return the list of Helm charts to install based on cdk.json helm config.
 
@@ -2392,9 +2849,6 @@ class GCORegionalStack(Stack):
         # Order matters: dependencies first, Kueue last
         chart_map: list[tuple[str, list[str]]] = [
             ("keda", ["keda"]),
-            ("nvidia_gpu_operator", ["nvidia-gpu-operator"]),
-            ("nvidia_dra_driver", ["nvidia-dra-driver"]),
-            ("nvidia_network_operator", ["nvidia-network-operator"]),
             ("aws_efa_device_plugin", ["aws-efa-device-plugin"]),
             ("aws_neuron_device_plugin", ["aws-neuron-device-plugin"]),
             ("volcano", ["volcano"]),
@@ -2405,10 +2859,18 @@ class GCORegionalStack(Stack):
             ("kueue", ["kueue"]),  # Must be last
         ]
 
+        # Charts that are mandatory platform components and cannot be disabled
+        # via cdk.json. KEDA is always installed: it backs the built-in SQS
+        # queue processor (a ScaledJob) and is the only metrics bridge that lets
+        # autoscalers consume GPU/CloudWatch metrics (the keda-metrics-apiserver
+        # serves external.metrics.k8s.io). Disabling it would silently break
+        # both, so the cdk.json toggle is ignored for KEDA.
+        mandatory_chart_keys = {"keda"}
+
         enabled_charts = []
         for config_key, chart_names in chart_map:
             chart_config = helm_config.get(config_key, {})
-            if chart_config.get("enabled", True):
+            if config_key in mandatory_chart_keys or chart_config.get("enabled", True):
                 enabled_charts.extend(chart_names)
 
         return enabled_charts
@@ -2420,8 +2882,8 @@ class GCORegionalStack(Stack):
         (TLS certificates, CRDs, etc.) that are difficult to manage via raw manifests.
 
         Charts installed:
-        - KEDA: Kubernetes Event-Driven Autoscaling (enabled by default)
-        - NVIDIA DRA Driver: Dynamic Resource Allocation for GPUs (disabled by default)
+        - KEDA: Kubernetes Event-Driven Autoscaling (mandatory, always installed)
+        - Volcano, KubeRay, Kueue, cert-manager, and other schedulers (toggle via cdk.json)
         """
         project_name = self.config.get_project_name()
 
@@ -2497,8 +2959,22 @@ class GCORegionalStack(Stack):
             environment={
                 "CLUSTER_NAME": self.cluster.cluster_name,
                 "REGION": self.deployment_region,
+                "PROJECT_NAME": project_name,
             },
             tracing=lambda_.Tracing.ACTIVE,
+        )
+
+        # Allow the installer to record per-chart add-on status to SSM so the
+        # add-on layer's health is observable out-of-band (decoupled from the
+        # CloudFormation rollback path). Read back via `gco stacks addons-status`.
+        helm_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["ssm:PutParameter"],
+                resources=[
+                    f"arn:aws:ssm:{self.deployment_region}:{self.account}:"
+                    f"parameter/{project_name}/addons/*"
+                ],
+            )
         )
 
         # Add EKS access entry for the Lambda role
@@ -2514,7 +2990,212 @@ class GCORegionalStack(Stack):
             ],
         )
 
-        # Create log group for Helm installer provider
+        # ------------------------------------------------------------------
+        # Step Functions state machine: one task per chart, in charts.yaml
+        # order. Each chart gets its own retry + Step Functions console
+        # visibility, and — critically — no single Lambda invocation is bound
+        # by the 15-minute Lambda limit, so a slow operator (e.g. a cold NVIDIA
+        # image pull) just costs extra retries instead of failing the deploy.
+        # ------------------------------------------------------------------
+        chart_order = _load_helm_chart_order()
+
+        def _chart_task(chart_name: str) -> sfn_tasks.LambdaInvoke:
+            task = sfn_tasks.LambdaInvoke(
+                self,
+                f"HelmChart-{chart_name}",
+                lambda_function=self.helm_installer_lambda,
+                payload=sfn.TaskInput.from_object(
+                    {
+                        "Action": "install_chart",
+                        "Chart": chart_name,
+                        "ClusterName": sfn.JsonPath.string_at("$.ClusterName"),
+                        "Region": sfn.JsonPath.string_at("$.Region"),
+                        "EnabledCharts": sfn.JsonPath.list_at("$.EnabledCharts"),
+                        "Charts": sfn.JsonPath.object_at("$.Charts"),
+                        "KedaOperatorRoleArn": sfn.JsonPath.string_at("$.KedaOperatorRoleArn"),
+                    }
+                ),
+                payload_response_only=True,
+                # Keep the execution input intact so the next chart task can
+                # still read $.ClusterName, $.EnabledCharts, etc.
+                result_path="$.lastChart",
+                task_timeout=sfn.Timeout.duration(Duration.minutes(16)),
+            )
+            # Per-chart retry with backoff. A cold image pull or a webhook race
+            # clears on a later attempt; only after exhausting these does the
+            # chart (and the deploy) fail.
+            task.add_retry(
+                errors=["States.ALL"],
+                max_attempts=4,
+                interval=Duration.seconds(30),
+                backoff_rate=2.0,
+                max_delay=Duration.minutes(5),
+            )
+            return task
+
+        def _kubectl_task(task_id: str, *, post_helm: bool) -> sfn_tasks.LambdaInvoke:
+            """One kubectl-apply pass (base or post-Helm) as a state-machine task.
+
+            Reads ClusterName / Region / ImageReplacements from the execution
+            input; the handler raises on any manifest failure so the task's
+            Retry/Catch can react.
+            """
+            task = sfn_tasks.LambdaInvoke(
+                self,
+                task_id,
+                lambda_function=self.kubectl_lambda,
+                payload=sfn.TaskInput.from_object(
+                    {
+                        "Action": "apply_manifests",
+                        "ClusterName": sfn.JsonPath.string_at("$.ClusterName"),
+                        "Region": sfn.JsonPath.string_at("$.Region"),
+                        "ImageReplacements": sfn.JsonPath.object_at("$.ImageReplacements"),
+                        "PostHelm": "true" if post_helm else "false",
+                    }
+                ),
+                payload_response_only=True,
+                # Keep the execution input intact so later tasks still read
+                # $.ClusterName, $.ImageReplacements, $.EndpointGroupArn, etc.
+                result_path="$.lastApply",
+                task_timeout=sfn.Timeout.duration(Duration.minutes(15)),
+            )
+            task.add_retry(
+                errors=["States.ALL"],
+                max_attempts=3,
+                interval=Duration.seconds(30),
+                backoff_rate=2.0,
+                max_delay=Duration.minutes(3),
+            )
+            return task
+
+        def _ga_task() -> sfn_tasks.LambdaInvoke:
+            """Register the Ingress-created ALB with Global Accelerator (final step).
+
+            The handler polls for the active ALB (up to a 14-minute budget), so
+            this task gets a 16-minute timeout to cover the Lambda's full run.
+            """
+            task = sfn_tasks.LambdaInvoke(
+                self,
+                "RegisterGlobalAccelerator",
+                lambda_function=self.ga_registration_lambda,
+                payload=sfn.TaskInput.from_object(
+                    {
+                        "Action": "register_ga",
+                        "ClusterName": sfn.JsonPath.string_at("$.ClusterName"),
+                        "Region": sfn.JsonPath.string_at("$.Region"),
+                        "EndpointGroupArn": sfn.JsonPath.string_at("$.EndpointGroupArn"),
+                        "IngressName": "gco-ingress",
+                        "Namespace": "gco-system",
+                        "GlobalRegion": self.config.get_global_region(),
+                        "ProjectName": project_name,
+                    }
+                ),
+                payload_response_only=True,
+                result_path="$.gaRegistration",
+                task_timeout=sfn.Timeout.duration(Duration.minutes(16)),
+            )
+            task.add_retry(
+                errors=["States.ALL"],
+                max_attempts=3,
+                interval=Duration.seconds(30),
+                backoff_rate=2.0,
+                max_delay=Duration.minutes(3),
+            )
+            return task
+
+        chart_tasks = [_chart_task(name) for name in chart_order]
+
+        # The state machine owns the full convergence pipeline:
+        #   base kubectl apply -> Helm charts -> post-Helm kubectl apply -> GA.
+        # Failure policy:
+        #   * base apply: retry, then NO catch -> a failed base pass (missing
+        #     namespaces / RBAC / storage / nodepools) FAILS the execution;
+        #     nothing downstream should run against a half-applied base.
+        #   * charts: each chart's success AND its post-retry failure both route
+        #     to the next, so one slow/broken chart never blocks the rest.
+        #   * post-Helm apply + GA: retry, then catch-and-continue, so a single
+        #     CRD-dependent manifest or a GA hiccup can't wedge the rest.
+        # Per-task outcomes are recorded to SSM; the trigger is fire-and-forget,
+        # so a degraded add-on layer never rolls back the cluster.
+        done = sfn.Succeed(self, "HelmInstallComplete")
+        base_apply = _kubectl_task("ApplyBaseManifests", post_helm=False)
+        post_apply = _kubectl_task("ApplyPostHelmManifests", post_helm=True)
+        ga_task = _ga_task()
+
+        # post-Helm apply -> GA -> done, both catch-and-continue.
+        post_apply.add_catch(ga_task, errors=["States.ALL"], result_path="$.lastApplyError")
+        post_apply.next(ga_task)
+        ga_task.add_catch(done, errors=["States.ALL"], result_path="$.gaError")
+        ga_task.next(done)
+
+        if chart_tasks:
+            for i, task in enumerate(chart_tasks):
+                next_state: sfn.IChainable = (
+                    chart_tasks[i + 1] if i + 1 < len(chart_tasks) else post_apply
+                )
+                task.add_catch(
+                    next_state,
+                    errors=["States.ALL"],
+                    result_path="$.lastChartError",
+                )
+                task.next(next_state)
+            base_apply.next(chart_tasks[0])
+        else:  # pragma: no cover - charts.yaml is always present in the repo
+            base_apply.next(post_apply)
+
+        # base apply has NO catch on purpose: a persistent base-manifest failure
+        # fails the execution rather than converging onto an incomplete base.
+        start_state: sfn.IChainable = base_apply
+
+        helm_sm_log_group = logs.LogGroup(
+            self,
+            "HelmInstallStateMachineLogGroup",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        self.helm_install_state_machine = sfn.StateMachine(
+            self,
+            "HelmInstallStateMachine",
+            definition_body=sfn.DefinitionBody.from_chainable(start_state),
+            state_machine_type=sfn.StateMachineType.STANDARD,
+            timeout=Duration.hours(2),
+            tracing_enabled=True,
+            logs=sfn.LogOptions(destination=helm_sm_log_group, level=sfn.LogLevel.ALL),
+        )
+
+        # Thin fire-and-forget provider: onEvent starts the execution and
+        # returns immediately. It does no Helm/Kubernetes work, so it never
+        # approaches the Lambda timeout — all the heavy lifting lives in the
+        # state machine, which converges charts in the background.
+        helm_orchestrator_on_event = lambda_.Function(
+            self,
+            "HelmOrchestratorOnEvent",
+            runtime=getattr(lambda_.Runtime, LAMBDA_PYTHON_RUNTIME),
+            handler="handler.on_event",
+            code=lambda_.Code.from_asset("lambda/helm-orchestrator"),
+            timeout=Duration.minutes(1),
+            memory_size=256,
+            environment={
+                "STATE_MACHINE_ARN": self.helm_install_state_machine.state_machine_arn,
+            },
+        )
+        self.helm_install_state_machine.grant_start_execution(helm_orchestrator_on_event)
+
+        # Let on_event persist the execution input to SSM so the add-on install
+        # can be replayed out-of-band (gco stacks addons install) without the
+        # CLI reconstructing chart config or the KEDA role ARN.
+        helm_orchestrator_on_event.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:PutParameter"],
+                resources=[
+                    f"arn:aws:ssm:{self.deployment_region}:{self.account}:"
+                    f"parameter/{project_name}/addons/*"
+                ],
+            )
+        )
+
+        # Create log group for the custom-resource provider framework
         helm_provider_log_group = logs.LogGroup(
             self,
             "HelmInstallerProviderLogGroup",
@@ -2522,16 +3203,23 @@ class GCORegionalStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Create custom resource provider
+        # Fire-and-forget custom-resource provider: onEvent starts the helm
+        # install state machine and the resource completes immediately. The
+        # cluster's CloudFormation lifecycle is deliberately NOT bound to the
+        # helm batch finishing — a slow chart (e.g. volcano retrying docker.io
+        # pulls) would otherwise keep the execution RUNNING past CloudFormation's
+        # ~1h custom-resource ceiling and trigger a rollback that destroys the
+        # cluster. Charts converge in the background; status lives in SSM and is
+        # surfaced via `gco stacks addons status` / re-converged with
+        # `gco stacks addons install`. No isComplete handler => no waiter.
         self.helm_installer_provider = cr.Provider(
             self,
             "HelmInstallerProvider",
-            on_event_handler=self.helm_installer_lambda,
+            on_event_handler=helm_orchestrator_on_event,
             log_group=helm_provider_log_group,
         )
 
-        # cdk-nag suppression: the Helm installer Lambda requires broad
-        # EKS and Kubernetes API access to install Helm charts.
+        # cdk-nag suppressions for the install path.
         from cdk_nag import NagSuppressions
 
         NagSuppressions.add_resource_suppressions(
@@ -2547,6 +3235,89 @@ class GCORegionalStack(Stack):
                         "is dynamic and not known at synth time."
                     ),
                     "appliesTo": ["Resource::*"],
+                },
+            ],
+            apply_to_children=True,
+        )
+        # The state machine role (auto-generated) invokes the worker Lambda
+        # across versions using the AWS-standard ``:*`` qualifier that cannot be
+        # enumerated at synth time.
+        NagSuppressions.add_resource_suppressions(
+            self.helm_install_state_machine,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "The state machine invokes the helm worker Lambda; CDK grants "
+                        "lambda:InvokeFunction with the :* version qualifier, which is the "
+                        "standard form and cannot be narrowed at synth time."
+                    ),
+                    "appliesTo": ["Resource::*"],
+                },
+            ],
+            apply_to_children=True,
+        )
+        NagSuppressions.add_resource_suppressions(
+            helm_orchestrator_on_event,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Start on the helm-install state machine requires the "
+                        "execution-ARN wildcard (arn:...:execution:<sm>:*) because "
+                        "execution names are generated at runtime. The finding is a "
+                        "granular execution-ARN wildcard that cannot be enumerated at "
+                        "synth time, so no appliesTo filter is supplied."
+                    ),
+                },
+            ],
+            apply_to_children=True,
+        )
+
+        # The cr.Provider framework auto-generates a framework-onEvent Lambda and
+        # its role (and, were an is_complete_handler set, a waiter state machine —
+        # which this fire-and-forget provider does NOT create). None of these are
+        # configurable by us: the framework role invokes our handler Lambda via
+        # the standard ``<lambda-arn>:*`` version qualifier that cannot be narrowed
+        # at synth time. Suppress the relevant rules across the whole provider
+        # subtree; appliesTo is omitted because the findings are granted on
+        # CDK-managed resources we do not author. The SF1/SF2/X-Ray entries are
+        # retained defensively to cover any helper state machine the framework may
+        # emit across CDK versions; they are harmless no-ops when none exists.
+        NagSuppressions.add_resource_suppressions(
+            self.helm_installer_provider,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "CDK custom-resource provider framework roles invoke the "
+                        "orchestrator Lambdas via the standard '<lambda-arn>:*' version "
+                        "qualifier, which cannot be enumerated at synth time."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-SF1",
+                    "reason": (
+                        "The waiter state machine is auto-generated by the CDK "
+                        "cr.Provider framework and does not expose log configuration; "
+                        "ALL-event logging cannot be enabled on it."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-SF2",
+                    "reason": (
+                        "The waiter state machine is auto-generated by the CDK "
+                        "cr.Provider framework and does not expose tracing "
+                        "configuration; X-Ray cannot be enabled on it."
+                    ),
+                },
+                {
+                    "id": "Serverless-StepFunctionStateMachineXray",
+                    "reason": (
+                        "The waiter state machine is auto-generated by the CDK "
+                        "cr.Provider framework and does not expose tracing "
+                        "configuration; X-Ray cannot be enabled on it."
+                    ),
                 },
             ],
             apply_to_children=True,

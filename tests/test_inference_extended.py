@@ -245,7 +245,7 @@ class TestHPACreation:
         spec = {
             "autoscaling": {
                 "enabled": True,
-                "metrics": [{"type": "gpu", "target": 50}],
+                "metrics": [{"type": "disk", "target": 50}],
             }
         }
         with patch(
@@ -381,11 +381,14 @@ class TestCreateDeployment:
         deployment = call_args[0][1]
         container = deployment.spec.template.spec.containers[0]
         assert container.env is not None
-        # 2 user env vars
-        assert len(container.env) == 2
+        # 2 user env vars + the injected PYTHONHASHSEED default
+        assert len(container.env) == 3
         env_names = {e.name for e in container.env}
         assert "MODEL" in env_names
         assert "MAX_LEN" in env_names
+        # PYTHONHASHSEED=0 is defaulted for deterministic prefix-cache hashing.
+        env_by_name = {e.name: e.value for e in container.env}
+        assert env_by_name["PYTHONHASHSEED"] == "0"
 
     def test_create_deployment_with_command_and_args(self):
         monitor = _make_monitor()
@@ -773,9 +776,15 @@ class TestDeleteResourcesExtended:
         monitor.core_v1.delete_namespaced_service.side_effect = ApiException(status=500)
         monitor.networking_v1.delete_namespaced_ingress.side_effect = ApiException(status=500)
 
-        with patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa:
+        with (
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa,
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom,
+        ):
             mock_hpa.return_value.delete_namespaced_horizontal_pod_autoscaler.side_effect = (
                 ApiException(status=500)
+            )
+            mock_custom.return_value.delete_namespaced_custom_object.side_effect = ApiException(
+                status=500
             )
             # Should not raise, just log errors
             monitor._delete_resources("ep", "ns")

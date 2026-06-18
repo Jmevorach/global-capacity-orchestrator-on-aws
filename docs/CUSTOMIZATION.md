@@ -402,7 +402,7 @@ spec:
 
 ### GPU Time-Slicing (Fractional GPUs)
 
-You can share a single GPU across multiple pods using NVIDIA time-slicing. The NVIDIA device plugin is already installed via the GPU Operator, but time-slicing is not enabled by default. To enable it, apply a ConfigMap that sets the number of replicas per physical GPU (e.g., `replicas: 4` makes one GPU appear as four schedulable units). The kube-scheduler can then place several lightweight workloads onto one GPU node. Note that Karpenter does not currently account for time-slicing replicas when provisioning nodes ([kubernetes-sigs/karpenter#2140](https://github.com/kubernetes-sigs/karpenter/issues/2140)), so it may over-provision initially.
+You can share a single GPU across multiple pods using NVIDIA time-slicing. The NVIDIA device plugin is already installed (as a standalone DaemonSet, with EKS Auto Mode providing the GPU drivers), but time-slicing is not enabled by default. To enable it, apply a ConfigMap that sets the number of replicas per physical GPU (e.g., `replicas: 4` makes one GPU appear as four schedulable units). The kube-scheduler can then place several lightweight workloads onto one GPU node. Note that Karpenter does not currently account for time-slicing replicas when provisioning nodes ([kubernetes-sigs/karpenter#2140](https://github.com/kubernetes-sigs/karpenter/issues/2140)), so it may over-provision initially.
 
 See `examples/gpu-timeslicing-job.yaml` for a complete example with setup instructions.
 
@@ -880,9 +880,6 @@ GCO installs scheduler and infrastructure Helm charts via the `helm` section in 
   "context": {
     "helm": {
       "keda": { "enabled": true },
-      "nvidia_gpu_operator": { "enabled": true },
-      "nvidia_dra_driver": { "enabled": true },
-      "nvidia_network_operator": { "enabled": true },
       "aws_efa_device_plugin": { "enabled": true },
       "aws_neuron_device_plugin": { "enabled": true },
       "volcano": { "enabled": true },
@@ -899,9 +896,6 @@ GCO installs scheduler and infrastructure Helm charts via the `helm` section in 
 | Chart | Default | Description |
 |-------|---------|-------------|
 | `keda` | Enabled | Event-driven autoscaling (SQS, Prometheus, etc.) |
-| `nvidia_gpu_operator` | Enabled | GPU driver and toolkit management |
-| `nvidia_dra_driver` | Enabled | Dynamic Resource Allocation for GPUs |
-| `nvidia_network_operator` | Enabled | RDMA and GPUDirect for distributed training |
 | `aws_efa_device_plugin` | Enabled | EFA device management for high-performance networking |
 | `aws_neuron_device_plugin` | Enabled | Trainium/Inferentia device management |
 | `volcano` | Enabled | Gang scheduling for distributed training |
@@ -913,7 +907,79 @@ GCO installs scheduler and infrastructure Helm charts via the `helm` section in 
 
 A useful subset of charts is enabled by default, but every cluster is different. Experiment to find which tools best suit your workloads and disable the ones you don't need — each enabled chart runs controller pods that consume CPU and memory on your system nodes. For example, if you don't use gang scheduling, disable Volcano. If you don't need event-driven autoscaling, disable KEDA. Fewer charts means less system overhead and faster deploys.
 
+> **⚠️ Helm charts install asynchronously — give them time to finish.**
+>
+> Chart installation is **deliberately decoupled from the CloudFormation deploy**. When `gco stacks deploy-all` reports the regional stack as `CREATE_COMPLETE`, that means the install has been *kicked off* — not that every chart is ready. The charts are then installed one at a time by a Step Functions state machine in the background, and full convergence can take **10–30+ minutes** depending on how many charts are enabled and how fast their images pull (some third-party images come from `docker.io` and can be slow, e.g. Volcano).
+>
+> This is intentional: a slow or failing chart must **never** roll back and destroy the freshly-created EKS cluster. Each chart installs independently — one slow or broken chart does not block the rest.
+>
+> Monitor convergence and inspect per-chart results at any time:
+>
+> ```bash
+> # Per-chart status (reads the status each chart task records in SSM)
+> gco stacks addons status -r <region>
+> gco stacks addons status --all-regions
+> ```
+>
+> If a chart shows as failed (for example, a transient image-pull timeout), re-converge the add-on layer without touching the cluster:
+>
+> ```bash
+> gco stacks addons install -r <region>
+> gco stacks addons install --all-regions
+> ```
+>
+> Workloads that depend on a specific scheduler/operator (Volcano, Kueue, KubeRay, etc.) should wait until that chart shows `installed` before they are submitted.
+
 See [Schedulers & Orchestrators](SCHEDULERS.md) for detailed guidance on each tool.
+
+### Get Volcano's docker.io images off the rate-limited path (ECR mirror)
+
+A few add-on charts pull their images directly from Docker Hub (`docker.io`) — most notably **Volcano** (`volcanosh/vc-*`). On a cold cluster those anonymous pulls are slow and subject to Docker Hub rate limits, which can make Volcano's install time out and retry. GCO can mirror those images into the project's **own ECR** (under the `gco/*` prefix) and point Volcano at the mirror, so the cluster makes fast, same-account ECR pulls with the pull-only node role it already has. This is **on by default** and needs **no Docker Hub credential** — it's a static mirror you refresh when the chart version changes.
+
+> **Why a mirror and not an ECR pull-through cache?** ECR pull-through cache for Docker Hub *requires* a stored Docker Hub credential (anonymous Docker Hub PTC isn't supported), and on EKS Auto Mode the pull-only, service-managed node role complicates cache-miss imports. Mirroring sidesteps both: no credential, and the images are plain `gco/*` ECR repos the nodes can already pull.
+
+When enabled, the regional stack injects one Volcano value override — `basic.image_registry` → `<account>.dkr.ecr.<region>.amazonaws.com/<ecr_namespace>` — so every Volcano image (controller, scheduler, admission webhook, and the pre-install admission-init hook, which all render from `basic.image_registry`) resolves from ECR. It creates **no** CloudFormation resources; the mirror is populated by `gco stacks deploy` (automatically, see below) or the `gco images mirror` CLI.
+
+**1. Default `cdk.json` config** (on by default; the default `ecr_namespace` of `gco/dockerhub` is fine). To disable, set `enabled` to `false`:
+
+```json
+{
+  "context": {
+    "volcano_image_mirror": {
+      "enabled": true,
+      "ecr_namespace": "gco/dockerhub"
+    }
+  }
+}
+```
+
+**2. Deploy.** `gco stacks deploy <stack>` / `deploy-all` **auto-mirrors** the images into ECR (per region) right before the regional stack's Helm install — so a fresh install just works, with no separate step. The copy is idempotent and skips images already present, so repeat deploys cost only a couple of ECR lookups. From a machine with a container runtime (Docker Buildx, Finch, or skopeo) and AWS credentials; the source pull from Docker Hub is anonymous and one-time.
+
+**3. Converge / check.** If Volcano had previously failed, re-converge without touching the cluster:
+
+```bash
+gco stacks addons install -r <region>
+gco stacks addons status -r <region>
+```
+
+**Mirror manually (optional).** To pre-seed a region before enabling, or to re-mirror after a version bump, run the CLI directly:
+
+```bash
+gco images mirror --region us-east-1
+gco images mirror --region us-east-1 --dry-run   # preview only
+```
+
+It reads the image set and pinned tag from `lambda/helm-installer/charts.yaml`, creates the `gco/<...>` ECR repositories if needed, and copies each image preserving the **full multi-arch manifest list** (via `docker buildx imagetools create`, Finch `--all-platforms`, or `skopeo copy --all`, whichever the runtime supports) — so both amd64 and arm64 (Graviton) nodes find a matching image. A plain `docker pull`/`push` would drop every architecture except the build host's, so it is never used.
+
+Notes:
+
+- `ecr_namespace` must start with `gco/` so it inherits the project's `gco/*` node-pull access, ECR replication, and trusted-registry allow-list. The toggle is validated at synth time — an `ecr_namespace` outside `gco/` or an invalid ECR path fails fast.
+- If an enabled mirror can't complete during deploy (no container runtime, network, credentials), the deploy aborts **before** CloudFormation rather than bringing up a cluster whose Volcano images aren't in ECR.
+- It's a **static** mirror: when you bump the Volcano chart `version`/`image_tag_version` in `charts.yaml`, the next `gco stacks deploy` re-mirrors the new tag (or run `gco images mirror` to do it out-of-band).
+- This only changes where images are *pulled from* — Volcano's behavior and versions are unchanged.
+- The mirror is a **general** tool — to mirror another chart's docker.io-only image down the road, see "HOW TO ADD AN IMAGE TO THE MIRROR" in `cli/_image_mirror.py`.
+
+For the full reference — architecture, the multi-arch copy strategy, the MCP tools (`images_mirror_plan` / `images_mirror_status` / `images_mirror`), troubleshooting, and how to add another chart's image — see [Image Mirror](IMAGE_MIRROR.md).
 
 ## Enabling Additional Features
 
@@ -1424,7 +1490,7 @@ gco stacks deploy-all -y
 
 ## EFA (Elastic Fabric Adapter) Configuration
 
-EFA enables high-performance inter-node communication for distributed training and high-performance LLM inference. GCO installs the EFA device plugin and NVIDIA Network Operator by default, and creates an EFA-optimized nodepool for instances like `p4d.24xlarge`, `p5.48xlarge`, and `p6` (B200/B300).
+EFA enables high-performance inter-node communication for distributed training and high-performance LLM inference. GCO installs the EFA device plugin by default, and creates an EFA-optimized nodepool for instances like `p4d.24xlarge`, `p5.48xlarge`, and `p6` (B200/B300). On EKS Auto Mode the GPU AMI already ships the EFA and NVIDIA kernel drivers, so no separate networking operator is required.
 
 ### Disable EFA
 
@@ -1434,7 +1500,6 @@ EFA is enabled by default. To disable it, edit the `helm` section in `cdk.json`:
 {
   "context": {
     "helm": {
-      "nvidia_network_operator": { "enabled": false },
       "aws_efa_device_plugin": { "enabled": false }
     }
   }
@@ -1449,7 +1514,6 @@ gco stacks deploy-all -y
 
 When enabled, this provides:
 
-- NVIDIA Network Operator (RDMA, GPUDirect)
 - AWS EFA Kubernetes Device Plugin (advertises `vpc.amazonaws.com/efa` resources)
 - EFA-optimized nodepool (`gpu-efa-pool`) for p4d/p5 instances
 

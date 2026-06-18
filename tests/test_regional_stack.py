@@ -1975,7 +1975,7 @@ class TestClusterSharedBucketRegionalIntegration:
 
     1. Populate the three ``{{CLUSTER_SHARED_BUCKET}}``,
        ``{{CLUSTER_SHARED_BUCKET_ARN}}``, and ``{{CLUSTER_SHARED_BUCKET_REGION}}``
-       keys in the ``KubectlApplyManifests`` CustomResource's
+       keys in the ``HelmInstallCharts`` convergence-trigger CustomResource's
        ``ImageReplacements`` property with non-empty values (tokens or strings).
     2. Attach two IAM policy statements to ``service_account_role`` — an
        S3 RW grant scoped to the cluster-shared bucket ARN (resolved via
@@ -1986,7 +1986,7 @@ class TestClusterSharedBucketRegionalIntegration:
        ``analytics_environment.enabled=true`` and ``=false`` cases —
        the regional stack does not read the analytics toggle, so flipping
        it MUST NOT produce any diff in the regional template's
-       ``KubectlApplyManifests`` or ``AWS::IAM::Policy`` resources. Any
+       ``HelmInstallCharts`` or ``AWS::IAM::Policy`` resources. Any
        delta lives in ``gco-analytics``, not the regional stack.
     """
 
@@ -2042,25 +2042,24 @@ class TestClusterSharedBucketRegionalIntegration:
 
     @staticmethod
     def _kubectl_apply_properties(template: assertions.Template) -> dict:
-        """Return the ``ImageReplacements`` property of the
-        ``KubectlApplyManifests`` custom resource.
+        """Return the properties of the ``HelmInstallCharts`` convergence-trigger
+        custom resource.
 
-        The custom resource is synthesized as
-        ``AWS::CloudFormation::CustomResource`` with logical id
-        ``KubectlApplyManifests``. There is a second, sibling custom
-        resource ``KubectlApplyPostHelmManifests`` that re-applies after
-        helm finishes — we assert on the primary one here; the
-        always-present ConfigMap property test covers the post-helm
-        sibling separately via Hypothesis.
+        The manifest ``ImageReplacements`` now live on the single fire-and-forget
+        trigger CustomResource (logical id ``HelmInstallCharts``, type
+        ``AWS::CloudFormation::CustomResource``) that starts the convergence
+        state machine. The base and post-Helm kubectl passes run as tasks inside
+        that state machine rather than as their own custom resources, so there is
+        no longer a ``KubectlApplyManifests`` resource in the template.
         """
         resources = template.to_json().get("Resources", {})
-        primary = resources.get("KubectlApplyManifests")
-        assert primary is not None, (
-            "KubectlApplyManifests CustomResource must be present in the "
+        trigger = resources.get("HelmInstallCharts")
+        assert trigger is not None, (
+            "HelmInstallCharts CustomResource must be present in the "
             "synthesized template. Available logical ids: "
-            f"{sorted(k for k in resources if 'KubectlApply' in k)}"
+            f"{sorted(k for k in resources if 'Helm' in k or 'Kubectl' in k)}"
         )
-        properties: dict = primary.get("Properties", {})
+        properties: dict = trigger.get("Properties", {})
         return properties
 
     def test_configmap_replacements_present_when_analytics_disabled(self):
@@ -2240,7 +2239,7 @@ class TestClusterSharedBucketRegionalIntegration:
 
     def test_regional_template_shape_identical_across_analytics_toggle(self):
         """The ``analytics_environment.enabled`` toggle MUST NOT change
-        the regional stack's ``KubectlApplyManifests`` or
+        the regional stack's ``HelmInstallCharts`` or
         ``AWS::IAM::Policy`` resources beyond synthesis-only artifacts
         (stack-name-embedded logical ids, synth-time deployment
         timestamp).
@@ -2261,16 +2260,19 @@ class TestClusterSharedBucketRegionalIntegration:
         resources_off = template_off.to_json().get("Resources", {})
         resources_on = template_on.to_json().get("Resources", {})
 
-        # Compare KubectlApplyManifests + KubectlApplyPostHelmManifests (both
-        # carry ImageReplacements) and every AWS::IAM::Policy resource. The
-        # logical ids are deterministic because the construct tree is the
-        # same in both synths, so a direct key-by-key dict comparison works.
-        kubectl_logical_ids = sorted(lid for lid in resources_off if "KubectlApply" in lid)
-        assert kubectl_logical_ids, (
-            "Expected at least one KubectlApply* CustomResource in the regional template."
+        # The convergence-trigger CustomResource ("HelmInstallCharts") carries
+        # the manifest ImageReplacements; compare it across the analytics toggle.
+        # The base/post-Helm kubectl passes now run inside the state machine, so
+        # there are no longer KubectlApply* custom resources to compare. The
+        # logical id is deterministic because the construct tree is the same in
+        # both synths, so a direct key-by-key dict comparison works.
+        trigger_logical_ids = sorted(lid for lid in resources_off if lid == "HelmInstallCharts")
+        assert trigger_logical_ids, (
+            "Expected the HelmInstallCharts convergence-trigger CustomResource "
+            "in the regional template."
         )
 
-        for lid in kubectl_logical_ids:
+        for lid in trigger_logical_ids:
             off_json = self._canonicalize_resource(resources_off[lid], off_prefix, on_prefix)
             on_json = self._canonicalize_resource(resources_on.get(lid, {}), off_prefix, on_prefix)
             assert off_json == on_json, (
@@ -2295,3 +2297,102 @@ class TestClusterSharedBucketRegionalIntegration:
                 f"stack's IAM grants are always-on and must be independent "
                 f"of the analytics toggle."
             )
+
+
+class TestRegionalStackVolcanoImageMirror:
+    """The optional Volcano image mirror (cdk.json ``volcano_image_mirror``).
+
+    Verifies the feature is off by default (no override, and — regression —
+    no pull-through-cache/registry-policy resources), that enabling it injects
+    the Volcano ``basic.image_registry`` override pointing at the gco/* ECR
+    mirror, and that a misconfigured ``ecr_namespace`` fails fast at synth.
+    """
+
+    @staticmethod
+    def _build(app):
+        """Synthesize the regional stack under the given app (carrying context)."""
+        from gco.stacks.regional_stack import GCORegionalStack
+
+        config = MockConfigLoader(app)
+        with (
+            patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
+            patch.object(
+                GCORegionalStack,
+                "_create_helm_installer_lambda",
+                TestRegionalStackSynthesis._mock_helm_installer,
+            ),
+        ):
+            mock_image = MagicMock()
+            mock_image.image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
+            mock_docker.return_value = mock_image
+            stack = GCORegionalStack(
+                app,
+                "test-regional-mirror",
+                config=config,
+                region="us-east-1",
+                auth_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:test-secret",  # nosec B106 - test fixture ARN, fake account, not a real secret
+                env=cdk.Environment(account="123456789012", region="us-east-1"),
+            )
+        return stack
+
+    def _enabled_app(self, **overrides):
+        mirror = {"enabled": True, "ecr_namespace": "gco/dockerhub"}
+        mirror.update(overrides)
+        return cdk.App(context={"volcano_image_mirror": mirror})
+
+    def test_disabled_by_default_no_override_no_cache_resources(self):
+        """No context -> no registry override, and (regression) no PTC resources."""
+        stack = self._build(cdk.App())
+        assert stack.volcano_mirror_registry is None
+        assert stack._helm_chart_value_overrides() == {}
+        template = assertions.Template.from_stack(stack)
+        # The mirror approach creates no pull-through cache / registry policy.
+        template.resource_count_is("AWS::ECR::PullThroughCacheRule", 0)
+        template.resource_count_is("AWS::ECR::RegistryPolicy", 0)
+
+    def test_enabled_sets_mirror_registry(self):
+        stack = self._build(self._enabled_app())
+        assert (
+            stack.volcano_mirror_registry
+            == "123456789012.dkr.ecr.us-east-1.amazonaws.com/gco/dockerhub"
+        )
+        # Still creates no pull-through cache / registry policy resources.
+        template = assertions.Template.from_stack(stack)
+        template.resource_count_is("AWS::ECR::PullThroughCacheRule", 0)
+        template.resource_count_is("AWS::ECR::RegistryPolicy", 0)
+
+    def test_enabled_redirects_volcano_image_registry(self):
+        """The HelmInstallCharts custom resource carries the Volcano override."""
+        template = assertions.Template.from_stack(self._build(self._enabled_app()))
+        template.has_resource_properties(
+            "AWS::CloudFormation::CustomResource",
+            {
+                "Charts": {
+                    "volcano": {
+                        "values": {
+                            "basic": {
+                                "image_registry": (
+                                    "123456789012.dkr.ecr.us-east-1.amazonaws.com/gco/dockerhub"
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+    def test_custom_namespace_is_honored(self):
+        stack = self._build(self._enabled_app(ecr_namespace="gco/mirror"))
+        assert stack.volcano_mirror_registry == (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/gco/mirror"
+        )
+
+    def test_namespace_outside_gco_prefix_raises(self):
+        app = self._enabled_app(ecr_namespace="dockerhub")
+        with pytest.raises(ValueError, match="gco/"):
+            self._build(app)
+
+    def test_invalid_namespace_path_raises(self):
+        app = self._enabled_app(ecr_namespace="gco/Bad_Seg!")
+        with pytest.raises(ValueError, match="ecr_namespace"):
+            self._build(app)

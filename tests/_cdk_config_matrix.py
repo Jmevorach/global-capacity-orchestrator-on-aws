@@ -273,7 +273,6 @@ CONFIGS.extend(
                     "keda": {"enabled": False},
                     "volcano": {"enabled": False},
                     "kuberay": {"enabled": False},
-                    "nvidia_network_operator": {"enabled": False},
                     "aws_efa_device_plugin": {"enabled": False},
                 }
             },
@@ -287,7 +286,6 @@ CONFIGS.extend(
                     "kuberay": {"enabled": False},
                     "kueue": {"enabled": False},
                     "cert_manager": {"enabled": False},
-                    "nvidia_network_operator": {"enabled": False},
                     "aws_efa_device_plugin": {"enabled": False},
                     "aws_neuron_device_plugin": {"enabled": False},
                 }
@@ -393,6 +391,22 @@ CONFIGS.extend(
     ]
 )
 
+# Volcano image mirror (gco/stacks/regional_stack.py
+# _configure_volcano_image_mirror). Enabling it injects the Volcano
+# basic.image_registry override into the HelmInstallCharts custom resource and
+# creates no new resources, so the nag matrix exercises that synth path.
+CONFIGS.append(
+    (
+        "volcano-mirror-enabled",
+        {
+            "volcano_image_mirror": {
+                "enabled": True,
+                "ecr_namespace": "gco/dockerhub",
+            }
+        },
+    )
+)
+
 
 # ---------------------------------------------------------------------------
 # NAG_CONFIGS — subset of CONFIGS used by tests/test_nag_compliance.py
@@ -427,6 +441,9 @@ _NAG_CONFIG_NAMES = {
     "all-features-enabled",
     "three-regions",
     "aurora-pgvector-enabled",
+    # Exercises the Volcano image-mirror registry override (no new resources,
+    # just the basic.image_registry override on the HelmInstallCharts CR).
+    "volcano-mirror-enabled",
     "analytics-enabled",
     # ``analytics-enabled-hyperpod-canvas`` exercises *both* analytics
     # sub-toggles in a single synth — it subsumes the coverage that

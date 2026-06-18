@@ -9,6 +9,7 @@ Deploy and manage multi-region GPU inference endpoints with GCO (Global Capacity
 - [Model Weight Management](#model-weight-management)
 - [Deploying Inference Endpoints](#deploying-inference-endpoints)
 - [Supported Frameworks](#supported-frameworks)
+- [Disaggregated Inference (Mooncake)](#disaggregated-inference-mooncake)
 - [Managing Endpoints](#managing-endpoints)
 - [Invoking Endpoints](#invoking-endpoints)
 - [Multi-Region Deployment](#multi-region-deployment)
@@ -261,6 +262,81 @@ gco inference deploy torchserve-resnet \
   --model-source s3://your-bucket/models/torchserve-mar
 ```
 
+## Disaggregated Inference (Mooncake)
+
+GCO supports Mooncake disaggregated serving, which splits inference into separate prefill and decode roles. This architecture enables independent scaling of compute-bound prefill and memory-bound decode workloads — prefill nodes can saturate GPU compute filling the KV cache while decode nodes stream tokens at lower utilization.
+
+### Deploy a Disaggregated Endpoint
+
+```bash
+gco inference deploy my-llm \
+  --mooncake-mode disaggregated \
+  --gpu-count 1 \
+  --prefill-replicas 2 \
+  --decode-replicas 4 \
+  -e MODEL=meta-llama/Llama-3.1-8B-Instruct
+```
+
+When `--mooncake-mode disaggregated` is set:
+
+- The inference monitor creates separate Deployments for each role: `{name}-prefill` and `{name}-decode`
+- A shared Mooncake transfer engine enables zero-copy KV cache transfer between roles via RDMA/TCP
+- The `--image` flag is optional; when omitted, the upstream `vllm/vllm-openai` image (which bundles the Mooncake transfer engine) is used by default
+- `--prefill-replicas` and `--decode-replicas` set the initial replica count for each role (both default to 1)
+
+### Per-Role Autoscaling
+
+Each role can autoscale independently based on its own metrics:
+
+```bash
+gco inference deploy my-llm \
+  --mooncake-mode disaggregated \
+  --gpu-count 1 \
+  --prefill-replicas 2 --decode-replicas 4 \
+  --mooncake-autoscale prefill:1:8:gpu:70 \
+  --mooncake-autoscale decode:2:16:cpu:60:gpu:50
+```
+
+The `--mooncake-autoscale` format is `ROLE:MIN:MAX[:METRIC:TARGET...]`:
+
+- `ROLE` — `prefill` or `decode`
+- `MIN:MAX` — replica bounds for that role
+- `METRIC:TARGET` pairs (optional, repeatable) — scaling signals (`cpu`, `memory`, `gpu`, `gpu_memory`)
+
+Each role gets its own KEDA ScaledObject (for GPU metrics) or HPA (for CPU/memory only), targeting just that role's Deployment.
+
+### Resize Topology
+
+Change the prefill/decode replica counts on a running disaggregated endpoint:
+
+```bash
+gco inference set-topology my-llm --prefill 3 --decode 6
+```
+
+### Mooncake Modes
+
+| Mode | Description |
+|------|-------------|
+| `disaggregated` | Separate prefill and decode Deployments with KV cache transfer |
+| `store` | Shared Mooncake KV-cache store (etcd-backed, cluster-wide) |
+| `both` | Disaggregated roles plus the shared store |
+
+### Architecture
+
+```text
+                 ┌──────────────────────────────────────┐
+                 │        Mooncake Transfer Engine      │
+                 │   (zero-copy KV cache via RDMA/TCP)  │
+                 └────────────┬─────────────┬───────────┘
+                              │             │
+              ┌───────────────▼──┐    ┌─────▼──────────────┐
+              │  Prefill Pods    │    │   Decode Pods      │
+              │  (compute-bound) │    │   (memory-bound)   │
+              │  {name}-prefill  │    │   {name}-decode    │
+              │  GPU-saturated   │    │   Streaming tokens │
+              └──────────────────┘    └────────────────────┘
+```
+
 ## Managing Endpoints
 
 ### List Endpoints
@@ -285,7 +361,7 @@ gco inference scale my-llm --replicas 4
 
 ### Autoscaling (HPA)
 
-Inference endpoints support Horizontal Pod Autoscaler (HPA) for automatic scaling based on resource utilization. When autoscaling is enabled, the inference_monitor creates a Kubernetes HPA alongside the Deployment.
+Inference endpoints support automatic scaling based on resource utilization. When autoscaling is enabled, the inference_monitor creates a Kubernetes Horizontal Pod Autoscaler (HPA) alongside the Deployment. GPU-based scaling is handled through KEDA instead (see below), since GPU utilization is not a native HPA resource metric.
 
 ```bash
 # Deploy with autoscaling enabled
@@ -294,18 +370,29 @@ gco inference deploy my-llm \
   --replicas 2 --gpu-count 1 \
   --min-replicas 1 --max-replicas 8 \
   --autoscale-metric cpu:70 --autoscale-metric memory:80
+
+# Scale on GPU utilization (routed through KEDA + CloudWatch)
+gco inference deploy my-llm \
+  -i vllm/vllm-openai:v0.22.0 \
+  --replicas 2 --gpu-count 1 \
+  --min-replicas 1 --max-replicas 8 \
+  --autoscale-metric gpu:60
 ```
 
 **Supported metrics:**
 
-| Metric | Description | Example |
-|--------|-------------|---------|
-| `cpu` | CPU utilization percentage | `cpu:70` (scale at 70% CPU) |
-| `memory` | Memory utilization percentage | `memory:80` (scale at 80% memory) |
+| Metric | Description | Example | Backend |
+|--------|-------------|---------|---------|
+| `cpu` | CPU utilization percentage | `cpu:70` (scale at 70% CPU) | Native HPA |
+| `memory` | Memory utilization percentage | `memory:80` (scale at 80% memory) | Native HPA |
+| `gpu` | GPU utilization percentage | `gpu:60` (scale at 60% GPU) | KEDA + CloudWatch |
+| `gpu_memory` | GPU memory utilization percentage | `gpu_memory:80` | KEDA + CloudWatch |
 
 The `--autoscale-metric` flag is repeatable — you can combine multiple metrics. The format is `type:target` where `target` is the utilization percentage threshold. If no target is specified, it defaults to 70%.
 
 The HPA respects `--min-replicas` (default: 1) and `--max-replicas` (default: 10) bounds. The `--replicas` flag sets the initial replica count before the HPA takes over.
+
+**GPU autoscaling.** GPU utilization cannot be read by a native HPA (Kubernetes Resource metrics are limited to CPU and memory). When any `--autoscale-metric gpu:...` (or `gpu_memory:...`) is requested, the endpoint is materialized as a KEDA `ScaledObject` with an `aws-cloudwatch` trigger that reads the `ContainerInsights` per-pod GPU metric (`pod_gpu_utilization` / `pod_gpu_memory_utilization`) for the Deployment. CPU/memory targets supplied alongside a GPU metric ride on the same `ScaledObject` as native KEDA triggers. KEDA is a mandatory cluster component, and the KEDA operator's IAM role is granted read-only CloudWatch access (`GetMetricData`, `GetMetricStatistics`, `ListMetrics`) for this purpose.
 
 ### Update Image (Rolling Update)
 

@@ -202,7 +202,7 @@ Uses Elastic Fabric Adapter (EFA) for high-bandwidth inter-node communication â€
 gco jobs submit-direct examples/efa-distributed-training.yaml -r us-east-1
 ```
 
-**Requirements:** EFA-capable instances (p4d.24xlarge, p5.48xlarge, p5e.48xlarge, p6-b200.48xlarge, p6-b300.48xlarge, p6e-gb200.*, trn1.32xlarge, trn2.48xlarge). EFA is enabled by default via the NVIDIA Network Operator Helm chart.
+**Requirements:** EFA-capable instances (p4d.24xlarge, p5.48xlarge, p5e.48xlarge, p6-b200.48xlarge, p6-b300.48xlarge, p6e-gb200.*, trn1.32xlarge, trn2.48xlarge). EFA is enabled by default via the AWS EFA Kubernetes device plugin.
 
 **When to use:** Large-scale distributed training requiring high inter-node bandwidth, NCCL-based multi-node GPU communication.
 
@@ -527,7 +527,7 @@ kubectl get pods -n gco-jobs -l job-name=pytorch-ddp-training
 kubectl logs -f job/pytorch-ddp-training -n gco-jobs
 ```
 
-**Requirements:** GPU nodes available, NVIDIA GPU Operator (enabled by default).
+**Requirements:** GPU nodes available, NVIDIA device plugin (installed by default).
 
 **When to use:** Multi-node distributed training, PyTorch DDP workloads, scaling training across GPUs.
 
