@@ -6,4 +6,4 @@ can read it without importing Python. ``__version__`` below mirrors that
 file; ``scripts/bump_version.py`` keeps the two in sync.
 """
 
-__version__ = "2.4.0"
+__version__ = "3.0.0"
