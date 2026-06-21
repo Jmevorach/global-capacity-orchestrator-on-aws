@@ -28,8 +28,10 @@ import json
 import logging
 import os
 import re
+import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from kubernetes import client, config
@@ -107,6 +109,17 @@ _WORKER_ROLES_BY_MODE = {
 EFA_RESOURCE_NAME = "vpc.amazonaws.com/efa"
 EFA_NODE_SELECTOR_KEY = "efa"
 EFA_NODE_SELECTOR_VALUE = "true"
+
+# Mooncake KV-transfer role pods are pinned to a dedicated EFA NodePool
+# (mooncake-efa-pool, manifest 46-nodepool-mooncake-efa.yaml) that only offers
+# instance families with >=80GB of GPU memory and FP8-capable Hopper/Blackwell
+# GPUs. The shared training EFA pool (43-nodepool-efa.yaml) also offers p4d
+# (A100 40GB, Ampere, no FP8), which is too small for many disaggregated/store
+# models and can be selected by Karpenter whenever a pod asks only for efa=true.
+# Selecting this extra label keeps role pods off p4d without disturbing the
+# training pool. The value must match the label on the dedicated NodePool.
+MOONCAKE_EFA_NODE_SELECTOR_KEY = "mooncake-efa"
+MOONCAKE_EFA_NODE_SELECTOR_VALUE = "true"
 
 # The shared per-region Mooncake master exposes its RPC service and the
 # built-in HTTP metadata server on these fixed ports.
@@ -192,7 +205,9 @@ MOONCAKE_MASTER_IMAGE_ENV = "MOONCAKE_MASTER_IMAGE"
 MOONCAKE_MASTER_READY_TIMEOUT_SECONDS = 600
 
 # Object-key prefix under which cold-tier KV objects are written in the
-# general-purpose regional bucket.
+# general-purpose regional bucket. Mirrors the value the regional stack and the
+# `gco inference populate-kv` upload surface use; kept local so the monitor
+# needs no infrastructure (CDK) imports at runtime.
 MOONCAKE_COLD_TIER_KEY_PREFIX = "mooncake-kv"
 
 # SSM namespace publishing the always-on general-purpose regional bucket's
@@ -278,6 +293,18 @@ PD_PROXY_ADMIN_PATH = "/instances/add"
 # endpoint spec or passed as a command-line argument.
 PD_PROXY_ADMIN_API_KEY_ENV = "ADMIN_API_KEY"
 ADMIN_API_KEY_SECRET_DATA_KEY = "ADMIN_API_KEY"
+
+# The proxy program (gco/services/mooncake_pd_proxy.py) is shipped to the proxy
+# pod as a ConfigMap and run from this mount path. The prefill/decode backend
+# URLs and the listen port are passed to it through these env vars; it routes to
+# the role pods through their in-cluster Services so kube-proxy load-balances
+# across only the Ready endpoints of each role.
+PD_PROXY_SCRIPT_FILENAME = "mooncake_pd_proxy.py"
+PD_PROXY_CONFIG_MOUNT_DIR = "/etc/pd-proxy"
+PD_PROXY_SCRIPT_PATH = f"{PD_PROXY_CONFIG_MOUNT_DIR}/{PD_PROXY_SCRIPT_FILENAME}"
+PD_PROXY_PORT_ENV = "PD_PROXY_PORT"
+PD_PROXY_PREFILL_URL_ENV = "PD_PROXY_PREFILL_URL"
+PD_PROXY_DECODE_URL_ENV = "PD_PROXY_DECODE_URL"
 
 
 @dataclass
@@ -503,7 +530,13 @@ def render_mooncake_config(
     }
     if store.get("enabled"):
         cfg["master_server_address"] = region_services["master_server_address"]
-        cfg["global_segment_size"] = store.get("global_segment_size", "0")
+        # The store runs embedded in each vLLM pod (every rank contributes
+        # `global_segment_size` to the shared pool; GCO's per-region
+        # mooncake-master is only the metadata/master coordinator, not a
+        # standalone store that owns the pool). Embedded mode rejects a zero
+        # segment, so default to 4 GiB (the upstream default) when the spec
+        # does not set one; an operator can tune it via configure-store.
+        cfg["global_segment_size"] = store.get("global_segment_size", "4294967296")
         cfg["local_buffer_size"] = store.get("local_buffer_size", "2147483648")
         # Only the boolean True enables the cold tier; any other value leaves it
         # off. The URI is resolved by the caller for the monitor's own region —
@@ -524,11 +557,18 @@ def apply_efa_scheduling(mooncake: dict[str, Any], pod_spec: client.V1PodSpec) -
 
     - add a ``vpc.amazonaws.com/efa`` toleration (in addition to any existing
       tolerations such as the GPU one),
-    - add an ``efa=true`` node selector (merged with any existing selectors),
-      and
+    - add an ``efa=true`` node selector plus a ``mooncake-efa=true`` node
+      selector (merged with any existing selectors), and
     - request at least one ``vpc.amazonaws.com/efa`` device on the pod's
       containers, leaving every existing resource request and limit — including
       GPU asks — untouched.
+
+    The ``mooncake-efa=true`` selector pins the pod to the dedicated
+    ``mooncake-efa-pool`` NodePool, which only offers instance families with
+    >=80GB of GPU memory and FP8-capable Hopper/Blackwell GPUs. This keeps role
+    pods off the A100-40GB ``p4d`` family that the shared training EFA pool
+    still offers — that family OOMs on many models and cannot run FP8 KV-cache
+    configs, so Karpenter selecting it for a mooncake pod is a latent failure.
 
     When the transfer protocol is explicitly set to anything other than
     ``rdma`` (for example ``tcp``) the pod is left exactly as it was: no
@@ -562,9 +602,13 @@ def apply_efa_scheduling(mooncake: dict[str, Any], pod_spec: client.V1PodSpec) -
         )
     pod_spec.tolerations = tolerations
 
-    # Merge the EFA node selector with any selectors already in place.
+    # Merge the EFA node selectors with any selectors already in place. The
+    # generic efa=true selector lands the pod on EFA fabric; mooncake-efa=true
+    # narrows that to the dedicated mooncake-efa-pool, which excludes the
+    # A100-40GB p4d family that the shared training EFA pool still offers.
     node_selector = dict(pod_spec.node_selector or {})
     node_selector[EFA_NODE_SELECTOR_KEY] = EFA_NODE_SELECTOR_VALUE
+    node_selector[MOONCAKE_EFA_NODE_SELECTOR_KEY] = MOONCAKE_EFA_NODE_SELECTOR_VALUE
     pod_spec.node_selector = node_selector
 
     # Request at least one EFA device, preserving existing requests and limits
@@ -1329,6 +1373,13 @@ class InferenceMonitor:
         # Step 7: front-end. Disaggregated and both run behind the proxy; store
         # exposes its single Deployment directly.
         if mode in ("disaggregated", "both"):
+            # Per-role Services so the proxy can address prefill and decode by
+            # stable in-cluster DNS. Routing through a Service means kube-proxy
+            # load-balances across only the Ready pods of each role, which is
+            # what gives the proxy ready-only decode routing for free.
+            role_port = spec.get("port", 8000)
+            for role in desired_roles:
+                self._create_role_service(name, ns, role, role_port)
             try:
                 self._create_pd_proxy(name, ns, spec, endpoint)
             except AdminApiKeySecretError as e:
@@ -1500,17 +1551,13 @@ class InferenceMonitor:
 
         master_address = os.environ.get(MOONCAKE_MASTER_ADDRESS_ENV, "").strip()
 
-        # The store needs an own-region master. Without one, leave the endpoint
-        # untouched and surface the unresolved-master condition.
+        # The store needs an own-region master. It is a fixed in-cluster Service
+        # the monitor itself provisions per region (mooncake-master:50051), so
+        # when no override is set in the environment, default to that Service
+        # rather than deferring — the address is known by construction. An
+        # operator may still override it via MOONCAKE_MASTER_ADDRESS.
         if store_enabled and not master_address:
-            return RegionServicesResolution(
-                render_skipped=True,
-                store_master_unresolved=True,
-                error=(
-                    "shared store master address is not configured for region "
-                    f"{self.region}; deferring store configuration"
-                ),
-            )
+            master_address = f"{MOONCAKE_MASTER_SERVICE}:{MOONCAKE_MASTER_RPC_PORT}"
 
         region_services: dict[str, Any] = {
             "metadata_server": self._metadata_server_url(master_address),
@@ -2571,6 +2618,89 @@ class InferenceMonitor:
             # A value that cannot be decoded is unusable as an admin key.
             return False
 
+    def _ensure_admin_api_key_secret(self, name: str, proxy: dict[str, Any], ns: str) -> str:
+        """Return the proxy admin-key Secret name, provisioning one if needed.
+
+        The prefill-decode proxy guards a privileged admin path and must never
+        run without a usable ``ADMIN_API_KEY``. Two paths satisfy that:
+
+        - **Bring-your-own**: when the proxy block names a Secret, that Secret
+          must already exist and carry a non-empty ``ADMIN_API_KEY``; otherwise
+          the deployment is rejected, so a typo or a missing pre-created Secret
+          fails fast. The named Secret is only read, never created or mutated.
+        - **Auto-managed**: when the proxy names no Secret, a per-endpoint
+          ``{name}-admin`` Secret is provisioned create-if-absent with a
+          generated key, so a split deploy needs no manual Secret. The generated
+          key only ever lives in the cluster — it is never written to the
+          endpoint spec, a command argument, or a log line.
+
+        Args:
+            name: The endpoint name, used to derive the auto-managed Secret name.
+            proxy: The ``spec["mooncake"]["proxy"]`` block.
+            ns: The namespace the Secret lives in.
+
+        Returns:
+            The Secret name to reference from the proxy container.
+
+        Raises:
+            AdminApiKeySecretError: Only on the bring-your-own path, when the
+                named Secret is absent or its ``ADMIN_API_KEY`` is empty. The
+                auto-managed path never raises this.
+        """
+        named = proxy.get("admin_api_key_secret")
+        if isinstance(named, str) and named:
+            return self._verify_admin_api_key_secret(proxy, ns)
+        return self._provision_admin_api_key_secret(f"{name}-admin", ns)
+
+    def _provision_admin_api_key_secret(self, secret_name: str, ns: str) -> str:
+        """Create the auto-managed proxy admin-key Secret if absent.
+
+        Uses create-if-absent semantics so the key stays stable across reconcile
+        passes: an existing Secret (the steady state, or one a prior pass
+        created) is left untouched, and a concurrent create (409) is treated as
+        success. A freshly created Secret carries a cryptographically strong
+        64-character hex ``ADMIN_API_KEY`` from :func:`secrets.token_hex`, which
+        reaches the proxy only through a Secret reference — the value is never
+        logged or written to the spec.
+
+        Args:
+            secret_name: The Secret to ensure exists (``{endpoint}-admin``).
+            ns: The namespace to create it in.
+
+        Returns:
+            The Secret name, ready for a Secret reference.
+        """
+        try:
+            self.core_v1.read_namespaced_secret(secret_name, ns, _request_timeout=self._k8s_timeout)
+            # Already present: keep the existing key so proxy pods need no churn.
+            return secret_name
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        secret = client.V1Secret(
+            metadata=client.V1ObjectMeta(
+                name=secret_name,
+                namespace=ns,
+                labels={"app": secret_name, "project": "gco", "gco.io/type": "inference"},
+            ),
+            string_data={ADMIN_API_KEY_SECRET_DATA_KEY: secrets.token_hex(32)},
+            type="Opaque",
+        )
+        # The two logger.info calls below carry a bare `# nosemgrep`: the
+        # logger-credential-disclosure rule matches the literal word "Secret" in
+        # the message, but only the Secret's name and namespace (%s/%s) are
+        # logged here — never the generated key value set above in string_data.
+        try:
+            self.core_v1.create_namespaced_secret(ns, secret, _request_timeout=self._k8s_timeout)
+            logger.info("Provisioned proxy admin-key Secret %s/%s", ns, secret_name)  # nosemgrep
+        except ApiException as e:
+            if e.status == 409:
+                logger.info("Proxy admin-key Secret %s/%s exists", ns, secret_name)  # nosemgrep
+            else:
+                raise
+        return secret_name
+
     def _create_pd_proxy(
         self, name: str, ns: str, spec: dict[str, Any], endpoint: dict[str, Any]
     ) -> None:
@@ -2619,9 +2749,12 @@ class InferenceMonitor:
         proxy_name = f"{name}-proxy"
 
         # The proxy fronts a privileged admin path, so it never starts without a
-        # usable admin key. This rejects the deployment before any proxy
-        # resource is created when the backing Secret is missing or empty.
-        admin_secret_name = self._verify_admin_api_key_secret(proxy, ns)
+        # usable admin key. When the spec names a Secret it must already exist
+        # and be non-empty (the deployment is rejected otherwise); when it names
+        # none, a per-endpoint admin-key Secret is auto-provisioned with a
+        # generated key. Either way the key reaches the container only by Secret
+        # reference.
+        admin_secret_name = self._ensure_admin_api_key_secret(name, proxy, ns)
 
         proxy_env = build_pd_proxy_config(mooncake)
         container_env = [client.V1EnvVar(name=k, value=v) for k, v in proxy_env.items()]
@@ -2651,15 +2784,41 @@ class InferenceMonitor:
             "gco.io/role": PD_PROXY_ROLE_LABEL,
         }
 
+        # The proxy reaches prefill and decode through their per-role Services
+        # and listens on PD_PROXY_PORT for the public serving paths. Routing via
+        # the Services means only Ready role pods receive traffic.
+        port = spec.get("port", 8000)
+        container_env.extend(
+            [
+                client.V1EnvVar(name=PD_PROXY_PORT_ENV, value=str(PD_PROXY_PORT)),
+                client.V1EnvVar(
+                    name=PD_PROXY_PREFILL_URL_ENV, value=f"http://{name}-prefill:{port}"
+                ),
+                client.V1EnvVar(name=PD_PROXY_DECODE_URL_ENV, value=f"http://{name}-decode:{port}"),
+            ]
+        )
+
+        # Ship the proxy program to the pod as a ConfigMap and run it from there.
+        self._ensure_pd_proxy_configmap(name, ns)
+        proxy_volume_name = "pd-proxy-script"
+
         container = client.V1Container(
             name="proxy",
             image=proxy.get("image"),
+            command=["python3", PD_PROXY_SCRIPT_PATH],
             ports=[client.V1ContainerPort(container_port=PD_PROXY_PORT)],
             env=container_env if container_env else None,
             resources=client.V1ResourceRequirements(
                 requests={"cpu": "250m", "memory": "256Mi"},
                 limits={"cpu": "1", "memory": "1Gi"},
             ),
+            volume_mounts=[
+                client.V1VolumeMount(
+                    name=proxy_volume_name,
+                    mount_path=PD_PROXY_CONFIG_MOUNT_DIR,
+                    read_only=True,
+                )
+            ],
             readiness_probe=client.V1Probe(
                 tcp_socket=client.V1TCPSocketAction(port=PD_PROXY_PORT),
                 initial_delay_seconds=10,
@@ -2687,6 +2846,15 @@ class InferenceMonitor:
                     spec=client.V1PodSpec(
                         service_account_name="gco-service-account",
                         containers=[container],
+                        volumes=[
+                            client.V1Volume(
+                                name=proxy_volume_name,
+                                config_map=client.V1ConfigMapVolumeSource(
+                                    name=f"{name}-pd-proxy",
+                                    default_mode=0o555,
+                                ),
+                            )
+                        ],
                     ),
                 ),
             ),
@@ -2704,7 +2872,82 @@ class InferenceMonitor:
                 raise
 
         self._create_proxy_service(proxy_name, ns)
-        self._update_proxy_ingress(name, proxy_name, ns)
+        self._update_proxy_ingress(name, proxy_name, ns, endpoint)
+
+    def _create_role_service(self, name: str, ns: str, role: str, port: int = 8000) -> None:
+        """Create the ClusterIP Service that fronts one role's pods.
+
+        Named ``{name}-{role}`` and selecting that role Deployment's app label,
+        so the PD proxy can address prefill or decode by stable in-cluster DNS.
+        Routing through a Service means kube-proxy load-balances across only the
+        role's Ready pods, which is what gives the proxy ready-only decode
+        routing without watching the Kubernetes API. Idempotent at the API
+        boundary: an already-present Service is left in place.
+        """
+        deploy_name = f"{name}-{role}"
+        service = client.V1Service(
+            metadata=client.V1ObjectMeta(
+                name=deploy_name,
+                namespace=ns,
+                labels={
+                    "app": deploy_name,
+                    "project": "gco",
+                    "gco.io/type": "inference",
+                    "gco.io/role": role,
+                },
+            ),
+            spec=client.V1ServiceSpec(
+                selector={"app": deploy_name},
+                ports=[client.V1ServicePort(port=port, target_port=port, protocol="TCP")],
+                type="ClusterIP",
+            ),
+        )
+        try:
+            self.core_v1.create_namespaced_service(ns, service, _request_timeout=self._k8s_timeout)
+            logger.info("Created role service %s/%s", ns, deploy_name)
+        except ApiException as e:
+            if e.status == 409:
+                logger.info("Role service %s/%s already exists", ns, deploy_name)
+            else:
+                raise
+
+    def _ensure_pd_proxy_configmap(self, name: str, ns: str) -> None:
+        """Publish the PD proxy program to the pod as a ConfigMap.
+
+        The proxy program (``mooncake_pd_proxy.py``) ships in this image
+        alongside the monitor; its source is read here and mounted into the
+        ``{name}-proxy`` pod, which runs it with ``python3`` from
+        ``PD_PROXY_SCRIPT_PATH``. The ConfigMap is patched on conflict so the
+        program tracks the running monitor build.
+        """
+        script = (Path(__file__).resolve().parent / PD_PROXY_SCRIPT_FILENAME).read_text(
+            encoding="utf-8"
+        )
+        cm_name = f"{name}-pd-proxy"
+        body = client.V1ConfigMap(
+            metadata=client.V1ObjectMeta(
+                name=cm_name,
+                namespace=ns,
+                labels={
+                    "app": f"{name}-proxy",
+                    "project": "gco",
+                    "gco.io/type": "inference",
+                    "gco.io/role": PD_PROXY_ROLE_LABEL,
+                },
+            ),
+            data={PD_PROXY_SCRIPT_FILENAME: script},
+        )
+        try:
+            self.core_v1.create_namespaced_config_map(ns, body, _request_timeout=self._k8s_timeout)
+            logger.info("Created PD proxy ConfigMap %s/%s", ns, cm_name)
+        except ApiException as e:
+            if e.status == 409:
+                self.core_v1.patch_namespaced_config_map(
+                    cm_name, ns, body, _request_timeout=self._k8s_timeout
+                )
+                logger.info("Updated PD proxy ConfigMap %s/%s", ns, cm_name)
+            else:
+                raise
 
     def _create_proxy_service(self, proxy_name: str, namespace: str) -> None:
         """Create the Service that fronts only the proxy pods.
@@ -2748,21 +2991,35 @@ class InferenceMonitor:
             else:
                 raise
 
-    def _update_proxy_ingress(self, name: str, proxy_name: str, namespace: str) -> None:
-        """Create or update the public Ingress that routes ``/v1/*`` to the proxy.
+    def _update_proxy_ingress(
+        self, name: str, proxy_name: str, namespace: str, endpoint: dict[str, Any]
+    ) -> None:
+        """Create or update the public Ingress that routes the proxy's serving paths.
 
-        Only the OpenAI-compatible serving paths are published: the rule routes
-        the ``/v1`` prefix to the proxy Service. The proxy's privileged admin
-        path (``/instances/add``) is deliberately not among the published
-        paths, so an admin request arriving from outside the namespace never
-        matches an Ingress rule and is never forwarded to the proxy. The Ingress
-        merges onto the shared ALB through the ``alb`` ingress class, matching
-        the legacy single-Deployment Ingress convention.
+        Only the OpenAI-compatible serving paths are published, and they are
+        scoped to the endpoint's own ingress prefix: the rule routes
+        ``{ingress_path}/v1`` (for example ``/inference/{name}/v1``) to the
+        proxy Service. Scoping to the endpoint prefix is what makes a
+        disaggregated endpoint reachable — every client request arrives at
+        ``/inference/{name}/...`` (through Global Accelerator and the shared
+        ALB), exactly as it does for a single-Deployment endpoint, so a bare
+        ``/v1`` rule would neither match the client URL nor stay isolated from
+        other endpoints sharing the ALB. The proxy's privileged admin path
+        (``{ingress_path}/instances/add``) is deliberately not among the
+        published paths, so an admin request arriving from outside the namespace
+        never matches an Ingress rule and is never forwarded to the proxy. The
+        Ingress merges onto the shared ALB through the ``alb`` ingress class,
+        matching the legacy single-Deployment Ingress convention.
         """
-        # The public Ingress carries only the serving prefix. The proxy's admin
-        # path is filtered out here so no future edit to the published set can
-        # route it in from outside the namespace.
-        published_paths = [p for p in [PD_PROXY_PUBLIC_PATH_PREFIX] if p != PD_PROXY_ADMIN_PATH]
+        # The public Ingress carries only the serving prefix, scoped to this
+        # endpoint's ingress path so it matches the client URL
+        # (``/inference/{name}/v1/...``) and stays isolated from other endpoints
+        # on the shared ALB. The proxy's admin path is filtered out so no future
+        # edit to the published set can route it in from outside the namespace.
+        ingress_path = endpoint.get("ingress_path", f"/inference/{name}")
+        serving_prefix = f"{ingress_path}{PD_PROXY_PUBLIC_PATH_PREFIX}"
+        admin_prefix = f"{ingress_path}{PD_PROXY_ADMIN_PATH}"
+        published_paths = [p for p in [serving_prefix] if p != admin_prefix]
         ingress = client.V1Ingress(
             metadata=client.V1ObjectMeta(
                 name=f"inference-{proxy_name}",
@@ -2774,7 +3031,7 @@ class InferenceMonitor:
                     "gco.io/role": PD_PROXY_ROLE_LABEL,
                 },
                 annotations={
-                    "alb.ingress.kubernetes.io/healthcheck-path": PD_PROXY_PUBLIC_PATH_PREFIX,
+                    "alb.ingress.kubernetes.io/healthcheck-path": serving_prefix,
                     "alb.ingress.kubernetes.io/healthcheck-interval-seconds": "15",
                 },
             ),
@@ -2809,7 +3066,7 @@ class InferenceMonitor:
             logger.info(
                 "Created proxy ingress for %s routing %s to %s",
                 name,
-                PD_PROXY_PUBLIC_PATH_PREFIX,
+                serving_prefix,
                 proxy_name,
             )
         except ApiException as e:
