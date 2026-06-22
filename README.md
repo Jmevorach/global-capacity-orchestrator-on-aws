@@ -91,7 +91,7 @@ cd global-capacity-orchestrator-on-aws && pipx install -e .
 
 See the [Quick Start](#quick-start) for the full install + first-job walkthrough, or [`docs/CLI.md`](docs/CLI.md) for every CLI command.
 
-> **💡 New to the codebase?** GCO ships with the **GCO MCP server** — an [MCP server](mcp/) exposing 98 tools by default (up to 130 with feature flags) that index the whole project: docs, examples, source code, K8s manifests, and scripts. Connect it to an AI-powered IDE with MCP support (like [Kiro](https://kiro.dev)) and explore GCO conversationally — ask questions about the codebase instead of reading repository files directly: *"How does region recommendation work?"*, *"Walk me through the inference deployment flow"*. See [mcp/README.md](mcp/README.md).
+> **💡 New to the codebase?** GCO ships with the **GCO MCP server** — an [MCP server](gco_mcp/) exposing 98 tools by default (up to 130 with feature flags) that index the whole project: docs, examples, source code, K8s manifests, and scripts. Connect it to an AI-powered IDE with MCP support (like [Kiro](https://kiro.dev)) and explore GCO conversationally — ask questions about the codebase instead of reading repository files directly: *"How does region recommendation work?"*, *"Walk me through the inference deployment flow"*. See [gco_mcp/README.md](gco_mcp/README.md).
 
 <details>
 <summary><b>Table of contents</b></summary>
@@ -516,7 +516,7 @@ This is host-socket pass-through, not true Docker-in-Docker. Anyone with access 
 │   ├── regional-api-proxy/              # Regional API Gateway → internal ALB proxy
 │   └── secret-rotation/                 # Daily secret rotation
 │
-├── mcp/                                 # MCP server for LLM interaction (98 tools default, up to 130 with feature flags)
+├── gco_mcp/                             # MCP server for LLM interaction (98 tools default, up to 130 with feature flags)
 ├── scripts/                             # Utility scripts (version bump, cluster access setup)
 └── tests/                               # PyTest + BATS test suites (counts tracked via badges)
 ```
@@ -529,7 +529,7 @@ Quick start for contributors (dev container — recommended):
 
 ```bash
 docker build -f Dockerfile.dev -t gco-dev .
-docker run --rm -v $(pwd):/workspace -w /workspace gco-dev pytest tests/ -v --cov=gco --cov=cli --cov=mcp
+docker run --rm -v $(pwd):/workspace -w /workspace gco-dev pytest tests/ -v --cov=gco --cov=cli --cov=gco_mcp
 ```
 
 Or, in a clean virtual environment on your host:
@@ -537,7 +537,7 @@ Or, in a clean virtual environment on your host:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest tests/ -v --cov=gco --cov=cli --cov=mcp
+pytest tests/ -v --cov=gco --cov=cli --cov=gco_mcp
 ```
 
 > If `pip install -e ".[dev]"` fails with dependency-resolver errors, that's the pinned-versions issue mentioned in [Prerequisites](#prerequisites). Use the dev container instead — it ships everything at the exact versions CI uses.
