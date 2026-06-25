@@ -287,6 +287,11 @@ class GCOGlobalStack(Stack):
         poll_interval_minutes = int(historical["poll_interval_minutes"])
         watch_instance_types = list(historical["watch_instance_types"])
         enabled_regions = list(historical["enabled_regions"]) or self.config.get_regions()
+        # Capacity Block probe durations. ``get_capacity_history_config`` always
+        # supplies both keys (defaults merged in), so index directly like the
+        # sibling fields above.
+        block_duration_hours = int(historical["capacity_block_duration_hours"])
+        long_block_duration_hours = int(historical["capacity_block_long_duration_hours"])
 
         self.capacity_history_table = dynamodb.Table(
             self,
@@ -359,6 +364,8 @@ class GCOGlobalStack(Stack):
                 "WATCH_INSTANCE_TYPES": ",".join(watch_instance_types),
                 "ENABLED_REGIONS": ",".join(enabled_regions),
                 "CAPACITY_HISTORY_RETENTION_DAYS": str(retention_days),
+                "CAPACITY_BLOCK_DURATION_HOURS": str(block_duration_hours),
+                "CAPACITY_BLOCK_LONG_DURATION_HOURS": str(long_block_duration_hours),
             },
             tracing=lambda_.Tracing.ACTIVE,
             description=(

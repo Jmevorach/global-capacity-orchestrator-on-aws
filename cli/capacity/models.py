@@ -75,8 +75,16 @@ GPU_INSTANCE_SPECS = {
     "p3.8xlarge": InstanceTypeInfo("p3.8xlarge", 32, 244, 4, "V100", 64, "x86_64"),
     "p3.16xlarge": InstanceTypeInfo("p3.16xlarge", 64, 488, 8, "V100", 128, "x86_64"),
     "p3dn.24xlarge": InstanceTypeInfo("p3dn.24xlarge", 96, 768, 8, "V100", 256, "x86_64"),
-    # P4d - NVIDIA A100
+    # P4d / P4de - NVIDIA A100
     "p4d.24xlarge": InstanceTypeInfo("p4d.24xlarge", 96, 1152, 8, "A100", 320, "x86_64"),
-    # P5 - NVIDIA H100
+    "p4de.24xlarge": InstanceTypeInfo("p4de.24xlarge", 96, 1152, 8, "A100", 640, "x86_64"),
+    # P5 / P5e / P5en - NVIDIA H100 / H200
     "p5.48xlarge": InstanceTypeInfo("p5.48xlarge", 192, 2048, 8, "H100", 640, "x86_64"),
+    "p5e.48xlarge": InstanceTypeInfo("p5e.48xlarge", 192, 2048, 8, "H200", 1128, "x86_64"),
+    "p5en.48xlarge": InstanceTypeInfo("p5en.48xlarge", 192, 2048, 8, "H200", 1128, "x86_64"),
+    # P6 - NVIDIA Blackwell B200 / B300 Ultra (standalone EC2 types). The
+    # Grace-Blackwell GB200/GB300 NVL72 superchips ship only as P6e-GB
+    # UltraServers, so those are intentionally absent from this standalone table.
+    "p6-b200.48xlarge": InstanceTypeInfo("p6-b200.48xlarge", 192, 2048, 8, "B200", 1440, "x86_64"),
+    "p6-b300.48xlarge": InstanceTypeInfo("p6-b300.48xlarge", 192, 4096, 8, "B300", 2144, "x86_64"),
 }
