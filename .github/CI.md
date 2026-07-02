@@ -46,9 +46,11 @@ For contributor-facing docs (how to run tests locally, release process, dependen
 │   ├── integration-tests.yml       # Integration Tests workflow
 │   ├── security.yml                # Security workflow
 │   ├── lint.yml                    # Linting workflow
+│   ├── mooncake-image.yml          # Mooncake vLLM image contract test (push/PR)
 │   ├── release.yml                 # Manual workflow_dispatch release
 │   ├── deps-scan.yml               # Monthly dependency scan
-│   └── cve-scan.yml                # Weekly CVE scan
+│   ├── cve-scan.yml                # Weekly CVE scan
+│   └── pages.yml                   # Publish coverage report to GitHub Pages (workflow_run)
 ├── CODEOWNERS
 ├── dependabot.yml
 ├── pull_request_template.md
@@ -64,18 +66,22 @@ Each file maps to one row in the README badge table.
 
 | File | README row | What it covers |
 |------|------------|----------------|
-| `workflows/unit-tests.yml` | Unit Tests | pytest with coverage (fail under 85%), BATS, CLI smoke, CDK synth + config matrix, lockfile freshness, fresh install, MCP install + launch smoke, workload import checks |
+| `workflows/unit-tests.yml` | Unit Tests | pytest with coverage (fail under 90%), BATS, CLI smoke, CDK synth + config matrix, lockfile freshness, fresh install, MCP install + launch smoke, workload import checks |
 | `workflows/integration-tests.yml` | Integration Tests | Per-Dockerfile build + module-import smoke, dev-container smoke, kind E2E with Calico (NetworkPolicy enforcement, RBAC verification, ResourceQuota/LimitRange, PDB validation, cross-namespace traffic blocking, all 3 service deployments), K8s manifest validation, Lambda import validation, cross-module pytest, MCP server pytest |
 | `workflows/security.yml` | Security | bandit, pip-audit, trivy (filesystem + per-image matrix), trufflehog, gitleaks, semgrep, checkov, KICS, CodeQL (Python) |
 | `workflows/lint.yml` | Linting | actionlint, hadolint, markdownlint, mypy (strict / stacks / lambda), ruff (format + check, imports included), shellcheck, yamllint |
 
 ### Satellites
 
+Workflows outside the four badged gates. Most are schedule- or dispatch-driven; `mooncake-image.yml` also runs on push and PR but is a narrow, feature-specific contract test rather than a headline gate.
+
 | File | Trigger | Purpose |
 |------|---------|---------|
 | `workflows/release.yml` | `workflow_dispatch` | Bump version, tag, create a GitHub Release with auto-generated notes. Uses the built-in `GITHUB_TOKEN` — no PAT required |
 | `workflows/deps-scan.yml` | `cron: 0 9 1 * *` (monthly, UTC) + manual | Check Python / Docker / Helm / EKS-addon / Bedrock-model versions; open a GitHub issue if drift is found |
 | `workflows/cve-scan.yml` | `cron: 0 9 * * 1` (Mondays, UTC) + manual | Re-run trivy against current CVE databases |
+| `workflows/pages.yml` | `workflow_run` after **Unit Tests** completes on `main` | Download the `pytest-coverage` artifact from the triggering run, regenerate the shields.io coverage badge, and deploy `htmlcov/` to GitHub Pages via `actions/deploy-pages`. Split out of `unit-tests.yml` so a GitHub Pages backend stall surfaces here instead of failing the test gate |
+| `workflows/mooncake-image.yml` | `push`: `main`, PR, manual | Pull the upstream Mooncake vLLM image pinned in `cli/images.py` (`_DISAGGREGATED_DEFAULT_IMAGE`) and run `tests/test_mooncake_image_contract.py`: prefill-decode proxy health under the image's `python3`, `MooncakeStoreConfig` acceptance of the rendered store config, and KV-connector name registration. Deliberately not Trivy/CVE-scanned — the image is upstream and unpatchable; version drift is surfaced by `deps-scan` |
 
 ### Naming conventions
 
@@ -87,9 +93,9 @@ Each file maps to one row in the README badge table.
 
 All CI workflows share the same safety defaults:
 
-- `concurrency.group: ${{ github.workflow }}-${{ github.ref }}` with `cancel-in-progress: true` so rapid pushes on the same branch supersede in-flight runs. Explicitly **off** on `release.yml` — a half-run release is worse than a slow one.
+- `concurrency.group: ${{ github.workflow }}-${{ github.ref }}` with `cancel-in-progress: true` so rapid pushes on the same branch supersede in-flight runs. Explicitly **off** on `release.yml` — a half-run release is worse than a slow one. `pages.yml` is the other exception: it uses a dedicated `concurrency.group: pages` with `cancel-in-progress: false` so a real Pages deployment is never cancelled mid-flight.
 - `timeout-minutes` on every job (10 min for lint, 15 for unit, 20–30 for integration).
-- `permissions:` scoped narrowly. All CI workflows run with `contents: read`; `release.yml` upgrades to `contents: write` so the version-bump job can push a tag and create a GitHub Release.
+- `permissions:` scoped narrowly. All CI workflows run with `contents: read`; `release.yml` upgrades to `contents: write` so the version-bump job can push a tag and create a GitHub Release. `pages.yml`'s deploy job grants `pages: write` + `id-token: write` (to publish to Pages) and `actions: read` (to pull the `pytest-coverage` artifact from the triggering Unit Tests run).
 - Caching: `actions/setup-python@v6` with `cache: pip` and `cache-dependency-path: requirements-lock.txt`. Mypy jobs add an explicit `actions/cache@v5` on `.mypy_cache/`.
 - AWS auth (when a future test needs it) uses OIDC via `aws-actions/configure-aws-credentials@v4` — not long-lived access keys.
 
