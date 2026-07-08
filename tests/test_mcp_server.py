@@ -156,15 +156,18 @@ class TestToolRegistration:
         #     (deploy_disaggregated_inference, set_mooncake_topology,
         #     mooncake_topology_status, populate_kv_cache,
         #     upload_to_regional_bucket)
-        # = 102 total at default registration.
-        # reserve_capacity adds 1 when GCO_ENABLE_CAPACITY_PURCHASE=true.
+        #   * 2 unconditional ODCR/Capacity-Block parity tools
+        #     (find_capacity_reservations sweep, nodepools_create_capacity_block)
+        # = 104 total at default registration.
+        # reserve_capacity and create_reservation add 2 when
+        # GCO_ENABLE_CAPACITY_PURCHASE=true.
         # Image-publish-gated tools (images_build, images_push, images_mirror)
         # add 3 when GCO_ENABLE_IMAGE_PUBLISH=true. Destructive-gated tools add
-        # 12 when GCO_ENABLE_DESTRUCTIVE_OPERATIONS=true: delete_job,
+        # 13 when GCO_ENABLE_DESTRUCTIVE_OPERATIONS=true: delete_job,
         # delete_inference, delete_template, delete_webhook, delete_model,
-        # delete_nodepool, analytics_user_remove, cancel_queue_job (eight
-        # non-image), plus images_cleanup, images_prune, images_delete_tag,
-        # images_delete_repo (four image variants). Model-upload-gated
+        # delete_nodepool, analytics_user_remove, cancel_queue_job,
+        # cancel_reservation (nine non-image), plus images_cleanup, images_prune,
+        # images_delete_tag, images_delete_repo (four image variants). Model-upload-gated
         # models_upload adds 1 when GCO_ENABLE_MODEL_UPLOAD=true.
         # Infrastructure-deploy gated tools (deploy_stack, deploy_all,
         # bootstrap_cdk) add 3 when GCO_ENABLE_INFRASTRUCTURE_DEPLOY=true.
@@ -177,21 +180,25 @@ class TestToolRegistration:
         # mission_checkpoint, mission_complete, mission_abort, mission_resume,
         # mission_history, mission_list) add 9 when GCO_ENABLE_MISSION=true.
         # With every flag enabled the ceiling is
-        # 107 + 1 + 3 + 12 + 1 + 3 + 2 + 1 + 1 + 9 = 140.
-        # (107 base includes the unconditional find_capacity_blocks sweep tool.)
-        base_count = 107
+        # 109 + 2 + 3 + 13 + 1 + 3 + 2 + 1 + 1 + 9 = 144.
+        # (109 base includes the unconditional find_capacity_blocks and
+        # find_capacity_reservations sweep tools plus the
+        # nodepools_create_capacity_block generator.)
+        base_count = 109
         tool_names = [t.name for t in tools]
         expected = base_count
         if "reserve_capacity" in tool_names:
-            expected += 1
+            # reserve_capacity + create_reservation register together under
+            # GCO_ENABLE_CAPACITY_PURCHASE.
+            expected += 2
         if "images_build" in tool_names:
             expected += 2  # images_build + images_push register together
         if "images_mirror" in tool_names:
             expected += 1  # images_mirror (also GCO_ENABLE_IMAGE_PUBLISH-gated)
         if "delete_job" in tool_names:
-            # All eight destructive-gated tools register together with the
-            # four destructive image variants — twelve total under the flag.
-            expected += 12
+            # All nine destructive-gated non-image tools register together with
+            # the four destructive image variants — thirteen total under the flag.
+            expected += 13
         if "models_upload" in tool_names:
             expected += 1
         if "deploy_stack" in tool_names:
@@ -231,6 +238,7 @@ class TestToolRegistration:
             "list_reservations",
             "reservation_check",
             "find_capacity_blocks",
+            "find_capacity_reservations",
             "capacity_history_show",
             "capacity_history_stats",
             "capacity_history_patterns",
@@ -321,6 +329,7 @@ class TestToolRegistration:
             "nodepools_describe",
             # Mutating
             "nodepools_create_odcr",
+            "nodepools_create_capacity_block",
             # Analytics
             "analytics_doctor",
             "analytics_login_url",
@@ -361,10 +370,11 @@ class TestToolRegistration:
             "task_status",
             "task_tail",
         }
-        # reserve_capacity is conditionally registered via env var
-        # and may also appear if a prior test reloaded the module
+        # reserve_capacity + create_reservation are conditionally registered via
+        # env var and may also appear if a prior test reloaded the module
         if "reserve_capacity" in names:
             expected.add("reserve_capacity")
+            expected.add("create_reservation")
         # Image-publish-gated tools register under GCO_ENABLE_IMAGE_PUBLISH.
         if "images_build" in names:
             expected.add("images_build")
@@ -400,6 +410,7 @@ class TestToolRegistration:
                     "delete_nodepool",
                     "analytics_user_remove",
                     "cancel_queue_job",
+                    "cancel_reservation",
                 }
             )
         # Model-upload gated tool registers under GCO_ENABLE_MODEL_UPLOAD.
@@ -416,6 +427,24 @@ class TestToolRegistration:
         # Local-file metric reader registers under GCO_ENABLE_LOCAL_METRICS.
         if "metrics_from_local_file" in names:
             expected.add("metrics_from_local_file")
+        # Semantic-progress judge registers under GCO_ENABLE_SEMANTIC_PROGRESS.
+        if "metrics_semantic_progress" in names:
+            expected.add("metrics_semantic_progress")
+        # The nine mission_* tools register together under GCO_ENABLE_MISSION.
+        if "mission_start" in names:
+            expected.update(
+                {
+                    "mission_start",
+                    "mission_status",
+                    "mission_iterate",
+                    "mission_checkpoint",
+                    "mission_complete",
+                    "mission_abort",
+                    "mission_resume",
+                    "mission_history",
+                    "mission_list",
+                }
+            )
         assert names == expected
 
     def test_each_tool_has_description(self):
@@ -1928,13 +1957,15 @@ class TestTemplatesTools:
     async def test_templates_run_minimal(self):
         with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
-            await run_mcp.templates_run(name="t1")
+            await run_mcp.templates_run(template_name="t1", job_name="j1", region="us-east-1")
             cmd = mock.call_args[0][0]
             assert "templates" in cmd
             assert "run" in cmd
             assert "t1" in cmd
-            assert "-r" not in cmd
-            assert "-n" not in cmd
+            assert cmd[cmd.index("--name") : cmd.index("--name") + 2] == ["--name", "j1"]
+            assert cmd[cmd.index("-r") : cmd.index("-r") + 2] == ["-r", "us-east-1"]
+            assert "--namespace" not in cmd
+            assert "-p" not in cmd
             assert "--priority" not in cmd
 
     @pytest.mark.asyncio
@@ -1942,21 +1973,24 @@ class TestTemplatesTools:
         with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             await run_mcp.templates_run(
-                name="t1",
+                template_name="t1",
+                job_name="j1",
                 region="us-east-1",
-                override_namespace="ns2",
-                override_priority=10,
+                namespace="ns2",
+                params=["image=custom:v1"],
             )
             cmd = mock.call_args[0][0]
             assert "templates" in cmd
             assert "run" in cmd
             assert "t1" in cmd
+            assert cmd[cmd.index("--name") : cmd.index("--name") + 2] == ["--name", "j1"]
             assert cmd[cmd.index("-r") : cmd.index("-r") + 2] == ["-r", "us-east-1"]
-            assert cmd[cmd.index("-n") : cmd.index("-n") + 2] == ["-n", "ns2"]
-            assert cmd[cmd.index("--priority") : cmd.index("--priority") + 2] == [
-                "--priority",
-                "10",
+            assert cmd[cmd.index("--namespace") : cmd.index("--namespace") + 2] == [
+                "--namespace",
+                "ns2",
             ]
+            assert cmd[cmd.index("-p") : cmd.index("-p") + 2] == ["-p", "image=custom:v1"]
+            assert "--priority" not in cmd
 
 
 class TestWebhooksTools:
@@ -2009,14 +2043,12 @@ class TestWebhooksTools:
         with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             await run_mcp.webhooks_create(
-                name="hook1",
                 url="https://example.com/hook",
                 events=["job.completed"],
             )
             cmd = mock.call_args[0][0]
             assert "webhooks" in cmd
             assert "create" in cmd
-            assert "hook1" in cmd
             assert cmd[cmd.index("--url") : cmd.index("--url") + 2] == [
                 "--url",
                 "https://example.com/hook",
@@ -2025,31 +2057,29 @@ class TestWebhooksTools:
             assert cmd.count("--event") == 1
             assert "job.completed" in cmd
             assert "-r" not in cmd
-            assert "--secret-name" not in cmd
+            assert "--secret" not in cmd
 
     @pytest.mark.asyncio
     async def test_webhooks_create_multiple_events(self):
         with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             await run_mcp.webhooks_create(
-                name="hook1",
                 url="https://example.com/hook",
                 events=["job.started", "job.completed", "job.failed"],
                 region="us-east-1",
-                secret_name="my-secret",
+                secret="my-secret",
             )
             cmd = mock.call_args[0][0]
             assert "webhooks" in cmd
             assert "create" in cmd
-            assert "hook1" in cmd
             # Three --event flags.
             assert cmd.count("--event") == 3
             assert "job.started" in cmd
             assert "job.completed" in cmd
             assert "job.failed" in cmd
             assert cmd[cmd.index("-r") : cmd.index("-r") + 2] == ["-r", "us-east-1"]
-            assert cmd[cmd.index("--secret-name") : cmd.index("--secret-name") + 2] == [
-                "--secret-name",
+            assert cmd[cmd.index("--secret") : cmd.index("--secret") + 2] == [
+                "--secret",
                 "my-secret",
             ]
 
@@ -2161,55 +2191,49 @@ class TestNodepoolsTools:
             await run_mcp.nodepools_create_odcr(
                 name="gpu-reserved",
                 region="us-east-1",
-                instance_type="p4d.24xlarge",
                 capacity_reservation_id="cr-0123456789abcdef0",
+                instance_type=["p4d.24xlarge"],
             )
             cmd = mock.call_args[0][0]
             assert "nodepools" in cmd
             assert "create-odcr" in cmd
-            assert "gpu-reserved" in cmd
+            assert cmd[cmd.index("-n") : cmd.index("-n") + 2] == ["-n", "gpu-reserved"]
             assert cmd[cmd.index("-r") : cmd.index("-r") + 2] == ["-r", "us-east-1"]
-            assert cmd[cmd.index("--instance-type") : cmd.index("--instance-type") + 2] == [
-                "--instance-type",
-                "p4d.24xlarge",
+            assert cmd[cmd.index("-c") : cmd.index("-c") + 2] == ["-c", "cr-0123456789abcdef0"]
+            assert cmd[cmd.index("-i") : cmd.index("-i") + 2] == ["-i", "p4d.24xlarge"]
+            assert cmd[cmd.index("--max-nodes") : cmd.index("--max-nodes") + 2] == [
+                "--max-nodes",
+                "100",
             ]
-            assert cmd[
-                cmd.index("--capacity-reservation-id") : cmd.index("--capacity-reservation-id") + 2
-            ] == ["--capacity-reservation-id", "cr-0123456789abcdef0"]
-            assert cmd[cmd.index("--count") : cmd.index("--count") + 2] == ["--count", "1"]
             # Optional flags absent when not supplied.
-            assert "--cluster" not in cmd
-            assert "--taint" not in cmd
-            assert "--label" not in cmd
+            assert "--fallback-on-demand" not in cmd
+            assert "--efa" not in cmd
 
     @pytest.mark.asyncio
-    async def test_nodepools_create_odcr_with_cluster(self):
+    async def test_nodepools_create_odcr_with_options(self):
         with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             await run_mcp.nodepools_create_odcr(
                 name="gpu-reserved",
                 region="us-east-1",
-                instance_type="p4d.24xlarge",
                 capacity_reservation_id="cr-0123456789abcdef0",
-                cluster="my-cluster",
-                count=4,
-                taints=["nvidia.com/gpu=true:NoSchedule"],
-                labels={"team": "ml", "tier": "reserved"},
+                instance_type=["p4d.24xlarge", "p5.48xlarge"],
+                max_nodes=50,
+                fallback_on_demand=True,
+                efa=True,
             )
             cmd = mock.call_args[0][0]
             assert "nodepools" in cmd
             assert "create-odcr" in cmd
-            assert "gpu-reserved" in cmd
-            assert cmd[cmd.index("--cluster") : cmd.index("--cluster") + 2] == [
-                "--cluster",
-                "my-cluster",
+            assert cmd[cmd.index("--max-nodes") : cmd.index("--max-nodes") + 2] == [
+                "--max-nodes",
+                "50",
             ]
-            assert cmd[cmd.index("--count") : cmd.index("--count") + 2] == ["--count", "4"]
-            assert cmd.count("--taint") == 1
-            assert "nvidia.com/gpu=true:NoSchedule" in cmd
-            assert cmd.count("--label") == 2
-            assert "team=ml" in cmd
-            assert "tier=reserved" in cmd
+            assert cmd.count("-i") == 2
+            assert "p4d.24xlarge" in cmd
+            assert "p5.48xlarge" in cmd
+            assert "--fallback-on-demand" in cmd
+            assert "--efa" in cmd
 
 
 class TestAnalyticsTools:
@@ -2231,8 +2255,12 @@ class TestAnalyticsTools:
             await run_mcp.analytics_login_url(username="alice")
             cmd = mock.call_args[0][0]
             assert "analytics" in cmd
-            assert "login-url" in cmd
-            assert "alice" in cmd
+            assert "studio" in cmd
+            assert "login" in cmd
+            assert cmd[cmd.index("--username") : cmd.index("--username") + 2] == [
+                "--username",
+                "alice",
+            ]
 
     @pytest.mark.asyncio
     async def test_analytics_users_list(self):
@@ -2250,10 +2278,11 @@ class TestAnalyticsTools:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             await run_mcp.enable_analytics()
             cmd = mock.call_args[0][0]
-            assert "stacks" in cmd
             assert "analytics" in cmd
             assert "enable" in cmd
             assert "-y" in cmd
+            # It's the top-level `analytics enable`, not `stacks analytics enable`.
+            assert "stacks" not in cmd
 
     @pytest.mark.asyncio
     async def test_disable_analytics(self):
@@ -2261,10 +2290,10 @@ class TestAnalyticsTools:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             await run_mcp.disable_analytics()
             cmd = mock.call_args[0][0]
-            assert "stacks" in cmd
             assert "analytics" in cmd
             assert "disable" in cmd
             assert "-y" in cmd
+            assert "stacks" not in cmd
 
     @pytest.mark.asyncio
     async def test_analytics_user_add(self):
@@ -2293,7 +2322,7 @@ class TestConfigTools:
             mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
             await run_mcp.config_get()
             cmd = mock.call_args[0][0]
-            assert "config" in cmd
+            assert "config-cmd" in cmd
             assert "get" in cmd
             # When no key is supplied, the positional should be absent.
             assert "some.key" not in cmd
@@ -2304,7 +2333,7 @@ class TestConfigTools:
             mock.return_value = MagicMock(returncode=0, stdout='"value"', stderr="")
             await run_mcp.config_get(key="some.key")
             cmd = mock.call_args[0][0]
-            assert "config" in cmd
+            assert "config-cmd" in cmd
             assert "get" in cmd
             assert "some.key" in cmd
 
@@ -2316,12 +2345,14 @@ class TestStorageReadOnlyTools:
     async def test_files_get(self):
         with patch("cli_runner.subprocess.run") as mock:
             mock.return_value = MagicMock(returncode=0, stdout="contents", stderr="")
-            await run_mcp.files_get(path="/some/file", region="us-east-1")
+            await run_mcp.files_get(region="us-east-1")
             cmd = mock.call_args[0][0]
             assert "files" in cmd
             assert "get" in cmd
-            assert "/some/file" in cmd
-            assert cmd[cmd.index("-r") : cmd.index("-r") + 2] == ["-r", "us-east-1"]
+            # `files get REGION [-t type]` — region is positional, no -r.
+            assert "us-east-1" in cmd
+            assert "-r" not in cmd
+            assert cmd[cmd.index("-t") : cmd.index("-t") + 2] == ["-t", "efs"]
 
     @pytest.mark.asyncio
     async def test_files_access_points_no_args(self):
