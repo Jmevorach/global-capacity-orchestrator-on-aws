@@ -102,9 +102,7 @@ from constructs import Construct
 
 from gco.config.config_loader import ConfigLoader
 from gco.stacks.constants import (
-    API_GATEWAY_AUTH_SECRET_NAME,
     AURORA_POSTGRES_VERSION,
-    CLUSTER_SHARED_SSM_PARAMETER_PREFIX,
     EKS_ADDON_CLOUDWATCH_OBSERVABILITY,
     EKS_ADDON_EFS_CSI_DRIVER,
     EKS_ADDON_FSX_CSI_DRIVER,
@@ -113,14 +111,18 @@ from gco.stacks.constants import (
     EKS_UNSUPPORTED_AZ_IDS,
     LAMBDA_PYTHON_RUNTIME,
     MOONCAKE_MASTER_DEFAULT_IMAGE,
-    REGIONAL_SHARED_BUCKET_NAME_PREFIX,
-    REGIONAL_SHARED_SSM_PARAMETER_PREFIX,
+    api_gateway_auth_secret_name,
+    cluster_shared_ssm_parameter_prefix,
+    regional_shared_bucket_name_prefix,
+    regional_shared_ssm_parameter_prefix,
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Flowchart(s) generated from this file:
 #   * ``GCORegionalStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack___init__.png``)
+#   * ``GCORegionalStack._get_volcano_image_mirror_config`` -> ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack__get_volcano_image_mirror_config.html``
+#     (PNG: ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack__get_volcano_image_mirror_config.png``)
 # Regenerate with ``python diagrams/code_diagrams/generate.py``.
 # <pyflowchart-code-diagram> END
 
@@ -479,6 +481,7 @@ class GCORegionalStack(Stack):
             regions=self.config.get_regions(),
             global_region=self.config.get_global_region(),
             api_gateway_region=self.config.get_api_gateway_region(),
+            project_name=self.config.get_project_name(),
         )
 
     def _create_sqs_queue(self) -> None:
@@ -1319,7 +1322,7 @@ class GCORegionalStack(Stack):
         # full ARN with suffix or the partial ARN without it).
         auth_secret_resource = (
             f"arn:aws:secretsmanager:{self.config.get_api_gateway_region()}"
-            f":{self.account}:secret:{API_GATEWAY_AUTH_SECRET_NAME}*"
+            f":{self.account}:secret:{api_gateway_auth_secret_name(self.config.get_project_name())}*"
         )
         self.service_account_role.add_to_policy(
             iam.PolicyStatement(
@@ -1739,10 +1742,11 @@ class GCORegionalStack(Stack):
         from gco.stacks.nag_suppressions import acknowledge_nag_findings
 
         global_region = self.config.get_global_region()
+        cluster_shared_prefix = cluster_shared_ssm_parameter_prefix(self.config.get_project_name())
         resolved: dict[str, str] = {}
 
         for suffix in ("name", "arn", "region"):
-            parameter_name = f"{CLUSTER_SHARED_SSM_PARAMETER_PREFIX}/{suffix}"
+            parameter_name = f"{cluster_shared_prefix}/{suffix}"
             read_cr = cr.AwsCustomResource(
                 self,
                 f"ReadClusterSharedBucket{suffix.capitalize()}",
@@ -1907,9 +1911,10 @@ class GCORegionalStack(Stack):
         2. ``regional_shared_access_logs_bucket`` — the dedicated S3 access-logs
            destination for the primary bucket.
         3. ``regional_shared_bucket`` — the primary bucket named
-           ``gco-regional-shared-<account>-<region>`` (the prefix
-           ``REGIONAL_SHARED_BUCKET_NAME_PREFIX`` is the stable ARN prefix used
-           by IAM policies and nag assertions). KMS-encrypted with
+           ``<project_name>-regional-shared-<account>-<region>`` (the prefix
+           from ``regional_shared_bucket_name_prefix(project_name)`` is the
+           stable ARN prefix used by IAM policies and nag assertions).
+           KMS-encrypted with
            ``regional_shared_kms_key``, block-public-access on, SSL enforced,
            versioned, destroy-on-teardown.
 
@@ -1989,15 +1994,20 @@ class GCORegionalStack(Stack):
             ],
         )
 
-        # Primary general-purpose regional bucket. The name uses the constant
-        # prefix so IAM allow-list assertions (arn:aws:s3:::gco-regional-shared-*)
-        # stay stable across refactors. `bucket_key_enabled=True` mirrors the
-        # central-bucket pattern to reduce per-object KMS request costs.
+        # Primary general-purpose regional bucket. The name is derived from
+        # ``project_name`` so the bucket and the IAM allow-list assertions
+        # (arn:aws:s3:::<project_name>-regional-shared-*) stay in lockstep and
+        # two deployments in the same account+region do not collide.
+        # `bucket_key_enabled=True` mirrors the central-bucket pattern to
+        # reduce per-object KMS request costs.
+        project_name = self.config.get_project_name()
+        regional_shared_prefix = regional_shared_ssm_parameter_prefix(project_name)
         self.regional_shared_bucket = s3.Bucket(
             self,
             "RegionalSharedBucket",
             bucket_name=(
-                f"{REGIONAL_SHARED_BUCKET_NAME_PREFIX}-{self.account}-{self.deployment_region}"
+                f"{regional_shared_bucket_name_prefix(project_name)}"
+                f"-{self.account}-{self.deployment_region}"
             ),
             encryption=s3.BucketEncryption.KMS,
             encryption_key=self.regional_shared_kms_key,
@@ -2034,13 +2044,13 @@ class GCORegionalStack(Stack):
         # regional upload surface resolve the always-on regional bucket by
         # reading these back rather than reconstructing the name. Because the
         # bucket is unconditional, these parameters are always present once the
-        # region's stack is deployed. The prefix
-        # ``REGIONAL_SHARED_SSM_PARAMETER_PREFIX`` is the single source of truth
-        # for the namespace.
+        # region's stack is deployed. The prefix from
+        # ``regional_shared_ssm_parameter_prefix(project_name)`` is the single
+        # source of truth for the namespace.
         ssm.StringParameter(
             self,
             "RegionalSharedBucketNameParam",
-            parameter_name=f"{REGIONAL_SHARED_SSM_PARAMETER_PREFIX}/name",
+            parameter_name=f"{regional_shared_prefix}/name",
             string_value=self.regional_shared_bucket.bucket_name,
             description="Name of the always-on general-purpose regional bucket for this region.",
         )
@@ -2048,7 +2058,7 @@ class GCORegionalStack(Stack):
         ssm.StringParameter(
             self,
             "RegionalSharedBucketArnParam",
-            parameter_name=f"{REGIONAL_SHARED_SSM_PARAMETER_PREFIX}/arn",
+            parameter_name=f"{regional_shared_prefix}/arn",
             string_value=self.regional_shared_bucket.bucket_arn,
             description="ARN of the always-on general-purpose regional bucket for this region.",
         )
@@ -2056,7 +2066,7 @@ class GCORegionalStack(Stack):
         ssm.StringParameter(
             self,
             "RegionalSharedBucketRegionParam",
-            parameter_name=f"{REGIONAL_SHARED_SSM_PARAMETER_PREFIX}/region",
+            parameter_name=f"{regional_shared_prefix}/region",
             string_value=self.deployment_region,
             description="Home region of the always-on general-purpose regional bucket.",
         )
@@ -2406,12 +2416,23 @@ class GCORegionalStack(Stack):
             "{{PENDING_REQUESTED_CPU_VCPUS}}": str(thresholds.pending_requested_cpu_vcpus),
             "{{PENDING_REQUESTED_MEMORY_GB}}": str(thresholds.pending_requested_memory_gb),
             "{{PENDING_REQUESTED_GPUS}}": str(thresholds.pending_requested_gpus),
+            # Deployment prefix (#139). Injected so in-cluster services (the
+            # inference monitor) resolve project-scoped SSM paths
+            # (/<project>/regional-shared-bucket/*) instead of a hardcoded
+            # /gco/ namespace, letting two deployments share an account+region.
+            "{{PROJECT_NAME}}": self.config.get_project_name(),
             # DynamoDB table names (from global stack)
             "{{TEMPLATES_TABLE_NAME}}": f"{self.config.get_project_name()}-job-templates",
             "{{WEBHOOKS_TABLE_NAME}}": f"{self.config.get_project_name()}-webhooks",
             "{{JOBS_TABLE_NAME}}": f"{self.config.get_project_name()}-jobs",
+            "{{INFERENCE_ENDPOINTS_TABLE_NAME}}": (
+                f"{self.config.get_project_name()}-inference-endpoints"
+            ),
             # DynamoDB region (global stack region, may differ from cluster region)
             "{{DYNAMODB_REGION}}": self.config.get_global_region(),
+            # Global region for cross-region SSM reads/writes (e.g. the health
+            # monitor's /<project>/alb-hostname-<region> sync in the global region).
+            "{{GLOBAL_REGION}}": self.config.get_global_region(),
             # Manifest processor resource quotas (sourced from shared policy).
             "{{MP_MAX_CPU_PER_MANIFEST}}": str(job_quotas.get("max_cpu_per_manifest", "10")),
             "{{MP_MAX_MEMORY_PER_MANIFEST}}": str(
@@ -2935,29 +2956,37 @@ class GCORegionalStack(Stack):
         Volcano pointed at docker.io.
 
         - ``enabled`` (default False) — master toggle.
-        - ``ecr_namespace`` (default ``"gco/dockerhub"``) — the ECR repository
+        - ``ecr_namespace`` (default ``"<project_name>/dockerhub"``, i.e.
+          ``gco/dockerhub`` for the stock project) — the ECR repository
           namespace the mirrored Volcano images live under. Must start with
-          ``gco/`` so it inherits the project's existing ``gco/*`` machinery
-          (node pull access, replication rule, trusted-registry allow-list)
-          with no extra IAM, and must be a valid (possibly nested) ECR
-          repository path.
+          ``<project_name>/`` so it inherits the project's existing
+          ``<project_name>/*`` machinery (node pull access, replication rule,
+          trusted-registry allow-list) with no extra IAM, and must be a valid
+          (possibly nested) ECR repository path.
         """
         raw = self.node.try_get_context("volcano_image_mirror") or {}
         if not isinstance(raw, dict):
             raise ValueError(f"volcano_image_mirror must be a mapping, got {type(raw).__name__}")
 
+        # The mirror namespace lives under this deployment's project prefix
+        # (``<project_name>/``) so it inherits the project's ECR access,
+        # replication rule, and trusted-registry allow-list (#139). Defaults to
+        # ``<project_name>/dockerhub`` — ``gco/dockerhub`` for the stock project.
+        project_prefix = f"{self.config.get_project_name()}/"
         enabled = bool(raw.get("enabled", False))
-        ecr_namespace = str(raw.get("ecr_namespace", "gco/dockerhub")).strip().strip("/")
+        ecr_namespace = (
+            str(raw.get("ecr_namespace", f"{project_prefix}dockerhub")).strip().strip("/")
+        )
 
         if not enabled:
             return {"enabled": False, "ecr_namespace": ecr_namespace}
 
         # Must live under the project prefix and be a valid nested ECR repo
         # path (lowercase alphanumerics + . _ - per segment, slash-separated).
-        if not ecr_namespace.startswith("gco/"):
+        if not ecr_namespace.startswith(project_prefix):
             raise ValueError(
-                "volcano_image_mirror.ecr_namespace must start with 'gco/' so it "
-                "inherits the project's gco/* ECR access/replication, got "
+                f"volcano_image_mirror.ecr_namespace must start with {project_prefix!r} so it "
+                f"inherits the project's {project_prefix}* ECR access/replication, got "
                 f"{ecr_namespace!r}"
             )
         segment = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
@@ -3793,7 +3822,7 @@ class GCORegionalStack(Stack):
             self,
             "ValkeyCache",
             engine="valkey",
-            serverless_cache_name=f"gco-{self.deployment_region}",
+            serverless_cache_name=f"{self.config.get_project_name()}-{self.deployment_region}",
             description=f"GCO K/V cache for {self.deployment_region}",
             major_engine_version="8",
             security_group_ids=[valkey_sg.security_group_id],
