@@ -142,6 +142,11 @@ MAX_CPU = _parse_cpu_string(os.environ.get("MAX_CPU_PER_MANIFEST", "10000"))  # 
 MAX_MEMORY = _parse_memory_string(os.environ.get("MAX_MEMORY_PER_MANIFEST", "32Gi"))  # bytes
 MAX_GPU = int(os.environ.get("MAX_GPU_PER_MANIFEST", "4"))
 
+# Accelerator resource keys and their node taint keys (taint key == resource
+# key for all three). Kept in sync with the mirror in
+# gco/services/manifest_processor.py::ACCELERATOR_TAINTS.
+ACCELERATOR_TAINTS = ("nvidia.com/gpu", "aws.amazon.com/neuron", "vpc.amazonaws.com/efa")
+
 # Trusted image sources (populated from cdk.json::manifest_processor at deploy time).
 # Comma-separated env vars; empty/unset disables the check (fail-open logged).
 # Keep in sync with gco/services/manifest_processor.py::_validate_image_sources.
@@ -180,10 +185,59 @@ BLOCK_HOST_PATH = _env_bool("BLOCK_HOST_PATH", True)
 BLOCK_ADDED_CAPABILITIES = _env_bool("BLOCK_ADDED_CAPABILITIES", True)
 BLOCK_RUN_AS_ROOT = _env_bool("BLOCK_RUN_AS_ROOT", False)
 
+# Hard-reject accelerator jobs that lack a matching node toleration. Mirrors
+# manifest_processor.require_accelerator_toleration so the SQS path is not a
+# bypass.
+REQUIRE_ACCELERATOR_TOLERATION = _env_bool("REQUIRE_ACCELERATOR_TOLERATION", True)
+
 
 def _is_registry_domain(entry: str) -> bool:
     """True if the entry looks like a registry domain (has '.' or ':')."""
     return "." in entry or ":" in entry
+
+
+def _positive_quantity(value: Any) -> bool:
+    """True if a K8s resource quantity is present and greater than zero."""
+    if value is None:
+        return False
+    try:
+        return float(value) > 0
+    except TypeError, ValueError:
+        return True
+
+
+def _toleration_matches(tolerations: list[dict[str, Any]], taint_key: str) -> bool:
+    """True if *tolerations* tolerates the ``<taint_key>=true:NoSchedule`` taint.
+
+    Matches manifest_processor._toleration_matches: the toleration's ``key``
+    must equal *taint_key*, its effect must be empty or ``NoSchedule``, and it
+    must use ``operator: Exists`` or ``operator: Equal`` with ``value: "true"``.
+    """
+    for tol in tolerations:
+        if not isinstance(tol, dict) or tol.get("key") != taint_key:
+            continue
+        effect = tol.get("effect", "")
+        if effect not in ("", "NoSchedule"):
+            continue
+        operator = tol.get("operator", "Equal")
+        if operator == "Exists":
+            return True
+        if operator == "Equal" and str(tol.get("value")) == "true":
+            return True
+    return False
+
+
+def _requested_accelerators(pod_spec: dict[str, Any]) -> set[str]:
+    """Return the set of accelerator taint keys any container requests."""
+    requested: set[str] = set()
+    for _kind, c in _iter_containers(pod_spec):
+        res = c.get("resources", {}) or {}
+        for section in ("requests", "limits"):
+            values = res.get(section, {}) or {}
+            for taint in ACCELERATOR_TAINTS:
+                if _positive_quantity(values.get(taint)):
+                    requested.add(taint)
+    return requested
 
 
 def _iter_containers(pod_spec: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -315,6 +369,24 @@ def validate_manifest(m: dict[str, Any]) -> tuple[bool, str]:
 
     if pod_spec:
         all_containers = _iter_containers(pod_spec)
+
+        # --- Accelerator toleration check ---
+        # Mirror manifest_processor._validate_tolerations: a job requesting a
+        # GPU/Neuron/EFA resource must carry a matching toleration or it would
+        # stay Pending forever on tainted accelerator nodes.
+        if REQUIRE_ACCELERATOR_TOLERATION:
+            tolerations = pod_spec.get("tolerations", []) or []
+            for taint in _requested_accelerators(pod_spec):
+                if not _toleration_matches(tolerations, taint):
+                    hint = (
+                        f"add a matching toleration (e.g. key '{taint}', operator "
+                        "'Exists', effect 'NoSchedule'); see examples/gpu-job.yaml"
+                    )
+                    return (
+                        False,
+                        f"Job requests accelerator '{taint}' but no matching "
+                        f"toleration for taint {taint}=true:NoSchedule was found. {hint}",
+                    )
 
         # --- Pod-level security policy checks ---
         # Mirror manifest_processor._validate_security_context so the SQS
