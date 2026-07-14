@@ -27,6 +27,12 @@ Two layers, matching what each CI stage can afford:
         proves the chart renders to Kubernetes manifests (installable) with
         the values ``charts.yaml`` ships.
 
+    Every network-touching helm call (repo add/update, show chart, template)
+    is issued through ``_run_with_retry``, which retries a fixed number of
+    times with exponential backoff and takes the first success. An intermittent
+    registry blip is ridden out in-process instead of forcing a manual job
+    rerun, while a genuinely bad pin fails on every attempt and still surfaces.
+
 By default *every* chart in the file is validated, including entries with
 ``enabled: false``: those are toggled on via ``cdk.json``, so their pinned
 ``(name, version)`` must be valid too.
@@ -256,14 +262,25 @@ def _run_with_retry(
     cmd: list[str],
     env: dict[str, str],
     *,
-    attempts: int = 2,
+    attempts: int = 4,
+    base_delay: float = 2.0,
+    max_delay: float = 20.0,
     timeout: int = 120,
+    verbose: bool = False,
+    description: str = "",
 ) -> tuple[int, str, str]:
-    """Run a network-touching helm command, retrying transient failures once.
+    """Run a network-touching helm command up to ``attempts`` times; first success wins.
 
-    Registries (ghcr.io, public.ecr.aws, artifacthub-backed HTTP repos) blip;
-    a single retry clears most of those without masking a genuinely bad pin,
-    which fails on every attempt.
+    The command is retried on any non-zero exit, regardless of why it failed:
+    the first attempt that succeeds (rc 0) is returned immediately, and if none
+    do, the last failure is returned. Between attempts we sleep an exponentially
+    growing delay (``base_delay`` doubling each round, capped at ``max_delay``)
+    to give a blipping registry a moment to recover.
+
+    This is the guard against intermittent registry failures (timeouts, resets,
+    5xx) that otherwise force a manual rerun of the ``integration:helm:charts-valid``
+    job. A genuinely bad pin fails on every attempt and still surfaces, just a
+    few seconds later.
     """
     result: tuple[int, str, str] = (1, "", "")
     for attempt in range(1, attempts + 1):
@@ -271,7 +288,14 @@ def _run_with_retry(
         if result[0] == 0:
             return result
         if attempt < attempts:
-            time.sleep(2)
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            if verbose:
+                label = description or " ".join(cmd)
+                print(
+                    f"  attempt {attempt}/{attempts} failed, retrying in "
+                    f"{delay:.1f}s — {label}: {_tail(result[2], 200)}"
+                )
+            time.sleep(delay)
     return result
 
 
@@ -314,13 +338,22 @@ def _versions_match(resolved: str, requested: str) -> bool:
     return resolved.lstrip("v") == requested.lstrip("v")
 
 
-def _render_chart(ref: ChartRef, ref_str: str, helm_binary: str, env: dict[str, str]) -> str | None:
+def _render_chart(
+    ref: ChartRef,
+    ref_str: str,
+    helm_binary: str,
+    env: dict[str, str],
+    *,
+    verbose: bool = False,
+) -> str | None:
     """``helm template`` the chart with its shipped values; return an error or None.
 
     Rendering with the exact ``values`` block from ``charts.yaml`` proves the
     chart is installable *as GCO configures it*, not just with upstream
-    defaults. No cluster is contacted — templating is purely local once the
-    chart is pulled.
+    defaults. No cluster is contacted, but templating a remote ``--version``
+    ref still pulls the chart from its registry, so it goes through
+    ``_run_with_retry`` to ride out the same transient blips as the resolve
+    step.
     """
     args = [
         helm_binary,
@@ -345,7 +378,13 @@ def _render_chart(ref: ChartRef, ref_str: str, helm_binary: str, env: dict[str, 
         args.extend(["--values", values_path])
 
     try:
-        rc, _out, err = _run(args, env, timeout=180)
+        rc, _out, err = _run_with_retry(
+            args,
+            env,
+            timeout=180,
+            verbose=verbose,
+            description=f"helm template {ref.name}",
+        )
     finally:
         if values_path:
             with contextlib.suppress(OSError):
@@ -382,11 +421,21 @@ def validate_online(
             rc, _out, err = _run_with_retry(
                 [helm_binary, "repo", "add", repo_name, repo_url, "--force-update"],
                 env,
+                verbose=verbose,
+                description=f"helm repo add {repo_name}",
             )
             if rc != 0:
                 errors.append(f"helm repo add {repo_name} ({repo_url}) failed: {_tail(err)}")
         if classic:
-            _run([helm_binary, "repo", "update"], env, timeout=180)
+            # Index refresh is network-bound too — retry it so a blip here
+            # doesn't cascade into spurious "cannot resolve" errors below.
+            _run_with_retry(
+                [helm_binary, "repo", "update"],
+                env,
+                timeout=180,
+                verbose=verbose,
+                description="helm repo update",
+            )
 
         # 2. Resolve + render each chart at exactly its pinned version.
         for ref in refs:
@@ -396,6 +445,8 @@ def validate_online(
             rc, out, err = _run_with_retry(
                 [helm_binary, "show", "chart", ref_str, "--version", ref.version],
                 env,
+                verbose=verbose,
+                description=f"helm show chart {ref.name}",
             )
             if rc != 0:
                 errors.append(
@@ -417,7 +468,7 @@ def validate_online(
             if skip_template:
                 continue
 
-            render_error = _render_chart(ref, ref_str, helm_binary, env)
+            render_error = _render_chart(ref, ref_str, helm_binary, env, verbose=verbose)
             if render_error:
                 errors.append(f"{ref.name}: {render_error}")
                 if verbose:

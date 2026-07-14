@@ -410,3 +410,134 @@ class TestLiveChartsOnline:
         errors = validator.validate_online([bogus])
         assert errors
         assert any("99.99.99" in e for e in errors)
+
+
+# ── fixed-count network retry guard (offline) ────────────────────────────────
+#
+# These pin the retry behavior added to ride out intermittent registry blips
+# (the kind that used to force a manual rerun of integration:helm:charts-valid):
+# a network-touching helm call is retried a fixed number of times and the first
+# success wins. All offline: _run and time.sleep are monkeypatched so nothing
+# sleeps or touches the network.
+
+
+class TestRunWithRetry:
+    @pytest.fixture(autouse=True)
+    def _no_real_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Retry tests must never actually sleep.
+        monkeypatch.setattr(validator.time, "sleep", lambda *_a, **_k: None)
+
+    def _script(self, monkeypatch: pytest.MonkeyPatch, results: list[tuple]) -> dict:
+        """Make validator._run return successive (rc, out, err) tuples, counting calls.
+
+        The last tuple is repeated once the sequence is exhausted, so a
+        single-element list models a persistent failure.
+        """
+        calls = {"n": 0}
+        seq = list(results)
+
+        def fake_run(cmd, env, *, timeout=120):  # noqa: ANN001
+            calls["n"] += 1
+            return seq[min(calls["n"] - 1, len(seq) - 1)]
+
+        monkeypatch.setattr(validator, "_run", fake_run)
+        return calls
+
+    def test_success_first_try_runs_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = self._script(monkeypatch, [(0, "ok", "")])
+        rc, out, _err = validator._run_with_retry(["helm", "x"], {})
+        assert rc == 0 and out == "ok"
+        assert calls["n"] == 1
+
+    def test_first_success_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Any single successful attempt counts as success, no matter how many
+        # attempts failed before it.
+        calls = self._script(
+            monkeypatch,
+            [(1, "", "boom"), (1, "", "still boom"), (0, "ok", "")],
+        )
+        rc, _out, _err = validator._run_with_retry(["helm", "x"], {}, attempts=4)
+        assert rc == 0
+        assert calls["n"] == 3  # stopped as soon as it succeeded
+
+    def test_retries_exactly_attempts_times_then_gives_up(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A persistent failure is attempted exactly `attempts` times (regardless
+        # of the failure text) and then the last result is returned.
+        calls = self._script(monkeypatch, [(1, "", "whatever")])
+        rc, _out, _err = validator._run_with_retry(["helm", "x"], {}, attempts=4)
+        assert rc == 1
+        assert calls["n"] == 4
+
+    def test_attempts_one_means_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = self._script(monkeypatch, [(1, "", "boom")])
+        validator._run_with_retry(["helm", "x"], {}, attempts=1)
+        assert calls["n"] == 1
+
+    def test_backoff_is_exponential(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._script(monkeypatch, [(1, "", "boom")])
+        sleeps: list[float] = []
+        monkeypatch.setattr(validator.time, "sleep", lambda s: sleeps.append(s))
+        validator._run_with_retry(["helm", "x"], {}, attempts=4, base_delay=2.0, max_delay=100.0)
+        # 3 sleeps between 4 attempts: 2, 4, 8.
+        assert sleeps == [2.0, 4.0, 8.0]
+
+    def test_backoff_capped_at_max_delay(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._script(monkeypatch, [(1, "", "boom")])
+        sleeps: list[float] = []
+        monkeypatch.setattr(validator.time, "sleep", lambda s: sleeps.append(s))
+        validator._run_with_retry(["helm", "x"], {}, attempts=5, base_delay=10.0, max_delay=15.0)
+        assert sleeps == [10.0, 15.0, 15.0, 15.0]
+
+
+class TestRenderChartUsesRetry:
+    def test_render_routes_through_run_with_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict = {}
+
+        def fake_retry(cmd, env, **kwargs):  # noqa: ANN001
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return (0, "rendered", "")
+
+        monkeypatch.setattr(validator, "_run_with_retry", fake_retry)
+        (ref,) = validator.build_refs({"keda": _classic()})
+        err = validator._render_chart(ref, ref.reference(), "helm", {}, verbose=True)
+        assert err is None
+        assert captured["cmd"][:2] == ["helm", "template"]
+        assert "--version" in captured["cmd"]
+        # verbose is threaded so a retry is visible in the CI log.
+        assert captured["kwargs"].get("verbose") is True
+
+
+class TestValidateOnlineRetriesEveryNetworkCall:
+    def test_repo_update_and_show_chart_go_through_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `helm repo update` used to bypass the retry helper via a bare _run;
+        # prove every network call (repo add, repo update, show chart) now
+        # rides the retry path. _render_chart is stubbed so we observe only the
+        # resolve/repo commands here.
+        retried: list[list[str]] = []
+
+        def fake_retry(cmd, env, **kwargs):  # noqa: ANN001
+            retried.append(cmd)
+            return (0, "apiVersion: v2\nname: keda\nversion: 2.20.1\n", "")
+
+        monkeypatch.setattr(validator, "_run_with_retry", fake_retry)
+        monkeypatch.setattr(validator, "_render_chart", lambda *a, **k: None)
+        # If any call slipped past the retry helper to a bare _run, fail loudly.
+        monkeypatch.setattr(
+            validator,
+            "_run",
+            lambda *a, **k: pytest.fail("network call bypassed _run_with_retry"),
+        )
+
+        (ref,) = validator.build_refs({"keda": _classic()})
+        errors = validator.validate_online([ref])
+        assert errors == []
+
+        joined = [" ".join(c) for c in retried]
+        assert any(c.startswith("helm repo add kedacore") for c in joined)
+        assert any(c == "helm repo update" for c in joined)
+        assert any("show chart kedacore/keda" in c for c in joined)
