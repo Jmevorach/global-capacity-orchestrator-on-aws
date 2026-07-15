@@ -174,6 +174,289 @@ class TestPlaceholderSkipping:
 
         assert result["AppliedCount"] == 1
 
+    def test_lowercase_double_brace_content_is_not_skipped(self, handler_module, tmp_path):
+        """Grafana dashboard legend tokens ({{gpu}}, {{service}}) are NOT
+        feature-gate placeholders and must survive substitution untouched.
+
+        Regression guard for the observability dashboard ConfigMaps: the old
+        blanket ``"{{" in content and "}}" in content`` check skipped any file
+        containing double braces, which would have silently dropped every
+        dashboard even when observability is enabled. Only UPPER_SNAKE tokens
+        gate a file now.
+        """
+        (tmp_path / "post-helm-grafana-dashboards.yaml").write_text(
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            "  name: gco-dashboard-gpu\n"
+            "  namespace: monitoring\n"
+            "data:\n"
+            '  d.json: \'{"targets":[{"legendFormat":"{{Hostname}} gpu{{gpu}}"}]}\'\n'
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_client.CustomObjectsApi.return_value = MagicMock()
+
+            result = handler_module.apply_manifests(
+                "test-cluster", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        assert "unreplaced-placeholders" not in result["Skipped"]
+
+    def test_uppercase_gate_still_skips_even_beside_lowercase_tokens(
+        self, handler_module, tmp_path
+    ):
+        """A file mixing an unresolved UPPER_SNAKE gate with lowercase legend
+        tokens is still skipped — the gate placeholder wins.
+
+        This is how the dashboards ConfigMap is turned off when observability
+        is disabled: ``{{CLUSTER_OBSERVABILITY_ENABLED}}`` stays unresolved and
+        gates the whole file, while the ``{{gpu}}`` legend token alone would
+        not have.
+        """
+        (tmp_path / "post-helm-grafana-dashboards.yaml").write_text(
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            "  name: gco-dashboard-gpu\n"
+            "  namespace: monitoring\n"
+            "  annotations:\n"
+            '    gco.io/cluster-observability-enabled: "{{CLUSTER_OBSERVABILITY_ENABLED}}"\n'
+            "data:\n"
+            '  d.json: \'{"targets":[{"legendFormat":"{{gpu}}"}]}\'\n'
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_client.CustomObjectsApi.return_value = MagicMock()
+
+            result = handler_module.apply_manifests(
+                "test-cluster", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 0
+        assert "post-helm-grafana-dashboards.yaml:unreplaced-placeholders" in result["Skipped"]
+
+
+class TestPrometheusOperatorCRDs:
+    """ServiceMonitor / PodMonitor are applied as monitoring.coreos.com objects.
+
+    Regression guard: these Prometheus Operator CRDs had no dedicated apply
+    branch, so they fell through to the "unsupported kind" skip and were never
+    created — silently breaking every cluster-observability scrape target.
+    They are applied in the post-Helm pass because the kube-prometheus-stack
+    chart registers their CRDs.
+    """
+
+    def test_servicemonitor_applied_as_namespaced_custom_object(self, handler_module, tmp_path):
+        (tmp_path / "post-helm-servicemonitors.yaml").write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "monitoring.coreos.com/v1",
+                    "kind": "ServiceMonitor",
+                    "metadata": {"name": "gco-kueue", "namespace": "monitoring"},
+                    "spec": {"endpoints": [{"port": "metrics"}]},
+                }
+            )
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_custom = MagicMock()
+            mock_client.CustomObjectsApi.return_value = mock_custom
+
+            result = handler_module.apply_manifests(
+                "c", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        mock_custom.create_namespaced_custom_object.assert_called_once()
+        args = mock_custom.create_namespaced_custom_object.call_args.args
+        assert args[0] == "monitoring.coreos.com"
+        assert args[1] == "v1"
+        assert args[2] == "monitoring"
+        assert args[3] == "servicemonitors"
+
+    def test_podmonitor_applied_with_podmonitors_plural(self, handler_module, tmp_path):
+        (tmp_path / "post-helm-podmonitors.yaml").write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "monitoring.coreos.com/v1",
+                    "kind": "PodMonitor",
+                    "metadata": {"name": "gco-health-monitor", "namespace": "monitoring"},
+                    "spec": {"podMetricsEndpoints": [{"port": "http"}]},
+                }
+            )
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_custom = MagicMock()
+            mock_client.CustomObjectsApi.return_value = mock_custom
+
+            result = handler_module.apply_manifests(
+                "c", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        args = mock_custom.create_namespaced_custom_object.call_args.args
+        assert args[3] == "podmonitors"
+
+    def test_servicemonitor_patched_on_conflict(self, handler_module, tmp_path):
+        """A 409 on create falls back to patch (idempotent re-apply)."""
+        from kubernetes.client.rest import ApiException
+
+        (tmp_path / "post-helm-servicemonitors.yaml").write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "monitoring.coreos.com/v1",
+                    "kind": "ServiceMonitor",
+                    "metadata": {"name": "gco-kueue", "namespace": "monitoring"},
+                    "spec": {"endpoints": [{"port": "metrics"}]},
+                }
+            )
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_custom = MagicMock()
+            mock_custom.create_namespaced_custom_object.side_effect = ApiException(status=409)
+            mock_client.CustomObjectsApi.return_value = mock_custom
+
+            result = handler_module.apply_manifests(
+                "c", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        mock_custom.patch_namespaced_custom_object.assert_called_once()
+        patch_args = mock_custom.patch_namespaced_custom_object.call_args.args
+        assert patch_args[3] == "servicemonitors"
+        assert patch_args[4] == "gco-kueue"
+
+
+class TestCronJobApply:
+    """batch/v1 CronJob is applied via BatchV1Api.
+
+    Regression guard mirroring the ServiceMonitor/PodMonitor fix: the Grafana
+    admin-password rotation CronJob (observability post-Helm pass) had no
+    dedicated apply branch, so it fell through to the "unsupported kind" skip
+    and was never created — its RBAC applied but the rotation CronJob did not.
+    Caught in live us-east-1 verification.
+    """
+
+    def test_cronjob_applied_via_batch_v1(self, handler_module, tmp_path):
+        (tmp_path / "post-helm-grafana-credential-rotation.yaml").write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "metadata": {
+                        "name": "gco-grafana-admin-password-rotation",
+                        "namespace": "monitoring",
+                    },
+                    "spec": {"schedule": "0 4 1 * *"},
+                }
+            )
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_client.CustomObjectsApi.return_value = MagicMock()
+            mock_batch = MagicMock()
+            mock_client.BatchV1Api.return_value = mock_batch
+
+            result = handler_module.apply_manifests(
+                "c", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        assert "CronJob/gco-grafana-admin-password-rotation" not in result["Skipped"]
+        mock_batch.create_namespaced_cron_job.assert_called_once()
+        assert mock_batch.create_namespaced_cron_job.call_args.args[0] == "monitoring"
+
+    def test_cronjob_patched_on_conflict(self, handler_module, tmp_path):
+        """A 409 on create falls back to patch (idempotent re-apply)."""
+        from kubernetes.client.rest import ApiException
+
+        (tmp_path / "post-helm-grafana-credential-rotation.yaml").write_text(
+            yaml.dump(
+                {
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "metadata": {
+                        "name": "gco-grafana-admin-password-rotation",
+                        "namespace": "monitoring",
+                    },
+                    "spec": {"schedule": "0 4 1 * *"},
+                }
+            )
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_client.CustomObjectsApi.return_value = MagicMock()
+            mock_batch = MagicMock()
+            mock_batch.create_namespaced_cron_job.side_effect = ApiException(status=409)
+            mock_client.BatchV1Api.return_value = mock_batch
+
+            result = handler_module.apply_manifests(
+                "c", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        mock_batch.patch_namespaced_cron_job.assert_called_once()
+        patch_args = mock_batch.patch_namespaced_cron_job.call_args.args
+        assert patch_args[0] == "gco-grafana-admin-password-rotation"
+        assert patch_args[1] == "monitoring"
+
 
 class TestPersistentVolumeHandling:
     """Tests for PV smart recreate logic."""

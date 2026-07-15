@@ -549,12 +549,22 @@ Static analysis tests act as guardrails against regressions in specific drift di
 | `test_cli_config.py` | Tests for cli/config.py. |
 | `test_cli_inference_models.py` | Tests for the inference and models CLI subgroups in cli/main.py. |
 | `test_cloudwatch_logs_fallback.py` | Tests for JobManager.get_job_logs CloudWatch Logs fallback. |
+| `test_cluster_observability_charts.py` | Regional-stack wiring for kube-prometheus-stack — chart-enable membership, value overrides, the gp3 StorageClass manifest, and the pure `_compute_kubectl_observability_replacements` gate helper. |
+| `test_cluster_observability_cli.py` | The `gco monitoring` CLI (status/enable/disable/open) plus the validated `kubectl port-forward` and SSM remote-host tunnel argv builders, including private-endpoint detection and the `--via-ssm` path. |
+| `test_cluster_observability_config.py` | `ConfigLoader.get_cluster_observability_config` defaults/merge and `_validate_cluster_observability_config` (enabled/persistence/retention/rotation-schedule validation), with a Hypothesis toggle round-trip. |
+| `test_cluster_observability_dashboards.py` | The curated Grafana dashboard ConfigMaps — four dashboards, the `grafana_dashboard` sidecar label, the observability gate annotation, valid dashboard JSON, and the UPPER_SNAKE-only placeholder guard. |
+| `test_cluster_observability_rotation.py` | The Grafana admin-password rotation module (`gco/services/grafana_rotator.py`) with mocked k8s client + HTTP, plus the gated rotation CronJob + least-privilege RBAC manifest assertions. |
+| `test_cluster_observability_screenshots.py` | The dashboard screenshot tooling (`scripts/capture_monitoring_screenshots.py`) — the capture targets stay in lockstep with the shipped dashboard ConfigMaps, output paths are PNGs under the repo `images/` directory, and `main()` wiring (Playwright `capture` mocked). |
+| `test_cluster_observability_service_metrics.py` | The GCO-service Prometheus instrumentation in `gco/services/service_metrics.py` (RED metrics + the scrape-time collector). |
+| `test_cluster_observability_users.py` | Grafana user management (`cli/monitoring_user_mgmt.py`) over the admin HTTP API and the `gco monitoring users` subcommands, with mocked requests + kubectl. |
+| `test_cluster_tunnel.py` | The shared cluster-tunnel core (`cli/cluster_tunnel.py`): `TunnelPlan` connection-plan builders, the `open_api_server_tunnel` lifecycle (all branches), the `gco cluster tunnel` command (interactive + `--print`), and the `gco monitoring open --via-ssm auto` bastion path. |
 | `test_costs.py` | Tests for the cost-visibility feature in cli/costs.py. |
 | `test_costs_cmd_extended.py` | Extended tests for cli/commands/costs_cmd.py. |
 | `test_cross_region_aggregator_extended.py` | Extended coverage tests for the cross-region aggregator Lambda. |
 | `test_dag.py` | Tests for the job-DAG pipeline feature in cli/dag.py. |
 | `test_default_bedrock_model_consistency.py` | Guards that the default Bedrock model id stays identical across the two advisory subsystems that pin it independently — `DEFAULT_BEDROCK_MODEL_ID` in `gco_mcp/mission/sampling.py` and `BedrockCapacityAdvisor.DEFAULT_MODEL` in `cli/capacity/advisor.py` — and that it has the system-defined inference-profile shape the deps-scan Bedrock-model drift check assumes. |
 | `test_drift_detection.py` | Tests for the CloudFormation drift-detection resources on the regional stack. |
+| `test_ephemeral_bastion.py` | The ephemeral SSM bastion lifecycle (`cli/ephemeral_bastion.py`): validated `aws` CLI argv builders with orphan safeguards (IMDSv2, shutdown-terminate, self-terminate user-data, `gco:ephemeral` tags), network/AMI discovery, and the atomic create/destroy lifecycle, with the AWS CLI shell-out mocked. |
 | `test_ga_registration.py` | Tests for the Global Accelerator registration Lambda (lambda/ga-registration/handler.py). |
 | `test_health_check_coverage.py` | Consistency tests between ALB Ingress health-check paths and the auth middleware allowlist. |
 | `test_helm_orchestrator_handler.py` | Unit tests for the helm-orchestrator custom-resource provider handler. |
@@ -569,6 +579,7 @@ Static analysis tests act as guardrails against regressions in specific drift di
 | `test_lambda_handlers_extended.py` | Extended tests for secret-rotation and alb-header-validator Lambdas. |
 | `test_lambda_proxy.py` | Tests for the Lambda proxy handlers and shared proxy_utils. |
 | `test_manifest_property.py` | Property-based tests for manifest validation and YAML parsing. |
+| `test_mcp_cluster_tool.py` | The `cluster_tunnel_command` MCP tool (`gco_mcp/tools/cluster.py`) — asserts the `gco cluster tunnel --print` argv it constructs, with the CLI subprocess mocked. |
 | `test_mcp_iam_role.py` | CDK assertion tests for the dedicated MCP server IAM role on the regional stack. |
 | `test_mcp_self_resources.py` | Tests for the self-indexing MCP resources (``mcp://gco/...``). |
 | `test_mcp_task_tools.py` | Tests for the read-only MCP observability tools (``task_status`` and ``task_tail``) and the matching ``gco tasks`` CLI surface. |
@@ -581,7 +592,7 @@ Static analysis tests act as guardrails against regressions in specific drift di
 | `test_regional_api_gateway_stack.py` | Tests for gco/stacks/regional_api_gateway_stack.GCORegionalApiGatewayStack. |
 | `test_request_size_limit.py` | Tests for the RequestSizeLimitMiddleware on the Manifest API. |
 | `test_resource_quota_config.py` | End-to-end tests that cdk.json resource quota values flow into the Kubernetes manifests applied on the cluster. |
-| `test_resource_quota_manifest.py` | Tests for the ResourceQuota + LimitRange manifest (lambda/kubectl-applier-simple/manifests/06-resource-quotas.yaml). |
+| `test_resource_quota_manifest.py` | Tests for the ResourceQuota + LimitRange manifest (lambda/kubectl-applier-simple/manifests/04-resource-quotas.yaml). |
 | `test_stacks_access.py` | Tests for `gco stacks access` — the kubectl bootstrap command in cli/commands/stacks_cmd.py. |
 | `test_stacks_ordering_fsx.py` | Tests for stack ordering helpers and FSx configuration in cli/stacks.py. |
 | `test_task_status.py` | Tests for the disk-backed task status writer. |

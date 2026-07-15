@@ -7,6 +7,7 @@ on the root ``cli`` group via ``cli.add_command()``.
 
 from .analytics_cmd import analytics
 from .capacity_cmd import capacity
+from .cluster_cmd import cluster
 from .config_cmd import config_cmd
 from .costs_cmd import costs
 from .dag_cmd import dag
@@ -16,6 +17,7 @@ from .inference_cmd import inference
 from .jobs_cmd import jobs
 from .mission_cmd import mission_cmd
 from .models_cmd import models
+from .monitoring_cmd import monitoring
 from .nodepools_cmd import nodepools
 from .queue_cmd import queue
 from .stacks_cmd import stacks
@@ -26,6 +28,7 @@ from .webhooks_cmd import webhooks
 __all__ = [
     "analytics",
     "capacity",
+    "cluster",
     "config_cmd",
     "costs",
     "dag",
@@ -35,6 +38,7 @@ __all__ = [
     "jobs",
     "mission_cmd",
     "models",
+    "monitoring",
     "nodepools",
     "queue",
     "stacks",

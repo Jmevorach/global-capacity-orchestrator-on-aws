@@ -44,7 +44,7 @@ import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any
@@ -747,6 +747,14 @@ class StackManager:
         # GCO_CDK_DEPLOY_TIMEOUT_SECONDS.
         timeout_s = float(os.environ.get("GCO_CDK_DEPLOY_TIMEOUT_SECONDS", "3600"))
 
+        # Timestamp (UTC) marking the start of this deploy attempt. The failure
+        # reconciliation below uses it to tell a *fresh* CloudFormation
+        # completion (cdk's client-side polling gave up just after CFN finished
+        # — a real success) apart from a *stale* terminal state left by a
+        # previous deploy (cdk failed before touching CloudFormation — a real
+        # failure that must not be masked).
+        deploy_start = datetime.now(UTC)
+
         try:
             result = self._run_cdk(cmd, env=env, timeout=timeout_s)
             success = result.returncode == 0
@@ -757,29 +765,59 @@ class StackManager:
             )
             success = False
 
-        # Reconcile against CloudFormation. If the stack is in a terminal
-        # CREATE/UPDATE_COMPLETE state, the deploy actually succeeded
-        # despite cdk's exit code or timeout.
+        # Reconcile a cdk failure/timeout against CloudFormation. cdk's
+        # client-side polling can give up (a transient ``read EADDRNOTAVAIL``
+        # socket error, or our wall-clock timeout) while CloudFormation keeps
+        # working server-side, so a non-zero exit does not always mean the
+        # deploy failed. The trick is to reconcile without masking a *real*
+        # failure by mistaking a stale terminal state for a fresh success.
         if stack_name and not all_stacks and not success:
             cfn_status = self._get_stack_status(stack_name)
-            # cdk may have died on a transient client-side error (e.g. a
-            # ``read EADDRNOTAVAIL`` socket failure) while CloudFormation kept
-            # working. If the stack is still mid-operation, wait for it to
-            # settle to a terminal state before judging — a status read taken
-            # the instant cdk exits can otherwise catch a stack seconds before
-            # it reaches CREATE_COMPLETE and report a false failure.
             if cfn_status is not None and cfn_status.endswith("_IN_PROGRESS"):
+                # CloudFormation is still mid-operation — observing that is
+                # itself proof it ran an operation for this attempt. Wait for it
+                # to settle and accept a terminal COMPLETE as a genuine success.
                 print(
                     f"  cdk exited non-zero but {stack_name} is {cfn_status} in "
                     "CloudFormation; waiting for the operation to settle..."
                 )
-                cfn_status = self._wait_for_stack_settle(stack_name)
-            if cfn_status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
-                print(
-                    f"  cdk reported a non-zero exit but {stack_name} is in "
-                    f"{cfn_status} in CloudFormation — treating as success."
-                )
-                success = True
+                settled_status = self._wait_for_stack_settle(stack_name)
+                if settled_status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
+                    print(
+                        f"  cdk reported a non-zero exit but {stack_name} settled "
+                        f"to {settled_status} in CloudFormation — treating as "
+                        "success."
+                    )
+                    success = True
+            elif cfn_status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
+                # The stack is already terminal and CloudFormation is not
+                # mid-flight. Two very different situations look identical on
+                # status alone; only the stack's last-operation time tells them
+                # apart:
+                #   * cdk's polling gave up just *after* CloudFormation finished
+                #     this attempt's operation — a genuine success whose
+                #     last-update time is newer than when we started.
+                #   * cdk failed *before* it ever touched CloudFormation (a
+                #     synth error, a cloud-assembly schema mismatch, an
+                #     asset/image build failure); the stack is merely sitting in
+                #     a *previous* deploy's COMPLETE state, whose last-update
+                #     time predates this attempt. Masking this is the
+                #     false-success bug this guards against.
+                last_op = self._get_stack_last_update_time(stack_name)
+                if last_op is not None and last_op >= deploy_start:
+                    print(
+                        f"  cdk reported a non-zero exit but {stack_name} shows a "
+                        f"fresh {cfn_status} in CloudFormation — treating as "
+                        "success."
+                    )
+                    success = True
+                else:
+                    print(
+                        f"  cdk failed and {stack_name} is {cfn_status}, but no "
+                        "new CloudFormation operation ran for this attempt — cdk "
+                        "failed before touching CloudFormation. Treating as a "
+                        "failed deploy."
+                    )
 
         # Conversely, when cdk reports success, confirm CloudFormation actually
         # landed in a terminal success state. A zero cdk exit can still mask a
@@ -1140,6 +1178,31 @@ class StackManager:
             cfn = boto3.client("cloudformation", region_name=region)
             resp = cfn.describe_stacks(StackName=stack_name)
             return str(resp["Stacks"][0]["StackStatus"])
+        except Exception:
+            return None
+
+    def _get_stack_last_update_time(self, stack_name: str) -> datetime | None:
+        """Return the UTC time of ``stack_name``'s most recent CloudFormation
+        operation, or None if the stack is absent or the lookup fails.
+
+        Uses ``LastUpdatedTime`` when the stack has been updated at least once,
+        falling back to ``CreationTime`` for a stack that has only ever been
+        created. ``deploy()`` compares this against the moment the deploy
+        attempt started to decide whether a cdk failure/timeout that leaves the
+        stack ``*_COMPLETE`` reflects a *fresh* operation (cdk's polling merely
+        gave up early — success) or a *stale* one left by a previous deploy
+        (cdk failed before touching CloudFormation — a real failure). A None
+        return keeps the conservative 'cdk's failure stands' verdict.
+        """
+        import boto3
+
+        try:
+            region = self._get_destroy_region(stack_name)
+            cfn = boto3.client("cloudformation", region_name=region)
+            resp = cfn.describe_stacks(StackName=stack_name)
+            stack = resp["Stacks"][0]
+            last_op = stack.get("LastUpdatedTime") or stack.get("CreationTime")
+            return last_op if isinstance(last_op, datetime) else None
         except Exception:
             return None
 
@@ -2626,3 +2689,46 @@ def update_analytics_config(settings: dict[str, Any]) -> None:
     ``cognito.removal_policy``.
     """
     _update_feature_config("analytics_environment", settings, _ANALYTICS_DEFAULTS)
+
+
+# =============================================================================
+# Cluster observability configuration
+# =============================================================================
+
+# Mirrors the on-by-default cdk.json cluster_observability block. Unlike the
+# other feature toggles this one defaults to enabled=True: a stock deploy
+# installs kube-prometheus-stack on every regional cluster and operators opt
+# out. The CDK side reads/validates the same block via
+# ConfigLoader.get_cluster_observability_config.
+_CLUSTER_OBSERVABILITY_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "grafana": {
+        "persistence_size": "10Gi",
+        "admin_user": "admin",
+        "admin_password_rotation_schedule": "0 4 1 * *",
+    },
+    "prometheus": {"persistence_size": "50Gi", "retention": "15d"},
+    "alertmanager": {"enabled": True, "persistence_size": "5Gi"},
+}
+
+
+def get_cluster_observability_config() -> dict[str, Any]:
+    """Get the cluster observability configuration from cdk.json.
+
+    Observability is per-region (installed on every regional cluster) but the
+    toggle itself is global, so this takes no region argument. Returns the
+    defaults merged with any operator overrides from the
+    ``context.cluster_observability`` block.
+    """
+    return _get_feature_config("cluster_observability", _CLUSTER_OBSERVABILITY_DEFAULTS)
+
+
+def update_cluster_observability_config(settings: dict[str, Any]) -> None:
+    """Update the cluster observability toggle in cdk.json.
+
+    ``gco monitoring enable`` / ``disable`` pass ``{"enabled": True/False}``;
+    the grafana/prometheus/alertmanager sub-blocks are left untouched so an
+    operator's sizing/retention/rotation overrides survive a disable/enable
+    cycle.
+    """
+    _update_feature_config("cluster_observability", settings, _CLUSTER_OBSERVABILITY_DEFAULTS)

@@ -116,6 +116,7 @@ from tools.capacity import (  # noqa: E402, F401
     reservation_check,
     spot_prices,
 )
+from tools.cluster import cluster_tunnel_command  # noqa: E402, F401
 from tools.config import config_get  # noqa: E402, F401
 from tools.costs import cost_by_region, cost_forecast, cost_summary, cost_trend  # noqa: E402, F401
 from tools.dag import dag_run, dag_validate  # noqa: E402, F401
@@ -172,6 +173,13 @@ from tools.metrics import (  # noqa: E402, F401
     metrics_from_shared_storage_file,
 )
 from tools.models import get_model_uri, list_models  # noqa: E402, F401
+from tools.monitoring import (  # noqa: E402, F401
+    disable_monitoring,
+    enable_monitoring,
+    monitoring_status,
+    monitoring_user_add,
+    monitoring_users_list,
+)
 from tools.nodepools import (  # noqa: E402, F401
     nodepools_create_capacity_block,
     nodepools_create_odcr,
@@ -257,6 +265,9 @@ with _contextlib.suppress(ImportError):
 
 with _contextlib.suppress(ImportError):
     from tools.analytics import analytics_user_remove  # noqa: F401
+
+with _contextlib.suppress(ImportError):
+    from tools.monitoring import monitoring_user_remove  # noqa: F401
 
 with _contextlib.suppress(ImportError):
     from tools.queue import cancel_queue_job  # noqa: F401
@@ -393,6 +404,12 @@ if _DESTRUCTIVE_FLAG_ON:
     if hasattr(_q_mod, "cancel_queue_job"):
         globals()["cancel_queue_job"] = _q_mod.cancel_queue_job
 
+    from tools import monitoring as _mon_mod  # noqa: E402
+
+    _importlib.reload(_mon_mod)
+    if hasattr(_mon_mod, "monitoring_user_remove"):
+        globals()["monitoring_user_remove"] = _mon_mod.monitoring_user_remove
+
 # tools.models is reloaded if either the destructive flag (delete_model)
 # or the model-upload flag (models_upload) is set, so do it once here
 # regardless of which (or both) flipped.
@@ -459,6 +476,7 @@ __all__ = [
     "chat_inference",
     "check_capacity",
     "cluster_health",
+    "cluster_tunnel_command",
     "config_get",
     "cost_by_region",
     "cost_forecast",
@@ -482,11 +500,13 @@ __all__ = [
     "disable_analytics",
     "disable_aurora",
     "disable_fsx",
+    "disable_monitoring",
     "disable_valkey",
     "emit_startup_log",
     "enable_analytics",
     "enable_aurora",
     "enable_fsx",
+    "enable_monitoring",
     "enable_valkey",
     "files_access_points",
     "files_get",
@@ -547,6 +567,10 @@ __all__ = [
     "mission_start",
     "mission_status",
     "models_upload",
+    "monitoring_status",
+    "monitoring_user_add",
+    "monitoring_user_remove",
+    "monitoring_users_list",
     "mooncake_topology_status",
     "nodepools_create_capacity_block",
     "nodepools_create_odcr",

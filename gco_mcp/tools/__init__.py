@@ -12,6 +12,7 @@ def register_all_tools() -> None:
     from tools import (  # noqa: F401
         analytics,
         capacity,
+        cluster,
         config,
         costs,
         dag,
@@ -23,6 +24,7 @@ def register_all_tools() -> None:
         metrics,
         mission,
         models,
+        monitoring,
         nodepools,
         queue,
         semantic_progress,

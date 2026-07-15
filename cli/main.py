@@ -24,6 +24,7 @@ from . import __version__
 from .commands import (
     analytics,
     capacity,
+    cluster,
     config_cmd,
     costs,
     dag,
@@ -33,6 +34,7 @@ from .commands import (
     jobs,
     mission_cmd,
     models,
+    monitoring,
     nodepools,
     queue,
     stacks,
@@ -138,6 +140,7 @@ cli.add_command(queue)
 cli.add_command(templates)
 cli.add_command(webhooks)
 cli.add_command(capacity)
+cli.add_command(cluster)
 cli.add_command(inference)
 cli.add_command(images)
 cli.add_command(models)
@@ -147,6 +150,7 @@ cli.add_command(stacks)
 cli.add_command(files)
 cli.add_command(config_cmd)
 cli.add_command(analytics)
+cli.add_command(monitoring)
 cli.add_command(tasks)
 cli.add_command(mission_cmd)
 

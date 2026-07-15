@@ -20,6 +20,7 @@ Complete command-line interface documentation for GCO (Global Capacity Orchestra
   - [images](#images-commands)
   - [files](#files-commands)
   - [nodepools](#nodepools-commands)
+  - [monitoring](#monitoring-commands)
   - [analytics](#analytics-commands)
   - [config-cmd](#config-cmd-commands)
   - [tasks](#tasks-commands)
@@ -3156,6 +3157,170 @@ gco nodepools delete NODEPOOL_NAME [OPTIONS]
 ```bash
 gco nodepools delete gpu-reserved -r us-east-1
 gco nodepools delete gpu-reserved -r us-east-1 -y
+```
+
+---
+
+### Monitoring Commands
+
+Manage in-cluster observability (`kube-prometheus-stack`: Prometheus + Grafana +
+Alertmanager). Unlike most features this one is **on by default** on every
+regional cluster. See the [Monitoring Guide](MONITORING.md) for the cost model,
+private-endpoint access, and credential rotation.
+
+Grafana has no public endpoint, so `gco monitoring open` port-forwards over the
+PRIVATE EKS API endpoint and can tunnel through an SSM-managed instance with
+`--via-ssm`. The `users` subcommands drive Grafana's admin HTTP API over that
+port-forward.
+
+<details>
+<summary>All <code>gco monitoring</code> commands (7) — click to expand</summary>
+
+| Command | Description |
+| --- | --- |
+| [`gco monitoring status`](#gco-monitoring-status) | Show the current `cluster_observability.*` toggle state from `cdk.json`. |
+| [`gco monitoring enable`](#gco-monitoring-enable) | Flip `cluster_observability.enabled` to `true` in `cdk.json`. |
+| [`gco monitoring disable`](#gco-monitoring-disable) | Flip `cluster_observability.enabled` to `false` in `cdk.json`. |
+| [`gco monitoring open`](#gco-monitoring-open) | Port-forward Grafana / Prometheus / Alertmanager over the private endpoint (optionally via an SSM tunnel). |
+| [`gco monitoring users add`](#gco-monitoring-users) | Create a Grafana user via the admin API. |
+| [`gco monitoring users list`](#gco-monitoring-users) | List Grafana organisation users. |
+| [`gco monitoring users remove`](#gco-monitoring-users) | Delete a Grafana user. |
+
+</details>
+
+#### `gco monitoring status`
+
+Show the merged `cluster_observability` config (toggle plus grafana / prometheus
+/ alertmanager sub-blocks) from `cdk.json`.
+
+```bash
+gco monitoring status
+```
+
+#### `gco monitoring enable`
+
+Flip `cluster_observability.enabled` to `true` in `cdk.json` (it is already on by
+default). Takes effect on the next `gco stacks deploy`.
+
+```bash
+gco monitoring enable [-y]
+```
+
+#### `gco monitoring disable`
+
+Flip `cluster_observability.enabled` to `false`. The grafana / prometheus /
+alertmanager sub-blocks are left untouched so preferences survive a
+disable/enable cycle. The in-cluster stack and its EBS volumes are removed on the
+next deploy.
+
+```bash
+gco monitoring disable [-y]
+```
+
+#### `gco monitoring open`
+
+Port-forward a monitoring component over the private EKS API endpoint. Runs in
+the foreground; press Ctrl-C to stop.
+
+```bash
+gco monitoring open [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--service` | `grafana` (default, `localhost:3000`), `prometheus` (`:9090`), or `alertmanager` (`:9093`). |
+| `--region` | Cluster region (defaults to the first `deployment_regions.regional` entry). |
+| `--local-port` | Override the local bind port. |
+| `--via-ssm INSTANCE_ID` | Tunnel to the private API endpoint through an SSM-managed instance (requires the Session Manager plugin). |
+
+**Example:**
+
+```bash
+# From inside the VPC:
+gco monitoring open --region us-east-1
+
+# From a laptop, tunnelling through an SSM-managed instance:
+gco monitoring open --region us-east-1 --via-ssm i-0123456789abcdef0
+```
+
+#### `gco monitoring users`
+
+Manage Grafana users through the admin HTTP API, over an active
+`gco monitoring open` port-forward (default `http://localhost:3000`). Admin
+credentials are read from the `kube-prometheus-stack-grafana` Secret, or passed
+with `--admin-password` / `$GCO_GRAFANA_ADMIN_PASSWORD`.
+
+```bash
+gco monitoring users add --username alice --email alice@example.com --generate-password
+gco monitoring users list [--as-json]
+gco monitoring users remove --username alice --yes
+```
+
+---
+
+### Cluster Commands
+
+Reach a cluster's **PRIVATE** EKS API endpoint from outside the VPC over an AWS
+Systems Manager tunnel, so `kubectl` works without a VPN or a standing bastion.
+`gco cluster tunnel` is the general form of the SSM tunnelling that
+`gco monitoring open` uses for Grafana; the MCP `cluster_tunnel_command` tool
+(see [`gco_mcp/tools/README.md`](../gco_mcp/tools/README.md)) returns the same
+connection plan for agents.
+
+<details>
+<summary>All <code>gco cluster</code> commands (1) — click to expand</summary>
+
+| Command | Description |
+| --- | --- |
+| [`gco cluster tunnel`](#gco-cluster-tunnel) | Open (or `--print`) an SSM tunnel to the private EKS API endpoint, optionally auto-provisioning a self-terminating ephemeral bastion. |
+
+</details>
+
+#### `gco cluster tunnel`
+
+Open an SSM Session Manager tunnel to the cluster's private API endpoint and hold
+it open in the foreground (Ctrl-C to stop), printing the `kubectl` flags to use
+in another shell. With `--print` it instead emits the ready-to-run tunnel +
+`kubectl` commands (a connection plan) without opening anything — JSON under
+`gco --output json`, copy-paste shell commands otherwise.
+
+```bash
+gco cluster tunnel [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--region` | Cluster region (defaults to the first `deployment_regions.regional` entry). |
+| `--via-ssm INSTANCE_ID\|auto` | Tunnel through an existing SSM-managed instance, or `auto` to provision a self-terminating ephemeral bastion and tear it down on exit. |
+| `--local-port` | Local port to bind for the API tunnel (default `8443`). |
+| `--print` | Print the tunnel + `kubectl` connection plan instead of opening the tunnel. |
+| `--bastion-ttl-minutes` | Self-terminate backstop for an `--via-ssm auto` bastion (default `120`). |
+| `--yes` / `-y` | Skip the confirmation prompt when provisioning an `--via-ssm auto` bastion. |
+
+The `auto` bastion is a minimal `t3.micro` in the cluster VPC that reuses the
+cluster security group (no new security group, and **no inbound ports** — SSM is
+outbound-only), requires IMDSv2, self-terminates after `--bastion-ttl-minutes`,
+and is tagged `gco:ephemeral=true`. It is torn down automatically when the tunnel
+closes; if teardown ever fails, the command prints the exact orphan-check
+command.
+
+**Example:**
+
+```bash
+# Auto-provision an ephemeral bastion, tunnel, and hold it open:
+gco cluster tunnel --region us-east-1 --via-ssm auto
+
+# In another shell, run kubectl through the tunnel:
+kubectl --server https://localhost:8443 \
+    --tls-server-name <endpoint-host> get nodes
+
+# Or just print the connection plan (no changes made, JSON for scripting):
+gco cluster tunnel --region us-east-1 --print
+gco --output json cluster tunnel --region us-east-1 --via-ssm i-0123456789abcdef0 --print
 ```
 
 ---
