@@ -39,7 +39,7 @@ instead of the upstream — typically a Helm ``image_registry``/``image`` overri
 in ``gco/stacks/regional_stack.py`` (see ``_helm_chart_value_overrides`` /
 ``_configure_volcano_image_mirror`` for the Volcano example) or a manifest image
 reference. The mirror copies ``<registry>/<repo>:<tag>`` to
-``<account>.dkr.ecr.<region>.amazonaws.com/<ecr_namespace>/<repo>:<tag>``, so the
+``<account>.dkr.ecr.<region>.<url-suffix>/<ecr_namespace>/<repo>:<tag>``, so the
 consumer must point at ``<…>/<ecr_namespace>/<repo>``.
 
 WHY mirror rather than pull-through cache: ECR pull-through cache for Docker Hub
@@ -62,7 +62,7 @@ import base64
 import json
 import shutil
 import subprocess  # nosec B404 - invokes container CLI / skopeo with fixed, non-shell argv
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,7 +70,10 @@ from typing import Any
 import boto3
 import yaml
 
+from ._image_uri import ecr_registry_host
+
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-07-18T01:03:40Z
 # Flowchart(s) generated from this file:
 #   * ``read_mirror_config`` -> ``diagrams/code_diagrams/cli/_image_mirror.read_mirror_config.html``
 #     (PNG: ``diagrams/code_diagrams/cli/_image_mirror.read_mirror_config.png``)
@@ -107,6 +110,19 @@ _VOLCANO_UPSTREAM_REGISTRY = "docker.io"
 # Default logger — callers may pass their own ``log`` callable (e.g. to route
 # through a deploy progress stream).
 LogFn = Callable[[str], None]
+RepositoryCreatedCallback = Callable[[str, Mapping[str, Any]], None]
+
+
+def _bind_repository_created_callback(
+    callback: RepositoryCreatedCallback,
+    region: str,
+) -> Callable[[Mapping[str, Any]], None]:
+    """Bind one target Region without obscuring the callback's payload type."""
+
+    def notify(repository: Mapping[str, Any]) -> None:
+        callback(region, repository)
+
+    return notify
 
 
 @dataclass(frozen=True)
@@ -212,7 +228,7 @@ def plan_from_sources(
 ) -> list[MirrorItem]:
     """Compute the copy plan: one :class:`MirrorItem` per source ref.
 
-    ``registry_host`` is ``<account>.dkr.ecr.<region>.amazonaws.com`` and
+    ``registry_host`` is ``<account>.dkr.ecr.<region>.<url-suffix>`` and
     ``ecr_namespace`` is the destination prefix (e.g. ``gco/dockerhub``). The
     destination preserves the upstream repo path so it lines up with whatever
     ``image_registry``/``image`` override the consumer points at
@@ -262,7 +278,8 @@ def _account_id() -> str:
 
 
 def _registry_host(account_id: str, region: str) -> str:
-    return f"{account_id}.dkr.ecr.{region}.amazonaws.com"
+    """Return the ECR host using botocore's partition URL suffix metadata."""
+    return ecr_registry_host(account_id, region)
 
 
 def detect_runtime() -> str:
@@ -333,13 +350,37 @@ def resolve_copy_strategy(runtime: str) -> str:
     )
 
 
-def ensure_repository(ecr_client: Any, repo_name: str, log: LogFn = print) -> None:
-    """Create the ECR repository if it does not already exist (idempotent)."""
+def ensure_repository(
+    ecr_client: Any,
+    repo_name: str,
+    log: LogFn = print,
+    repository_tags: Mapping[str, str] | None = None,
+    on_created: Callable[[Mapping[str, Any]], None] | None = None,
+) -> bool:
+    """Create a repository and synchronously publish its causal acknowledgement."""
+    kwargs: dict[str, Any] = {"repositoryName": repo_name}
+    if repository_tags:
+        kwargs["tags"] = [
+            {"Key": str(key), "Value": str(value)} for key, value in sorted(repository_tags.items())
+        ]
     try:
-        ecr_client.create_repository(repositoryName=repo_name)
+        response = ecr_client.create_repository(**kwargs)
+        repository = response.get("repository") if isinstance(response, dict) else None
+        if on_created is not None:
+            if not isinstance(repository, dict):
+                raise RuntimeError(
+                    f"ECR create_repository omitted its acknowledgement for {repo_name}"
+                )
+            if str(repository.get("repositoryName") or "") != repo_name:
+                raise RuntimeError(
+                    f"ECR create_repository acknowledged a different repository for {repo_name}"
+                )
+            on_created(repository)
         log(f"  created ECR repository {repo_name}")
+        return True
     except ecr_client.exceptions.RepositoryAlreadyExistsException:
         log(f"  ECR repository {repo_name} already exists")
+        return False
 
 
 def tag_exists(ecr_client: Any, repo_name: str, tag: str) -> bool:
@@ -457,7 +498,7 @@ def plan_mirror(
     ``source_refs`` defaults to :func:`collect_source_refs`; ``ecr_namespace``
     defaults to :func:`cdk_default_namespace`. Returns ``{region, registry,
     ecr_namespace, images: [{source_ref, dest_repo, dest_ref, tag}, ...]}`` where
-    ``registry`` is ``<account>.dkr.ecr.<region>.amazonaws.com/<ecr_namespace>``.
+    ``registry`` is ``<account>.dkr.ecr.<region>.<url-suffix>/<ecr_namespace>``.
     """
     ecr_namespace = (ecr_namespace or cdk_default_namespace()).strip("/")
     if source_refs is None:
@@ -521,6 +562,8 @@ def mirror_images(
     charts_path: Path | None = None,
     skip_existing: bool = True,
     log: LogFn = print,
+    repository_tags: Mapping[str, str] | None = None,
+    on_repository_created: RepositoryCreatedCallback | None = None,
 ) -> dict[str, Any]:
     """Mirror the configured upstream images into ECR for ``region`` (full flow).
 
@@ -559,8 +602,21 @@ def mirror_images(
     ecr_client = boto3.client("ecr", region_name=region)
     mirrored: list[str] = []
     skipped: list[str] = []
+    created_repositories: list[str] = []
+    on_created = (
+        _bind_repository_created_callback(on_repository_created, region)
+        if on_repository_created is not None
+        else None
+    )
     for item in plan:
-        ensure_repository(ecr_client, item.dest_repo, log=log)
+        if ensure_repository(
+            ecr_client,
+            item.dest_repo,
+            log=log,
+            repository_tags=repository_tags,
+            on_created=on_created,
+        ):
+            created_repositories.append(item.dest_repo)
         if skip_existing and tag_exists(ecr_client, item.dest_repo, item.tag):
             log(f"  skip (already mirrored): {item.dest_ref}")
             skipped.append(item.dest_ref)
@@ -573,4 +629,5 @@ def mirror_images(
         "strategy": strategy,
         "mirrored": mirrored,
         "skipped": skipped,
+        "created_repositories": sorted(set(created_repositories)),
     }

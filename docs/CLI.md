@@ -68,23 +68,38 @@ These options are available for all commands:
 | `--region` | `-r` | Default AWS region |
 | `--output` | `-o` | Output format: `table`, `json`, `yaml` |
 | `--verbose` | `-v` | Enable verbose output |
-| `--regional-api` | | Use regional API endpoints (for private access) |
+| `--regional-api` | | Require the authorized direct regional API path instead of the global endpoint |
 | `--help` | | Show help message |
 | `--version` | | Show version |
 
 ### Regional API Mode
 
-When `--regional-api` is enabled (or `GCO_REGIONAL_API=true` environment variable is set), the CLI routes requests through regional API Gateways instead of the global API Gateway. This is required when:
+Every workload region has a regional API bridge because the centralized
+aggregator uses it to reach that region's private VPC. In the commercial `aws`
+partition, the bridge's resource policy admits only the aggregator role by
+default, and `api_gateway.regional_api_enabled=true` additionally permits
+IAM-authorized principals from the deployment account. In other partitions,
+same-account direct access is enabled automatically because Global Accelerator
+and its global proxy routes are omitted.
 
-- The ALB is internal-only (no public exposure)
-- Public access is disabled on the EKS cluster
-- Maximum security posture is required
+When a command supplies an exact target region, the CLI automatically resolves
+and signs against that region's API Gateway; it never forwards a routing header
+to the global endpoint. When `--regional-api` is enabled (or
+`GCO_REGIONAL_API=true` is set), the CLI requires a selected region for every API
+call and never uses the global API Gateway → Global Accelerator path. In `aws`,
+enable the policy opt-in in `cdk.json` and redeploy before using either form of
+direct regional access. Outside `aws`, the deployment enables that same-account
+policy automatically. The global endpoint rejects `X-GCO-Target-Region` rather
+than silently pretending a region pin succeeded.
+
+Both API Gateway hops use AWS-managed TLS and SigV4. The regional VPC Lambda
+then uses HMAC plus deployment-local private-root TLS to the internal ALB.
 
 ```bash
-# Use regional API for a single command
+# Use the deployed regional API for a single command
 gco --regional-api jobs list --region us-east-1
 
-# Or set environment variable for all commands
+# Or select regional mode for subsequent commands
 export GCO_REGIONAL_API=true
 gco jobs list --region us-east-1
 ```
@@ -893,7 +908,7 @@ Manage CDK infrastructure stacks.
 
 | Command | Description |
 | --- | --- |
-| [`gco stacks list`](#gco-stacks-list) | List all GCO stacks. |
+| [`gco stacks list`](#gco-stacks-list) | List all stacks synthesized by the local CDK app. |
 | [`gco stacks status`](#gco-stacks-status) | Get detailed status of a stack. |
 | [`gco stacks deploy`](#gco-stacks-deploy) | Deploy a single stack. |
 | [`gco stacks deploy-all`](#gco-stacks-deploy-all) | Deploy all stacks in correct order. |
@@ -922,8 +937,7 @@ gco stacks list [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--region` | `-r` | Filter by region |
-| `--all-regions` | | List from all regions |
+| `--refresh` | | Compatibility flag; stack discovery runs live on every invocation |
 
 #### `gco stacks status`
 
@@ -957,8 +971,9 @@ gco stacks deploy STACK_NAME [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--region` | `-r` | Stack region |
 | `--yes` | `-y` | Skip confirmation |
+| `--outputs-file` | `-o` | Write stack outputs to a file |
+| `--tag` | `-t` | Add a stack tag (`KEY=VALUE`), repeatable |
 
 **Example:**
 
@@ -979,6 +994,8 @@ gco stacks deploy-all [OPTIONS]
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--yes` | `-y` | Skip confirmation |
+| `--outputs-file` | `-o` | Write stack outputs to a file |
+| `--tag` | `-t` | Add a stack tag (`KEY=VALUE`), repeatable |
 | `--parallel` | `-p` | Deploy regional stacks in parallel |
 | `--max-workers` | `-w` | Max parallel workers (default: 4) |
 
@@ -1001,7 +1018,6 @@ gco stacks destroy STACK_NAME [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--region` | `-r` | Stack region |
 | `--yes` | `-y` | Skip confirmation |
 
 #### `gco stacks destroy-all`
@@ -1032,7 +1048,8 @@ gco stacks bootstrap [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--region` | `-r` | Region to bootstrap |
+| `--account` | `-a` | AWS account ID (defaults to the active credentials) |
+| `--region` | `-r` | Region to bootstrap (required) |
 
 #### `gco stacks access`
 
@@ -1046,7 +1063,7 @@ gco stacks access [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--cluster` | `-c` | Cluster name (default: gco-{region}) |
+| `--cluster` | `-c` | Cluster name (default: `<project_name>-<region>`) |
 | `--region` | `-r` | AWS region (default: first deployment region) |
 
 **Examples:**
@@ -1583,7 +1600,12 @@ This command gathers comprehensive capacity data including:
 - Current cluster utilization (queue depth, GPU/CPU usage)
 - Running and pending job counts
 
-The data is analyzed by an LLM (Claude by default) to provide intelligent recommendations.
+The data is analyzed by the Bedrock model selected by `cdk.json`
+`context.bedrock.default_model_id` (Amazon Nova 2 Lite's global inference
+profile in the stock configuration). The stock
+`context.bedrock.thinking.effort=high` enables Nova 2 Lite's maximum reasoning
+effort; reasoning tokens are billed as output and can materially increase
+latency. Explicit model overrides do not inherit Nova-specific thinking fields.
 
 **Requirements:**
 
@@ -1602,7 +1624,7 @@ The data is analyzed by an LLM (Claude by default) to provide intelligent recomm
 | `--min-memory-gb` | | Minimum memory in GB |
 | `--fault-tolerance` | `-f` | Fault tolerance level: `high`, `medium`, `low` |
 | `--max-cost` | | Maximum cost per hour in USD |
-| `--model` | `-m` | Bedrock model ID to use |
+| `--model` | `-m` | Bedrock model ID to use (default: `cdk.json` `context.bedrock.default_model_id`) |
 | `--raw` | | Show raw AI response |
 
 **Example:**
@@ -1955,7 +1977,7 @@ gco capacity predict [OPTIONS]
 | `--region` | `-r` | AWS region (omit when using `--all-regions`) |
 | `--all-regions` | `-a` | Predict across every region that has historical data for the instance type |
 | `--hours` | `-H` | Hours of history to analyze (default 168 = 7 days) |
-| `--model` | `-m` | Bedrock model ID to use |
+| `--model` | `-m` | Bedrock model ID to use (default: `cdk.json` `context.bedrock.default_model_id`) |
 | `--raw` | | Show the raw AI response |
 
 **Example:**
@@ -2037,6 +2059,8 @@ gco inference deploy ENDPOINT_NAME [OPTIONS]
 | `--mooncake-mode` | | Mooncake serving mode: `disaggregated` (prefill/decode split), `store` (shared KV-cache), or `both` |
 | `--prefill-replicas` | | Number of prefill replicas (default: 1). Used with `--mooncake-mode disaggregated\|both` |
 | `--decode-replicas` | | Number of decode replicas (default: 1). Used with `--mooncake-mode disaggregated\|both` |
+| `--mooncake-protocol` | | Transfer intent: `rdma` (default, rendered to vLLM's EFA connector protocol and scheduled on EFA) or `tcp` (non-EFA fallback). Requires `--mooncake-mode` |
+| `--mooncake-device-name` | | Optional provider-visible network device forwarded to Mooncake. Omit for auto-detection. Requires `--mooncake-mode` |
 | `--mooncake-autoscale` | | Per-role autoscaling as `ROLE:MIN:MAX[:METRIC:TARGET...]`. Repeatable. E.g. `prefill:1:8:gpu:70` |
 | `--mooncake-cold-tier` | | Enable the async per-region S3 cold tier for the shared KV-cache store. Requires `--mooncake-mode store\|both`. Pre-warm with `gco inference populate-kv` |
 | `--mooncake-proxy-image` | | Container image for the prefill-decode proxy (disaggregated/both). Defaults to the endpoint image |
@@ -2046,9 +2070,9 @@ gco inference deploy ENDPOINT_NAME [OPTIONS]
 **Example:**
 
 ```bash
-gco inference deploy my-llm -i vllm/vllm-openai:v0.22.0
+gco inference deploy my-llm -i vllm/vllm-openai:v0.24.0
 gco inference deploy llama3-70b \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   -r us-east-1 -r eu-west-1 \
   --replicas 2 --gpu-count 4 \
   --model-source s3://bucket/models/llama3-70b \
@@ -2056,7 +2080,7 @@ gco inference deploy llama3-70b \
 
 # Deploy with autoscaling (creates a Kubernetes HPA)
 gco inference deploy my-llm \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --replicas 2 --gpu-count 1 \
   --min-replicas 1 --max-replicas 8 \
   --autoscale-metric cpu:70 --autoscale-metric memory:80
@@ -2190,7 +2214,7 @@ gco inference update-image ENDPOINT_NAME [OPTIONS]
 **Example:**
 
 ```bash
-gco inference update-image my-llm -i vllm/vllm-openai:v0.22.0
+gco inference update-image my-llm -i vllm/vllm-openai:v0.24.0
 ```
 
 #### `gco inference invoke`
@@ -2214,7 +2238,12 @@ gco inference invoke ENDPOINT_NAME [OPTIONS]
 | `--path` | | API sub-path (default: auto-detected from image) |
 | `--region` | `-r` | Target region for the request |
 | `--max-tokens` | | Max tokens to generate (default: 100) |
-| `--stream/--no-stream` | | Stream the response |
+| `--stream/--no-stream` | | Enable or disable incremental response streaming; when omitted, raw JSON with `"stream": true` enables it automatically |
+
+`--stream` forces the OpenAI-compatible `"stream": true` field and prints bytes
+as they arrive. `--no-stream` forces buffered model output even if raw JSON asks
+for streaming. TGI streaming automatically uses `/generate_stream`; request
+bodies remain buffered because API Gateway supports response streaming only.
 
 **Example:**
 
@@ -2227,6 +2256,12 @@ gco inference invoke my-llm -p "Explain Kubernetes" --max-tokens 200
 
 # Raw JSON body
 gco inference invoke my-llm -d '{"prompt": "Hello", "max_tokens": 50}'
+
+# Stream OpenAI-compatible output incrementally
+gco inference invoke my-llm -p "Hello" --stream
+
+# Raw JSON can opt in automatically when the explicit flag is omitted
+gco inference invoke my-llm -d '{"prompt": "Hello", "stream": true}'
 
 # Explicit API path
 gco inference invoke my-llm -p "Hello" --path /v1/chat/completions
@@ -2308,10 +2343,10 @@ gco inference canary ENDPOINT_NAME [OPTIONS]
 
 ```bash
 # 10% traffic to new version
-gco inference canary my-llm -i vllm/vllm-openai:v0.22.0
+gco inference canary my-llm -i vllm/vllm-openai:v0.24.0
 
 # 25% traffic with 2 canary replicas
-gco inference canary my-llm -i vllm/vllm-openai:v0.22.0 -w 25 -r 2
+gco inference canary my-llm -i vllm/vllm-openai:v0.24.0 -w 25 -r 2
 ```
 
 #### `gco inference promote`
@@ -2436,7 +2471,7 @@ See [Inference Guide](INFERENCE.md) for details on model weight management.
 | [`gco models upload`](#gco-models-upload) | Upload model weights to the central S3 bucket. |
 | [`gco models upload-regional`](#gco-models-upload-regional) | Upload local files or a directory to a region's general-purpose regional bucket (`gco-regional-shared-<account>-<region>`), resolved from that region's own SSM parameter. |
 | [`gco models list`](#gco-models-list) | List models in the central S3 bucket. |
-| [`gco models delete`](#gco-models-delete) | Delete a model and all its files from the S3 bucket. |
+| [`gco models delete`](#gco-models-delete) | Permanently delete a model, including all current and historical S3 object versions. |
 | [`gco models uri`](#gco-models-uri) | Get the S3 URI for a model (for use with `--model-source` in inference deploy). |
 
 </details>
@@ -2508,7 +2543,11 @@ gco models list
 
 #### `gco models delete`
 
-Delete a model and all its files from the S3 bucket.
+Permanently delete a model from the versioned central S3 bucket. This removes
+all current files, historical object versions, and delete markers beneath the
+model prefix; the operation cannot be undone. If S3 reports an error for one
+batch, earlier successful deletions remain in effect and the command reports
+the failed object versions.
 
 ```bash
 gco models delete MODEL_NAME [OPTIONS]
@@ -2518,7 +2557,7 @@ gco models delete MODEL_NAME [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--yes` | `-y` | Skip confirmation |
+| `--yes` | `-y` | Skip the permanent-deletion confirmation |
 
 **Example:**
 
@@ -3954,7 +3993,8 @@ in this order:
 2. MCP host capability (only when running inside an MCP host).
 3. Bedrock credential probe — when `boto3` resolves credentials, the
    Bedrock backend is selected with the model id from
-   `GCO_MISSION_BEDROCK_MODEL_ID` (or the default).
+   `GCO_MISSION_BEDROCK_MODEL_ID` (or `cdk.json`
+   `context.bedrock.default_model_id`).
 4. Otherwise sampling is off and the loop runs deterministically.
 
 <details>
@@ -4255,7 +4295,7 @@ Set any threshold to `-1` to disable that health check. This is useful when runn
 | `GCO_ENABLE_MISSION` | Gate the `gco mission` subcommand group (`true`/`false`). With the flag unset, every subcommand exits 2 with a hint. |
 | `GCO_ENABLE_ALL_TOOLS` | Umbrella flag that satisfies every per-tool gate including `GCO_ENABLE_MISSION`. |
 | `GCO_MISSION_STATE_BACKEND` | Persistence backend for sessions (`filesystem` or `dynamodb`). Unrecognised values fall back to filesystem with a one-line warning. |
-| `GCO_MISSION_BEDROCK_MODEL_ID` | Override the default Bedrock model id (Amazon Nova Pro, `us.amazon.nova-pro-v1:0`) used by the CLI sampling backend. See [Customization → Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). |
+| `GCO_MISSION_BEDROCK_MODEL_ID` | Override the shared `cdk.json` `context.bedrock.default_model_id` used by the CLI sampling backend (stock value: Amazon Nova 2 Lite, `global.amazon.nova-2-lite-v1:0`). Explicit overrides do not inherit the stock Nova-specific `thinking.effort=high` field. See [Customization → Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). |
 | `GCO_MISSION_BEDROCK_REGION` | Override the default Bedrock region (`us-east-1`). |
 
 ## Examples
@@ -4295,7 +4335,7 @@ gco models upload ./llama3-weights/ --name llama3-8b
 
 # 2. Deploy inference endpoint
 gco inference deploy my-llm \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --gpu-count 1 \
   --model-source $(gco models uri llama3-8b) \
   -e MODEL=/models/my-llm \
@@ -4309,13 +4349,13 @@ gco inference scale my-llm --replicas 3
 
 # Or enable autoscaling
 gco inference deploy my-llm \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --replicas 2 --gpu-count 1 \
   --min-replicas 1 --max-replicas 8 \
   --autoscale-metric cpu:70
 
 # 5. Rolling update
-gco inference update-image my-llm -i vllm/vllm-openai:v0.22.0
+gco inference update-image my-llm -i vllm/vllm-openai:v0.24.0
 
 # 6. Cleanup
 gco inference delete my-llm -y

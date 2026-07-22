@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dependency-scan.sh — check Python, Docker, Helm, and EKS-addon versions
+# dependency-scan.sh — check Python, Node.js, Docker, Helm, and EKS versions
 # =============================================================================
 #
 # Invoked by .github/workflows/deps-scan.yml (monthly schedule).
@@ -9,29 +9,33 @@
 #
 #   - Python packages pinned in pyproject.toml
 #   - Docker images referenced from workflows, K8s manifests, examples,
-#     and Helm chart values
+#     local live-validation manifests, and Helm chart values
 #   - Helm chart versions from charts.yaml
 #   - EKS add-on versions from gco/stacks/constants.py (AWS creds)
 #   - EKS Kubernetes minor from cdk.json (AWS creds)
 #   - Aurora PostgreSQL engine versions (AWS creds)
 #   - EMR Serverless release labels (AWS creds)
-#   - Bedrock default model id from gco_mcp/mission/sampling.py compared
-#     against the newest system-defined inference profile in the same
+#   - Bedrock default model id from cdk.json context.bedrock.default_model_id
+#     compared against the newest system-defined inference profile in the same
 #     model family (AWS creds)
+#   - Accelerator catalog and Karpenter NodePool policy (offline), plus live
+#     NVIDIA GPU / AWS Neuron EC2 catalog drift across enabled Regions (AWS creds)
 #   - Dockerfile.dev ARG pins (Node LTS major, npm, CDK CLI, kubectl,
 #     AWS CLI v2, Docker CLI, Docker Buildx) — public endpoints, no AWS creds needed
 #   - Pre-commit hook revisions in .pre-commit-config.yaml compared
 #     against the latest tag published upstream (GitHub API)
 #   - CDK enum constants from gco/stacks/constants.py compared against the
-#     installed aws-cdk-lib (LAMBDA_PYTHON_RUNTIME, AURORA_POSTGRES_VERSION)
+#     installed aws-cdk-lib (LAMBDA_PYTHON_RUNTIME, LAMBDA_NODEJS_RUNTIME,
+#     AURORA_POSTGRES_VERSION)
 #   - Latest stable Python release from endoflife.date — public endpoint
 #   - CI tooling the workflows install by hand: Trivy (TRIVY_VERSION), Helm and
 #     kubectl (HELM_VERSION / KUBECTL_VERSION), kubeconform
-#     (KUBECONFORM_VERSION), and kind + its node image — public endpoints,
-#     no AWS creds
+#     (KUBECONFORM_VERSION), Metrics Server (METRICS_SERVER_VERSION), and kind
+#     + its node image — public endpoints, no AWS creds
 #   - Version consistency: ruff (pyproject / pre-commit / lint workflow),
-#     python-version across workflows, and any *_VERSION env pin that resolves
-#     to different values across workflow files
+#     Python and Node runtime pins, npm packageManager + CDK CLI pins, every
+#     owned npm graph's lockfile/Dependabot coverage, and duplicated *_VERSION
+#     workflow environment pins
 #   - Base-image security epochs (APT_SECURITY_EPOCH / DNF_SECURITY_EPOCH)
 #     older than SECURITY_EPOCH_STALE_DAYS
 #   - Suppression expiries: .trivyignore / .pip-audit-ignore entries expiring
@@ -272,6 +276,10 @@ grep -rhoE "image: [a-zA-Z0-9_./-]+:[a-zA-Z0-9._-]+" lambda/kubectl-applier-simp
 
 echo "Checking example manifest images..."
 grep -rhoE "image: [a-zA-Z0-9_./-]+:[a-zA-Z0-9._-]+" examples/ 2>/dev/null \
+  | sed 's/image: //' >> "$ALL_IMAGES" || true
+
+echo "Checking local live-validation manifest images..."
+grep -rhoE "image: [a-zA-Z0-9_./-]+:[a-zA-Z0-9._-]+" scripts/live_release_validation/manifests/ 2>/dev/null \
   | sed 's/image: //' >> "$ALL_IMAGES" || true
 
 echo "Checking Helm chart value images..."
@@ -586,20 +594,19 @@ EMR_COUNT="$(wc -l < "$EMR_RESULTS" 2>/dev/null | tr -d ' ')"
 # ---------------------------------------------------------------------------
 # Bedrock default model (best-effort — requires AWS credentials)
 #
-# Compares the default Bedrock model id pinned in
-# gco_mcp/mission/sampling.py (DEFAULT_BEDROCK_MODEL_ID, mirrored by
-# cli/capacity/advisor.py BedrockCapacityAdvisor.DEFAULT_MODEL) against the
-# newest system-defined inference profile in the SAME model family, as
-# listed by aws bedrock list-inference-profiles. This id lives in a Python
-# constant, so neither Dependabot nor the manifest/Dockerfile sweeps above
-# ever see it.
+# Compares the shared default Bedrock model id in
+# cdk.json (context.bedrock.default_model_id) against the newest
+# system-defined inference profile in the SAME model family, as listed by
+# aws bedrock list-inference-profiles. The Python consumers resolve this one
+# configuration value through gco.bedrock, so the scan and both advisory paths
+# cannot silently diverge.
 #
 # Same-family scoping (see bedrock_model_family) means we only flag a newer
-# release of the same model line (e.g. a newer Amazon Nova Pro) — never a
+# release of the same model line (e.g. a newer global Amazon Nova Lite) — never a
 # different tier or provider, since switching those is a human decision,
-# not drift. When a newer release is reported, bump DEFAULT_BEDROCK_MODEL_ID
-# (and the mirrored advisor constant), then re-capture the scaffold fixture
-# with scripts/capture_scaffold_fixtures.py.
+# not drift. When a newer release is reported, update
+# context.bedrock.default_model_id in cdk.json, then re-capture the scaffold
+# fixture with scripts/capture_scaffold_fixtures.py.
 #
 # IAM action: bedrock:ListInferenceProfiles. Pinned to us-east-1 (the
 # advisor + Mission sampling default region) regardless of the workflow's
@@ -611,10 +618,10 @@ echo "=== Checking Bedrock default model ==="
 
 BEDROCK_MODEL_RESULTS="$(mktemp)"
 BEDROCK_MODEL_SKIP_REASON=""
-CURRENT_BEDROCK_MODEL="$(extract_default_bedrock_model gco_mcp/mission/sampling.py)"
+CURRENT_BEDROCK_MODEL="$(extract_default_bedrock_model cdk.json)"
 
 if [ -z "$CURRENT_BEDROCK_MODEL" ]; then
-  BEDROCK_MODEL_SKIP_REASON="Could not read DEFAULT_BEDROCK_MODEL_ID from gco_mcp/mission/sampling.py."
+  BEDROCK_MODEL_SKIP_REASON="Could not read context.bedrock.default_model_id from cdk.json."
   echo "  $BEDROCK_MODEL_SKIP_REASON"
 elif ! aws sts get-caller-identity >/dev/null 2>&1; then
   BEDROCK_MODEL_SKIP_REASON="No AWS credentials available (scan needs bedrock:ListInferenceProfiles). Configure OIDC to enable."
@@ -624,7 +631,7 @@ else
   if [ -n "$LATEST_BEDROCK_MODEL" ] && [ "$CURRENT_BEDROCK_MODEL" != "$LATEST_BEDROCK_MODEL" ] \
      && [ "$(compare_bedrock_model "$CURRENT_BEDROCK_MODEL" "$LATEST_BEDROCK_MODEL")" = "newer" ]; then
     echo "  - bedrock default model: ${CURRENT_BEDROCK_MODEL} -> ${LATEST_BEDROCK_MODEL}"
-    echo "DEFAULT_BEDROCK_MODEL_ID|${CURRENT_BEDROCK_MODEL}|${LATEST_BEDROCK_MODEL}" >> "$BEDROCK_MODEL_RESULTS"
+    echo "context.bedrock.default_model_id|${CURRENT_BEDROCK_MODEL}|${LATEST_BEDROCK_MODEL}" >> "$BEDROCK_MODEL_RESULTS"
   fi
 fi
 
@@ -840,9 +847,10 @@ PRECOMMIT_COUNT="$(wc -l < "$PRECOMMIT_RESULTS" 2>/dev/null | tr -d ' ')"
 # library, or simply because the latest published release added one)
 # but ``constants.py`` still pins an older one.
 #
-# Two enums are tracked today:
+# Three enums are tracked today:
 #
 #   - ``LAMBDA_PYTHON_RUNTIME`` → ``aws_cdk.aws_lambda.Runtime.PYTHON_X_Y``
+#   - ``LAMBDA_NODEJS_RUNTIME`` → ``aws_cdk.aws_lambda.Runtime.NODEJS_<major>_X``
 #   - ``AURORA_POSTGRES_VERSION`` → ``aws_cdk.aws_rds.AuroraPostgresEngineVersion.VER_X_Y``
 #
 # The deps-scan workflow installs the latest ``aws-cdk-lib`` for this
@@ -871,6 +879,22 @@ else
     if [ "$(compare_semver "$cur_v" "$lat_v")" = "newer" ]; then
       echo "  - LAMBDA_PYTHON_RUNTIME: ${LAMBDA_RT_CURRENT} -> ${LAMBDA_RT_LATEST}"
       echo "LAMBDA_PYTHON_RUNTIME|aws_lambda.Runtime|${LAMBDA_RT_CURRENT}|${LAMBDA_RT_LATEST}" >> "$CDK_ENUM_RESULTS"
+    fi
+  fi
+
+  # Lambda Node.js runtime enum
+  LAMBDA_NODE_RT_CURRENT="$(extract_constant_value LAMBDA_NODEJS_RUNTIME)"
+  LAMBDA_NODE_RT_LATEST="$(get_latest_lambda_nodejs_runtime)"
+  if [ -n "$LAMBDA_NODE_RT_CURRENT" ] && [ -n "$LAMBDA_NODE_RT_LATEST" ] \
+     && [ "$LAMBDA_NODE_RT_CURRENT" != "$LAMBDA_NODE_RT_LATEST" ]; then
+    cur_major="${LAMBDA_NODE_RT_CURRENT#NODEJS_}"
+    cur_major="${cur_major%_X}"
+    lat_major="${LAMBDA_NODE_RT_LATEST#NODEJS_}"
+    lat_major="${lat_major%_X}"
+    if [[ "$cur_major" =~ ^[0-9]+$ ]] && [[ "$lat_major" =~ ^[0-9]+$ ]] \
+       && [ "$lat_major" -gt "$cur_major" ]; then
+      echo "  - LAMBDA_NODEJS_RUNTIME: ${LAMBDA_NODE_RT_CURRENT} -> ${LAMBDA_NODE_RT_LATEST}"
+      echo "LAMBDA_NODEJS_RUNTIME|aws_lambda.Runtime|${LAMBDA_NODE_RT_CURRENT}|${LAMBDA_NODE_RT_LATEST}" >> "$CDK_ENUM_RESULTS"
     fi
   fi
 
@@ -934,7 +958,7 @@ PYTHON_RELEASE_COUNT="$(wc -l < "$PYTHON_RELEASE_RESULTS" 2>/dev/null | tr -d ' 
 # CI tooling pins (public endpoints — no AWS creds)
 #
 # The workflows install their own pinned tooling — Trivy (cve-scan.yml /
-# security.yml), Helm + kubectl (deps-scan.yml), and kubeconform
+# security.yml), Helm + kubectl (deps-scan.yml), kubeconform and Metrics Server
 # (integration-tests.yml) — from plain ``*_VERSION`` env strings, and the
 # integration-tests workflow also pins kind + its node image on the
 # ``helm/kind-action`` step. None of these are ``uses:`` refs or Dockerfile
@@ -977,6 +1001,16 @@ check_github_tool "Helm (HELM_VERSION)" "$HELM_PIN" "helm/helm" \
 KUBECONFORM_PIN="$(extract_workflow_env_pin KUBECONFORM_VERSION | head -1)"
 check_github_tool "kubeconform (KUBECONFORM_VERSION)" "$KUBECONFORM_PIN" "yannh/kubeconform" \
   "https://github.com/yannh/kubeconform/releases"
+
+# Metrics Server (kubernetes-sigs/metrics-server) — kind installs this pin so
+# the inference proxy HPA must reach ScalingActive, mirroring the EKS managed
+# add-on contract used in production.
+METRICS_SERVER_PIN="$(extract_workflow_env_pin METRICS_SERVER_VERSION | head -1)"
+check_github_tool \
+  "Metrics Server (METRICS_SERVER_VERSION)" \
+  "$METRICS_SERVER_PIN" \
+  "kubernetes-sigs/metrics-server" \
+  "https://github.com/kubernetes-sigs/metrics-server/releases"
 
 # kind (kubernetes-sigs/kind) — the kind binary on the kind-action step.
 KIND_PIN="$(extract_kind_pins .github/workflows/integration-tests.yml | awk -F'|' '$1=="kind"{print $2}')"
@@ -1031,6 +1065,11 @@ CI_TOOLING_COUNT="$(wc -l < "$CI_TOOLING_RESULTS" 2>/dev/null | tr -d ' ')"
 #     binary ruff-action step in lint.yml.
 #   - python-version across the workflows vs the project's canonical Python
 #     (the LAMBDA_PYTHON_RUNTIME the Lambdas ship on).
+#   - Node major across LAMBDA_NODEJS_RUNTIME, .nvmrc, every package engine,
+#     and Dockerfile.dev; npm across every packageManager and Dockerfile.dev.
+#   - AWS CDK CLI across the locked root npm graph and Dockerfile.dev.
+#   - every repository-owned package.json has a lockfile, exact direct pins,
+#     and a matching npm entry in Dependabot.
 #   - the same tool env pin (TRIVY_VERSION/HELM_VERSION/KUBECTL_VERSION)
 #     resolving to different values in different workflow files.
 # ---------------------------------------------------------------------------
@@ -1059,6 +1098,81 @@ if [ -n "$PY_PINS_UNIQUE" ]; then
     echo "  - python-version pins: ${py_list} (project runtime: ${CANON_PY:-unknown})"
     echo "python-version (CI vs runtime)|CI: ${py_list}; runtime: ${CANON_PY:-unknown}" >> "$CONSISTENCY_RESULTS"
   fi
+fi
+
+NPM_PACKAGE_SOURCES="$(
+  list_npm_package_dirs . | while IFS= read -r package_dir; do
+    [ -n "$package_dir" ] || continue
+    if [ "$package_dir" = "." ]; then
+      echo "package.json"
+    else
+      echo "${package_dir}/package.json"
+    fi
+  done
+)"
+
+NODE_PINS="$(extract_node_major_pins . gco/stacks/constants.py .nvmrc Dockerfile.dev | sort -u)"
+EXPECTED_NODE_SOURCES="$(
+  {
+    printf '%s\n' gco/stacks/constants.py .nvmrc Dockerfile.dev
+    printf '%s\n' "$NPM_PACKAGE_SOURCES"
+  } | sed '/^$/d' | sort -u
+)"
+NODE_PIN_SOURCES="$(printf '%s\n' "$NODE_PINS" | cut -d'|' -f1 | sed '/^$/d' | sort -u)"
+NODE_MISSING="$(comm -23 <(printf '%s\n' "$EXPECTED_NODE_SOURCES") <(printf '%s\n' "$NODE_PIN_SOURCES"))"
+node_distinct="$(printf '%s\n' "$NODE_PINS" | cut -d'|' -f2 | sed '/^$/d' | sort -u | grep -c .)"
+if [ -n "$NODE_MISSING" ] || [ "$node_distinct" -gt 1 ]; then
+  node_detail="$(printf '%s\n' "$NODE_PINS" | awk -F'|' '{printf "%s=%s ", $1, $2}' | sed 's/ *$//')"
+  if [ -n "$NODE_MISSING" ]; then
+    node_missing_list="$(printf '%s\n' "$NODE_MISSING" | paste -sd',' -)"
+    node_detail="${node_detail}; missing=${node_missing_list}"
+  fi
+  echo "  - Node.js major pins disagree or are missing: ${node_detail}"
+  echo "Node.js major (runtime / packages / dev container)|${node_detail}" >> "$CONSISTENCY_RESULTS"
+fi
+
+NPM_PINS="$(extract_npm_version_pins . Dockerfile.dev | sort -u)"
+EXPECTED_NPM_SOURCES="$(
+  {
+    printf '%s\n' Dockerfile.dev
+    printf '%s\n' "$NPM_PACKAGE_SOURCES"
+  } | sed '/^$/d' | sort -u
+)"
+NPM_PIN_SOURCES="$(printf '%s\n' "$NPM_PINS" | cut -d'|' -f1 | sed '/^$/d' | sort -u)"
+NPM_MISSING="$(comm -23 <(printf '%s\n' "$EXPECTED_NPM_SOURCES") <(printf '%s\n' "$NPM_PIN_SOURCES"))"
+npm_distinct="$(printf '%s\n' "$NPM_PINS" | cut -d'|' -f2 | sed '/^$/d' | sort -u | grep -c .)"
+if [ -n "$NPM_MISSING" ] || [ "$npm_distinct" -gt 1 ]; then
+  npm_detail="$(printf '%s\n' "$NPM_PINS" | awk -F'|' '{printf "%s=%s ", $1, $2}' | sed 's/ *$//')"
+  if [ -n "$NPM_MISSING" ]; then
+    npm_missing_list="$(printf '%s\n' "$NPM_MISSING" | paste -sd',' -)"
+    npm_detail="${npm_detail}; missing=${npm_missing_list}"
+  fi
+  echo "  - npm pins disagree or are missing: ${npm_detail}"
+  echo "npm (packageManager / dev container)|${npm_detail}" >> "$CONSISTENCY_RESULTS"
+fi
+
+CDK_CLI_PINS="$(extract_cdk_cli_pins . Dockerfile.dev | sort -u)"
+CDK_CLI_MISSING="$(comm -23 \
+  <(printf '%s\n' Dockerfile.dev package.json | sort -u) \
+  <(printf '%s\n' "$CDK_CLI_PINS" | cut -d'|' -f1 | sed '/^$/d' | sort -u))"
+cdk_cli_distinct="$(printf '%s\n' "$CDK_CLI_PINS" | cut -d'|' -f2 | sed '/^$/d' | sort -u | grep -c .)"
+if [ -n "$CDK_CLI_MISSING" ] || [ "$cdk_cli_distinct" -gt 1 ]; then
+  cdk_detail="$(printf '%s\n' "$CDK_CLI_PINS" | awk -F'|' '{printf "%s=%s ", $1, $2}' | sed 's/ *$//')"
+  if [ -n "$CDK_CLI_MISSING" ]; then
+    cdk_missing_list="$(printf '%s\n' "$CDK_CLI_MISSING" | paste -sd',' -)"
+    cdk_detail="${cdk_detail}; missing=${cdk_missing_list}"
+  fi
+  echo "  - AWS CDK CLI pins disagree or are missing: ${cdk_detail}"
+  echo "AWS CDK CLI (package / dev container)|${cdk_detail}" >> "$CONSISTENCY_RESULTS"
+fi
+
+NPM_MANAGEMENT_PROBLEMS="$(check_npm_package_management . .github/dependabot.yml)"
+if [ -n "$NPM_MANAGEMENT_PROBLEMS" ]; then
+  while IFS='|' read -r manifest problem; do
+    [ -n "$manifest" ] || continue
+    echo "  - npm dependency management: ${manifest}: ${problem}"
+    echo "npm dependency management|${manifest}: ${problem}" >> "$CONSISTENCY_RESULTS"
+  done <<< "$NPM_MANAGEMENT_PROBLEMS"
 fi
 
 for consistency_var in TRIVY_VERSION HELM_VERSION KUBECTL_VERSION; do
@@ -1158,6 +1272,128 @@ LOCKFILE_COUNT="$(wc -l < "$LOCKFILE_RESULTS" 2>/dev/null | tr -d ' ')"
 [ -z "$LOCKFILE_COUNT" ] && LOCKFILE_COUNT=0
 
 # ---------------------------------------------------------------------------
+# Accelerator catalog and Karpenter NodePools
+#
+# The deterministic check always runs and validates the reviewed catalog
+# against every NodePool plus the exact cdk.json capacity-history watch list.
+# With AWS credentials, the monthly job also compares the catalog against the
+# union of NVIDIA GPU / AWS Neuron types returned across enabled commercial
+# Regions. Ordinary policy/catalog drift joins the rolling dependency issue;
+# execution or parser failures become one operational finding, never a
+# false-clean result.
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Checking accelerator catalog and Karpenter NodePools ==="
+
+ACCELERATOR_OFFLINE_REPORT="$(mktemp)"
+ACCELERATOR_ONLINE_REPORT="$(mktemp)"
+ACCELERATOR_ONLINE_SUMMARY="$(mktemp)"
+ACCELERATOR_OFFLINE_ERROR="$(mktemp)"
+ACCELERATOR_ONLINE_ERROR="$(mktemp)"
+ACCELERATOR_OFFLINE_COUNT=0
+ACCELERATOR_ONLINE_COUNT=0
+ACCELERATOR_SKIP_REASON=""
+ACCELERATOR_SUMMARY_SKIP_REASON=""
+
+write_accelerator_operational_report() {
+  local report_path="$1" title="$2" detail="$3" error_path="$4"
+  {
+    echo "## ${title}"
+    echo ""
+    echo "**Status: OPERATIONAL ERROR.**"
+    echo ""
+    echo "### Accelerator maintenance check could not complete"
+    echo ""
+    echo "- **Why:** ${detail}"
+    echo "- **Recommended change:** Re-run the command locally, repair the tool or credentials, and do not treat this scan as current until it succeeds."
+    if [ -s "$error_path" ]; then
+      echo "- **Tool output:**"
+      sed 's/^/    /' "$error_path"
+    fi
+  } > "$report_path"
+}
+
+python3 scripts/accelerator_catalog.py validate \
+  --format markdown \
+  --output "$ACCELERATOR_OFFLINE_REPORT" \
+  2>"$ACCELERATOR_OFFLINE_ERROR"
+ACCELERATOR_OFFLINE_STATUS=$?
+if [ "$ACCELERATOR_OFFLINE_STATUS" -eq 0 ]; then
+  echo "  Offline NodePool/watch-list policy is current."
+elif [ "$ACCELERATOR_OFFLINE_STATUS" -eq 1 ]; then
+  ACCELERATOR_OFFLINE_COUNT="$(grep -c '^### ' "$ACCELERATOR_OFFLINE_REPORT" || true)"
+  if ! [[ "$ACCELERATOR_OFFLINE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    ACCELERATOR_OFFLINE_COUNT=1
+    write_accelerator_operational_report \
+      "$ACCELERATOR_OFFLINE_REPORT" \
+      "Offline accelerator catalog validation" \
+      "The validator reported drift but emitted no parseable actionable findings." \
+      "$ACCELERATOR_OFFLINE_ERROR"
+  else
+    echo "  Found ${ACCELERATOR_OFFLINE_COUNT} offline accelerator policy finding(s)."
+  fi
+else
+  ACCELERATOR_OFFLINE_COUNT=1
+  write_accelerator_operational_report \
+    "$ACCELERATOR_OFFLINE_REPORT" \
+    "Offline accelerator catalog validation" \
+    "The deterministic validator exited with status ${ACCELERATOR_OFFLINE_STATUS}." \
+    "$ACCELERATOR_OFFLINE_ERROR"
+  echo "  Offline accelerator validator failed operationally."
+fi
+
+if ! aws sts get-caller-identity >/dev/null 2>&1; then
+  ACCELERATOR_SKIP_REASON="No AWS credentials available for the online EC2 catalog check (needs ec2:DescribeRegions and ec2:DescribeInstanceTypes); offline policy validation still ran."
+  echo "  $ACCELERATOR_SKIP_REASON"
+else
+  python3 scripts/accelerator_catalog.py check-online \
+    --report "$ACCELERATOR_ONLINE_REPORT" \
+    --json-summary \
+    >"$ACCELERATOR_ONLINE_SUMMARY" \
+    2>"$ACCELERATOR_ONLINE_ERROR"
+  ACCELERATOR_ONLINE_STATUS=$?
+  if [ "$ACCELERATOR_ONLINE_STATUS" -eq 0 ] || [ "$ACCELERATOR_ONLINE_STATUS" -eq 1 ]; then
+    if ACCELERATOR_ONLINE_COUNT="$(parse_accelerator_drift_count "$ACCELERATOR_ONLINE_SUMMARY")"; then
+      if { [ "$ACCELERATOR_ONLINE_STATUS" -eq 0 ] && [ "$ACCELERATOR_ONLINE_COUNT" -ne 0 ]; } \
+         || { [ "$ACCELERATOR_ONLINE_STATUS" -eq 1 ] && [ "$ACCELERATOR_ONLINE_COUNT" -eq 0 ]; }; then
+        ACCELERATOR_ONLINE_COUNT=1
+        write_accelerator_operational_report \
+          "$ACCELERATOR_ONLINE_REPORT" \
+          "Online EC2 accelerator catalog drift" \
+          "The command exit status disagreed with its JSON drift summary." \
+          "$ACCELERATOR_ONLINE_ERROR"
+        echo "  Online accelerator scan returned an inconsistent result."
+      elif [ "$ACCELERATOR_ONLINE_COUNT" -eq 0 ]; then
+        echo "  Live EC2 accelerator catalog is current."
+      else
+        echo "  Found ${ACCELERATOR_ONLINE_COUNT} live EC2 catalog drift finding(s)."
+      fi
+    else
+      ACCELERATOR_ONLINE_COUNT=1
+      write_accelerator_operational_report \
+        "$ACCELERATOR_ONLINE_REPORT" \
+        "Online EC2 accelerator catalog drift" \
+        "The online scanner emitted a missing or malformed JSON summary." \
+        "$ACCELERATOR_ONLINE_ERROR"
+      echo "  Online accelerator scan summary could not be parsed."
+    fi
+  else
+    ACCELERATOR_ONLINE_COUNT=1
+    write_accelerator_operational_report \
+      "$ACCELERATOR_ONLINE_REPORT" \
+      "Online EC2 accelerator catalog drift" \
+      "The online scanner exited with status ${ACCELERATOR_ONLINE_STATUS}." \
+      "$ACCELERATOR_ONLINE_ERROR"
+    echo "  Online accelerator scanner failed operationally."
+  fi
+fi
+
+ACCELERATOR_COUNT=$((ACCELERATOR_OFFLINE_COUNT + ACCELERATOR_ONLINE_COUNT))
+if [ -n "$ACCELERATOR_SKIP_REASON" ] && [ "$ACCELERATOR_COUNT" -eq 0 ]; then
+  ACCELERATOR_SUMMARY_SKIP_REASON="$ACCELERATOR_SKIP_REASON"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary + Markdown report
 # ---------------------------------------------------------------------------
 echo ""
@@ -1190,6 +1426,11 @@ if [ -n "$BEDROCK_MODEL_SKIP_REASON" ]; then
 else
   echo "Bedrock default model:    $BEDROCK_MODEL_COUNT"
 fi
+if [ -n "$ACCELERATOR_SKIP_REASON" ]; then
+  echo "Accelerator catalog:      ${ACCELERATOR_COUNT} (online skipped)"
+else
+  echo "Accelerator catalog:      $ACCELERATOR_COUNT"
+fi
 echo "Dockerfile.dev pins:      $DOCKERFILE_COUNT"
 echo "Pre-commit hooks:         $PRECOMMIT_COUNT"
 if [ -n "$CDK_ENUM_SKIP_REASON" ]; then
@@ -1217,6 +1458,7 @@ if [ "$PYTHON_COUNT" -eq 0 ] && [ "$DOCKER_COUNT" -eq 0 ] \
    && [ "$CDK_ENUM_COUNT" -eq 0 ] \
    && [ "$PYTHON_RELEASE_COUNT" -eq 0 ] \
    && [ "$BEDROCK_MODEL_COUNT" -eq 0 ] \
+   && [ "$ACCELERATOR_COUNT" -eq 0 ] \
    && [ "$CI_TOOLING_COUNT" -eq 0 ] \
    && [ "$CONSISTENCY_COUNT" -eq 0 ] \
    && [ "$EPOCH_COUNT" -eq 0 ] \
@@ -1243,6 +1485,10 @@ if [ "$PYTHON_COUNT" -eq 0 ] && [ "$DOCKER_COUNT" -eq 0 ] \
     [ -n "$SKIP_NOTES" ] && SKIP_NOTES="$SKIP_NOTES; "
     SKIP_NOTES="${SKIP_NOTES}Bedrock model skipped: $BEDROCK_MODEL_SKIP_REASON"
   fi
+  if [ -n "$ACCELERATOR_SKIP_REASON" ]; then
+    [ -n "$SKIP_NOTES" ] && SKIP_NOTES="$SKIP_NOTES; "
+    SKIP_NOTES="${SKIP_NOTES}Online accelerator catalog skipped: $ACCELERATOR_SKIP_REASON"
+  fi
   if [ -n "$CDK_ENUM_SKIP_REASON" ]; then
     [ -n "$SKIP_NOTES" ] && SKIP_NOTES="$SKIP_NOTES; "
     SKIP_NOTES="${SKIP_NOTES}CDK enums skipped: $CDK_ENUM_SKIP_REASON"
@@ -1256,12 +1502,16 @@ if [ "$PYTHON_COUNT" -eq 0 ] && [ "$DOCKER_COUNT" -eq 0 ] \
   else
     echo "All dependencies are up to date."
   fi
-  rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS"
+  rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS" "$ACCELERATOR_OFFLINE_REPORT" "$ACCELERATOR_ONLINE_REPORT" "$ACCELERATOR_ONLINE_SUMMARY" "$ACCELERATOR_OFFLINE_ERROR" "$ACCELERATOR_ONLINE_ERROR"
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
       echo "# Dependency Update Report"
       echo ""
       echo "All scanned surfaces are up to date."
+      if [ -n "$SKIP_NOTES" ]; then
+        echo ""
+        echo "_Skipped checks: ${SKIP_NOTES}_"
+      fi
     } >> "$GITHUB_STEP_SUMMARY"
   fi
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
@@ -1309,6 +1559,7 @@ summary_row() {
   summary_row "Aurora PostgreSQL Engine" "$AURORA_COUNT"         "$AURORA_SKIP_REASON"       "routine"
   summary_row "EMR Serverless"           "$EMR_COUNT"            "$EMR_SKIP_REASON"          "routine"
   summary_row "Bedrock Default Model"    "$BEDROCK_MODEL_COUNT"  "$BEDROCK_MODEL_SKIP_REASON" "routine"
+  summary_row "Accelerator Catalog and NodePools" "$ACCELERATOR_COUNT" "$ACCELERATOR_SUMMARY_SKIP_REASON" "act soon"
   summary_row "Dockerfile.dev Pins"      "$DOCKERFILE_COUNT"     ""                          "routine"
   summary_row "Pre-commit Hooks"         "$PRECOMMIT_COUNT"      ""                          "routine"
   summary_row "CDK Enum Constants"       "$CDK_ENUM_COUNT"       "$CDK_ENUM_SKIP_REASON"     "routine"
@@ -1396,14 +1647,32 @@ summary_row() {
   if [ "$BEDROCK_MODEL_COUNT" -gt 0 ]; then
     echo "## Bedrock Default Model"
     echo ""
-    echo "The default Bedrock model id pinned in \`gco_mcp/mission/sampling.py\`"
-    echo "(\`DEFAULT_BEDROCK_MODEL_ID\`, mirrored by \`cli/capacity/advisor.py\`) is"
-    echo "behind a newer system-defined inference profile in the same model"
-    echo "family. Bump the constant in both files, then re-capture the scaffold"
-    echo "fixture (\`scripts/capture_scaffold_fixtures.py\`)."
+    echo "The default Bedrock model id configured at \`cdk.json\`"
+    echo "(\`context.bedrock.default_model_id\`) is behind a newer system-defined"
+    echo "inference profile in the same model family. Update that one value, then"
+    echo "re-capture the scaffold fixture (\`scripts/capture_scaffold_fixtures.py\`)."
     echo ""
-    emit_md_table "Constant|Current|Latest" "$BEDROCK_MODEL_RESULTS"
+    emit_md_table "Configuration key|Current|Latest" "$BEDROCK_MODEL_RESULTS"
     echo ""
+  fi
+
+  if [ "$ACCELERATOR_COUNT" -gt 0 ]; then
+    echo "## Accelerator Catalog and NodePools"
+    echo ""
+    echo "The offline check keeps reviewed lifecycle/generation policy, Karpenter"
+    echo "NodePools, and \`historical.watch_instance_types\` synchronized. The online"
+    echo "check compares the catalog with EC2 across enabled commercial Regions."
+    echo "Follow each recommended change; review family metadata before refreshing"
+    echo "the checked-in catalog."
+    echo ""
+    if [ -s "$ACCELERATOR_OFFLINE_REPORT" ]; then
+      sed -E 's/^### /#### /; s/^## /### /' "$ACCELERATOR_OFFLINE_REPORT"
+      echo ""
+    fi
+    if [ -s "$ACCELERATOR_ONLINE_REPORT" ]; then
+      sed -E 's/^### /#### /; s/^## /### /' "$ACCELERATOR_ONLINE_REPORT"
+      echo ""
+    fi
   fi
 
   if [ "$DOCKERFILE_COUNT" -gt 0 ]; then
@@ -1484,9 +1753,9 @@ summary_row() {
   if [ "$CONSISTENCY_COUNT" -gt 0 ]; then
     echo "## Version Consistency"
     echo ""
-    echo "These versions are pinned in more than one place and must move together."
-    echo "The copies below disagree — reconcile them so local installs, the"
-    echo "pre-commit hooks, and CI all use the same version."
+    echo "These versions and dependency-management surfaces must move together."
+    echo "The rows below identify missing coverage or disagreement across runtime,"
+    echo "package, dev-container, pre-commit, and CI pins."
     echo ""
     emit_md_table "What|Pinned values" "$CONSISTENCY_RESULTS"
     echo ""
@@ -1538,7 +1807,7 @@ summary_row() {
   fi
 
   # ----- Skipped checks (collapsed) -----
-  if [ -n "${ADDON_SKIP_REASON}${EKS_K8S_SKIP_REASON}${AURORA_SKIP_REASON}${EMR_SKIP_REASON}${BEDROCK_MODEL_SKIP_REASON}${CDK_ENUM_SKIP_REASON}${PYTHON_RELEASE_SKIP_REASON}" ]; then
+  if [ -n "${ADDON_SKIP_REASON}${EKS_K8S_SKIP_REASON}${AURORA_SKIP_REASON}${EMR_SKIP_REASON}${BEDROCK_MODEL_SKIP_REASON}${ACCELERATOR_SKIP_REASON}${CDK_ENUM_SKIP_REASON}${PYTHON_RELEASE_SKIP_REASON}" ]; then
     echo "<details>"
     echo "<summary>Skipped checks</summary>"
     echo ""
@@ -1547,6 +1816,7 @@ summary_row() {
     [ -n "$AURORA_SKIP_REASON" ]        && echo "- **Aurora PostgreSQL Engine:** $AURORA_SKIP_REASON"
     [ -n "$EMR_SKIP_REASON" ]           && echo "- **EMR Serverless:** $EMR_SKIP_REASON"
     [ -n "$BEDROCK_MODEL_SKIP_REASON" ] && echo "- **Bedrock Default Model:** $BEDROCK_MODEL_SKIP_REASON"
+    [ -n "$ACCELERATOR_SKIP_REASON" ]   && echo "- **Online Accelerator Catalog:** $ACCELERATOR_SKIP_REASON"
     [ -n "$CDK_ENUM_SKIP_REASON" ]      && echo "- **CDK Enum Constants:** $CDK_ENUM_SKIP_REASON"
     [ -n "$PYTHON_RELEASE_SKIP_REASON" ] && echo "- **Python Release:** $PYTHON_RELEASE_SKIP_REASON"
     echo ""
@@ -1557,17 +1827,19 @@ summary_row() {
   echo "## Action Required"
   echo ""
   echo "1. Review changelogs for breaking changes (see the per-row **Ref** links)"
-  echo "2. Update versions in \`pyproject.toml\`, manifests, \`charts.yaml\`, or the"
+  echo "2. Follow accelerator findings exactly; review lifecycle/generation metadata"
+  echo "   before running \`python scripts/accelerator_catalog.py refresh\`"
+  echo "3. Update versions in \`pyproject.toml\`, manifests, \`charts.yaml\`, or the"
   echo "   pinned \`*_VERSION\` env / ARG values"
-  echo "3. Regenerate \`requirements-lock.txt\` if Python deps changed"
-  echo "4. Reconcile any **Version Consistency** rows so every copy of a pin agrees"
-  echo "5. Run tests locally to verify compatibility, then open a PR"
+  echo "4. Regenerate \`requirements-lock.txt\` if Python deps changed"
+  echo "5. Reconcile any **Version Consistency** rows so every copy of a pin agrees"
+  echo "6. Run tests locally to verify compatibility, then open a PR"
   echo ""
   echo "---"
   echo "_Automatically created by the \`deps-scan\` workflow._"
 } > "$REPORT_FILE"
 
-rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS"
+rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS" "$ACCELERATOR_OFFLINE_REPORT" "$ACCELERATOR_ONLINE_REPORT" "$ACCELERATOR_ONLINE_SUMMARY" "$ACCELERATOR_OFFLINE_ERROR" "$ACCELERATOR_ONLINE_ERROR"
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "has_drift=true"            >> "$GITHUB_OUTPUT"

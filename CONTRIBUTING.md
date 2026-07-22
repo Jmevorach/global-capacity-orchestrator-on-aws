@@ -12,12 +12,14 @@ Thank you for contributing to GCO (Global Capacity Orchestrator on AWS)! This gu
   - [Dependency Management](#dependency-management)
   - [Type Checking](#type-checking)
   - [Authentication](#authentication)
+  - [Tenet-Driven Decisions](#tenet-driven-decisions)
 - [Code Organization](#code-organization)
   - [Directory Structure](#directory-structure)
   - [Adding New Features](#adding-new-features)
 - [Testing](#testing)
   - [Running Tests Locally](#running-tests-locally)
   - [Pre-Pull-Request Verification](#pre-pull-request-verification)
+  - [Live Release Validation Applicability](#live-release-validation-applicability)
   - [CI/CD Pipeline](#cicd-pipeline)
   - [Integration Tests](#integration-tests)
 - [Documentation](#documentation)
@@ -159,18 +161,39 @@ If `pip install` fails with `ResolutionImpossible` or "the conflict is caused by
 
 ### Dependency Management
 
-GCO uses exact-pinned dependencies in `pyproject.toml` and a committed lockfile (`requirements-lock.txt`) for reproducible builds.
+GCO uses exact-pinned Python dependencies in `pyproject.toml` with a committed transitive lock (`requirements-lock.txt`). It also owns two isolated npm graphs, each with exact direct pins, a committed `package-lock.json`, an npm `packageManager` pin, Dependabot coverage, and CI audit enforcement.
 
 #### Dependency Groups
 
-| Group | Install command | What it includes |
-|-------|----------------|------------------|
+| Group | Consumer / install command | What it includes |
+|-------|----------------------------|------------------|
 | Core | `pip install -e .` | CLI runtime deps (boto3, click, requests, etc.) |
 | CDK | `pip install -e ".[cdk]"` | AWS CDK, cdk-nag, constructs (for stack synthesis) |
 | Dev | `pip install -e ".[dev]"` | Everything: CDK + lint + typecheck + test + security |
 | MCP | `pip install -e ".[mcp]"` | FastMCP server |
+| Image: health monitor | Docker reads `[image-health-monitor]` | Direct runtime roots for `gco.services.health_api` |
+| Image: manifest processor | Docker reads `[image-manifest-processor]` | Direct runtime roots for the manifest API and Grafana rotator |
+| Image: inference proxy | Docker reads `[image-inference-proxy]` | Direct runtime roots for `gco.services.inference_api` |
+| Image: inference monitor | Docker reads `[image-inference-monitor]` | Direct runtime roots for the inference reconciler |
+| Image: queue processor | Docker reads `[image-queue-processor]` | Direct runtime roots for the SQS worker |
 
-CDK dependencies are in a separate `[cdk]` extras group so operators who only use the CLI don't need to install the full CDK toolchain.
+CDK dependencies are in a separate `[cdk]` extras group so operators who only use the CLI don't need to install the full CDK toolchain. The five `image-*` groups are build metadata and the single source of direct dependency pins for production service images: each Dockerfile extracts only its own group with `tomllib`, constrains it with `requirements-lock.txt`, and deletes the generated requirements file in the same layer. Do not add per-image requirements files or install `.[image-*]` inside production images, because either approach introduces extra dependencies or another synchronization surface.
+
+#### Node.js Dependency Graphs
+
+| Graph | Purpose | Install command |
+|-------|---------|-----------------|
+| Repository root | Locked AWS CDK CLI, cdk-dia, and markdownlint tooling | `npm ci --ignore-scripts --no-audit --no-fund` |
+| `lambda/inference-streaming-proxy/` | Deployable AWS SDK clients; its package script runs the native tests in `tests/inference-streaming-proxy/` | `npm ci --prefix lambda/inference-streaming-proxy --ignore-scripts --no-audit --no-fund` |
+
+Before installing either graph, select Node from `.nvmrc` and install/verify the
+exact npm release declared by `packageManager`:
+
+```bash
+bash .github/scripts/use-pinned-npm.sh package.json
+```
+
+Keep these graphs separate: root development tools must never enter the deployable Lambda bundle. Direct versions must be exact, lockfiles must be committed, and every new repository-owned `package.json` must add a matching npm entry in `.github/dependabot.yml`. CI's `check_npm_package_management` guard fails on an unlocked, ranged, unpinned, or unmanaged graph. Node 24, npm 11.18.0, and the root CDK CLI pin are also checked against `.nvmrc`, `Dockerfile.dev`, `gco/stacks/constants.py`, and both manifests by the monthly dependency scan.
 
 #### Regenerating the Lockfile
 
@@ -236,7 +259,12 @@ mypy gco/ cli/ --ignore-missing-imports --check-untyped-defs
 
 ### Authentication
 
-The in-cluster services use token-based authentication via AWS Secrets Manager. The auth middleware (`gco/services/auth_middleware.py`) validates an `X-GCO-Auth-Token` header on every request (except health checks).
+The in-cluster services validate short-lived HMAC request envelopes produced by
+the IAM-protected API Gateway proxies. The middleware
+(`gco/services/auth_middleware.py`) binds each signature to its timestamp, nonce,
+HTTP method, exact path/query, and body digest, accepts current and pending
+Secrets Manager keys during rotation, and rejects stale or replayed envelopes.
+The reusable signing key is never sent to the cluster as a request header.
 
 **Important:** The middleware is fail-closed by default. If `AUTH_SECRET_ARN` is not set and `GCO_DEV_MODE` is not enabled, all authenticated requests return 503. To run services locally without Secrets Manager:
 
@@ -245,6 +273,20 @@ export GCO_DEV_MODE=true
 ```
 
 This is intentional — a missing `AUTH_SECRET_ARN` in production should fail loudly rather than silently allowing unauthenticated access.
+
+### Tenet-Driven Decisions
+
+Read [TENETS.md](TENETS.md) before making a change that affects architecture,
+security, accelerator support, destructive operations, regional behavior,
+recovery, or long-term maintenance. The tenets are prioritized: when two
+principles genuinely conflict, the earlier one wins. Reviews should name the
+relevant tenet and the evidence supporting the choice rather than treating the
+document as a generic checklist.
+
+Record an [Architecture Decision Record](docs/adr/README.md) when a decision is
+expensive to reverse, changes a trust boundary, resolves a real tenet conflict,
+or creates a durable exception. A bounded exception should identify its owner,
+scope, compensating controls, and revisit trigger.
 
 ### 1. Create a Feature Branch
 
@@ -312,10 +354,10 @@ cli/                         # CLI commands and utilities
 lambda/
 ├── kubectl-applier-simple/  # Lambda for kubectl operations
 ├── helm-installer/          # Lambda for Helm chart installation
-├── api-gateway-proxy/       # API Gateway proxy Lambda
+├── api-gateway-proxy/       # Global API Gateway proxy and HMAC signer
+├── regional-api-proxy/      # Region-pinned API Gateway proxy and HMAC signer
 ├── ga-registration/         # Global Accelerator registration
-├── secret-rotation/         # Secret rotation Lambda
-└── alb-header-validator/    # ALB header validation
+└── secret-rotation/         # Backend HMAC signing-key rotation Lambda
 
 dockerfiles/         # Dockerfiles for K8s services
 docs/                # Documentation
@@ -374,45 +416,59 @@ pytest tests/ -m integration
 
 ### Pre-Pull-Request Verification
 
-Before you open a pull request, run the same three checks CI runs — the test
-suite (`pytest`), the linter/formatter (`ruff`), and the type checker
-(`mypy`) — so your change is verified locally before it ever reaches the
-pipeline. These are the exact tools invoked by the `unit:pytest:core`,
-`lint:ruff:python`, and `lint:mypy:strict` jobs described under
-[CI/CD Pipeline](#cicd-pipeline), so a clean local run means a clean CI run.
+Before you open a pull request, run the core test, lint/format, and type-check
+commands plus the deterministic accelerator maintenance guard. These are the
+same surfaces invoked by `unit:pytest:core`, `lint:ruff:python`,
+`lint:mypy:strict`, and the explicit accelerator validation steps described
+under [CI/CD Pipeline](#cicd-pipeline).
 
-Run all three from your dev-container shell (the recommended path — see
+Run them from your dev-container shell (the recommended path — see
 [Using the Dev Container (Recommended)](#using-the-dev-container-recommended)):
 
 ```bash
 ruff format --check gco/ cli/ gco_mcp/ tests/ lambda/ scripts/ diagrams/
 ruff check gco/ cli/ gco_mcp/ tests/ lambda/ scripts/ diagrams/
 mypy gco/ cli/ gco_mcp/ scripts/ --exclude 'gco/stacks/'
+python scripts/accelerator_catalog.py validate
+pytest tests/test_accelerator_catalog.py -q
 pytest tests/ --cov=gco --cov=cli --cov=gco_mcp --cov-fail-under=90
 ```
 
-**Success indicator:** all four commands complete with no reported failures —
-`ruff` reports no formatting diffs and no lint findings, `mypy` reports no type
-errors, and `pytest` reports all tests passing with coverage at or above the
-threshold. When every command exits cleanly, your change is verified and ready
-for a pull request. If any command reports a failure, fix it and re-run the
-full sequence before submitting.
+**Success indicator:** all six commands complete with no reported failures —
+Ruff reports no formatting diffs or lint findings, mypy reports no type errors,
+the accelerator validator and focused tests report a current internally
+consistent catalog, and the aggregate pytest run passes at or above the coverage
+threshold. Fix any failure and re-run the full sequence before submitting.
 
 For what to update alongside code changes, see the [Testing](#testing) and
 [Documentation](#documentation) guidance below and the
 [Contributing section of the README](README.md#contributing).
 
+### Live Release Validation Applicability
+
+Live release validation is a separate, explicitly authorized local operator process for behavior that mocked/offline CI cannot prove. Use the highest-risk row that applies to the pull request.
+
+| Decision | Typical changes |
+|---|---|
+| **Required** | CDK or CloudFormation topology and lifecycle changes; deploy/destroy or retained-resource cleanup changes; IAM, networking, regional routing, EKS/Kubernetes runtime wiring; and deployed service or Lambda behavior that depends on real AWS integration |
+| **Usually not required** | Isolated CLI changes that fast mocked/offline tests completely validate; CI/workflow/test-tooling-only changes; routine dependency bumps with no deployed runtime or infrastructure effect; docs-only or test-only changes; and behavior-preserving refactors |
+
+These are risk categories, not blanket path exemptions. A CLI command that mutates live AWS resources still requires validation, while a dependency bump may require it if it changes a deployed image, AWS SDK behavior, CDK output, or runtime integration. Explain the decision in the pull request; maintainers may require validation when impact is uncertain.
+
+When required, obtain explicit account and KMS-deletion authorization, run `python -m scripts.live_release_validation --actions all` only on a developer's local machine, and manually attach the generated Markdown report to the pull request for the exact SHA. Never invoke the harness from GitHub Actions and never upload `checkpoint.json`. See the [Live Release Validation runbook](docs/LIVE_RELEASE_VALIDATION.md) for the safety gates and complete command.
+
 ### CI/CD Pipeline
 
-The project uses GitHub Actions for automated testing. Every push and pull request runs five primary workflows in parallel, plus three satellites on schedule or manual trigger.
+The project uses GitHub Actions for automated testing. Every push and pull request runs six primary workflows in parallel, plus three satellites on schedule or manual trigger.
 
 #### Primary workflows (run on every push + PR)
 
 | Workflow file | README row | Purpose |
 |---------------|------------|---------|
-| `.github/workflows/unit-tests.yml` | Unit Tests | pytest with coverage, BATS, CLI smoke, CDK synth + config matrix, lockfile freshness, fresh install, workload import checks |
+| `.github/workflows/unit-tests.yml` | Unit Tests | pytest with coverage, explicit offline accelerator catalog/NodePool validation, BATS, CLI smoke, CDK synth + config matrix, lockfile freshness, fresh install, workload import checks |
 | `.github/workflows/integration-tests.yml` | Integration Tests | Per-Dockerfile build + healthcheck, kind cluster E2E (with Calico for NetworkPolicy enforcement), K8s manifest schema, Lambda import validation, cross-module pytest, MCP server pytest |
-| `.github/workflows/security.yml` | Security | bandit, pip-audit, trivy (filesystem + per-image), trufflehog, gitleaks, semgrep, checkov, KICS |
+| `.github/workflows/security.yml` | Security | bandit, pip-audit, npm audit for every owned graph, trivy (filesystem + per-image), trufflehog, gitleaks, semgrep, checkov, KICS, and CodeQL for Python + JavaScript |
+| `.github/workflows/inference-streaming-proxy.yml` | — (no badge) | Native Node.js 24 tests for the streaming Lambda with 93% line/function/branch gates |
 | `.github/workflows/lint.yml` | Linting | actionlint, hadolint, markdownlint, mypy (strict/stacks/lambda), ruff (format + check, imports included), shellcheck, yamllint |
 | `.github/workflows/mooncake-image.yml` | — (no badge) | Mooncake vLLM image contract: runs the real upstream image GCO defaults to (`cli/images.py::_DISAGGREGATED_DEFAULT_IMAGE`) and asserts the PD proxy starts under `python3` + serves `/healthz`, the rendered store config is accepted by the image's loader, and the connector names GCO emits are registered — so an image-version bump is validated by CI |
 
@@ -423,7 +479,7 @@ Each workflow file has a comment header documenting triggers and per-job purpose
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `.github/workflows/release.yml` | Manual (`workflow_dispatch`) | Bump version, tag, and create a GitHub Release with auto-generated notes |
-| `.github/workflows/deps-scan.yml` | `cron: 0 9 1 * *` (monthly) | Check Python/Docker/Helm/EKS-addon versions; open an issue if drift detected |
+| `.github/workflows/deps-scan.yml` | `cron: 0 9 1 * *` (monthly) | Check pinned versions plus deterministic NodePool/watch-list policy and live EC2 accelerator-catalog drift; update one rolling issue when drift is detected |
 | `.github/workflows/cve-scan.yml` | `cron: 0 9 * * 1` (weekly) | Re-run Trivy against current CVE databases |
 
 #### Auto-generated badges
@@ -449,9 +505,12 @@ ruff format --check gco/ cli/ gco_mcp/ tests/ lambda/ scripts/ diagrams/
 ruff check gco/ cli/ gco_mcp/ tests/ lambda/ scripts/ diagrams/
 yamllint -c .github/config/.yamllint.yml --strict .
 
-# Run markdownlint (requires Node; no Python install needed).
-# Config lives in .github/config/.markdownlint-cli2.yaml.
-npx markdownlint-cli2 --config .github/config/.markdownlint-cli2.yaml
+# Install locked tooling and the isolated production-Lambda graph.
+bash .github/scripts/use-pinned-npm.sh package.json
+npm ci --ignore-scripts --no-audit --no-fund
+npm run lint:markdown
+npm ci --prefix lambda/inference-streaming-proxy --ignore-scripts --no-audit --no-fund
+npm --prefix lambda/inference-streaming-proxy test
 
 # Run type checks (everything except stacks — fast, no CDK needed)
 mypy gco/ cli/ gco_mcp/ scripts/ --exclude 'gco/stacks/'
@@ -523,6 +582,7 @@ gco stacks destroy-all -y
 
 ### Documentation Files
 
+- `TENETS.md`: Normative north star and prioritized project decision guidance
 - `README.md`: Overview and quick start
 - `QUICKSTART.md`: Step-by-step setup guide
 - `docs/ARCHITECTURE.md`: Technical architecture
@@ -537,7 +597,14 @@ gco stacks destroy-all -y
 
 ### Architecture Decision Records
 
-Record architecturally significant decisions — ones that are expensive to reverse or that shape the system in ways future contributors must understand — as an [Architecture Decision Record](docs/adr/README.md). Copy `docs/adr/template.md` to the next `docs/adr/NNNN-title.md`, fill in the context, decision, and consequences, then add a row to the ADR index. See [docs/adr/README.md](docs/adr/README.md) for when to write one and the full process.
+Record architecturally significant decisions — ones that are expensive to reverse,
+resolve a real conflict between the prioritized [project tenets](TENETS.md), or
+shape the system in ways future contributors must understand — as an
+[Architecture Decision Record](docs/adr/README.md). Copy `docs/adr/template.md`
+to the next `docs/adr/NNNN-title.md`, fill in the context, decision, and
+consequences, then add a row to the ADR index. See
+[docs/adr/README.md](docs/adr/README.md) for when to write one and the full
+process.
 
 ### Documentation Style
 
@@ -551,10 +618,14 @@ Record architecturally significant decisions — ones that are expensive to reve
   - `diagrams/code_diagrams/` — per-function control-flow charts
     (Lambda handlers, CLI entry points) rendered with pyflowchart +
     Playwright. Run `python diagrams/code_diagrams/generate.py` to
-    refresh; the script auto-inserts a `# Flowchart:` pointer
-    comment at the top of every source file it charts so readers
-    can navigate from code to diagram without guessing. Add new
-    targets by editing `diagrams/code_diagrams/_targets.py`.
+    refresh; the script auto-inserts a generated marker block at the
+    top of every source file it charts with both the flowchart path and
+    the invocation-wide UTC generation timestamp. The same timestamp
+    appears in HTML metadata/visible content, PNG pixels, and the
+    generated README. A normal run intentionally refreshes that wall-clock
+    metadata even when source is unchanged; set a fixed integer
+    `SOURCE_DATE_EPOCH` for byte-reproducible output. Add new targets by
+    editing `diagrams/code_diagrams/_targets.py`.
 - Keep it up-to-date with code changes
 
 ## Code Review Guidelines
@@ -571,6 +642,7 @@ Record architecturally significant decisions — ones that are expensive to reve
 
 - Be constructive and respectful
 - Focus on code quality and maintainability
+- Check the change against the prioritized [project tenets](TENETS.md), starting with the earliest affected tenet
 - Check for security issues
 - Verify documentation is updated
 - Test changes if possible
@@ -634,16 +706,18 @@ After releasing, confirm the auto-generated GitHub Release notes read well (they
 
 Dependency drift is tracked through three layers:
 
-1. **Dependabot (weekly PRs)** — GitHub Actions and Docker only. See `.github/dependabot.yml`. Python packages are intentionally excluded because `requirements-lock.txt` is managed through `pip-compile` and bumped intentionally.
-2. **`deps-scan` workflow (monthly issue)** — runs on the 1st of each month at 09:00 UTC. Checks Python packages, Docker images, Helm charts, EKS add-on versions, Aurora PostgreSQL engine versions, and pre-commit hook revisions. If anything is out of date, it opens a GitHub issue labeled `dependencies, automated`. The scan logic lives in [`.github/scripts/dependency-scan.sh`](.github/scripts/dependency-scan.sh) — see [`.github/CI.md`](.github/CI.md#dependency-scan-script) for the full reference (surfaces checked, inputs, outputs, extension points, failure modes). Pinned versions are centralised in [`gco/stacks/constants.py`](gco/stacks/constants.py).
+1. **Dependabot (weekly PRs)** — GitHub Actions, Docker, the locked root npm tooling graph, and the deployable inference-streaming Lambda graph. See `.github/dependabot.yml`. Python packages are intentionally excluded because `requirements-lock.txt` is managed through `pip-compile` and bumped intentionally.
+2. **`deps-scan` workflow (monthly issue)** — runs on the 1st of each month at 09:00 UTC. Checks Python packages, Docker images, Helm charts, EKS add-on versions, Aurora PostgreSQL engine versions, pre-commit hook revisions, and accelerator catalog/NodePool/watch-list policy. Deterministic accelerator validation always runs offline; with OIDC credentials the scan also compares the checked-in catalog with the live enabled-Region EC2 union. If anything is out of date or an online check cannot run correctly, it updates one GitHub issue labeled `dependencies, automated`. The scan logic lives in [`.github/scripts/dependency-scan.sh`](.github/scripts/dependency-scan.sh) — see [`.github/CI.md`](.github/CI.md#dependency-scan-script) for the full reference (surfaces checked, inputs, outputs, extension points, failure modes). Pinned versions are centralised in [`gco/stacks/constants.py`](gco/stacks/constants.py).
 3. **`cve-scan` workflow (weekly job)** — runs Mondays at 09:00 UTC. Re-runs Trivy against the latest CVE databases. A red run is the signal; the per-push `security.yml` workflow will catch the same issue on the next PR.
 
 #### What Gets Checked by `deps-scan`
 
-- **Python Packages**: all packages resolved from `pyproject.toml` are checked against PyPI for newer versions
+- **Python Packages**: direct dependencies resolved from `pyproject.toml` are checked against PyPI for newer versions; transitive-only drift is left to the direct package that owns it
+- **Node/npm**: Node 24, npm, the CDK CLI, exact package pins, lockfile presence, and Dependabot coverage across every repository-owned `package.json`
 - **Docker Images**: semver-tagged images referenced in `.github/workflows/*.yml`, K8s manifests, examples, and Helm chart values
 - **Helm Charts**: from `lambda/helm-installer/charts.yaml`
-- **EKS Add-ons**: extracted from `gco/stacks/regional_stack.py` (requires AWS credentials via OIDC; falls back gracefully otherwise)
+- **EKS Add-ons**: extracted from `gco/stacks/constants.py` (requires AWS credentials via OIDC; records an explicit skip otherwise)
+- **Accelerator Catalog and NodePools**: always runs `python scripts/accelerator_catalog.py validate` offline to reject deprecated scheduling, surface newer unreferenced generations, and require exact catalog/`watch_instance_types`/`ConfigLoader` synchronization; with AWS credentials, compares the catalog with NVIDIA GPU and AWS Neuron instance types returned by EC2 across enabled commercial Regions
 - **Pre-commit Hooks**: `rev:` pins in `.pre-commit-config.yaml` are compared against the latest tag published by the upstream GitHub repo
 
 #### Running the Dependency Check Manually
@@ -656,7 +730,11 @@ The monthly scan is also wired to `workflow_dispatch`:
 
 #### Checking EKS Addon Versions
 
-EKS addon versions are checked by `deps-scan` when AWS credentials are configured. Without credentials, the addon section is skipped silently. To check manually at any time:
+The EKS add-on check is one of several AWS-backed dependency surfaces. EKS
+cluster-version, Aurora, EMR, Bedrock, and online EC2 accelerator discovery also
+use the OIDC role. Without credentials, each online surface is explicitly marked
+skipped rather than reported current; deterministic accelerator/NodePool
+validation still runs offline. To inspect EKS add-ons manually:
 
 ```bash
 # Check latest versions for all addons used by GCO
@@ -672,10 +750,11 @@ for addon in metrics-server aws-efs-csi-driver amazon-cloudwatch-observability a
 done
 ```
 
-Current addon versions are defined in `gco/stacks/regional_stack.py`. To update:
+Current add-on versions are defined in `gco/stacks/constants.py` and consumed by
+`gco/stacks/regional_stack.py`. To update:
 
 1. Run the command above to get latest versions
-2. Update the `addon_version` parameter for each addon in `regional_stack.py`
+2. Update the matching `EKS_ADDON_*` constants in `gco/stacks/constants.py`
 3. Test the deployment in a non-production environment first
 4. Review the [EKS addon release notes](https://docs.aws.amazon.com/eks/latest/userguide/eks-add-ons.html) for breaking changes
 
@@ -772,8 +851,14 @@ aws cloudformation describe-stack-events \
   --region us-east-1 \
   --max-items 20
 
-# Check Lambda logs
-aws logs tail /aws/lambda/gco-us-east-1-KubectlApplier* \
+# Resolve generated Lambda and log-group physical names
+aws cloudformation list-stack-resources \
+  --stack-name gco-us-east-1 \
+  --region us-east-1 \
+  --query "StackResourceSummaries[?ResourceType=='AWS::Lambda::Function' || ResourceType=='AWS::Logs::LogGroup'].{Type:ResourceType,Logical:LogicalResourceId,Physical:PhysicalResourceId}"
+
+# Tail the exact log group selected from the output above
+aws logs tail <EXACT_LOG_GROUP_NAME> \
   --region us-east-1 \
   --since 30m
 

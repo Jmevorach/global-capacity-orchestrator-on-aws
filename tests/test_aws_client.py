@@ -12,10 +12,25 @@ Gateway routing toggle. Heavy use of boto3.Session and requests.request
 mocking; every test stubs get_config to avoid reading real CDK context.
 """
 
+import json
 import time
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def _cache_regional_endpoint(client: Any, region: str) -> None:
+    """Install a fresh regional endpoint without CloudFormation discovery."""
+    from cli.aws_client import ApiEndpoint
+
+    client._regional_api_cache[region] = ApiEndpoint(
+        url=f"https://regional.execute-api.{region}.amazonaws.com/prod",
+        region=region,
+        api_id="regional",
+        is_regional=True,
+    )
+    client._cache_timestamp = time.time()
 
 
 class TestRegionalStack:
@@ -311,6 +326,41 @@ class TestGCOAWSClientRequests:
 
                 assert response.status_code == 200
                 mock_request.assert_called_once()
+                assert mock_request.call_args.kwargs["stream"] is False
+
+    def test_make_authenticated_request_streams_response_body(self):
+        """Streaming requests leave the body unbuffered and allow regional idle gaps."""
+        from cli.aws_client import ApiEndpoint, GCOAWSClient
+
+        with patch("cli.aws_client.get_config") as mock_config:
+            mock_config.return_value = MagicMock(cache_ttl_seconds=300)
+
+            with (
+                patch("boto3.Session") as mock_session,
+                patch("requests.request") as mock_request,
+                patch("cli.aws_client.SigV4Auth"),
+            ):
+                mock_session.return_value.get_credentials.return_value = MagicMock()
+                mock_request.return_value = MagicMock(status_code=200)
+
+                client = GCOAWSClient()
+                client._api_endpoint_cache = ApiEndpoint(
+                    url="https://api.example.com/prod",
+                    region="us-east-1",
+                    api_id="test",
+                )
+                client._cache_timestamp = time.time()
+
+                response = client.make_authenticated_request(
+                    "POST",
+                    "/inference/ep/v1/completions",
+                    body={"prompt": "hello", "stream": True},
+                    stream=True,
+                )
+
+                assert response.status_code == 200
+                assert mock_request.call_args.kwargs["stream"] is True
+                assert mock_request.call_args.kwargs["timeout"] == (10, 310)
 
     def test_submit_manifests(self):
         """Test submitting manifests."""
@@ -554,9 +604,15 @@ class TestGCOAWSClientRequests:
                 )
                 client._cache_timestamp = time.time()
 
-                result = client.delete_job("test-job", "default")
+                result = client.delete_job(
+                    "test-job",
+                    "default",
+                    expected_uid="uid:123/abc",
+                )
 
                 assert result["deleted"] is True
+                request_url = mock_request.call_args.kwargs["url"]
+                assert request_url.endswith("?expected_uid=uid%3A123%2Fabc")
 
 
 class TestGCOAWSClientDiscoverRegionalStacks:
@@ -881,7 +937,7 @@ class TestGCOAWSClientMakeAuthenticatedRequest:
                 assert response.status_code == 200
 
     def test_make_authenticated_request_with_target_region(self):
-        """Test making authenticated request with target region header."""
+        """Test that an exact region uses its regional API without routing headers."""
         from cli.aws_client import ApiEndpoint, GCOAWSClient
 
         with patch("cli.aws_client.get_config") as mock_config:
@@ -906,15 +962,121 @@ class TestGCOAWSClientMakeAuthenticatedRequest:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-west-2")
 
                 response = client.make_authenticated_request(
                     "GET", "/api/v1/jobs", target_region="us-west-2"
                 )
 
                 assert response.status_code == 200
-                # Verify target region header was included
                 call_kwargs = mock_request.call_args[1]
-                assert "X-GCO-Target-Region" in call_kwargs["headers"]
+                assert "regional.execute-api.us-west-2.amazonaws.com" in call_kwargs["url"]
+                assert "X-GCO-Target-Region" not in call_kwargs["headers"]
+
+    def test_regional_mode_defaults_omitted_region_to_configured_default(self):
+        """Supported unpinned calls use the default regional bridge."""
+        from cli.aws_client import GCOAWSClient
+        from cli.config import GCOConfig
+
+        config = GCOConfig(
+            default_region="eu-west-1",
+            use_regional_api=True,
+        )
+        with (
+            patch("boto3.Session") as mock_session,
+            patch("requests.request") as mock_request,
+            patch("cli.aws_client.SigV4Auth"),
+        ):
+            mock_session.return_value.get_credentials.return_value = MagicMock()
+            mock_response = MagicMock(status_code=200)
+            mock_request.return_value = mock_response
+
+            client = GCOAWSClient(config)
+            _cache_regional_endpoint(client, "eu-west-1")
+
+            response = client.make_authenticated_request("GET", "/api/v1/jobs")
+
+        assert response is mock_response
+        call_kwargs = mock_request.call_args.kwargs
+        assert "regional.execute-api.eu-west-1.amazonaws.com" in call_kwargs["url"]
+        assert "X-GCO-Target-Region" not in call_kwargs["headers"]
+
+    def test_regional_mode_default_region_missing_bridge_fails_closed(self):
+        """An omitted region never falls back to the global API."""
+        from cli.aws_client import GCOAWSClient
+        from cli.config import GCOConfig
+
+        config = GCOConfig(default_region="eu-west-1", use_regional_api=True)
+        with patch("boto3.Session"):
+            client = GCOAWSClient(config)
+            client.get_regional_api_endpoint = MagicMock(return_value=None)
+            client.get_api_endpoint = MagicMock()
+
+            with pytest.raises(
+                RuntimeError,
+                match="Regional API endpoint is not deployed in eu-west-1",
+            ):
+                client.make_authenticated_request("GET", "/api/v1/jobs")
+
+        client.get_regional_api_endpoint.assert_called_once_with("eu-west-1")
+        client.get_api_endpoint.assert_not_called()
+
+    @pytest.mark.parametrize("target_region", ["", "   "])
+    def test_regional_mode_rejects_blank_explicit_region(self, target_region):
+        """A blank explicit pin cannot escape strict mode through the global API."""
+        from cli.aws_client import GCOAWSClient
+        from cli.config import GCOConfig
+
+        config = GCOConfig(default_region="eu-west-1", use_regional_api=True)
+        with patch("boto3.Session"):
+            client = GCOAWSClient(config)
+            client.get_regional_api_endpoint = MagicMock()
+            client.get_api_endpoint = MagicMock()
+
+            with pytest.raises(ValueError, match="requires a non-empty.*AWS region"):
+                client.make_authenticated_request(
+                    "GET",
+                    "/api/v1/jobs",
+                    target_region=target_region,
+                )
+
+        client.get_regional_api_endpoint.assert_not_called()
+        client.get_api_endpoint.assert_not_called()
+
+    def test_regional_mode_rejects_blank_default_region(self):
+        """An omitted pin also fails closed when the configured default is blank."""
+        from cli.aws_client import GCOAWSClient
+        from cli.config import GCOConfig
+
+        config = GCOConfig(default_region="", use_regional_api=True)
+        with patch("boto3.Session"):
+            client = GCOAWSClient(config)
+            client.get_regional_api_endpoint = MagicMock()
+            client.get_api_endpoint = MagicMock()
+
+            with pytest.raises(ValueError, match="requires a non-empty.*AWS region"):
+                client.make_authenticated_request("GET", "/api/v1/jobs")
+
+        client.get_regional_api_endpoint.assert_not_called()
+        client.get_api_endpoint.assert_not_called()
+
+    def test_regional_mode_rejects_global_only_operation(self):
+        """Global aggregation helpers fail clearly in strict regional mode."""
+        from cli.aws_client import GCOAWSClient
+        from cli.config import GCOConfig
+
+        config = GCOConfig(default_region="eu-west-1", use_regional_api=True)
+        with patch("boto3.Session"):
+            client = GCOAWSClient(config)
+            client.get_regional_api_endpoint = MagicMock()
+
+            with pytest.raises(
+                ValueError,
+                match="Global API operations are unavailable in regional API mode",
+            ):
+                client.get_global_health()
+
+        client.get_regional_api_endpoint.assert_not_called()
 
 
 class TestGCOAWSClientGetJobs:
@@ -947,6 +1109,7 @@ class TestGCOAWSClientGetJobs:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-west-2")
 
                 jobs = client.get_jobs(region="us-west-2", namespace="gco-jobs", status="running")
 
@@ -1173,11 +1336,17 @@ class TestGCOAWSClientBulkDeleteGlobal:
                 client._cache_timestamp = time.time()
 
                 result = client.bulk_delete_global(
-                    namespace="default", status="failed", older_than_days=7, dry_run=True
+                    namespace="default",
+                    status="failed",
+                    older_than_days=7,
+                    label_selector="team=ml",
+                    dry_run=True,
                 )
 
                 assert result["dry_run"] is True
                 assert result["total"] == 2
+                request_body = json.loads(mock_request.call_args.kwargs["data"])
+                assert request_body["label_selector"] == "team=ml"
 
     def test_bulk_delete_global_execute(self):
         """Test bulk delete across all regions with actual deletion."""
@@ -1271,6 +1440,7 @@ class TestGCOAWSClientJobEvents:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-east-1")
 
                 result = client.get_job_events("test-job", "default", "us-east-1")
 
@@ -1321,6 +1491,7 @@ class TestGCOAWSClientJobPods:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-east-1")
 
                 result = client.get_job_pods("test-job", "default", "us-east-1")
 
@@ -1374,6 +1545,7 @@ class TestGCOAWSClientJobMetrics:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-east-1")
 
                 result = client.get_job_metrics("test-job", "default", "us-east-1")
 
@@ -1416,6 +1588,7 @@ class TestGCOAWSClientRetryJob:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-east-1")
 
                 result = client.retry_job("failed-job", "default", "us-east-1")
 
@@ -1463,6 +1636,7 @@ class TestGCOAWSClientBulkDeleteJobs:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-east-1")
 
                 result = client.bulk_delete_jobs(
                     namespace="default",
@@ -1502,6 +1676,7 @@ class TestGCOAWSClientBulkDeleteJobs:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-west-2")
 
                 client.bulk_delete_jobs(
                     label_selector="app=test,env=dev",
@@ -1556,6 +1731,7 @@ class TestGCOAWSClientGetHealth:
                     api_id="test",
                 )
                 client._cache_timestamp = time.time()
+                _cache_regional_endpoint(client, "us-east-1")
 
                 result = client.get_health("us-east-1")
 
@@ -1563,11 +1739,136 @@ class TestGCOAWSClientGetHealth:
                 assert result["region"] == "us-east-1"
                 call_args = mock_request.call_args
                 assert "/api/v1/health" in call_args[1]["url"]
-                assert call_args[1]["headers"]["X-GCO-Target-Region"] == "us-east-1"
+                assert "regional.execute-api.us-east-1.amazonaws.com" in call_args[1]["url"]
+                assert "X-GCO-Target-Region" not in call_args[1]["headers"]
 
 
 class TestGCOAWSClientRetryLogic:
     """Tests for retry logic in make_authenticated_request."""
+
+    def test_default_retries_504_and_succeeds(self):
+        """The default read-only retry budget handles a transient 504."""
+        from cli.aws_client import ApiEndpoint, GCOAWSClient
+
+        with patch("cli.aws_client.get_config") as mock_config:
+            mock_config.return_value = MagicMock(cache_ttl_seconds=300)
+
+            with (
+                patch("boto3.Session") as mock_session,
+                patch("requests.request") as mock_request,
+                patch("cli.aws_client.SigV4Auth"),
+                patch("time.sleep"),
+            ):
+                mock_session.return_value.get_credentials.return_value = MagicMock()
+                mock_504 = MagicMock(status_code=504)
+                mock_200 = MagicMock(status_code=200)
+                mock_request.side_effect = [mock_504, mock_200]
+
+                client = GCOAWSClient()
+                client._api_endpoint_cache = ApiEndpoint(
+                    url="https://api.example.com/prod",
+                    region="us-east-1",
+                    api_id="test",
+                )
+                client._cache_timestamp = time.time()
+
+                response = client.make_authenticated_request("GET", "/api/v1/health")
+
+                assert response is mock_200
+                assert mock_request.call_count == 2
+
+    @pytest.mark.parametrize("max_attempts", [True, False, 0, -1, 1.5, "3"])
+    @pytest.mark.parametrize("entrypoint", ["call_api", "make_authenticated_request"])
+    def test_invalid_max_attempts_rejected(self, entrypoint, max_attempts):
+        """Both public request entry points reject invalid attempt limits."""
+        from cli.aws_client import GCOAWSClient
+
+        with (
+            patch("cli.aws_client.get_config") as mock_config,
+            patch("boto3.Session"),
+            patch("requests.request") as mock_request,
+        ):
+            mock_config.return_value = MagicMock(cache_ttl_seconds=300)
+            client = GCOAWSClient()
+
+            with pytest.raises(ValueError, match="max_attempts must be a positive integer"):
+                getattr(client, entrypoint)(
+                    "GET",
+                    "/api/v1/health",
+                    max_attempts=max_attempts,
+                )
+
+            mock_request.assert_not_called()
+
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+    def test_mutating_methods_never_replay(self, method):
+        """An explicit read retry budget cannot enable mutating replay."""
+        from cli.aws_client import ApiEndpoint, GCOAWSClient
+
+        with patch("cli.aws_client.get_config") as mock_config:
+            mock_config.return_value = MagicMock(cache_ttl_seconds=300)
+
+            with (
+                patch("boto3.Session") as mock_session,
+                patch("requests.request") as mock_request,
+                patch("cli.aws_client.SigV4Auth"),
+            ):
+                mock_session.return_value.get_credentials.return_value = MagicMock()
+                mock_504 = MagicMock(status_code=504)
+                mock_200 = MagicMock(status_code=200)
+                mock_request.side_effect = [mock_504, mock_200]
+
+                client = GCOAWSClient()
+                client._api_endpoint_cache = ApiEndpoint(
+                    url="https://api.example.com/prod",
+                    region="us-east-1",
+                    api_id="test",
+                )
+                client._cache_timestamp = time.time()
+
+                response = client.make_authenticated_request(
+                    method,
+                    "/api/v1/manifests",
+                    max_attempts=3,
+                )
+
+                assert response is mock_504
+                assert mock_request.call_count == 1
+
+    def test_403_refresh_respects_max_attempts(self):
+        """Credential refresh never adds a request beyond the selected budget."""
+        from cli.aws_client import ApiEndpoint, GCOAWSClient
+
+        with patch("cli.aws_client.get_config") as mock_config:
+            mock_config.return_value = MagicMock(cache_ttl_seconds=300)
+
+            with (
+                patch("boto3.Session") as mock_session,
+                patch("requests.request") as mock_request,
+                patch("cli.aws_client.SigV4Auth"),
+            ):
+                mock_session.return_value.get_credentials.return_value = MagicMock()
+                mock_403 = MagicMock(status_code=403)
+                mock_200 = MagicMock(status_code=200)
+                mock_request.side_effect = [mock_403, mock_200]
+
+                client = GCOAWSClient()
+                client._api_endpoint_cache = ApiEndpoint(
+                    url="https://api.example.com/prod",
+                    region="us-east-1",
+                    api_id="test",
+                )
+                client._cache_timestamp = time.time()
+
+                response = client.make_authenticated_request(
+                    "GET",
+                    "/api/v1/health",
+                    max_attempts=1,
+                )
+
+                assert response is mock_403
+                assert mock_request.call_count == 1
+                assert mock_session.call_count == 1
 
     def test_retry_on_503(self):
         """Test that 503 responses trigger retries."""
@@ -1754,6 +2055,47 @@ class TestGCOAWSClientRetryLogic:
 
 class TestGCOAWSClientCallApi:
     """Tests for call_api method with improved error handling."""
+
+    def test_max_attempts_one_surfaces_first_504(self):
+        """call_api forwards a one-attempt budget and surfaces the first 504."""
+        from cli.aws_client import ApiEndpoint, GCOAWSClient
+
+        with patch("cli.aws_client.get_config") as mock_config:
+            mock_config.return_value = MagicMock(cache_ttl_seconds=300)
+
+            with (
+                patch("boto3.Session") as mock_session,
+                patch("requests.request") as mock_request,
+                patch("cli.aws_client.SigV4Auth"),
+            ):
+                mock_session.return_value.get_credentials.return_value = MagicMock()
+                mock_504 = MagicMock(
+                    status_code=504,
+                    ok=False,
+                    reason="Gateway Timeout",
+                    text="",
+                )
+                mock_504.json.return_value = {}
+                mock_200 = MagicMock(status_code=200, ok=True)
+                mock_200.json.return_value = {"data": "test"}
+                mock_request.side_effect = [mock_504, mock_200]
+
+                client = GCOAWSClient()
+                client._api_endpoint_cache = ApiEndpoint(
+                    url="https://api.example.com/prod",
+                    region="us-east-1",
+                    api_id="test",
+                )
+                client._cache_timestamp = time.time()
+
+                with pytest.raises(RuntimeError, match="504 Gateway Timeout"):
+                    client.call_api(
+                        "GET",
+                        "/api/v1/test",
+                        max_attempts=1,
+                    )
+
+                assert mock_request.call_count == 1
 
     def test_call_api_success(self):
         """Test successful call_api."""

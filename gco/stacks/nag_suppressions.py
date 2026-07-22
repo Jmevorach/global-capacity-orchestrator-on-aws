@@ -138,45 +138,44 @@ def acknowledge_nag_findings(
     acknowledgment on a stack covers all resources in that stack, and one on a
     role covers the role's generated policies.
     """
-    # cdk-nag renders the CloudFormation account/region pseudo-parameters in a
-    # finding's detail two different ways, and which one appears is decided
-    # per-ARN, not per-stack:
-    #   * an ARN built from an ``Aws.ACCOUNT_ID`` / ``Aws.REGION`` pseudo-param
-    #     always renders as the angle-bracket literal ``<AWS::AccountId>`` /
-    #     ``<AWS::Region>`` (CloudFormation resolves the pseudo-param at deploy,
-    #     never at synth), whereas
-    #   * an ARN hand-built from ``stack.account`` / ``stack.region`` renders as
-    #     the *concrete* value when the stack is environment-specific, and as
-    #     the pseudo-param literal when it is environment-agnostic.
-    # So for a concrete env we can't know from here which form cdk-nag will
-    # emit for any given finding. We therefore register the acknowledgment
-    # under BOTH the placeholder detail and its literal rendering; extra keys
-    # that match no finding are harmless, and whichever form cdk-nag emits then
-    # has a matching acknowledgment. A detail we ourselves built from a region/
-    # account *token* is first normalized to the placeholder form — a raw token
-    # can't be used as a metadata-map key (synth fails with
-    # ``KeyMustResolveToString``).
+    # cdk-nag renders the CloudFormation partition/account/region
+    # pseudo-parameters in a finding's detail two different ways, and which one
+    # appears is decided per ARN, not per stack:
+    #   * an ARN built from ``Aws.PARTITION`` / ``Aws.ACCOUNT_ID`` /
+    #     ``Aws.REGION`` may retain the angle-bracket pseudo-param literal,
+    #     whereas
+    #   * an ARN hand-built from ``stack.partition`` / ``stack.account`` /
+    #     ``stack.region`` renders concrete values when CDK can resolve them.
+    # So for a concrete env we can't know from here which form cdk-nag will emit
+    # for any given finding. Register the acknowledgment under both the
+    # placeholder detail and every resolvable literal rendering. Extra keys
+    # that match no finding are harmless; whichever exact form cdk-nag emits
+    # then has a matching acknowledgment. Any detail built from a raw token is
+    # normalized first because unresolved tokens cannot be metadata-map keys.
     stack = Stack.of(scope)
+    dimensions = (
+        (stack.partition, "<AWS::Partition>"),
+        (stack.account, "<AWS::AccountId>"),
+        (stack.region, "<AWS::Region>"),
+    )
 
     def _keys_for(rule_id: str, detail: str) -> list[str]:
-        if Token.is_unresolved(stack.region):
-            detail = detail.replace(stack.region, "<AWS::Region>")
-        if Token.is_unresolved(stack.account):
-            detail = detail.replace(stack.account, "<AWS::AccountId>")
+        for value, placeholder in dimensions:
+            if Token.is_unresolved(value):
+                detail = detail.replace(value, placeholder)
         if Token.is_unresolved(detail):
             raise ValueError(
                 "cdk-nag acknowledgment detail contains an unresolved token and "
                 f"cannot be used as a metadata key: {detail!r}. Use cdk-nag's "
                 "literal rendering (e.g. '<AWS::Region>', '<LogicalId.Arn>') instead."
             )
-        # Expand the placeholder detail into every form cdk-nag might emit: for
-        # each concrete env dimension, add a variant with the pseudo-param
-        # placeholder swapped for its literal value.
+        # Expand each placeholder into every concrete environment dimension
+        # CDK resolved, producing the exact partition/account/region combinations
+        # cdk-nag can render for the same policy resource.
         variants = {detail}
-        if not Token.is_unresolved(stack.account):
-            variants.update(v.replace("<AWS::AccountId>", stack.account) for v in list(variants))
-        if not Token.is_unresolved(stack.region):
-            variants.update(v.replace("<AWS::Region>", stack.region) for v in list(variants))
+        for value, placeholder in dimensions:
+            if not Token.is_unresolved(value):
+                variants.update(v.replace(placeholder, value) for v in list(variants))
         return [f"{rule_id}[{v}]" for v in variants]
 
     ack: dict[str, str] = {}
@@ -495,19 +494,19 @@ def add_iam_suppressions(
         # VPC Flow Logs delivery role writes log events to every stream in the
         # flow-log group (logs:CreateLogStream/PutLogEvents on `<group>.Arn:*`).
         "Resource::<VpcFlowLogGroup86559C69.Arn>:*",
-        # Secrets Manager access for the API Gateway auth token, with a
+        # Secrets Manager access for the backend HMAC signing key, with a
         # trailing wildcard for the random 6-char suffix. The regional
         # service-account role builds this exact ARN deterministically (from
         # the secret name + API Gateway region + account) so it matches in
         # both single-region and cross-region topologies — see issue #125.
-        f"Resource::arn:aws:secretsmanager:{secret_region}:<AWS::AccountId>:secret:{api_gateway_auth_secret_name(project_name)}*",
+        f"Resource::arn:<AWS::Partition>:secretsmanager:{secret_region}:<AWS::AccountId>:secret:{api_gateway_auth_secret_name(project_name)}*",
     ]
 
     # Add EKS addon patterns for each configured region
     if regions:
         for region in regions:
             applies_to.append(
-                f"Resource::arn:aws:eks:{region}:<AWS::AccountId>:addon/<GCOEksCluster841A896A>/*"
+                f"Resource::arn:<AWS::Partition>:eks:{region}:<AWS::AccountId>:addon/<GCOEksCluster841A896A>/*"
             )
 
     # Add SSM parameter patterns for global region and all regional regions.
@@ -523,13 +522,13 @@ def add_iam_suppressions(
 
     for region in sorted(ssm_regions_set):
         applies_to.append(
-            f"Resource::arn:aws:ssm:{region}:<AWS::AccountId>:parameter/{project_name}/*"
+            f"Resource::arn:<AWS::Partition>:ssm:{region}:<AWS::AccountId>:parameter/{project_name}/*"
         )
         # Per-chart add-on status + replay input written by the helm installer
         # and orchestrator (gco stacks addons status/install). Scoped to the
         # project's addons subtree in each region.
         applies_to.append(
-            f"Resource::arn:aws:ssm:{region}:<AWS::AccountId>:parameter/{project_name}/addons/*"
+            f"Resource::arn:<AWS::Partition>:ssm:{region}:<AWS::AccountId>:parameter/{project_name}/addons/*"
         )
 
     # Add DynamoDB index wildcard patterns for global region
@@ -537,10 +536,10 @@ def add_iam_suppressions(
     if global_region:
         applies_to.extend(
             [
-                f"Resource::arn:aws:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-job-templates/index/*",
-                f"Resource::arn:aws:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-webhooks/index/*",
-                f"Resource::arn:aws:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-jobs/index/*",
-                f"Resource::arn:aws:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-inference-endpoints/index/*",
+                f"Resource::arn:<AWS::Partition>:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-job-templates/index/*",
+                f"Resource::arn:<AWS::Partition>:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-webhooks/index/*",
+                f"Resource::arn:<AWS::Partition>:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-jobs/index/*",
+                f"Resource::arn:<AWS::Partition>:dynamodb:{global_region}:<AWS::AccountId>:table/{project_name}-inference-endpoints/index/*",
             ]
         )
 
@@ -550,13 +549,13 @@ def add_iam_suppressions(
     # single ``<project_name>-*`` prefix covers both.
     applies_to.extend(
         [
-            f"Resource::arn:aws:s3:::{project_name}-*",
-            f"Resource::arn:aws:s3:::{project_name}-*/*",
+            f"Resource::arn:<AWS::Partition>:s3:::{project_name}-*",
+            f"Resource::arn:<AWS::Partition>:s3:::{project_name}-*/*",
         ]
     )
 
     # KMS wildcard scoped to S3 via condition for model weights bucket decryption
-    applies_to.append("Resource::arn:aws:kms:*:<AWS::AccountId>:key/*")
+    applies_to.append("Resource::arn:<AWS::Partition>:kms:*:<AWS::AccountId>:key/*")
 
     acknowledge_nag_findings(
         stack,
@@ -591,7 +590,7 @@ def add_iam_suppressions(
                     "dynamic Kubernetes resources, (2) Custom resource providers to invoke Lambda versions, "
                     "(3) SSM parameter access for cross-region coordination, (4) EKS addon management, "
                     "(5) VPC Flow Logs to write to CloudWatch, (6) Secrets Manager cross-region access "
-                    "with wildcard suffix for auth token, (7) DynamoDB GSI access for job queue, templates, "
+                    "with wildcard suffix for the HMAC signing key, (7) DynamoDB GSI access for job queue, templates, "
                     "webhooks, and inference endpoints tables, (8) S3 access for model weights bucket "
                     "(auto-generated name). All wildcards are scoped to specific patterns. "
                     "(9) KMS decrypt scoped to S3 via condition for model weights bucket."
@@ -605,8 +604,8 @@ def add_iam_suppressions(
 def add_vpc_suppressions(stack: Stack) -> None:
     """Add suppressions for VPC-related cdk-nag findings.
 
-    Public subnets and IGW routes are required for ALB and NAT Gateway
-    functionality in a multi-tier architecture.
+    Public subnets and IGW routes host the NAT gateways that provide bounded
+    egress for private EKS nodes and VPC Lambdas. The platform ALB remains internal.
     """
     acknowledge_nag_findings(
         stack,
@@ -615,45 +614,51 @@ def add_vpc_suppressions(stack: Stack) -> None:
             NagSuppression(
                 id="HIPAA.Security-VPCSubnetAutoAssignPublicIpDisabled",
                 reason=(
-                    "Public subnets are required for internet-facing ALB. EC2 instances "
-                    "(EKS nodes) are deployed only in private subnets."
+                    "Public subnets host NAT gateways that provide controlled egress "
+                    "for private EKS nodes and VPC Lambdas; workloads and the platform "
+                    "ALB remain in private subnets."
                 ),
             ),
             NagSuppression(
                 id="HIPAA.Security-VPCNoUnrestrictedRouteToIGW",
                 reason=(
-                    "Public subnets require IGW route for ALB to receive traffic from "
-                    "Global Accelerator. All compute resources are in private subnets."
+                    "Public-subnet NAT gateways require an Internet Gateway route to "
+                    "provide outbound dependency access for private subnets. EKS nodes, "
+                    "VPC Lambdas, and the platform ALB remain private."
                 ),
             ),
             # NIST 800-53 VPC suppressions
             NagSuppression(
                 id="NIST.800.53.R5-VPCSubnetAutoAssignPublicIpDisabled",
                 reason=(
-                    "Public subnets are required for internet-facing ALB. EC2 instances "
-                    "(EKS nodes) are deployed only in private subnets."
+                    "Public subnets host NAT gateways that provide controlled egress "
+                    "for private EKS nodes and VPC Lambdas; workloads and the platform "
+                    "ALB remain in private subnets."
                 ),
             ),
             NagSuppression(
                 id="NIST.800.53.R5-VPCNoUnrestrictedRouteToIGW",
                 reason=(
-                    "Public subnets require IGW route for ALB to receive traffic from "
-                    "Global Accelerator. All compute resources are in private subnets."
+                    "Public-subnet NAT gateways require an Internet Gateway route to "
+                    "provide outbound dependency access for private subnets. EKS nodes, "
+                    "VPC Lambdas, and the platform ALB remain private."
                 ),
             ),
             # PCI DSS VPC suppressions
             NagSuppression(
                 id="PCI.DSS.321-VPCSubnetAutoAssignPublicIpDisabled",
                 reason=(
-                    "Public subnets are required for internet-facing ALB. EC2 instances "
-                    "(EKS nodes) are deployed only in private subnets."
+                    "Public subnets host NAT gateways that provide controlled egress "
+                    "for private EKS nodes and VPC Lambdas; workloads and the platform "
+                    "ALB remain in private subnets."
                 ),
             ),
             NagSuppression(
                 id="PCI.DSS.321-VPCNoUnrestrictedRouteToIGW",
                 reason=(
-                    "Public subnets require IGW route for ALB to receive traffic from "
-                    "Global Accelerator. All compute resources are in private subnets."
+                    "Public-subnet NAT gateways require an Internet Gateway route to "
+                    "provide outbound dependency access for private subnets. EKS nodes, "
+                    "VPC Lambdas, and the platform ALB remain private."
                 ),
             ),
         ],
@@ -705,22 +710,28 @@ def add_api_gateway_suppressions(stack: Stack) -> None:
             NagSuppression(
                 id="HIPAA.Security-APIGWSSLEnabled",
                 reason=(
-                    "Backend SSL certificates are not required as traffic flows through "
-                    "Global Accelerator (TLS terminated) to internal ALB (HTTPS)."
+                    "API Gateway integrates with Lambda rather than an HTTP backend that "
+                    "requires an API Gateway client certificate. The public API endpoint "
+                    "enforces HTTPS; Lambda signs the exact private-backend request with "
+                    "a short-lived HMAC envelope."
                 ),
             ),
             NagSuppression(
                 id="NIST.800.53.R5-APIGWSSLEnabled",
                 reason=(
-                    "Backend SSL certificates are not required as traffic flows through "
-                    "Global Accelerator (TLS terminated) to internal ALB (HTTPS)."
+                    "API Gateway integrates with Lambda rather than an HTTP backend that "
+                    "requires an API Gateway client certificate. The public API endpoint "
+                    "enforces HTTPS; Lambda signs the exact private-backend request with "
+                    "a short-lived HMAC envelope."
                 ),
             ),
             NagSuppression(
                 id="PCI.DSS.321-APIGWSSLEnabled",
                 reason=(
-                    "Backend SSL certificates are not required as traffic flows through "
-                    "Global Accelerator (TLS terminated) to internal ALB (HTTPS)."
+                    "API Gateway integrates with Lambda rather than an HTTP backend that "
+                    "requires an API Gateway client certificate. The public API endpoint "
+                    "enforces HTTPS; Lambda signs the exact private-backend request with "
+                    "a short-lived HMAC envelope."
                 ),
             ),
             # CloudWatch Log Group encryption suppressions
@@ -926,8 +937,9 @@ def add_eks_cluster_suppressions(stack: Stack) -> None:
             NagSuppression(
                 id="AwsSolutions-EKS1",
                 reason=(
-                    "EKS public endpoint is enabled for kubectl access from CI/CD pipelines "
-                    "and developer workstations. Access is controlled via IAM."
+                    "The production default is a private EKS API endpoint. When operators "
+                    "explicitly opt into PUBLIC_AND_PRIVATE for development access, the "
+                    "public endpoint is authenticated and authorized through IAM."
                 ),
             ),
         ],
@@ -1104,14 +1116,14 @@ def add_sagemaker_suppressions(
         # SageMaker execution role — SQS submit to any regional queue under
         # the project's ``<project>-jobs-*`` pattern. The SQS queue ARNs
         # are owned by the regional stacks and not directly importable.
-        f"Resource::arn:aws:sqs:*:<AWS::AccountId>:{project_name}-jobs-*",
+        f"Resource::arn:<AWS::Partition>:sqs:*:<AWS::AccountId>:{project_name}-jobs-*",
         # SageMaker execution role — ``ssm:GetParameter`` on the
         # Cluster_Shared_Bucket metadata parameters under
         # ``/gco/cluster-shared-bucket/*`` in the global region. The path
         # wildcard covers exactly three literal parameter names
         # (name / arn / region) defined by ``GCOGlobalStack``; the rest of
         # the ARN is fully scoped (global region + account).
-        f"Resource::arn:aws:ssm:{gbl_region}:<AWS::AccountId>:parameter/{project_name}/cluster-shared-bucket/*",
+        f"Resource::arn:<AWS::Partition>:ssm:{gbl_region}:<AWS::AccountId>:parameter/{project_name}/cluster-shared-bucket/*",
         # SageMaker execution role — execute-api on any REST API id
         # under ``/prod/*/api/v1/*`` and ``/prod/*/inference/*`` in the
         # api-gateway region. The concrete region value is templated in
@@ -1120,9 +1132,10 @@ def add_sagemaker_suppressions(
         # pinning ``GET``) so notebooks can submit jobs, update
         # templates, and manage inference endpoints in addition to
         # read-only GETs.
-        f"Resource::arn:aws:execute-api:{api_region}:<AWS::AccountId>:*/prod/*/api/v1/*",
-        f"Resource::arn:aws:execute-api:{api_region}:<AWS::AccountId>:*/prod/*/inference/*",
-        # KMS decrypt scoped by ``kms:ViaService=s3.<global-region>.amazonaws.com``
+        f"Resource::arn:<AWS::Partition>:execute-api:{api_region}:<AWS::AccountId>:*/prod/*/api/v1/*",
+        f"Resource::arn:<AWS::Partition>:execute-api:{api_region}:<AWS::AccountId>:*/prod/*/inference/*",
+        # KMS decrypt scoped by
+        # ``kms:ViaService=s3.<global-region>.<AWS::URLSuffix>``
         # condition — the resource ARN is unknown to this stack (cluster-
         # shared KMS key lives in the global region) so Resource::* is the
         # documented pattern, narrowed by the ViaService condition.
@@ -1146,14 +1159,14 @@ def add_sagemaker_suppressions(
         # ``kms:ViaService`` condition-scoped wildcard on the cluster-
         # shared bucket's KMS key — only matched when s3 is the invoking
         # service in the global region.
-        f"Condition::kms:ViaService:s3.{gbl_region}.amazonaws.com",
+        f"Condition::kms:ViaService:s3.{gbl_region}.<AWS::URLSuffix>",
         # Studio UI actions — the execution role is assumed by the Studio
         # runtime and needs domain/space/app/user-profile wildcards to
         # render the IDE and manage notebook apps.
-        f"Resource::arn:aws:sagemaker:{api_region}:<AWS::AccountId>:domain/*",
-        f"Resource::arn:aws:sagemaker:{api_region}:<AWS::AccountId>:user-profile/*/*",
-        f"Resource::arn:aws:sagemaker:{api_region}:<AWS::AccountId>:space/*/*",
-        f"Resource::arn:aws:sagemaker:{api_region}:<AWS::AccountId>:app/*/*/*/*",
+        f"Resource::arn:<AWS::Partition>:sagemaker:{api_region}:<AWS::AccountId>:domain/*",
+        f"Resource::arn:<AWS::Partition>:sagemaker:{api_region}:<AWS::AccountId>:user-profile/*/*",
+        f"Resource::arn:<AWS::Partition>:sagemaker:{api_region}:<AWS::AccountId>:space/*/*",
+        f"Resource::arn:<AWS::Partition>:sagemaker:{api_region}:<AWS::AccountId>:app/*/*/*/*",
         # EMR Serverless — Studio discovers and manages EMR apps via these
         # actions. Resource::* is required because EMR Serverless does not
         # support resource-level scoping on most actions.
@@ -1168,8 +1181,8 @@ def add_sagemaker_suppressions(
         # ``sagemaker-mlflow`` service prefix, so this statement stays
         # inline and scoped to the api-gateway region + account.
         "Action::sagemaker-mlflow:*",
-        f"Resource::arn:aws:sagemaker:{api_region}:<AWS::AccountId>:mlflow-tracking-server/*",
-        f"Resource::arn:aws:sagemaker:{api_region}:<AWS::AccountId>:mlflow-app/*",
+        f"Resource::arn:<AWS::Partition>:sagemaker:{api_region}:<AWS::AccountId>:mlflow-tracking-server/*",
+        f"Resource::arn:<AWS::Partition>:sagemaker:{api_region}:<AWS::AccountId>:mlflow-app/*",
         # ``sts:GetCallerIdentity`` does not support resource-level
         # scoping; the MLflow SigV4 plug-in calls it on every request.
         "Action::sts:GetCallerIdentity",
@@ -1189,7 +1202,7 @@ def add_sagemaker_suppressions(
                     "HTTP methods, so notebooks can submit jobs and "
                     "manage inference endpoints in addition to read-only "
                     "GETs), (3) KMS Decrypt/GenerateDataKey "
-                    "scoped by kms:ViaService=s3.<global-region>.amazonaws.com "
+                    "scoped by kms:ViaService=s3.<global-region>.<AWS::URLSuffix> "
                     "condition (the cluster-shared KMS key ARN is not known "
                     "to the analytics stack — it lives in the global region), "
                     "(4) S3 action wildcards (``s3:Abort*``, ``s3:DeleteObject*``, "
@@ -1586,13 +1599,21 @@ def add_presigned_url_lambda_suppressions(
                 ),
                 applies_to=[
                     "Resource::*",
-                    (f"Resource::arn:aws:sagemaker:{region}:<AWS::AccountId>:domain/*"),
-                    (f"Resource::arn:aws:sagemaker:{region}:<AWS::AccountId>:user-profile/*/*"),
+                    (
+                        f"Resource::arn:<AWS::Partition>:sagemaker:{region}:<AWS::AccountId>:domain/*"
+                    ),
+                    (
+                        f"Resource::arn:<AWS::Partition>:sagemaker:{region}:<AWS::AccountId>:user-profile/*/*"
+                    ),
                     # Generic shapes — catch tokenized-region variants
                     # (``<AWS::Region>``) produced when CDK synthesizes
                     # the policy without pinning the stack's env region.
-                    ("Resource::arn:aws:sagemaker:<AWS::Region>:<AWS::AccountId>:domain/*"),
-                    ("Resource::arn:aws:sagemaker:<AWS::Region>:<AWS::AccountId>:user-profile/*/*"),
+                    (
+                        "Resource::arn:<AWS::Partition>:sagemaker:<AWS::Region>:<AWS::AccountId>:domain/*"
+                    ),
+                    (
+                        "Resource::arn:<AWS::Partition>:sagemaker:<AWS::Region>:<AWS::AccountId>:user-profile/*/*"
+                    ),
                 ],
             ),
         ],
@@ -1642,7 +1663,7 @@ def apply_all_suppressions(
     Args:
         stack: The CDK stack to apply suppressions to
         stack_type: Type of stack - 'regional', 'global', 'api_gateway',
-            'monitoring', or 'analytics'
+            'regional_api_gateway', 'monitoring', or 'analytics'
         regions: List of regional deployment regions (for dynamic IAM suppression patterns)
         global_region: Global region for SSM parameters (for dynamic IAM suppression patterns)
         api_gateway_region: API Gateway region (for analytics stack — used to
@@ -1676,6 +1697,9 @@ def apply_all_suppressions(
     elif stack_type == "api_gateway":
         add_api_gateway_suppressions(stack)
         add_secrets_suppressions(stack)
+
+    elif stack_type == "regional_api_gateway":
+        add_api_gateway_suppressions(stack)
 
     elif stack_type == "monitoring":
         add_monitoring_suppressions(stack)

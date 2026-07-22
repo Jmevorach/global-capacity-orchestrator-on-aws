@@ -9,9 +9,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from cli.config import GCOConfig, get_config
+from gco.bedrock import (
+    BEDROCK_READ_TIMEOUT_SECONDS,
+    build_bedrock_converse_options,
+    extract_bedrock_converse_text,
+    get_default_bedrock_model_id,
+)
 
 from .checker import CapacityChecker
 from .multi_region import MultiRegionCapacityChecker, compute_price_trend
@@ -47,6 +54,13 @@ class CapacityPredictionResult:
     raw_response: str = ""
 
 
+class _SharedBedrockModelDefault:
+    """Lazily expose the historical advisor class attribute as a string."""
+
+    def __get__(self, instance: object, owner: type[Any] | None = None) -> str:
+        return get_default_bedrock_model_id()
+
+
 class BedrockCapacityAdvisor:
     """
     AI-powered capacity advisor using Amazon Bedrock.
@@ -58,25 +72,26 @@ class BedrockCapacityAdvisor:
     before making production decisions.
     """
 
-    # Default model to use if none specified. Amazon Nova Pro is a
-    # first-party Amazon model — access is enabled by default in
-    # commercial Regions with no Anthropic First-Time-Use (FTU) form —
-    # so the advisor works out of the box. Mirrors
-    # gco_mcp/mission/sampling.py::DEFAULT_BEDROCK_MODEL_ID. Override per
-    # call with --model (CLI) or model_id (constructor); see
-    # docs/CUSTOMIZATION.md ("Bedrock Model Selection").
-    DEFAULT_MODEL = "us.amazon.nova-pro-v1:0"
+    # Backward-compatible lazy class alias for callers that inspect the
+    # advisor default. Resolution occurs only when this Bedrock-specific
+    # attribute (or an advisor without an explicit model) is used.
+    DEFAULT_MODEL = _SharedBedrockModelDefault()
 
     def __init__(self, config: GCOConfig | None = None, model_id: str | None = None):
         self.config = config or get_config()
         self._session = boto3.Session()
         self._capacity_checker = CapacityChecker(config)
         self._multi_region_checker = MultiRegionCapacityChecker(config)
-        self.model_id = model_id or self.DEFAULT_MODEL
+        self._uses_default_model = model_id is None
+        self.model_id: str = self.DEFAULT_MODEL if model_id is None else model_id
 
     def _get_bedrock_client(self) -> Any:
         """Get Bedrock runtime client."""
-        return self._session.client("bedrock-runtime", region_name="us-east-1")
+        return self._session.client(
+            "bedrock-runtime",
+            region_name="us-east-1",
+            config=Config(read_timeout=BEDROCK_READ_TIMEOUT_SECONDS),
+        )
 
     def gather_capacity_data(
         self,
@@ -535,11 +550,16 @@ Respond ONLY with the JSON object, no additional text."""
             response = bedrock.converse(
                 modelId=self.model_id,
                 messages=[{"role": "user", "content": [{"text": prompt}]}],
-                inferenceConfig={"maxTokens": 2048, "temperature": 0.1},
+                **build_bedrock_converse_options(
+                    self.model_id,
+                    inference_config={"maxTokens": 2048, "temperature": 0.1},
+                    apply_default_reasoning=self._uses_default_model,
+                ),
             )
 
-            # Extract response text
-            response_text = response["output"]["message"]["content"][0]["text"]
+            # Extended reasoning precedes the final answer with a
+            # ``reasoningContent`` block; return the first real text block.
+            response_text = extract_bedrock_converse_text(response)
 
             # Parse JSON response
             # Find JSON in response (in case model adds extra text)
@@ -666,9 +686,13 @@ Respond ONLY with the JSON object, no additional text."""
         response = bedrock.converse(
             modelId=self.model_id,
             messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 2048, "temperature": 0.2},
+            **build_bedrock_converse_options(
+                self.model_id,
+                inference_config={"maxTokens": 2048, "temperature": 0.2},
+                apply_default_reasoning=self._uses_default_model,
+            ),
         )
-        text = response["output"]["message"]["content"][0]["text"]
+        text = extract_bedrock_converse_text(response)
 
         parsed: dict[str, Any] = {}
         start = text.find("{")

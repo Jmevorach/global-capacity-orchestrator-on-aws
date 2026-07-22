@@ -36,6 +36,43 @@ setup() {
     shellcheck -x "$LIB"
 }
 
+# ── accelerator catalog reporting ───────────────────────────────────────────
+
+@test "offline accelerator catalog validator passes the committed repository" {
+    run python3 scripts/accelerator_catalog.py validate
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Accelerator catalog validation passed"* ]]
+}
+
+@test "parse_accelerator_drift_count returns the exact valid count" {
+    tmpfile="$(mktemp)"
+    printf '%s\n' \
+        '{"status":"drift","drift_count":7,"added_count":4,"removed_count":2,"metadata_change_count":1,"regions_checked":17}' \
+        > "$tmpfile"
+    run parse_accelerator_drift_count "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ "$output" = "7" ]
+    rm -f "$tmpfile"
+}
+
+@test "parse_accelerator_drift_count rejects malformed JSON" {
+    tmpfile="$(mktemp)"
+    printf '%s\n' '{not-json' > "$tmpfile"
+    run parse_accelerator_drift_count "$tmpfile"
+    [ "$status" -ne 0 ]
+    [ -z "$output" ]
+    rm -f "$tmpfile"
+}
+
+@test "parse_accelerator_drift_count rejects a missing count" {
+    tmpfile="$(mktemp)"
+    printf '%s\n' '{"status":"current","regions_checked":17}' > "$tmpfile"
+    run parse_accelerator_drift_count "$tmpfile"
+    [ "$status" -ne 0 ]
+    [ -z "$output" ]
+    rm -f "$tmpfile"
+}
+
 # ── parse_image_registry ─────────────────────────────────────────────────────
 
 @test "parse_image_registry: nvcr.io image returns nvcr.io registry" {
@@ -1055,8 +1092,8 @@ EOF
 
 # ── extract_default_bedrock_model ──────────────────────────────────────
 
-@test "extract_default_bedrock_model: reads the pinned id from sampling.py" {
-    run extract_default_bedrock_model "gco_mcp/mission/sampling.py"
+@test "extract_default_bedrock_model: reads the configured id from cdk.json" {
+    run extract_default_bedrock_model "cdk.json"
     [ "$status" -eq 0 ]
     # A system-defined inference-profile id: geography.provider.model-vMAJOR:MINOR.
     [ -n "$output" ]
@@ -1064,27 +1101,22 @@ EOF
     [[ "$output" == *":"* ]]
 }
 
-@test "extract_default_bedrock_model: returns the exact pinned constant value" {
-    # Pin the helper output against the source of truth via an
-    # independent regex (mirroring the constant's real ``: str``
-    # annotation) so any drift between the two surfaces here.
+@test "extract_default_bedrock_model: returns the exact cdk context value" {
     expected="$(python3 -c '
-import re
-with open("gco_mcp/mission/sampling.py") as f:
-    m = re.search(r"DEFAULT_BEDROCK_MODEL_ID\s*(?::[^=]+)?=\s*\"([^\"]+)\"", f.read())
-print(m.group(1) if m else "")
+import json
+with open("cdk.json") as handle:
+    print(json.load(handle)["context"]["bedrock"]["default_model_id"])
 ')"
     [ -n "$expected" ]
-    run extract_default_bedrock_model "gco_mcp/mission/sampling.py"
+    run extract_default_bedrock_model "cdk.json"
     [ "$status" -eq 0 ]
     [ "$output" = "$expected" ]
 }
 
-@test "extract_default_bedrock_model: parses the constant from a fixture (with : str annotation)" {
+@test "extract_default_bedrock_model: parses context.bedrock.default_model_id" {
     tmpfile="$(mktemp)"
     cat > "$tmpfile" <<'EOF'
-# comment
-DEFAULT_BEDROCK_MODEL_ID: str = "us.amazon.nova-pro-v1:0"
+{"context":{"bedrock":{"default_model_id":"us.amazon.nova-pro-v1:0"}}}
 EOF
     run extract_default_bedrock_model "$tmpfile"
     [ "$status" -eq 0 ]
@@ -1092,9 +1124,18 @@ EOF
     rm -f "$tmpfile"
 }
 
-@test "extract_default_bedrock_model: empty when the constant is absent" {
+@test "extract_default_bedrock_model: empty when the context key is absent" {
     tmpfile="$(mktemp)"
-    echo "no model constant here" > "$tmpfile"
+    echo '{"context":{}}' > "$tmpfile"
+    run extract_default_bedrock_model "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -f "$tmpfile"
+}
+
+@test "extract_default_bedrock_model: empty when JSON is malformed" {
+    tmpfile="$(mktemp)"
+    echo '{not-json' > "$tmpfile"
     run extract_default_bedrock_model "$tmpfile"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
@@ -1102,7 +1143,7 @@ EOF
 }
 
 @test "extract_default_bedrock_model: empty when file is missing" {
-    run extract_default_bedrock_model "/nonexistent/sampling.py"
+    run extract_default_bedrock_model "/nonexistent/cdk.json"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
@@ -1114,11 +1155,11 @@ EOF
     [ "$result" = "us.amazon.nova-pro" ]
 }
 
-@test "bedrock_model_family: Nova 2 Lite folds the generation into the version" {
-    # The numeric generation token is dropped from the family so Nova 1
-    # Lite and Nova 2 Lite share a family (and compare by version).
-    result="$(bedrock_model_family "us.amazon.nova-2-lite-v1:0")"
-    [ "$result" = "us.amazon.nova-lite" ]
+@test "bedrock_model_family: global Nova 2 Lite preserves global scope and folds generation" {
+    # The numeric generation token is dropped from the family so later Nova
+    # Lite generations compare within the same global-profile family.
+    result="$(bedrock_model_family "global.amazon.nova-2-lite-v1:0")"
+    [ "$result" = "global.amazon.nova-lite" ]
 }
 
 @test "bedrock_model_family: Claude Sonnet drops the model version and date" {
@@ -1187,6 +1228,28 @@ SHIM
     # v2:0 is the newest ACTIVE nova-pro; the LEGACY v9:0 is skipped and
     # other families (nova-lite, claude) are filtered out.
     [ "$output" = "us.amazon.nova-pro-v2:0" ]
+    rm -rf "$tmpdir"
+}
+
+@test "get_latest_bedrock_model: selects the newest ACTIVE global Nova Lite profile" {
+    tmpdir="$(mktemp -d)"
+    cat > "$tmpdir/aws" <<'SHIM'
+#!/usr/bin/env bash
+cat <<'JSON'
+{"inferenceProfileSummaries":[
+  {"inferenceProfileId":"global.amazon.nova-2-lite-v1:0","status":"ACTIVE"},
+  {"inferenceProfileId":"global.amazon.nova-3-lite-v1:0","status":"ACTIVE"},
+  {"inferenceProfileId":"global.amazon.nova-9-lite-v1:0","status":"LEGACY"},
+  {"inferenceProfileId":"us.amazon.nova-8-lite-v1:0","status":"ACTIVE"},
+  {"inferenceProfileId":"global.amazon.nova-9-pro-v1:0","status":"ACTIVE"}
+]}
+JSON
+SHIM
+    chmod +x "$tmpdir/aws"
+    PATH="$tmpdir:$PATH" run get_latest_bedrock_model \
+        "global.amazon.nova-2-lite-v1:0" us-east-1
+    [ "$status" -eq 0 ]
+    [ "$output" = "global.amazon.nova-3-lite-v1:0" ]
     rm -rf "$tmpdir"
 }
 
@@ -1288,6 +1351,14 @@ SHIM
     run extract_workflow_env_pin KUBECONFORM_VERSION
     [ "$status" -eq 0 ]
     [[ "$output" =~ ^v[0-9] ]]
+}
+
+@test "extract_workflow_env_pin: reads the METRICS_SERVER_VERSION pin from integration-tests.yml" {
+    # kind installs this pinned component so CI can require the inference HPA's
+    # ScalingActive condition instead of checking admission alone.
+    run extract_workflow_env_pin METRICS_SERVER_VERSION
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 @test "extract_workflow_env_pin: empty for an unset var" {

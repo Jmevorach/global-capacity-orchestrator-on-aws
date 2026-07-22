@@ -17,25 +17,28 @@ See ``api_routes/`` for the individual routers:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
-from starlette.types import ASGIApp
 
 from gco.services.auth_middleware import AuthenticationMiddleware
+from gco.services.central_queue_worker import CentralQueueWorker
 from gco.services.manifest_processor import (
     ManifestProcessor,
     create_manifest_processor_from_env,
 )
 from gco.services.metrics_publisher import ManifestProcessorMetrics
+from gco.services.request_size_middleware import (
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
+    RequestSizeLimitMiddleware,
+)
 from gco.services.structured_logging import configure_structured_logging
 from gco.services.template_store import (
     JobStore,
@@ -46,72 +49,19 @@ from gco.services.template_store import (
     get_webhook_store,
 )
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-07-18T01:03:40Z
+# Flowchart(s) generated from this file:
+#   * ``lifespan`` -> ``diagrams/code_diagrams/gco/services/manifest_api.lifespan.html``
+#     (PNG: ``diagrams/code_diagrams/gco/services/manifest_api.lifespan.png``)
+# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# <pyflowchart-code-diagram> END
+
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Request Size Limit Middleware
-# ---------------------------------------------------------------------------
-
-# Default max request body size: 1MB
-DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576
-
-
-class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to enforce request body size limits.
-
-    Rejects requests that exceed the configured maximum body size with HTTP 413
-    (Payload Too Large). Checks the Content-Length header first for an early
-    rejection without reading the body. For requests without Content-Length,
-    reads up to limit + 1 byte and rejects if exceeded.
-    """
-
-    def __init__(self, app: ASGIApp, max_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES) -> None:
-        super().__init__(app)
-        self.max_body_bytes = max_body_bytes
-
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        # Skip size checks for GET, HEAD, OPTIONS, DELETE (typically no body)
-        if request.method in ("GET", "HEAD", "OPTIONS", "DELETE"):
-            return await call_next(request)
-
-        # Check Content-Length header for early rejection
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > self.max_body_bytes:
-                    return JSONResponse(
-                        status_code=413,
-                        content={
-                            "detail": f"Request body exceeds maximum size of {self.max_body_bytes} bytes"
-                        },
-                    )
-            except ValueError, TypeError:
-                # Invalid Content-Length header — let the request proceed
-                # and let downstream validation handle it
-                pass
-
-        # For requests without Content-Length (chunked transfer), read up to
-        # limit + 1 byte to detect oversized bodies
-        if not content_length:
-            body = await request.body()
-            if len(body) > self.max_body_bytes:
-                return JSONResponse(
-                    status_code=413,
-                    content={
-                        "detail": f"Request body exceeds maximum size of {self.max_body_bytes} bytes"
-                    },
-                )
-
-        return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +72,23 @@ manifest_metrics: ManifestProcessorMetrics | None = None
 template_store: TemplateStore | None = None
 webhook_store: WebhookStore | None = None
 job_store: JobStore | None = None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse an explicit deployment boolean without truthy-string surprises."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_number(name: str, default: float, minimum: float, maximum: float) -> float:
+    """Read a finite bounded worker setting from the environment."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if minimum <= value <= maximum else default
 
 
 # =============================================================================
@@ -136,9 +103,11 @@ job_store: JobStore | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Application lifespan manager — initializes manifest processor and stores."""
+    """Initialize API dependencies and the optional regional queue worker."""
     global manifest_processor, manifest_metrics, template_store, webhook_store, job_store
 
+    queue_worker: CentralQueueWorker | None = None
+    queue_worker_task: asyncio.Task[None] | None = None
     logger.info("Starting Manifest API Service")
     try:
         manifest_processor = create_manifest_processor_from_env()
@@ -159,13 +128,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         webhook_store = get_webhook_store()
         job_store = get_job_store()
         logger.info("DynamoDB stores initialized")
+
+        if _env_bool("CENTRAL_QUEUE_WORKER_ENABLED"):
+            queue_worker = CentralQueueWorker(
+                processor=manifest_processor,
+                store=job_store,
+                poll_interval_seconds=_env_number(
+                    "CENTRAL_QUEUE_POLL_INTERVAL_SECONDS", 10.0, 1.0, 300.0
+                ),
+                batch_size=int(_env_number("CENTRAL_QUEUE_BATCH_SIZE", 5.0, 1.0, 20.0)),
+                reconcile_limit=int(
+                    _env_number("CENTRAL_QUEUE_RECONCILE_LIMIT", 100.0, 1.0, 500.0)
+                ),
+                lease_renewal_seconds=_env_number(
+                    "CENTRAL_QUEUE_LEASE_RENEWAL_SECONDS", 60.0, 1.0, 300.0
+                ),
+            )
+            queue_worker_task = asyncio.create_task(
+                queue_worker.run(),
+                name=f"central-queue-worker-{manifest_processor.region}",
+            )
+            app.state.central_queue_worker = queue_worker
+            app.state.central_queue_worker_task = queue_worker_task
+        else:
+            app.state.central_queue_worker = None
+            app.state.central_queue_worker_task = None
     except Exception as e:
         logger.error(f"Failed to initialize manifest processor: {e}")
         raise
 
-    yield
-
-    logger.info("Shutting down Manifest API Service")
+    try:
+        yield
+    finally:
+        if queue_worker is not None and queue_worker_task is not None:
+            queue_worker.stop()
+            try:
+                await asyncio.wait_for(queue_worker_task, timeout=30)
+            except TimeoutError:
+                queue_worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await queue_worker_task
+        logger.info("Shutting down Manifest API Service")
 
 
 # =============================================================================
@@ -265,9 +268,12 @@ async def kubernetes_health_check() -> dict[str, str]:
 
 @app.get("/readyz", tags=["Health"])
 async def kubernetes_readiness_check() -> dict[str, str]:
-    """Kubernetes-style readiness probe."""
+    """Kubernetes readiness includes the enabled queue worker task."""
     if manifest_processor is None:
         raise HTTPException(status_code=503, detail="Manifest processor not ready")
+    worker_task = getattr(app.state, "central_queue_worker_task", None)
+    if worker_task is not None and worker_task.done():
+        raise HTTPException(status_code=503, detail="Central queue worker stopped unexpectedly")
     return {"status": "ready"}
 
 
@@ -340,11 +346,16 @@ async def get_service_status() -> dict[str, Any]:
             "max_cpu_per_manifest": os.getenv("MAX_CPU_PER_MANIFEST", "10"),
             "max_memory_per_manifest": os.getenv("MAX_MEMORY_PER_MANIFEST", "32Gi"),
             "max_gpu_per_manifest": os.getenv("MAX_GPU_PER_MANIFEST", "4"),
-            "allowed_namespaces": os.getenv("ALLOWED_NAMESPACES", "default,gco-jobs"),
+            "allowed_namespaces": os.getenv("ALLOWED_NAMESPACES", "gco-jobs"),
             "validation_enabled": os.getenv("VALIDATION_ENABLED", "true"),
         },
         "templates_count": templates_count,
         "webhooks_count": webhooks_count,
+        "central_queue_worker": (
+            worker.health()
+            if (worker := getattr(app.state, "central_queue_worker", None)) is not None
+            else {"enabled": False, "running": False}
+        ),
     }
 
     if manifest_processor:

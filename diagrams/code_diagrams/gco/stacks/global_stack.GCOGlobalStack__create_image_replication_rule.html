@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
         <title>Global ECR replication rule (project-scoped PREFIX_MATCH filter, #139)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -16,7 +17,7 @@
                 var btn = document.getElementById("run"),
                     cd = document.getElementById("code"),
                     chart;
-                    
+
                 (btn.onclick = function () {
                     var code = cd.value;
 
@@ -115,14 +116,14 @@
                     // output download link for base64 PNG converted on download from base64
                     var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
                     document.getElementById("pngbase64").innerHTML=pngOutHtml;
-                    });    
+                    });
                     // output download link for base64 SVG converted on download from base64
                     var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
                         document.getElementById("svgbase64").innerHTML=svgOutHtml;
                     })();
 
                             };
-                 
+
 
 // derived from https://stackoverflow.com/a/64800570
 // we need to use web browser canvas to generate a image. In this case png
@@ -190,7 +191,7 @@ function base64ToSvgDocument(base64) {
     svg = svg.substring(svg.indexOf('<svg'));
     let parser = new DOMParser();
     return parser.parseFromString(svg, "image/svg+xml");
-} 
+}
         </script>
 
         <script>
@@ -205,20 +206,20 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op3674=>operation: 'Provision the ECR replication rule for ``gco/*`` repositories.\n\n        When ``images.replication.enabled`` is True and at least one\n        non-source destination resolves, creates one\n        ``aws_ecr.CfnReplicationConfiguration`` rule with a single\n        ``PREFIX_MATCH`` filter on ``gco/`` and one destination per resolved\n        region. When replication is disabled or the destination list is\n        empty (e.g. single-region deploy), no replication resource is\n        provisioned and the method becomes a no-op.\n        '
-cond3677=>condition: if not self.images_config['replication']['enabled']
-e3682=>end: end function return
-op3688=>operation: destinations = self._resolve_replication_destinations(self.images_config['replication']['destinations'])
-cond3691=>condition: if not destinations
-e3696=>end: end function return
-sub3702=>subroutine: ecr.CfnReplicationConfiguration(self, 'GcoImageReplicationConfig', replication_configuration=ecr.CfnReplicationConfiguration.ReplicationConfigurationProperty(rules=[ecr.CfnReplicationConfiguration.ReplicationRuleProperty(destinations=[ecr.CfnReplicationConfiguration.ReplicationDestinationProperty(region=region, registry_id=self.account) for region in destinations], repository_filters=[ecr.CfnReplicationConfiguration.RepositoryFilterProperty(filter=f'{self.config.get_project_name()}/', filter_type='PREFIX_MATCH')])]))
+        <div><textarea id="code" style="width: 100%;" rows="11">op5640=>operation: 'Provision the ECR replication rule for ``gco/*`` repositories.\n\n        When ``images.replication.enabled`` is True and at least one\n        non-source destination resolves, creates one\n        ``aws_ecr.CfnReplicationConfiguration`` rule with a single\n        ``PREFIX_MATCH`` filter on ``gco/`` and one destination per resolved\n        region. When replication is disabled or the destination list is\n        empty (e.g. single-region deploy), no replication resource is\n        provisioned and the method becomes a no-op.\n        '
+cond5643=>condition: if not self.images_config['replication']['enabled']
+e5648=>end: end function return
+op5654=>operation: destinations = self._resolve_replication_destinations(self.images_config['replication']['destinations'])
+cond5657=>condition: if not destinations
+e5662=>end: end function return
+sub5668=>subroutine: ecr.CfnReplicationConfiguration(self, 'GcoImageReplicationConfig', replication_configuration=ecr.CfnReplicationConfiguration.ReplicationConfigurationProperty(rules=[ecr.CfnReplicationConfiguration.ReplicationRuleProperty(destinations=[ecr.CfnReplicationConfiguration.ReplicationDestinationProperty(region=region, registry_id=self.account) for region in destinations], repository_filters=[ecr.CfnReplicationConfiguration.RepositoryFilterProperty(filter=f'{self.config.get_project_name()}/', filter_type='PREFIX_MATCH')])]))
 
-op3674->cond3677
-cond3677(yes)->e3682
-cond3677(no)->op3688
-op3688->cond3691
-cond3691(yes)->e3696
-cond3691(no)->sub3702
+op5640->cond5643
+cond5643(yes)->e5648
+cond5643(no)->op5654
+op5654->cond5657
+cond5657(yes)->e5662
+cond5657(no)->sub5668
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -228,6 +229,12 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <div id="canvas"></div>
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
     </body>
 </html>

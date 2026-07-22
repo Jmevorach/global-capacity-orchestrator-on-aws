@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
         <title>Container runtime detection (docker > finch > podman)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -16,7 +17,7 @@
                 var btn = document.getElementById("run"),
                     cd = document.getElementById("code"),
                     chart;
-                    
+
                 (btn.onclick = function () {
                     var code = cd.value;
 
@@ -115,14 +116,14 @@
                     // output download link for base64 PNG converted on download from base64
                     var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
                     document.getElementById("pngbase64").innerHTML=pngOutHtml;
-                    });    
+                    });
                     // output download link for base64 SVG converted on download from base64
                     var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
                         document.getElementById("svgbase64").innerHTML=svgOutHtml;
                     })();
 
                             };
-                 
+
 
 // derived from https://stackoverflow.com/a/64800570
 // we need to use web browser canvas to generate a image. In this case png
@@ -190,7 +191,7 @@ function base64ToSvgDocument(base64) {
     svg = svg.substring(svg.indexOf('<svg'));
     let parser = new DOMParser();
     return parser.parseFromString(svg, "image/svg+xml");
-} 
+}
         </script>
 
         <script>
@@ -205,24 +206,24 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op2134=>operation: '\n    Detect available container runtime (cached).\n\n    Returns:\n        Runtime name (``"docker"``, ``"finch"``, or ``"podman"``) if a\n        runtime is found and running, ``None`` if nothing is available.\n\n    Note:\n        If the ``CDK_DOCKER`` environment variable is set, that value\n        is returned without checking if the runtime is available.\n    '
-op2136=>operation: global _container_runtime_cache
-cond2139=>condition: if _container_runtime_cache is not _UNCHECKED
-io2146=>inputoutput: output: _container_runtime_cache
-e2144=>end: end function return
-op2152=>operation: result = _detect_container_runtime_uncached()
-op2154=>operation: _container_runtime_cache = result
-io2159=>inputoutput: output: result
-e2157=>end: end function return
+        <div><textarea id="code" style="width: 100%;" rows="11">op3999=>operation: '\n    Detect available container runtime (cached).\n\n    Returns:\n        Runtime name (``"docker"``, ``"finch"``, or ``"podman"``) if a\n        runtime is found and running, ``None`` if nothing is available.\n\n    Note:\n        If the ``CDK_DOCKER`` environment variable is set, that value\n        is returned without checking if the runtime is available.\n    '
+op4001=>operation: global _container_runtime_cache
+cond4004=>condition: if _container_runtime_cache is not _UNCHECKED
+io4011=>inputoutput: output: _container_runtime_cache
+e4009=>end: end function return
+op4017=>operation: result = _detect_container_runtime_uncached()
+op4019=>operation: _container_runtime_cache = result
+io4024=>inputoutput: output: result
+e4022=>end: end function return
 
-op2134->op2136
-op2136->cond2139
-cond2139(yes)->io2146
-io2146->e2144
-cond2139(no)->op2152
-op2152->op2154
-op2154->io2159
-io2159->e2157
+op3999->op4001
+op4001->cond4004
+cond4004(yes)->io4011
+io4011->e4009
+cond4004(no)->op4017
+op4017->op4019
+op4019->io4024
+io4024->e4022
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -232,6 +233,12 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <div id="canvas"></div>
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
     </body>
 </html>

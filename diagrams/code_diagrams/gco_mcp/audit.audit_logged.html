@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
         <title>MCP audit_logged decorator (sync + async dispatch, Context capture)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -16,7 +17,7 @@
                 var btn = document.getElementById("run"),
                     cd = document.getElementById("code"),
                     chart;
-                    
+
                 (btn.onclick = function () {
                     var code = cd.value;
 
@@ -115,14 +116,14 @@
                     // output download link for base64 PNG converted on download from base64
                     var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
                     document.getElementById("pngbase64").innerHTML=pngOutHtml;
-                    });    
+                    });
                     // output download link for base64 SVG converted on download from base64
                     var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
                         document.getElementById("svgbase64").innerHTML=svgOutHtml;
                     })();
 
                             };
-                 
+
 
 // derived from https://stackoverflow.com/a/64800570
 // we need to use web browser canvas to generate a image. In this case png
@@ -190,7 +191,7 @@ function base64ToSvgDocument(base64) {
     svg = svg.substring(svg.indexOf('<svg'));
     let parser = new DOMParser();
     return parser.parseFromString(svg, "image/svg+xml");
-} 
+}
         </script>
 
         <script>
@@ -205,70 +206,70 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op2401=>operation: 'Decorator that emits structured JSON audit entries for tool invocations.\n\n    Dispatches on ``inspect.iscoroutinefunction(func)``: async tools get an\n    async wrapper that ``await``s the call, sync tools keep the existing\n    sync path. Both wrappers share ``_build_audit_entry``.\n    '
-cond2404=>condition: if inspect.iscoroutinefunction(func)
-st2409=>start: start async_wrapper
-io2411=>inputoutput: input: 
-op2414=>operation: start = time.time()
-op2416=>operation: sanitized_args = _sanitize_arguments(kwargs)
-op2419=>operation: result = await func(*args, **kwargs)
+        <div><textarea id="code" style="width: 100%;" rows="11">op4266=>operation: 'Decorator that emits structured JSON audit entries for tool invocations.\n\n    Dispatches on ``inspect.iscoroutinefunction(func)``: async tools get an\n    async wrapper that ``await``s the call, sync tools keep the existing\n    sync path. Both wrappers share ``_build_audit_entry``.\n    '
+cond4269=>condition: if inspect.iscoroutinefunction(func)
+st4274=>start: start async_wrapper
+io4276=>inputoutput: input:
+op4279=>operation: start = time.time()
+op4281=>operation: sanitized_args = _sanitize_arguments(kwargs)
+op4284=>operation: result = await func(*args, **kwargs)
 duration_ms = (time.time() - start) * 1000
 audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'success', duration_ms, None, result)))
 return result
-cond2418=>condition: exception raised?
-cond2421=>condition: except Exception as e
-op2425=>operation: duration_ms = (time.time() - start) * 1000
-sub2427=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
-sub2429=>subroutine: raise
-e2434=>end: end async_wrapper
-io2440=>inputoutput: output: async_wrapper
-e2438=>end: end function return
-st2447=>start: start sync_wrapper
-io2449=>inputoutput: input: 
-op2452=>operation: start = time.time()
-op2454=>operation: sanitized_args = _sanitize_arguments(kwargs)
-op2457=>operation: result = func(*args, **kwargs)
+cond4283=>condition: exception raised?
+cond4286=>condition: except Exception as e
+op4290=>operation: duration_ms = (time.time() - start) * 1000
+sub4292=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
+sub4294=>subroutine: raise
+e4299=>end: end async_wrapper
+io4305=>inputoutput: output: async_wrapper
+e4303=>end: end function return
+st4312=>start: start sync_wrapper
+io4314=>inputoutput: input:
+op4317=>operation: start = time.time()
+op4319=>operation: sanitized_args = _sanitize_arguments(kwargs)
+op4322=>operation: result = func(*args, **kwargs)
 duration_ms = (time.time() - start) * 1000
 audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'success', duration_ms, None, result)))
 return result
-cond2456=>condition: exception raised?
-cond2459=>condition: except Exception as e
-op2463=>operation: duration_ms = (time.time() - start) * 1000
-sub2465=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
-sub2467=>subroutine: raise
-e2472=>end: end sync_wrapper
-io2478=>inputoutput: output: sync_wrapper
-e2476=>end: end function return
+cond4321=>condition: exception raised?
+cond4324=>condition: except Exception as e
+op4328=>operation: duration_ms = (time.time() - start) * 1000
+sub4330=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
+sub4332=>subroutine: raise
+e4337=>end: end sync_wrapper
+io4343=>inputoutput: output: sync_wrapper
+e4341=>end: end function return
 
-op2401->cond2404
-cond2404(yes)->st2409
-st2409->io2411
-io2411->op2414
-op2414->op2416
-op2416->op2419
-op2419->cond2418
-cond2418(yes)->cond2421
-cond2421(yes)->op2425
-op2425->sub2427
-sub2427->sub2429
-cond2421(no)->e2434
-e2434->io2440
-io2440->e2438
-cond2418(no)->e2434
-cond2404(no)->st2447
-st2447->io2449
-io2449->op2452
-op2452->op2454
-op2454->op2457
-op2457->cond2456
-cond2456(yes)->cond2459
-cond2459(yes)->op2463
-op2463->sub2465
-sub2465->sub2467
-cond2459(no)->e2472
-e2472->io2478
-io2478->e2476
-cond2456(no)->e2472
+op4266->cond4269
+cond4269(yes)->st4274
+st4274->io4276
+io4276->op4279
+op4279->op4281
+op4281->op4284
+op4284->cond4283
+cond4283(yes)->cond4286
+cond4286(yes)->op4290
+op4290->sub4292
+sub4292->sub4294
+cond4286(no)->e4299
+e4299->io4305
+io4305->e4303
+cond4283(no)->e4299
+cond4269(no)->st4312
+st4312->io4314
+io4314->op4317
+op4317->op4319
+op4319->op4322
+op4322->cond4321
+cond4321(yes)->cond4324
+cond4324(yes)->op4328
+op4328->sub4330
+sub4330->sub4332
+cond4324(no)->e4337
+e4337->io4343
+io4343->e4341
+cond4321(no)->e4337
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -278,6 +279,12 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <div id="canvas"></div>
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
     </body>
 </html>

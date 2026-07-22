@@ -3,12 +3,10 @@
 These examples pin the behaviour that makes disaggregated and ``both``-mode
 endpoints usable end to end, and the surface for warming their KV cache:
 
-- The public prefill-decode proxy Ingress is scoped to the endpoint's own
-  ingress prefix (``/inference/{name}/v1``), so a client request — which always
-  arrives at ``/inference/{name}/...`` through Global Accelerator and the shared
-  ALB — actually reaches the proxy and stays isolated from other endpoints on
-  that ALB. A bare ``/v1`` rule would match neither the client URL nor stay
-  endpoint-scoped.
+- Reconciliation removes both historical per-endpoint Ingress names. Public
+  requests follow the shared ``gco-system/gco-gateway`` ``/inference`` HTTPRoute
+  to ``gco-system/inference-proxy``, which authenticates the request before
+  forwarding to the endpoint's internal ClusterIP Service.
 - A ``store``/``both`` deploy enables the shared KV-cache store by default so
   the store connector is wired to the shared master, and a split deploy
   defaults the prefill-decode proxy image to the endpoint image.
@@ -101,59 +99,6 @@ def mock_config():
         yield mock_cfg
 
 
-def _ingress_paths(monitor) -> list[str]:
-    """Return the routing paths from the last created proxy Ingress."""
-    args, _ = monitor.networking_v1.create_namespaced_ingress.call_args
-    ingress = args[1]
-    return [p.path for rule in ingress.spec.rules for p in rule.http.paths]
-
-
-# ===========================================================================
-# Invoke path: the proxy Ingress is scoped to the endpoint's ingress prefix
-# ===========================================================================
-
-
-class TestProxyIngressScoping:
-    def test_published_path_matches_the_client_invoke_url(self):
-        """The published prefix is a prefix of the URL the CLI builds and sends.
-
-        ``gco inference invoke`` posts to ``/inference/{name}{api_path}``. The
-        proxy Ingress must publish ``/inference/{name}/v1`` so that request
-        routes to the proxy rather than missing every rule on the shared ALB.
-        """
-        monitor = _make_monitor()
-        monitor._update_proxy_ingress("llama", "llama-proxy", "gco-inference", {})
-
-        paths = _ingress_paths(monitor)
-        assert paths == ["/inference/llama/v1"]
-        client_invoke_url = "/inference/llama/v1/completions"
-        assert client_invoke_url.startswith(paths[0])
-
-    def test_respects_a_custom_ingress_path(self):
-        """A non-default ingress path on the endpoint is honoured for the proxy."""
-        monitor = _make_monitor()
-        monitor._update_proxy_ingress(
-            "llama", "llama-proxy", "gco-inference", {"ingress_path": "/custom/llama"}
-        )
-        assert _ingress_paths(monitor) == ["/custom/llama/v1"]
-
-    def test_admin_path_is_never_published(self):
-        """The privileged ``/instances/add`` admin path stays off the public surface."""
-        monitor = _make_monitor()
-        monitor._update_proxy_ingress("llama", "llama-proxy", "gco-inference", {})
-        paths = _ingress_paths(monitor)
-        assert all("/instances" not in p for p in paths)
-
-    def test_healthcheck_path_is_scoped_too(self):
-        """The ALB health-check path tracks the scoped serving prefix."""
-        monitor = _make_monitor()
-        monitor._update_proxy_ingress("llama", "llama-proxy", "gco-inference", {})
-        args, _ = monitor.networking_v1.create_namespaced_ingress.call_args
-        ingress = args[1]
-        hc = ingress.metadata.annotations["alb.ingress.kubernetes.io/healthcheck-path"]
-        assert hc == "/inference/llama/v1"
-
-
 # ===========================================================================
 # Split-serving deployability: store auto-enable and proxy image default
 # ===========================================================================
@@ -244,6 +189,53 @@ class TestSplitDeployDefaults:
 
 
 class TestDeployFlagThreading:
+    def test_protocol_and_device_flags_reach_the_manager(self, runner):
+        mock_mgr = MagicMock()
+        mock_mgr.deploy.return_value = {
+            "endpoint_name": "pd",
+            "target_regions": ["us-east-1"],
+            "ingress_path": "/inference/pd",
+        }
+        mock_aws = MagicMock()
+        mock_aws.discover_regional_stacks.return_value = {"us-east-1": {}}
+        with (
+            patch("cli.inference.get_inference_manager", return_value=mock_mgr),
+            patch("cli.aws_client.get_aws_client", return_value=mock_aws),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "inference",
+                    "deploy",
+                    "pd",
+                    "--mooncake-mode",
+                    "disaggregated",
+                    "-r",
+                    "us-east-1",
+                    "--mooncake-protocol",
+                    "tcp",
+                    "--mooncake-device-name",
+                    "eth1",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert mock_mgr.deploy.call_args.kwargs["mooncake_transfer"] == {
+            "protocol": "tcp",
+            "device_name": "eth1",
+        }
+
+    @pytest.mark.parametrize(
+        "flag_args",
+        (["--mooncake-protocol", "rdma"], ["--mooncake-device-name", "eth0"]),
+    )
+    def test_transfer_flags_require_mooncake_mode(self, runner, flag_args):
+        mock_mgr = MagicMock()
+        with patch("cli.inference.get_inference_manager", return_value=mock_mgr):
+            result = runner.invoke(cli, ["inference", "deploy", "pd", *flag_args])
+        assert result.exit_code != 0
+        assert "require --mooncake-mode" in result.output
+        mock_mgr.deploy.assert_not_called()
+
     def test_cold_tier_and_proxy_flags_reach_the_manager(self, runner):
         mock_mgr = MagicMock()
         mock_mgr.deploy.return_value = {

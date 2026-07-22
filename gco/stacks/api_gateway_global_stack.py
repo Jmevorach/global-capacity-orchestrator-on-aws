@@ -3,31 +3,39 @@ Global API Gateway stack - Single authenticated entry point for all regions.
 
 This stack creates the centralized API Gateway that serves as the authenticated
 entry point for all GCO API requests. It provides:
-- Edge-optimized endpoint with CloudFront for global edge caching and DDoS protection
+- Edge-optimized endpoint in the commercial ``aws`` partition; regional endpoint elsewhere
 - IAM authentication (AWS SigV4) for all requests
-- Lambda proxy that adds secret header for backend validation
-- Secrets Manager secret with automatic rotation for request authentication
-- Multi-region replication for the auth secret
+- Global Accelerator-backed HMAC proxy routes in ``aws`` only
+- SigV4-authenticated aggregation through regional API Gateway bridges
+- Secrets Manager signing key with automatic rotation
+- Multi-region replication for the signing key
 - CloudWatch logging for audit and debugging
 
-Security Flow:
+Security Flow in the commercial ``aws`` partition:
     1. Client signs request with AWS credentials (SigV4)
     2. CloudFront edge location receives request (managed by AWS)
     3. API Gateway validates IAM permissions
-    4. Lambda proxy retrieves secret from Secrets Manager
-    5. Lambda adds X-GCO-Auth-Token header
-    6. Request forwarded to Global Accelerator
-    7. Backend services validate the secret header
+    4. Lambda proxy retrieves the signing key from Secrets Manager
+    5. Lambda signs the method, target, body digest, timestamp, and random nonce
+    6. Request is forwarded to Global Accelerator with the HMAC envelope
+    7. Backend middleware validates freshness, integrity, and replay protection
 
 Secret Rotation:
-    The auth token is automatically rotated daily. During rotation:
-    - A new token is generated and stored as AWSPENDING
-    - Backend services accept both AWSCURRENT and AWSPENDING tokens
+    The signing key is automatically rotated daily. During rotation:
+    - A new key is generated and stored as AWSPENDING
+    - Backend services accept signatures from AWSCURRENT and AWSPENDING keys
     - After validation, AWSPENDING becomes AWSCURRENT
-    - Multi-region replication ensures all regions receive the new token
+    - Multi-region replication ensures all regions receive the new key
 
-This ensures all traffic goes through the authenticated path and prevents
-direct access to the Global Accelerator or regional ALBs.
+Outside ``aws``, the Global Accelerator proxy Lambdas and catch-all workload
+routes are omitted. The regional global API retains authenticated aggregate
+routes, while callers use IAM-authenticated regional bridges for workload
+control and inference.
+
+The HMAC envelope authenticates each request but does not encrypt its payload;
+transport confidentiality is a separate property of the network path. Direct
+requests to Global Accelerator (when present) or regional ALBs cannot mint a
+valid envelope.
 """
 
 import json
@@ -36,23 +44,44 @@ from typing import Any
 
 from aws_cdk import (
     CfnOutput,
+    CustomResource,
     Duration,
     Fn,
     RemovalPolicy,
     Stack,
 )
 from aws_cdk import aws_apigateway as apigateway
+from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_cognito as cognito
+from aws_cdk import aws_ecr_assets as ecr_assets
+from aws_cdk import aws_events as events
+from aws_cdk import aws_events_targets as events_targets
 from aws_cdk import aws_iam as iam
+from aws_cdk import aws_kms as kms
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_secretsmanager as secretsmanager
+from aws_cdk import aws_sqs as sqs
 from aws_cdk import aws_wafv2 as wafv2
+from aws_cdk import custom_resources as cr
 from constructs import Construct
 
-from gco.stacks.constants import LAMBDA_PYTHON_RUNTIME, api_gateway_auth_secret_name
+from gco.stacks.constants import (
+    AGGREGATOR_REGIONAL_API_ROUTES,
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
+    LAMBDA_NODEJS_RUNTIME,
+    LAMBDA_PYTHON_RUNTIME,
+    api_gateway_auth_secret_name,
+    backend_tls_certificate_parameter_prefix,
+    backend_tls_root_ca_parameter_name,
+    backend_tls_root_secret_name,
+    backend_tls_server_name,
+    cross_region_aggregator_role_name,
+    validated_request_body_limit,
+)
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-07-18T01:03:40Z
 # Flowchart(s) generated from this file:
 #   * ``GCOApiGatewayGlobalStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/api_gateway_global_stack.GCOApiGatewayGlobalStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/api_gateway_global_stack.GCOApiGatewayGlobalStack___init__.png``)
@@ -113,8 +142,9 @@ class GCOApiGatewayGlobalStack(Stack):
     API requests. All requests must be signed with AWS credentials.
 
     Attributes:
-        secret: Secrets Manager secret for backend validation
-        proxy_lambda: Lambda function that proxies requests to Global Accelerator
+        secret: Secrets Manager secret containing the backend HMAC signing key
+        proxy_lambda: Buffered Lambda proxy for the control-plane API
+        inference_proxy_lambda: Response-streaming Lambda for `/inference/*`
         aggregator_lambda: Lambda function for cross-region aggregation
         api: REST API with IAM authentication
     """
@@ -123,10 +153,15 @@ class GCOApiGatewayGlobalStack(Stack):
         self,
         scope: Construct,
         construct_id: str,
-        global_accelerator_dns: str,
+        global_accelerator_dns: str | None,
         regional_endpoints: dict[str, str] | None = None,
         analytics_config: AnalyticsApiConfig | None = None,
         project_name: str = "gco",
+        api_gateway_config: dict[str, Any] | None = None,
+        registry_region: str | None = None,
+        certificate_regions: list[str] | None = None,
+        backend_tls_config: dict[str, Any] | None = None,
+        max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
         **kwargs: Any,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -137,8 +172,55 @@ class GCOApiGatewayGlobalStack(Stack):
         # Defaults to ``"gco"`` so the rendered names are byte-for-byte
         # identical to the pre-#139 literals for the stock deployment.
         self.project_name = project_name
-        self.ga_dns = global_accelerator_dns
+        self.ga_dns = str(global_accelerator_dns).strip() if global_accelerator_dns else None
         self.regional_endpoints = regional_endpoints or {}
+        # Regional ALB hostnames and backend-TLS public metadata are registered
+        # in the global stack's SSM region, which may differ from this stack.
+        self.registry_region = registry_region or self.region
+        self.certificate_regions = tuple(
+            dict.fromkeys(certificate_regions if certificate_regions is not None else ["us-east-1"])
+        )
+        default_backend_tls_config: dict[str, int] = {
+            "root_generation": 1,
+            "root_validity_days": 3_650,
+            "root_rotate_before_days": 180,
+            "root_activation_delay_hours": 24,
+            "root_overlap_days": 45,
+            "leaf_validity_days": 30,
+            "leaf_rotate_before_days": 10,
+            "rotation_schedule_hours": 12,
+            "trust_cache_ttl_seconds": 300,
+            "trust_cache_max_stale_seconds": 3_600,
+        }
+        self.backend_tls_config = {
+            **default_backend_tls_config,
+            **(backend_tls_config or {}),
+        }
+        self.backend_tls_server_name = backend_tls_server_name(self.project_name)
+        self.backend_tls_root_ca_parameter_name = backend_tls_root_ca_parameter_name(
+            self.project_name
+        )
+        self.backend_tls_certificate_parameter_prefix = backend_tls_certificate_parameter_prefix(
+            self.project_name
+        )
+        self.max_request_body_bytes = validated_request_body_limit(max_request_body_bytes)
+
+        default_api_gateway_config: dict[str, Any] = {
+            "throttle_rate_limit": 1000,
+            "throttle_burst_limit": 2000,
+            "log_level": "INFO",
+            "metrics_enabled": True,
+            "tracing_enabled": True,
+        }
+        if api_gateway_config is not None:
+            configured_api_gateway = api_gateway_config
+        else:
+            context_config = self.node.try_get_context("api_gateway")
+            configured_api_gateway = context_config if isinstance(context_config, dict) else {}
+        self.api_gateway_config = {
+            **default_api_gateway_config,
+            **configured_api_gateway,
+        }
         # When analytics is disabled (the default) this stays ``None`` and
         # the stack synthesizes exactly as it did pre-analytics. When
         # non-``None``, ``_wire_studio_routes`` is invoked at the end of
@@ -148,11 +230,21 @@ class GCOApiGatewayGlobalStack(Stack):
         # the API level.
         self.analytics_config: AnalyticsApiConfig | None = analytics_config
 
-        # Create secret token for ALB validation
+        # Create the deployment-local private PKI before any client Lambda.
+        # The manager writes only public trust material and ACM ARNs to SSM;
+        # its KMS-encrypted root private key is inaccessible to proxy roles.
+        self._create_backend_tls()
+
+        # Create the shared backend HMAC signing key.
         self.secret = self._create_secret()
 
-        # Create proxy Lambda
-        self.proxy_lambda = self._create_proxy_lambda()
+        # Global Accelerator-backed proxy routes exist only where that global
+        # service is available. In other partitions the global API retains its
+        # aggregate routes while callers use the regional IAM APIs directly.
+        self.proxy_lambda = self._create_proxy_lambda() if self.ga_dns is not None else None
+        self.inference_proxy_lambda = (
+            self._create_inference_proxy_lambda() if self.ga_dns is not None else None
+        )
 
         # Create cross-region aggregator Lambda
         self.aggregator_lambda = self._create_aggregator_lambda()
@@ -180,30 +272,417 @@ class GCOApiGatewayGlobalStack(Stack):
         """Apply cdk-nag suppressions for this stack."""
         from gco.stacks.nag_suppressions import apply_all_suppressions
 
-        # API Gateway stack needs global_region for SSM parameter access suppressions
-        # The aggregator Lambda reads ALB hostnames from SSM in the global region
+        # This stack's proxy and certificate-manager roles read project-scoped
+        # public SSM metadata from the global registry region. The aggregator
+        # itself discovers regional bridges through CloudFormation, not SSM.
         apply_all_suppressions(
             self,
             stack_type="api_gateway",
-            global_region=self.region,
+            global_region=self.registry_region,
             project_name=self.project_name,
         )
 
-    def _create_secret(self) -> secretsmanager.Secret:
-        """Create secret token for validating requests from API Gateway.
+    def _create_backend_tls(self) -> None:
+        """Create the private root, regional ACM manager, schedule, and alarms."""
+        config = self.backend_tls_config
+        project_name = self.project_name
 
-        The secret is configured with:
-        - Automatic rotation every 30 days
-        - A rotation Lambda that generates new secure random tokens
-        - Multi-region replication can be enabled via add_replica_region()
-        """
+        self.backend_tls_key = kms.Key(
+            self,
+            "BackendTlsRootKey",
+            alias=f"alias/{project_name}-backend-tls-root",
+            description="Encrypts the GCO deployment-local backend TLS root private key",
+            enable_key_rotation=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            pending_window=Duration.days(7),
+        )
+        self.backend_tls_root_secret = secretsmanager.Secret(
+            self,
+            "BackendTlsRootSecret",
+            secret_name=backend_tls_root_secret_name(project_name),
+            description=(
+                "Deployment-local backend TLS root CA; private key access is restricted "
+                "to the certificate manager Lambda"
+            ),
+            encryption_key=self.backend_tls_key,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                secret_string_template=json.dumps({"state": "UNINITIALIZED"}),
+                generate_string_key="bootstrap_nonce",
+                exclude_punctuation=True,
+                password_length=32,
+            ),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        manager_role = iam.Role(
+            self,
+            "BackendTlsManagerRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                )
+            ],
+        )
+        self.backend_tls_root_secret.grant_read(manager_role)
+        self.backend_tls_root_secret.grant_write(manager_role)
+        self.backend_tls_key.grant_encrypt_decrypt(manager_role)
+        manager_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "acm:AddTagsToCertificate",
+                    "acm:ImportCertificate",
+                    "acm:ListCertificates",
+                ],
+                resources=["*"],
+            )
+        )
+        manager_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "acm:DeleteCertificate",
+                    "acm:DescribeCertificate",
+                    "acm:GetCertificate",
+                    "acm:ListTagsForCertificate",
+                ],
+                resources=[f"arn:{self.partition}:acm:*:{self.account}:certificate/*"],
+            )
+        )
+        manager_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "ssm:DeleteParameter",
+                    "ssm:GetParameter",
+                    "ssm:GetParametersByPath",
+                    "ssm:PutParameter",
+                ],
+                resources=[
+                    f"arn:{self.partition}:ssm:{self.registry_region}:{self.account}:"
+                    f"parameter/{project_name}/backend-tls/*"
+                ],
+            )
+        )
+        manager_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={"StringEquals": {"cloudwatch:namespace": "GCO/BackendTLS"}},
+            )
+        )
+
+        manager_log_group = logs.LogGroup(
+            self,
+            "BackendTlsManagerLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        manager_environment = {
+            "ROOT_SECRET_ARN": self.backend_tls_root_secret.secret_arn,
+            "AWS_PARTITION": self.partition,
+            "AWS_ACCOUNT_ID": self.account,
+            "PROJECT_NAME": project_name,
+            "REGISTRY_REGION": self.registry_region,
+            "CERTIFICATE_REGIONS": json.dumps(self.certificate_regions),
+            "BACKEND_TLS_SERVER_NAME": self.backend_tls_server_name,
+            "ROOT_CA_PARAMETER_NAME": self.backend_tls_root_ca_parameter_name,
+            "CERTIFICATE_PARAMETER_PREFIX": self.backend_tls_certificate_parameter_prefix,
+            "ROOT_GENERATION": str(config["root_generation"]),
+            "ROOT_VALIDITY_DAYS": str(config["root_validity_days"]),
+            "ROOT_ROTATE_BEFORE_DAYS": str(config["root_rotate_before_days"]),
+            "ROOT_ACTIVATION_DELAY_HOURS": str(config["root_activation_delay_hours"]),
+            "ROOT_OVERLAP_DAYS": str(config["root_overlap_days"]),
+            "LEAF_VALIDITY_DAYS": str(config["leaf_validity_days"]),
+            "LEAF_ROTATE_BEFORE_DAYS": str(config["leaf_rotate_before_days"]),
+        }
+        self.backend_tls_manager_lambda = lambda_.DockerImageFunction(
+            self,
+            "BackendTlsCertificateManager",
+            function_name=f"{project_name}-backend-tls-manager",
+            code=lambda_.DockerImageCode.from_image_asset(
+                directory="lambda/tls-certificate-manager",
+                platform=ecr_assets.Platform.LINUX_AMD64,
+            ),
+            architecture=lambda_.Architecture.X86_64,
+            timeout=Duration.minutes(5),
+            memory_size=512,
+            reserved_concurrent_executions=1,
+            role=manager_role,
+            environment=manager_environment,
+            log_group=manager_log_group,
+            tracing=lambda_.Tracing.ACTIVE,
+            description="Bootstraps and rotates GCO private-root regional ACM certificates",
+        )
+
+        provider_log_group = logs.LogGroup(
+            self,
+            "BackendTlsProviderLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        provider = cr.Provider(
+            self,
+            "BackendTlsProvider",
+            on_event_handler=self.backend_tls_manager_lambda,
+            log_group=provider_log_group,
+        )
+        self.backend_tls_resource = CustomResource(
+            self,
+            "BackendTlsCertificates",
+            service_token=provider.service_token,
+            properties={
+                "ProjectName": project_name,
+                "RegistryRegion": self.registry_region,
+                "Regions": list(self.certificate_regions),
+                "ServerName": self.backend_tls_server_name,
+                "RootCaParameterName": self.backend_tls_root_ca_parameter_name,
+                "CertificateParameterPrefix": self.backend_tls_certificate_parameter_prefix,
+                "RootGeneration": config["root_generation"],
+                "RootValidityDays": config["root_validity_days"],
+                "RootRotateBeforeDays": config["root_rotate_before_days"],
+                "RootActivationDelayHours": config["root_activation_delay_hours"],
+                "RootOverlapDays": config["root_overlap_days"],
+                "LeafValidityDays": config["leaf_validity_days"],
+                "LeafRotateBeforeDays": config["leaf_rotate_before_days"],
+                "PolicyVersion": "1",
+            },
+        )
+        self.backend_tls_resource.node.add_dependency(self.backend_tls_root_secret)
+        # CloudFormation reverses dependencies on delete, so the provider's
+        # final invocation completes before its managed log group is removed.
+        self.backend_tls_resource.node.add_dependency(provider_log_group)
+
+        self.backend_tls_rotation_dlq = sqs.Queue(
+            self,
+            "BackendTlsRotationDlq",
+            queue_name=f"{project_name}-backend-tls-rotation-dlq",
+            retention_period=Duration.days(14),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        rotation_rule = events.Rule(
+            self,
+            "BackendTlsRotationSchedule",
+            description="Reconcile GCO private roots and imported regional ACM leaves",
+            schedule=events.Schedule.rate(Duration.hours(config["rotation_schedule_hours"])),
+        )
+        rotation_rule.add_target(
+            events_targets.LambdaFunction(
+                self.backend_tls_manager_lambda,
+                event=events.RuleTargetInput.from_object({"Action": "Rotate"}),
+                dead_letter_queue=self.backend_tls_rotation_dlq,
+                retry_attempts=2,
+                max_event_age=Duration.hours(6),
+            )
+        )
+        rotation_rule.node.add_dependency(self.backend_tls_resource)
+
+        self.backend_tls_manager_error_alarm = cloudwatch.Alarm(
+            self,
+            "BackendTlsManagerErrorAlarm",
+            alarm_description="Backend TLS certificate bootstrap or rotation failed",
+            metric=self.backend_tls_manager_lambda.metric_errors(
+                period=Duration.minutes(15), statistic="Sum"
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        self.backend_tls_rotation_dlq_alarm = cloudwatch.Alarm(
+            self,
+            "BackendTlsRotationDlqAlarm",
+            alarm_description="Backend TLS scheduled rotation exhausted its retries",
+            metric=self.backend_tls_rotation_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(5)
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        self.backend_tls_reconciliation_heartbeat_alarm = cloudwatch.Alarm(
+            self,
+            "BackendTlsReconciliationHeartbeatAlarm",
+            alarm_description=(
+                "Backend TLS reconciliation has not completed within two schedule intervals"
+            ),
+            metric=cloudwatch.Metric(
+                namespace="GCO/BackendTLS",
+                metric_name="ReconciliationSuccess",
+                dimensions_map={"Project": project_name},
+                statistic="Sum",
+                period=Duration.hours(config["rotation_schedule_hours"] * 2),
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.BREACHING,
+        )
+        self.backend_tls_root_expiry_alarm = cloudwatch.Alarm(
+            self,
+            "BackendTlsRootExpiryAlarm",
+            alarm_description=(
+                "Backend TLS root certificate is near expiry after its rotation window"
+            ),
+            metric=cloudwatch.Metric(
+                namespace="GCO/BackendTLS",
+                metric_name="RootCertificateDaysToExpiry",
+                dimensions_map={"Project": project_name},
+                statistic="Minimum",
+                period=Duration.hours(12),
+            ),
+            threshold=max(1, config["root_rotate_before_days"] // 2),
+            evaluation_periods=2,
+            comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        self.backend_tls_expiry_alarms: list[cloudwatch.Alarm] = []
+        expiry_alarm_threshold = max(1, config["leaf_rotate_before_days"] // 2)
+        for region in self.certificate_regions:
+            region_id = region.replace("-", "").title()
+            alarm = cloudwatch.Alarm(
+                self,
+                f"BackendTlsLeafExpiryAlarm{region_id}",
+                alarm_description=(
+                    f"Backend TLS certificate in {region} is near expiry after rotation window"
+                ),
+                metric=cloudwatch.Metric(
+                    namespace="GCO/BackendTLS",
+                    metric_name="LeafCertificateDaysToExpiry",
+                    dimensions_map={"Project": project_name, "Region": region},
+                    statistic="Minimum",
+                    period=Duration.hours(12),
+                ),
+                threshold=expiry_alarm_threshold,
+                evaluation_periods=2,
+                comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            )
+            self.backend_tls_expiry_alarms.append(alarm)
+
+        from gco.stacks.nag_suppressions import acknowledge_nag_findings
+
+        acknowledge_nag_findings(
+            manager_role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "ACM ImportCertificate requires Resource: * when creating a new imported "
+                        "certificate because its ARN does not exist yet. Other ACM actions are "
+                        "scoped to this account's certificate ARNs; SSM is scoped to the exact "
+                        "project backend-tls namespace."
+                    ),
+                    "appliesTo": [
+                        "Resource::*",
+                        "Action::kms:GenerateDataKey*",
+                        "Action::kms:ReEncrypt*",
+                        "Resource::arn:<AWS::Partition>:acm:*:<AWS::AccountId>:certificate/*",
+                        (
+                            f"Resource::arn:<AWS::Partition>:ssm:{self.registry_region}:"
+                            f"<AWS::AccountId>:parameter/{project_name}/backend-tls/*"
+                        ),
+                    ],
+                },
+            ],
+        )
+        acknowledge_nag_findings(
+            provider,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "The CDK custom-resource provider invokes only versioned aliases of "
+                        "BackendTlsCertificateManager; the generated :* qualifier cannot be "
+                        "narrowed to a version that does not exist until deployment."
+                    ),
+                    "appliesTo": [
+                        "Resource::<BackendTlsCertificateManager7EB9FC32.Arn>:*",
+                    ],
+                }
+            ],
+        )
+        acknowledge_nag_findings(
+            self.backend_tls_root_secret,
+            [
+                {
+                    "id": "AwsSolutions-SMG4",
+                    "reason": (
+                        "The long-lived private root is rotated by the serialized EventBridge "
+                        "certificate manager using a pending-root trust phase and overlap window; "
+                        "Secrets Manager's single-value rotation protocol cannot provide that "
+                        "multi-region certificate choreography."
+                    ),
+                },
+                {
+                    "id": "HIPAA.Security-SecretsManagerRotationEnabled",
+                    "reason": "The EventBridge certificate manager performs staged root rotation.",
+                },
+                {
+                    "id": "NIST.800.53.R5-SecretsManagerRotationEnabled",
+                    "reason": "The EventBridge certificate manager performs staged root rotation.",
+                },
+            ],
+        )
+        acknowledge_nag_findings(
+            self.backend_tls_rotation_dlq,
+            [
+                {
+                    "id": "AwsSolutions-SQS3",
+                    "reason": (
+                        "This is itself EventBridge's terminal dead-letter queue; it is "
+                        "retained for 14 days and monitored by BackendTlsRotationDlqAlarm. "
+                        "Chaining another DLQ would only move the same terminal failure."
+                    ),
+                },
+                {
+                    "id": "Serverless-SQSRedrivePolicy",
+                    "reason": (
+                        "This queue is the terminal EventBridge dead-letter queue and is monitored "
+                        "by BackendTlsRotationDlqAlarm; redriving it into another queue would only "
+                        "move the terminal failure."
+                    ),
+                },
+            ],
+        )
+        for alarm in [
+            self.backend_tls_manager_error_alarm,
+            self.backend_tls_rotation_dlq_alarm,
+            self.backend_tls_reconciliation_heartbeat_alarm,
+            self.backend_tls_root_expiry_alarm,
+            *self.backend_tls_expiry_alarms,
+        ]:
+            acknowledge_nag_findings(
+                alarm,
+                [
+                    {
+                        "id": "HIPAA.Security-CloudWatchAlarmAction",
+                        "reason": (
+                            "Backend TLS alarms are retained as operator-visible stack alarms; "
+                            "notification routing is deployment-specific and can be attached to "
+                            "the exported alarms without granting the PKI manager publish access."
+                        ),
+                    },
+                    {
+                        "id": "NIST.800.53.R5-CloudWatchAlarmAction",
+                        "reason": (
+                            "Backend TLS alarms are operator-visible; notification destinations "
+                            "remain deployment-specific."
+                        ),
+                    },
+                ],
+            )
+
+    def _create_secret(self) -> secretsmanager.Secret:
+        """Create the backend HMAC signing key and its daily rotation."""
         secret = secretsmanager.Secret(
             self,
             "GCOAuthSecret",
             secret_name=api_gateway_auth_secret_name(self.project_name),  # nosec B106 — this is the secret path, not a password
-            description="Secret token for validating requests from API Gateway to ALB (auto-rotated)",
+            description="HMAC signing key for API Gateway backend requests (auto-rotated)",
             generate_secret_string=secretsmanager.SecretStringGenerator(
-                secret_string_template=json.dumps({"description": "GCO API Gateway auth token"}),
+                secret_string_template=json.dumps({"description": "GCO backend HMAC signing key"}),
                 generate_string_key="token",
                 exclude_punctuation=True,
                 password_length=64,
@@ -280,7 +759,7 @@ class GCOApiGatewayGlobalStack(Stack):
             memory_size=128,
             role=rotation_role,
             log_group=rotation_log_group,
-            description="Rotates the GCO API Gateway auth token",
+            description="Rotates the GCO backend HMAC signing key",
             tracing=lambda_.Tracing.ACTIVE,
         )
 
@@ -311,7 +790,9 @@ class GCOApiGatewayGlobalStack(Stack):
         return rotation_lambda
 
     def _create_proxy_lambda(self) -> lambda_.Function:
-        """Create Lambda function that proxies requests to Global Accelerator."""
+        """Create the authenticated Global Accelerator backend proxy Lambda."""
+        if self.ga_dns is None:
+            raise RuntimeError("The global proxy requires a Global Accelerator endpoint")
 
         # Create IAM role
         lambda_role = iam.Role(
@@ -327,6 +808,38 @@ class GCOApiGatewayGlobalStack(Stack):
 
         # Grant read access to secret
         self.secret.grant_read(lambda_role)
+
+        # The global proxy reaches regional ALBs only through Global
+        # Accelerator. It needs the public root bundle but never the root
+        # secret, certificate private keys, regional ALB registry, or ELB APIs.
+        root_ca_parameter_arn = (
+            f"arn:{self.partition}:ssm:{self.registry_region}:{self.account}:"
+            f"parameter/{self.backend_tls_root_ca_parameter_name.lstrip('/')}"
+        )
+        lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["ssm:GetParameter"],
+                resources=[root_ca_parameter_arn],
+            )
+        )
+
+        from gco.stacks.nag_suppressions import acknowledge_nag_findings
+
+        acknowledge_nag_findings(
+            lambda_role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Active X-Ray tracing requires xray:PutTraceSegments and "
+                        "xray:PutTelemetryRecords on Resource::* because those APIs do not "
+                        "support resource-level IAM constraints."
+                    ),
+                    "appliesTo": ["Resource::*"],
+                }
+            ],
+        )
 
         # Create log group for Lambda
         proxy_lambda_log_group = logs.LogGroup(
@@ -349,43 +862,29 @@ class GCOApiGatewayGlobalStack(Stack):
             environment={
                 "GLOBAL_ACCELERATOR_ENDPOINT": self.ga_dns,
                 "SECRET_ARN": self.secret.secret_arn,
+                "BACKEND_TLS_SERVER_NAME": self.backend_tls_server_name,
+                "BACKEND_TLS_ROOT_CA_PARAMETER": self.backend_tls_root_ca_parameter_name,
+                "BACKEND_TLS_ROOT_CA_REGION": self.registry_region,
+                "BACKEND_TLS_CA_CACHE_TTL_SECONDS": str(
+                    self.backend_tls_config["trust_cache_ttl_seconds"]
+                ),
+                "BACKEND_TLS_CA_MAX_STALE_SECONDS": str(
+                    self.backend_tls_config["trust_cache_max_stale_seconds"]
+                ),
             },
             log_group=proxy_lambda_log_group,
             tracing=lambda_.Tracing.ACTIVE,
         )
 
-        # cdk-nag suppression: the proxy Lambda's execution role needs
-        # broad network access for VPC Lambda execution.
-        from gco.stacks.nag_suppressions import acknowledge_nag_findings
-
-        acknowledge_nag_findings(
-            lambda_role,
-            [
-                {
-                    "id": "AwsSolutions-IAM5",
-                    "reason": (
-                        "The API Gateway proxy Lambda forwards requests to regional ALBs. "
-                        "Its execution role needs broad network access "
-                        "(ec2:CreateNetworkInterface, etc.) for VPC Lambda execution. "
-                        "These APIs do not support resource-level scoping."
-                    ),
-                    "appliesTo": ["Resource::*"],
-                },
-            ],
-        )
-
         return proxy_lambda
 
-    def _create_aggregator_lambda(self) -> lambda_.Function:
-        """Create Lambda function for cross-region aggregation.
-
-        This Lambda queries all regional ALBs in parallel and aggregates
-        the results for global views of jobs, health, and metrics.
-        """
-        # Create IAM role
-        aggregator_role = iam.Role(
+    def _create_inference_proxy_lambda(self) -> lambda_.Function:
+        """Create the inference-only Lambda response-streaming proxy."""
+        if self.ga_dns is None:
+            raise RuntimeError("The global inference proxy requires Global Accelerator")
+        role = iam.Role(
             self,
-            "AggregatorLambdaRole",
+            "InferenceStreamingProxyRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             managed_policies=[
                 iam.ManagedPolicy.from_aws_managed_policy_name(
@@ -393,22 +892,127 @@ class GCOApiGatewayGlobalStack(Stack):
                 )
             ],
         )
+        self.secret.grant_read(role)
+        root_ca_parameter_arn = (
+            f"arn:{self.partition}:ssm:{self.registry_region}:{self.account}:"
+            f"parameter/{self.backend_tls_root_ca_parameter_name.lstrip('/')}"
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["ssm:GetParameter"],
+                resources=[root_ca_parameter_arn],
+            )
+        )
 
-        # Grant read access to secret
-        self.secret.grant_read(aggregator_role)
+        log_group = logs.LogGroup(
+            self,
+            "InferenceStreamingProxyLogGroup",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        function = lambda_.Function(
+            self,
+            "InferenceStreamingProxyFunction",
+            runtime=getattr(lambda_.Runtime, LAMBDA_NODEJS_RUNTIME),
+            handler="index.handler",
+            code=lambda_.Code.from_asset("lambda/inference-streaming-proxy-build"),
+            timeout=Duration.minutes(15),
+            memory_size=256,
+            role=role,
+            environment={
+                "ROUTING_MODE": "global",
+                "MAX_REQUEST_BODY_BYTES": str(self.max_request_body_bytes),
+                "GLOBAL_ACCELERATOR_ENDPOINT": self.ga_dns,
+                "SECRET_ARN": self.secret.secret_arn,
+                "BACKEND_TLS_SERVER_NAME": self.backend_tls_server_name,
+                "BACKEND_TLS_ROOT_CA_PARAMETER": self.backend_tls_root_ca_parameter_name,
+                "BACKEND_TLS_ROOT_CA_REGION": self.registry_region,
+                "BACKEND_TLS_CA_CACHE_TTL_SECONDS": str(
+                    self.backend_tls_config["trust_cache_ttl_seconds"]
+                ),
+                "BACKEND_TLS_CA_MAX_STALE_SECONDS": str(
+                    self.backend_tls_config["trust_cache_max_stale_seconds"]
+                ),
+            },
+            log_group=log_group,
+            tracing=lambda_.Tracing.ACTIVE,
+            description="Streams authenticated inference responses through Global Accelerator",
+        )
 
-        # Grant SSM read access for discovering regional endpoints
+        from gco.stacks.nag_suppressions import acknowledge_nag_findings
+
+        acknowledge_nag_findings(
+            role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Active X-Ray tracing requires write APIs on Resource::*; secret and "
+                        "SSM reads remain scoped to this deployment's exact resources."
+                    ),
+                    "appliesTo": ["Resource::*"],
+                }
+            ],
+        )
+        return function
+
+    def _create_aggregator_lambda(self) -> lambda_.Function:
+        """Create the SigV4 regional-API aggregation Lambda.
+
+        A Lambda in the API Gateway region cannot join every regional VPC and
+        therefore must not connect directly to internal ALBs. It discovers the
+        deterministic regional API Gateway stacks through CloudFormation and
+        invokes their account-restricted HTTPS endpoints with its execution-role
+        credentials. Each regional API's VPC Lambda then performs the private
+        authenticated-TLS hop to that region's ALB.
+        """
+        # The exact role ARN is embedded in every regional API resource policy.
+        # A project-scoped physical name keeps that ARN resolvable independently
+        # in every region, avoiding an impossible cross-region CloudFormation
+        # export while allowing multiple project deployments per account.
+        aggregator_role = iam.Role(
+            self,
+            "AggregatorLambdaRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            role_name=cross_region_aggregator_role_name(self.project_name),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                )
+            ],
+        )
+        self.aggregator_role = aggregator_role
+
+        regional_stack_arns = [
+            (
+                f"arn:{self.partition}:cloudformation:{region}:{self.account}:"
+                f"stack/{self.project_name}-regional-api-{region}/*"
+            )
+            for region in self.certificate_regions
+        ]
         aggregator_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
-                actions=["ssm:GetParametersByPath", "ssm:GetParameter"],
+                actions=["cloudformation:DescribeStacks"],
+                resources=regional_stack_arns,
+            )
+        )
+        aggregator_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["execute-api:Invoke"],
                 resources=[
-                    f"arn:aws:ssm:{self.region}:{self.account}:parameter/{self.project_name}/*"
+                    (
+                        f"arn:{self.partition}:execute-api:{region}:{self.account}:"
+                        f"*/*/{method}/{path}"
+                    )
+                    for region in self.certificate_regions
+                    for method, path in AGGREGATOR_REGIONAL_API_ROUTES
                 ],
             )
         )
 
-        # Create log group for Lambda
         aggregator_log_group = logs.LogGroup(
             self,
             "AggregatorLambdaLogGroup",
@@ -416,7 +1020,6 @@ class GCOApiGatewayGlobalStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Create Lambda function
         aggregator_lambda = lambda_.Function(
             self,
             "CrossRegionAggregatorFunction",
@@ -427,17 +1030,15 @@ class GCOApiGatewayGlobalStack(Stack):
             memory_size=512,
             role=aggregator_role,
             environment={
-                "SECRET_ARN": self.secret.secret_arn,
                 "PROJECT_NAME": self.project_name,
-                "GLOBAL_REGION": self.region,
+                "TARGET_REGIONS": json.dumps(self.certificate_regions),
+                "AWS_URL_SUFFIX": self.url_suffix,
             },
             log_group=aggregator_log_group,
-            description="Aggregates data from all regional GCO clusters",
+            description="Aggregates data through SigV4-authenticated regional GCO APIs",
             tracing=lambda_.Tracing.ACTIVE,
         )
 
-        # cdk-nag suppression: the aggregator Lambda reads SSM parameters
-        # and invokes regional endpoints.
         from gco.stacks.nag_suppressions import acknowledge_nag_findings
 
         acknowledge_nag_findings(
@@ -446,12 +1047,31 @@ class GCOApiGatewayGlobalStack(Stack):
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "The cross-region aggregator Lambda reads SSM parameters and "
-                        "invokes regional endpoints. Its execution role needs "
-                        "ssm:GetParameter on the project's parameter namespace and "
-                        "secretsmanager:GetSecretValue for the auth token."
+                        "The aggregator uses X-Ray write APIs that require Resource::*, "
+                        "describes only deterministic project/region CloudFormation stack "
+                        "ARNs, and invokes only this account's generated regional API IDs "
+                        "under /api/v1. Regional API resource policies admit only this role "
+                        "unless operators explicitly enable direct regional access."
                     ),
-                    "appliesTo": ["Resource::*"],
+                    "appliesTo": [
+                        "Resource::*",
+                        *[
+                            (
+                                f"Resource::arn:<AWS::Partition>:cloudformation:{region}:"
+                                f"<AWS::AccountId>:stack/{self.project_name}-regional-api-"
+                                f"{region}/*"
+                            )
+                            for region in self.certificate_regions
+                        ],
+                        *[
+                            (
+                                f"Resource::arn:<AWS::Partition>:execute-api:{region}:"
+                                f"<AWS::AccountId>:*/*/{method}/{path}"
+                            )
+                            for region in self.certificate_regions
+                            for method, path in AGGREGATOR_REGIONAL_API_ROUTES
+                        ],
+                    ],
                 },
             ],
         )
@@ -470,23 +1090,43 @@ class GCOApiGatewayGlobalStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Create REST API with edge-optimized endpoint
-        # Edge-optimized uses CloudFront for global edge caching and DDoS protection
+        configured_log_level = str(self.api_gateway_config["log_level"]).upper()
+        logging_levels = {
+            "OFF": apigateway.MethodLoggingLevel.OFF,
+            "ERROR": apigateway.MethodLoggingLevel.ERROR,
+            "INFO": apigateway.MethodLoggingLevel.INFO,
+        }
+        if configured_log_level not in logging_levels:
+            raise ValueError(
+                "api_gateway.log_level must be one of OFF, ERROR, or INFO; "
+                f"got {configured_log_level!r}"
+            )
+
+        # Edge-optimized API Gateway endpoints are a commercial-partition
+        # capability. Regional endpoints preserve the same IAM contract in
+        # partitions where the Global Accelerator data path is unavailable.
+        endpoint_type = (
+            apigateway.EndpointType.EDGE
+            if self.ga_dns is not None
+            else apigateway.EndpointType.REGIONAL
+        )
         api = apigateway.RestApi(
             self,
             "GCOGlobalApi",
             rest_api_name=f"{self.project_name}-global-api",
-            description="Global authenticated API for GCO (Global Capacity Orchestrator on AWS) (edge-optimized)",
-            endpoint_types=[apigateway.EndpointType.EDGE],
+            description="Authenticated global aggregation API for GCO",
+            endpoint_types=[endpoint_type],
             deploy=True,
             deploy_options=apigateway.StageOptions(
                 stage_name="prod",
-                throttling_rate_limit=1000,
-                throttling_burst_limit=2000,
-                logging_level=apigateway.MethodLoggingLevel.INFO,
-                data_trace_enabled=True,
-                metrics_enabled=True,
-                tracing_enabled=True,  # Enable X-Ray tracing for request analysis
+                throttling_rate_limit=self.api_gateway_config["throttle_rate_limit"],
+                throttling_burst_limit=self.api_gateway_config["throttle_burst_limit"],
+                logging_level=logging_levels[configured_log_level],
+                # Never put inference prompts/responses (or other API bodies)
+                # into execution logs. Standard access logs and metrics remain.
+                data_trace_enabled=False,
+                metrics_enabled=self.api_gateway_config["metrics_enabled"],
+                tracing_enabled=self.api_gateway_config["tracing_enabled"],
                 access_log_destination=apigateway.LogGroupLogDestination(api_log_group),
                 access_log_format=apigateway.AccessLogFormat.json_with_standard_fields(
                     caller=True,
@@ -501,6 +1141,8 @@ class GCOApiGatewayGlobalStack(Stack):
                 ),
             ),
             cloud_watch_role=True,
+            # CDK otherwise retains the generated API Gateway account role.
+            cloud_watch_role_removal_policy=RemovalPolicy.DESTROY,
         )
 
         # Add resource policy to restrict to account
@@ -528,38 +1170,42 @@ class GCOApiGatewayGlobalStack(Stack):
             )
         )
 
-        # Create Lambda integration
-        lambda_integration = apigateway.LambdaIntegration(
-            self.proxy_lambda, proxy=True, timeout=Duration.seconds(29)
-        )
-
-        # Create /api resource
+        # Create /api/v1. Aggregate routes are available in every partition;
+        # the GA-backed catch-all control-plane and inference routes are added
+        # only when the global data path exists.
         api_resource = api.root.add_resource("api")
         v1_resource = api_resource.add_resource("v1")
 
-        # Add proxy resource to catch all paths
-        proxy_resource = v1_resource.add_resource("{proxy+}")
-
-        # Add methods with IAM authentication
-        for method in ["GET", "POST", "PUT", "DELETE", "PATCH"]:
-            proxy_resource.add_method(
-                method,
-                lambda_integration,
-                authorization_type=apigateway.AuthorizationType.IAM,
-                method_responses=[
-                    apigateway.MethodResponse(status_code="200"),
-                    apigateway.MethodResponse(status_code="400"),
-                    apigateway.MethodResponse(status_code="403"),
-                    apigateway.MethodResponse(status_code="500"),
-                ],
+        if self.proxy_lambda is not None:
+            lambda_integration = apigateway.LambdaIntegration(
+                self.proxy_lambda,
+                proxy=True,
+                timeout=Duration.seconds(29),
             )
+            proxy_resource = v1_resource.add_resource("{proxy+}")
+            for method in ["GET", "POST", "PUT", "DELETE", "PATCH"]:
+                proxy_resource.add_method(
+                    method,
+                    lambda_integration,
+                    authorization_type=apigateway.AuthorizationType.IAM,
+                    method_responses=[
+                        apigateway.MethodResponse(status_code="200"),
+                        apigateway.MethodResponse(status_code="400"),
+                        apigateway.MethodResponse(status_code="403"),
+                        apigateway.MethodResponse(status_code="500"),
+                    ],
+                )
 
-        # Create global aggregation routes
         self._create_global_routes(api, v1_resource)
 
-        # Create inference proxy route
-        # /inference/{proxy+} → proxy Lambda → GA → ALB → K8s Ingress
-        self._create_inference_routes(api, lambda_integration)
+        if self.inference_proxy_lambda is not None:
+            inference_integration = apigateway.LambdaIntegration(
+                self.inference_proxy_lambda,
+                proxy=True,
+                timeout=Duration.minutes(15),
+                response_transfer_mode=apigateway.ResponseTransferMode.STREAM,
+            )
+            self._create_inference_routes(api, inference_integration)
 
         return api
 
@@ -628,16 +1274,15 @@ class GCOApiGatewayGlobalStack(Stack):
         """Create proxy route for inference endpoints.
 
         Routes:
-            ANY /inference/{proxy+} → proxy Lambda → GA → ALB → K8s Ingress
+            GET|HEAD|POST /inference/{proxy+} → streaming Lambda → GA → ALB → inference proxy
 
-        This allows authenticated inference requests to flow through the
-        API Gateway with IAM auth, then get proxied to the regional ALB
-        where K8s Ingress routes them to the correct inference Service.
+        The dedicated in-cluster service enforces endpoint state and the serving-
+        path allowlist before opening a streaming connection to a model server.
         """
         inference_resource = api.root.add_resource("inference")
         inference_proxy = inference_resource.add_resource("{proxy+}")
 
-        for method in ["GET", "POST", "PUT", "DELETE", "PATCH"]:
+        for method in ["GET", "HEAD", "POST"]:
             inference_proxy.add_method(
                 method,
                 lambda_integration,
@@ -666,8 +1311,24 @@ class GCOApiGatewayGlobalStack(Stack):
             self,
             "SecretArn",
             value=self.secret.secret_arn,
-            description="Secret ARN for ALB validation",
+            description="Backend HMAC signing-key secret ARN",
             export_name=f"{self.project_name}-auth-secret-arn",
+        )
+
+        CfnOutput(
+            self,
+            "BackendTlsServerName",
+            value=self.backend_tls_server_name,
+            description="Private SNI identity verified on every proxy-to-ALB TLS connection",
+            export_name=f"{self.project_name}-backend-tls-server-name",
+        )
+
+        CfnOutput(
+            self,
+            "BackendTlsRootCaParameter",
+            value=self.backend_tls_root_ca_parameter_name,
+            description="SSM parameter containing the public backend TLS root trust bundle",
+            export_name=f"{self.project_name}-backend-tls-root-ca-parameter",
         )
 
     def set_analytics_config(self, config: AnalyticsApiConfig) -> None:
@@ -920,7 +1581,8 @@ class GCOApiGatewayGlobalStack(Stack):
         # Rule priority ordering:
         #   0  -> PerIPRateLimit (evaluated FIRST so abusive IPs are blocked
         #         before expensive managed rule groups run)
-        #   1-6 -> AWS Managed Rule Groups
+        #   1  -> Preserve the CRS 8 KiB body limit outside /inference/*
+        #   2-7 -> AWS Managed Rule Groups
         waf_config = self.node.try_get_context("waf") or {}
         per_ip_rate_limit = int(waf_config.get("per_ip_rate_limit", 100))
 
@@ -962,15 +1624,82 @@ class GCOApiGatewayGlobalStack(Stack):
                         sampled_requests_enabled=True,
                     ),
                 ),
-                # Rule 1: AWS Managed Rules - Common Rule Set (OWASP Top 10)
+                # Rule 1: Preserve the CRS 8 KiB body limit for every route
+                # except the deployed /prod/inference/{proxy+} route. API Gateway
+                # invoke URLs include the stage in the client URI that WAF inspects,
+                # and the trailing slash is the route boundary: /prod/inference-extra
+                # must remain subject to this limit. Inference accepts bodies up to
+                # the backend's authoritative 1 MiB limit. MATCH fails closed on
+                # oversized control-plane bodies beyond WAF's inspection window.
+                wafv2.CfnWebACL.RuleProperty(
+                    name="NonInferenceBodySizeLimit",
+                    priority=1,
+                    action=wafv2.CfnWebACL.RuleActionProperty(block={}),
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        and_statement=wafv2.CfnWebACL.AndStatementProperty(
+                            statements=[
+                                wafv2.CfnWebACL.StatementProperty(
+                                    size_constraint_statement=wafv2.CfnWebACL.SizeConstraintStatementProperty(
+                                        comparison_operator="GT",
+                                        field_to_match=wafv2.CfnWebACL.FieldToMatchProperty(
+                                            body=wafv2.CfnWebACL.BodyProperty(
+                                                oversize_handling="MATCH"
+                                            )
+                                        ),
+                                        size=8_192,
+                                        text_transformations=[
+                                            wafv2.CfnWebACL.TextTransformationProperty(
+                                                priority=0,
+                                                type="NONE",
+                                            )
+                                        ],
+                                    )
+                                ),
+                                wafv2.CfnWebACL.StatementProperty(
+                                    not_statement=wafv2.CfnWebACL.NotStatementProperty(
+                                        statement=wafv2.CfnWebACL.StatementProperty(
+                                            byte_match_statement=wafv2.CfnWebACL.ByteMatchStatementProperty(
+                                                field_to_match=wafv2.CfnWebACL.FieldToMatchProperty(
+                                                    uri_path={}
+                                                ),
+                                                positional_constraint="STARTS_WITH",
+                                                search_string="/prod/inference/",
+                                                text_transformations=[
+                                                    wafv2.CfnWebACL.TextTransformationProperty(
+                                                        priority=0,
+                                                        type="NONE",
+                                                    )
+                                                ],
+                                            )
+                                        )
+                                    )
+                                ),
+                            ]
+                        )
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        metric_name="NonInferenceBodySizeLimit",
+                        sampled_requests_enabled=True,
+                    ),
+                ),
+                # Rule 2: AWS Managed Rules - Common Rule Set (OWASP Top 10).
+                # Override only SizeRestrictions_BODY: every other CRS rule
+                # continues to block normally, including body-content rules.
                 wafv2.CfnWebACL.RuleProperty(
                     name="AWSManagedRulesCommonRuleSet",
-                    priority=1,
+                    priority=2,
                     override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
                     statement=wafv2.CfnWebACL.StatementProperty(
                         managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
                             vendor_name="AWS",
                             name="AWSManagedRulesCommonRuleSet",
+                            rule_action_overrides=[
+                                wafv2.CfnWebACL.RuleActionOverrideProperty(
+                                    name="SizeRestrictions_BODY",
+                                    action_to_use=wafv2.CfnWebACL.RuleActionProperty(count={}),
+                                )
+                            ],
                         )
                     ),
                     visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
@@ -979,10 +1708,10 @@ class GCOApiGatewayGlobalStack(Stack):
                         sampled_requests_enabled=True,
                     ),
                 ),
-                # Rule 2: AWS Managed Rules - Known Bad Inputs
+                # Rule 3: AWS Managed Rules - Known Bad Inputs
                 wafv2.CfnWebACL.RuleProperty(
                     name="AWSManagedRulesKnownBadInputsRuleSet",
-                    priority=2,
+                    priority=3,
                     override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
                     statement=wafv2.CfnWebACL.StatementProperty(
                         managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
@@ -996,10 +1725,10 @@ class GCOApiGatewayGlobalStack(Stack):
                         sampled_requests_enabled=True,
                     ),
                 ),
-                # Rule 3: AWS Managed Rules - SQL Injection
+                # Rule 4: AWS Managed Rules - SQL Injection
                 wafv2.CfnWebACL.RuleProperty(
                     name="AWSManagedRulesSQLiRuleSet",
-                    priority=3,
+                    priority=4,
                     override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
                     statement=wafv2.CfnWebACL.StatementProperty(
                         managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
@@ -1013,10 +1742,10 @@ class GCOApiGatewayGlobalStack(Stack):
                         sampled_requests_enabled=True,
                     ),
                 ),
-                # Rule 4: AWS Managed Rules - Linux OS (protects against Linux-specific attacks)
+                # Rule 5: AWS Managed Rules - Linux OS (protects against Linux-specific attacks)
                 wafv2.CfnWebACL.RuleProperty(
                     name="AWSManagedRulesLinuxRuleSet",
-                    priority=4,
+                    priority=5,
                     override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
                     statement=wafv2.CfnWebACL.StatementProperty(
                         managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
@@ -1030,10 +1759,10 @@ class GCOApiGatewayGlobalStack(Stack):
                         sampled_requests_enabled=True,
                     ),
                 ),
-                # Rule 5: AWS Managed Rules - Amazon IP Reputation List
+                # Rule 6: AWS Managed Rules - Amazon IP Reputation List
                 wafv2.CfnWebACL.RuleProperty(
                     name="AWSManagedRulesAmazonIpReputationList",
-                    priority=5,
+                    priority=6,
                     override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
                     statement=wafv2.CfnWebACL.StatementProperty(
                         managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
@@ -1047,10 +1776,10 @@ class GCOApiGatewayGlobalStack(Stack):
                         sampled_requests_enabled=True,
                     ),
                 ),
-                # Rule 6: AWS Managed Rules - Anonymous IP List (blocks Tor, VPNs, proxies)
+                # Rule 7: AWS Managed Rules - Anonymous IP List (blocks Tor, VPNs, proxies)
                 wafv2.CfnWebACL.RuleProperty(
                     name="AWSManagedRulesAnonymousIpList",
-                    priority=6,
+                    priority=7,
                     override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
                     statement=wafv2.CfnWebACL.StatementProperty(
                         managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(

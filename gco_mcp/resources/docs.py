@@ -190,7 +190,7 @@ EXAMPLE_METADATA: dict[str, dict[str, str | list[str]]] = {
         "summary": "vLLM OpenAI-compatible LLM serving with PagedAttention.",
         "gpu": "NVIDIA",
         "opt_in": "",
-        "submission": "gco inference deploy my-llm -i vllm/vllm-openai:v0.22.0 --gpu-count 1",
+        "submission": "gco inference deploy my-llm -i vllm/vllm-openai:v0.24.0 --gpu-count 1",
         "keywords": [
             "vllm",
             "openai",
@@ -530,7 +530,7 @@ DOC_METADATA: dict[str, dict[str, str | list[str]]] = {
             "manifest processor",
             "endpoints",
             "auth",
-            "x-gco-auth-token",
+            "hmac request envelope",
             "api gateway",
             "sigv4",
             "openapi",
@@ -786,6 +786,29 @@ DOC_METADATA: dict[str, dict[str, str | list[str]]] = {
         ],
         "related": ["CONCEPTS", "CLI", "SCHEDULERS"],
     },
+    "LIVE_RELEASE_VALIDATION": {
+        "summary": "Local operator deploy-test-destroy harness for exact-commit live validation, guaranteed cleanup, and manually attached pull request reports.",
+        "topics": [
+            "deployment",
+            "runbooks",
+            "security",
+            "automation",
+            "multi-region",
+        ],
+        "keywords": [
+            "live release validation",
+            "local script",
+            "dedicated validation account",
+            "exact commit",
+            "deploy test destroy",
+            "checkpoint",
+            "resume",
+            "kms pending deletion",
+            "manual pull request upload",
+            "pull request comment",
+        ],
+        "related": ["RUNBOOKS", "MAINTENANCE", "CLI"],
+    },
     "MAINTENANCE": {
         "summary": "Routine upkeep — adding instance types to the nodepool lists, EKS Kubernetes version upgrades, base-image security-epoch refreshes, CVE-suppression renewals, and acting on the monthly dependency scan.",
         "topics": [
@@ -994,6 +1017,49 @@ DOC_METADATA: dict[str, dict[str, str | list[str]]] = {
 
 
 # ---------------------------------------------------------------------------
+# Root-doc metadata — searchable project-level guidance that deliberately lives
+# at the repository root rather than under ``docs/``. Keep this separate from
+# ``DOC_METADATA`` so the strict 1:1 metadata-to-``docs/*.md`` invariant remains
+# meaningful. Root docs use static ``docs://gco/{name}`` resources.
+# ---------------------------------------------------------------------------
+
+ROOT_DOC_METADATA: dict[str, dict[str, str | list[str]]] = {
+    "TENETS": {
+        "path": "TENETS.md",
+        "summary": (
+            "Prioritized project tenets and north-star guidance for safety, truth, "
+            "security, global capacity orchestration, automation, operations, cost, "
+            "and maintainability."
+        ),
+        "topics": [
+            "concepts",
+            "architecture",
+            "security",
+            "automation",
+            "multi-region",
+            "deployment",
+            "cost",
+        ],
+        "keywords": [
+            "tenets",
+            "north star",
+            "principles",
+            "decision framework",
+            "project ethos",
+            "safety",
+            "truth",
+            "reversibility",
+            "least privilege",
+            "capacity policy",
+            "deterministic automation",
+            "definition of done",
+        ],
+        "related": ["ARCHITECTURE", "MAINTENANCE", "LIVE_RELEASE_VALIDATION"],
+    }
+}
+
+
+# ---------------------------------------------------------------------------
 # Package-doc metadata — used by ``find_docs`` and the
 # ``docs://gco/packages/...`` resources to describe the package-level READMEs
 # that live next to the code (under ``gco_mcp/``) rather than in ``docs/``. These
@@ -1117,6 +1183,7 @@ def docs_index() -> str:
     sections.append("## Project Overview")
     sections.append("- `docs://gco/README` — Project README and overview")
     sections.append("- `docs://gco/QUICKSTART` — Quick start guide (deploy in under 60 minutes)")
+    sections.append("- `docs://gco/TENETS` — Prioritized project tenets and north-star guidance")
     sections.append("- `docs://gco/CONTRIBUTING` — Contributing guide\n")
 
     sections.append("## Documentation")
@@ -1190,14 +1257,16 @@ def docs_index() -> str:
 
     sections.append("## Live State")
     sections.append(
-        "- `gco://jobs/{job_name}` — live YAML for a Kubernetes Job in the `gco-jobs` namespace"
+        "- `gco://jobs/{region}/{job_name}` — live YAML for a Kubernetes Job in the "
+        "explicitly selected regional EKS cluster"
     )
     sections.append(
         "- `gco://inference/{endpoint_name}` — desired-state record for an inference endpoint "
         "from the DynamoDB store"
     )
     sections.append(
-        "- `gco://k8s/{namespace}/{kind}/{name}` — live YAML for any Kubernetes resource in any namespace"
+        "- `gco://k8s/{region}/{namespace}/{kind}/{name}` — live YAML for any Kubernetes "
+        "resource from the explicitly selected regional EKS cluster"
     )
     sections.append(
         "- `gco://cluster/{region}/topology` — Karpenter NodePools plus Pending pods snapshot for one region"
@@ -1206,6 +1275,10 @@ def docs_index() -> str:
         "- `costs://gco/summary/{days_window}` — cost summary for the given day window (positive integer)"
     )
     sections.append("- `tasks://gco/{task_id}` — current status of a FastMCP background task by ID")
+    sections.append(
+        "- `mission://sessions/{session_id}` — Mission session state, report, or audit replay "
+        "when `GCO_ENABLE_MISSION=true`"
+    )
     sections.append("")
 
     sections.append("## Other Resource Groups")
@@ -1213,14 +1286,20 @@ def docs_index() -> str:
     sections.append("- `iam://gco/policies/index` — IAM policy templates")
     sections.append("- `infra://gco/index` — Dockerfiles, Helm charts, CI/CD config")
     sections.append("- `ci://gco/index` — GitHub Actions workflows, composite actions, templates")
+    sections.append(
+        "- `images://gco/index` — ECR repositories, tags, images, and replication status"
+    )
     sections.append("- `source://gco/index` — Source code browser")
     sections.append("- `demos://gco/index` — Demo walkthroughs and presentation materials")
     sections.append("- `clients://gco/index` — API client examples (Python, curl, AWS CLI)")
     sections.append("- `scripts://gco/index` — Utility scripts")
     sections.append("- `tests://gco/index` — Test suite documentation and patterns")
     sections.append(
-        "- `config://gco/index` — CDK configuration, feature toggles, environment variables"
+        "- `config://gco/index` — authoritative CDK configuration, MCP feature flags, and environment variables"
     )
+    sections.append("- `mcp://gco/tools/index` — live registered-tool catalog")
+    sections.append("- `mcp://gco/resources/index` — live static-resource and template catalog")
+    sections.append("- `mcp://gco/feature-flags` — authoritative feature-gate mapping")
     return "\n".join(sections)
 
 
@@ -1237,6 +1316,25 @@ def quickstart_resource() -> str:
     if not path.is_file():
         return "QUICKSTART.md not found."
     return path.read_text()
+
+
+@mcp.resource("docs://gco/TENETS")
+def tenets_resource() -> str:
+    """Prioritized project tenets and north-star decision guidance."""
+    meta = ROOT_DOC_METADATA["TENETS"]
+    rel_path = str(meta["path"])
+    path = PROJECT_ROOT / rel_path
+    if not path.is_file():
+        return f"{rel_path} not found."
+    content = path.read_text()
+    topics = meta.get("topics", [])
+    related = meta.get("related", [])
+    header_lines = []
+    if isinstance(topics, list) and topics:
+        header_lines.append(f"<!-- Topics: {', '.join(str(t) for t in topics)} -->")
+    if isinstance(related, list) and related:
+        header_lines.append(f"<!-- Related: {', '.join(str(r) for r in related)} -->")
+    return "\n".join(header_lines) + "\n\n" + content
 
 
 @mcp.resource("docs://gco/CONTRIBUTING")

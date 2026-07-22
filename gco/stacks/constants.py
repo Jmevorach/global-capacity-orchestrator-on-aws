@@ -20,25 +20,179 @@ these fall behind the latest available release.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
+from functools import lru_cache
+from types import MappingProxyType
+
 # ---------------------------------------------------------------------------
-# Lambda Runtime
+# Lambda Runtimes
 # ---------------------------------------------------------------------------
-# All Lambda functions in GCO use the same Python runtime. Changing this
-# single constant updates every function across all stacks.
+# Keep every Lambda language runtime here rather than spelling enum members in
+# individual stacks. The monthly dependency scan compares these constants with
+# the newest managed runtimes exposed by aws-cdk-lib and checks the Node major
+# against .nvmrc, package.json, and Dockerfile.dev.
 LAMBDA_PYTHON_RUNTIME = "PYTHON_3_14"
-"""CDK enum name for the Lambda runtime (e.g. ``lambda_.Runtime.PYTHON_3_14``)."""
+"""CDK enum name for Python Lambdas (``lambda_.Runtime.PYTHON_3_14``)."""
+
+LAMBDA_NODEJS_RUNTIME = "NODEJS_24_X"
+"""CDK enum name for Node.js Lambdas (``lambda_.Runtime.NODEJS_24_X``)."""
+
+
+# ---------------------------------------------------------------------------
+# Deployment Region Contract
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def cloudformation_region_partitions() -> Mapping[str, str]:
+    """Return immutable SDK-known CloudFormation Region-to-partition metadata.
+
+    Botocore endpoint metadata covers every AWS partition and requires neither
+    credentials nor a network request. Keeping this dynamic avoids a project
+    allowlist that would reject opt-in, sovereign, or newly supported Regions
+    already known to the installed SDK.
+    """
+    import boto3
+
+    session = boto3.Session()
+    region_partitions: dict[str, str] = {}
+    for partition in session.get_available_partitions():
+        for region in session.get_available_regions(
+            "cloudformation",
+            partition_name=partition,
+        ):
+            recorded_partition = region_partitions.setdefault(region, partition)
+            if recorded_partition != partition:
+                raise RuntimeError(
+                    "AWS SDK endpoint metadata assigns CloudFormation region "
+                    f"{region!r} to both {recorded_partition!r} and {partition!r}"
+                )
+    if not region_partitions:
+        raise RuntimeError("AWS SDK endpoint metadata contains no CloudFormation regions")
+    return MappingProxyType(region_partitions)
+
+
+@lru_cache(maxsize=1)
+def known_cloudformation_regions() -> frozenset[str]:
+    """Return every AWS SDK-known Region that exposes CloudFormation."""
+    return frozenset(cloudformation_region_partitions())
+
+
+def validated_deployment_partition(
+    regions: Collection[object],
+    *,
+    region_partitions: Mapping[str, str] | None = None,
+) -> str:
+    """Require a deployment topology to resolve to exactly one AWS partition.
+
+    A single credentials/account context and this application's cross-stack
+    references cannot span commercial, China, GovCloud, or ISO partitions.
+    Region count remains deliberately unlimited within the selected partition.
+    """
+    if not regions:
+        raise ValueError("At least one deployment region must be specified")
+
+    metadata = (
+        cloudformation_region_partitions() if region_partitions is None else region_partitions
+    )
+    if not metadata:
+        raise RuntimeError("AWS SDK endpoint metadata contains no CloudFormation regions")
+
+    regions_by_partition: dict[str, list[str]] = {}
+    for region in regions:
+        if not isinstance(region, str) or region not in metadata:
+            raise ValueError(
+                f"Invalid region {region!r}; expected an AWS region with a "
+                "CloudFormation endpoint known to the installed SDK"
+            )
+        partition = metadata[region]
+        regions_by_partition.setdefault(partition, []).append(region)
+
+    if len(regions_by_partition) != 1:
+        details = "; ".join(
+            f"{partition}: {', '.join(sorted(partition_regions))}"
+            for partition, partition_regions in sorted(regions_by_partition.items())
+        )
+        raise ValueError(
+            f"Deployment regions must all belong to a single AWS partition; found {details}"
+        )
+    return next(iter(regions_by_partition))
+
+
+def validated_regional_deployment_regions(
+    value: object,
+    *,
+    known_regions: Collection[str] | None = None,
+) -> tuple[str, ...]:
+    """Return a non-empty, unique list of SDK-known workload Regions.
+
+    There is deliberately no project-specific allowlist or maximum count. The
+    optional ``known_regions`` argument lets callers reuse endpoint metadata
+    they have already loaded while preserving this one validation contract.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError("At least one region must be specified")
+
+    regions: list[str] = []
+    valid_regions = (
+        known_cloudformation_regions() if known_regions is None else frozenset(known_regions)
+    )
+    if not valid_regions:
+        raise RuntimeError("AWS SDK endpoint metadata contains no CloudFormation regions")
+
+    for region in value:
+        if not isinstance(region, str) or region not in valid_regions:
+            raise ValueError(
+                f"Invalid region {region!r}; expected an AWS region with a "
+                "CloudFormation endpoint known to the installed SDK"
+            )
+        regions.append(region)
+    if len(regions) != len(set(regions)):
+        raise ValueError("Duplicate regions found in configuration")
+    return tuple(regions)
+
+
+# ---------------------------------------------------------------------------
+# HTTP Request Body Limits
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576
+"""Default hard cap shared by API ingress and in-cluster request middleware."""
+
+MAX_CONFIGURABLE_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+"""Largest supported cap; matches API Gateway's request payload ceiling."""
+
+# The cross-region aggregator has a deliberately read-mostly regional contract.
+# Keep both its identity policy and each regional API resource policy generated
+# from this exact allowlist so a compromised aggregator cannot reach unrelated
+# control-plane mutations exposed by the regional greedy route.
+AGGREGATOR_REGIONAL_API_ROUTES = (
+    ("GET", "api/v1/jobs"),
+    ("DELETE", "api/v1/jobs"),
+    ("GET", "api/v1/health"),
+    ("GET", "api/v1/status"),
+)
+
+
+def validated_request_body_limit(value: object) -> int:
+    """Return a safe request-body limit or reject an inconsistent deployment."""
+    if type(value) is not int or value < 1 or value > MAX_CONFIGURABLE_REQUEST_BODY_BYTES:
+        raise ValueError(
+            "max_request_body_bytes must be an integer between 1 and "
+            f"{MAX_CONFIGURABLE_REQUEST_BODY_BYTES}"
+        )
+    return value
+
 
 # ---------------------------------------------------------------------------
 # API Gateway Auth Secret
 # ---------------------------------------------------------------------------
-# Physical name of the Secrets Manager secret that holds the token API Gateway
-# uses to authenticate requests to the regional ALBs. It is created by
+# Physical name of the Secrets Manager secret that holds the rotating HMAC
+# signing key used by trusted API Gateway proxy Lambdas. It is created by
 # ``GCOApiGatewayGlobalStack`` (in the ``api_gateway`` region) and read by the
-# regional service-account role and the regional API proxy Lambda.
+# regional service-account role and regional API proxy Lambda. The historical
+# ``api-gateway-auth-token`` suffix is retained to avoid replacing deployments.
 
 
 def api_gateway_auth_secret_name(project_name: str) -> str:
-    """Secrets Manager secret name for the API Gateway → ALB auth token.
+    """Secrets Manager name for the proxy-to-backend HMAC signing key.
 
     Derived from ``project_name`` (``<project_name>/api-gateway-auth-token``)
     so two deployments in the same account+region do not collide on the secret
@@ -64,6 +218,53 @@ def api_gateway_auth_secret_name(project_name: str) -> str:
     stack's ``project_name`` rather than re-typing the name.
     """
     return f"{project_name}/api-gateway-auth-token"  # nosec B105 — secret path/name, not a credential
+
+
+def cross_region_aggregator_role_name(project_name: str) -> str:
+    """IAM role name used by regional API resource-policy principals.
+
+    IAM roles are global within an account, and the role ARN is embedded in
+    API Gateway resource policies synthesized in other regions. A deterministic
+    project-scoped physical name avoids an unsupported cross-region
+    CloudFormation export. ``project_name`` is validated at 31 characters, so
+    this 24-character suffix keeps the result below IAM's 64-character limit.
+    """
+    return f"{project_name}-cross-region-aggregator"
+
+
+# ---------------------------------------------------------------------------
+# Backend TLS private PKI
+# ---------------------------------------------------------------------------
+
+
+def backend_tls_server_name(project_name: str) -> str:
+    """Private certificate identity asserted by every backend TLS client.
+
+    The name deliberately does not need public DNS. Proxy clients connect to
+    Global Accelerator or an internal ALB's real DNS name while sending this
+    value as SNI and verifying it against the deployment-local root CA.
+    """
+    return f"backend.{project_name}.gco.internal"
+
+
+def backend_tls_root_secret_name(project_name: str) -> str:
+    """Secrets Manager name containing the deployment-local root private key."""
+    return f"{project_name}/backend-tls/root-ca"
+
+
+def backend_tls_root_ca_parameter_name(project_name: str) -> str:
+    """SSM parameter containing only the public root trust bundle."""
+    return f"/{project_name}/backend-tls/root-ca.pem"
+
+
+def backend_tls_certificate_parameter_prefix(project_name: str) -> str:
+    """SSM prefix under which regional imported-certificate ARNs are stored."""
+    return f"/{project_name}/backend-tls/certificate-arn/"
+
+
+def backend_tls_certificate_arn_parameter_name(project_name: str, region: str) -> str:
+    """SSM parameter containing one region's stable imported ACM ARN."""
+    return f"{backend_tls_certificate_parameter_prefix(project_name)}{region}"
 
 
 # ---------------------------------------------------------------------------

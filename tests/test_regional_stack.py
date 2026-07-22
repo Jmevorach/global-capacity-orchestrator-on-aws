@@ -83,7 +83,7 @@ class MockConfigLoader:
             "image": "gco/manifest-processor:latest",
             "replicas": 3,
             "resource_limits": {"cpu": "1000m", "memory": "2Gi"},
-            "allowed_namespaces": ["default", "gco-jobs"],
+            "allowed_namespaces": ["gco-jobs"],
             "resource_quotas": {
                 "max_cpu_per_manifest": "10",
                 "max_memory_per_manifest": "32Gi",
@@ -272,6 +272,26 @@ class TestGlobalStackSynthesis:
 
         template = assertions.Template.from_stack(stack)
         template.resource_count_is("AWS::GlobalAccelerator::Accelerator", 1)
+
+    def test_noncommercial_partition_omits_global_accelerator(self):
+        """Partitions without GA retain shared resources without invalid GA types."""
+        from gco.stacks.global_stack import GCOGlobalStack
+
+        class NonCommercialConfig(MockConfigLoader):
+            def supports_global_accelerator(self):
+                return False
+
+        app = cdk.App()
+        stack = GCOGlobalStack(
+            app,
+            "test-synth-without-accelerator",
+            config=NonCommercialConfig(app),
+        )
+        template = assertions.Template.from_stack(stack)
+        template.resource_count_is("AWS::GlobalAccelerator::Accelerator", 0)
+        template.resource_count_is("AWS::GlobalAccelerator::Listener", 0)
+        template.resource_count_is("AWS::GlobalAccelerator::EndpointGroup", 0)
+        assert stack.get_accelerator_dns_name() is None
 
     def test_global_stack_creates_listener(self):
         """Test that GlobalStack creates a listener."""
@@ -592,8 +612,23 @@ class TestRegionalStackSynthesis:
             "arn:aws:lambda:us-east-1:123456789012:function:mock"  # nosec B106 - test fixture ARN with fake account ID, not a real credential
         )
 
-    def test_regional_stack_creates_vpc(self):
-        """Test that RegionalStack creates a VPC."""
+    @staticmethod
+    def _mock_helm_installer_with_teardown(stack):
+        """Provide lightweight constructs so dependency ordering synthesizes without Docker."""
+        TestRegionalStackSynthesis._mock_helm_installer(stack)
+        stack.helm_installer_access_entry = cdk.CfnResource(
+            stack,
+            "MockHelmInstallerAccessEntry",
+            type="AWS::EKS::AccessEntry",
+        )
+        stack.helm_teardown_resource = cdk.CustomResource(
+            stack,
+            "HelmTeardown",
+            service_token=("arn:aws:lambda:us-east-1:123456789012:function:mock-teardown"),
+        )
+
+    def test_regional_stack_creates_vpc_and_metrics_server_addon(self):
+        """Regional stacks create their VPC and the HPA metrics provider."""
 
         from gco.stacks.regional_stack import GCORegionalStack
 
@@ -624,6 +659,10 @@ class TestRegionalStackSynthesis:
 
             template = assertions.Template.from_stack(stack)
             template.resource_count_is("AWS::EC2::VPC", 1)
+            template.has_resource_properties(
+                "AWS::EKS::Addon",
+                {"AddonName": "metrics-server"},
+            )
 
     def test_regional_stack_ga_deregistration_teardown_guard(self):
         """Issue #130: a delete-time custom resource must deregister the ALB
@@ -685,6 +724,7 @@ class TestRegionalStackSynthesis:
                 f"Expected a GaDeregistration custom resource; found: {list(custom_resources)}"
             )
             (dereg_res,) = dereg.values()
+            assert dereg_res["Properties"]["RegistryRegion"] == "us-east-2"
             depends_on = dereg_res.get("DependsOn", [])
             if isinstance(depends_on, str):
                 depends_on = [depends_on]
@@ -725,6 +765,52 @@ class TestRegionalStackSynthesis:
                 },
             )
 
+    def test_runtime_teardown_dependency_chain(self):
+        """Delete order is Helm/quiesce -> GA -> convergence -> EKS access/cluster."""
+        from gco.stacks.regional_stack import GCORegionalStack
+
+        app = cdk.App()
+        config = MockConfigLoader(app)
+        with (
+            patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
+            patch.object(
+                GCORegionalStack,
+                "_create_helm_installer_lambda",
+                TestRegionalStackSynthesis._mock_helm_installer_with_teardown,
+            ),
+        ):
+            mock_image = MagicMock()
+            mock_image.image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
+            mock_docker.return_value = mock_image
+            stack = GCORegionalStack(
+                app,
+                "test-regional-runtime-teardown-order",
+                config=config,
+                region="us-east-1",
+                auth_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:test-secret",  # nosec B106
+                env=cdk.Environment(account="123456789012", region="us-east-1"),
+            )
+
+        resources = assertions.Template.from_stack(stack).to_json()["Resources"]
+
+        def _depends_on(logical_id):
+            value = resources[logical_id].get("DependsOn", [])
+            return [value] if isinstance(value, str) else value
+
+        assert "MockHelmInstallerAccessEntry" in _depends_on("HelmInstallCharts")
+        assert any(
+            logical_id.startswith("KubectlLambdaAccessEntry")
+            for logical_id in _depends_on("HelmInstallCharts")
+        )
+        ga_id = next(
+            logical_id
+            for logical_id, resource in resources.items()
+            if logical_id.startswith("GaDeregistration")
+            and resource["Type"] == "AWS::CloudFormation::CustomResource"
+        )
+        assert ga_id in _depends_on("HelmTeardown")
+        assert "HelmInstallCharts" in _depends_on(ga_id)
+
     def test_regional_stack_creates_ecr_repositories(self):
         """Test that RegionalStack creates ECR repositories."""
 
@@ -755,8 +841,8 @@ class TestRegionalStackSynthesis:
             )
 
             template = assertions.Template.from_stack(stack)
-            # Should have 2 ECR repositories (health monitor and manifest processor)
-            template.resource_count_is("AWS::ECR::Repository", 2)
+            # Dedicated repositories for health, manifest, and inference proxy services.
+            template.resource_count_is("AWS::ECR::Repository", 3)
 
     def test_regional_stack_creates_efs(self):
         """Test that RegionalStack creates EFS file system."""
@@ -822,6 +908,254 @@ class TestRegionalStackSynthesis:
             template = assertions.Template.from_stack(stack)
             # Should have multiple IAM roles (cluster admin, node group, service account, etc.)
             template.has_resource("AWS::IAM::Role", {})
+
+    def test_health_monitor_ssm_repair_policy_is_exact(self):
+        """Health self-healing gets only Get/Put on its one global-region parameter."""
+        from gco.stacks.regional_stack import GCORegionalStack
+
+        app = cdk.App()
+        config = MockConfigLoader(app)
+        with (
+            patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
+            patch.object(
+                GCORegionalStack,
+                "_create_helm_installer_lambda",
+                TestRegionalStackSynthesis._mock_helm_installer,
+            ),
+        ):
+            mock_image = MagicMock()
+            mock_image.image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
+            mock_docker.return_value = mock_image
+            stack = GCORegionalStack(
+                app,
+                "test-health-self-healing-iam",
+                config=config,
+                region="us-east-1",
+                auth_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:test-secret",  # nosec B106
+                env=cdk.Environment(account="123456789012", region="us-east-1"),
+            )
+
+        template = assertions.Template.from_stack(stack)
+        policies = template.find_resources("AWS::IAM::Policy")
+        health_statements = [
+            statement
+            for logical_id, policy in policies.items()
+            if logical_id.startswith("HealthMonitorRoleDefaultPolicy")
+            for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+        ]
+        shared_statements = [
+            statement
+            for logical_id, policy in policies.items()
+            if logical_id.startswith("ServiceAccountRoleDefaultPolicy")
+            for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+        ]
+        matching = []
+        for statement in health_statements:
+            actions = statement.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            if set(actions) == {"ssm:GetParameter", "ssm:PutParameter"}:
+                matching.append(statement)
+
+        assert len(matching) == 1
+        assert matching[0]["Resource"] == {
+            "Fn::Join": [
+                "",
+                [
+                    "arn:",
+                    {"Ref": "AWS::Partition"},
+                    ":ssm:us-east-2:123456789012:parameter/gco-test/alb-hostname-us-east-1",
+                ],
+            ]
+        }
+        for statement in shared_statements:
+            actions = statement.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            assert "ssm:PutParameter" not in actions
+
+    def test_manifest_processor_role_owns_jobs_table_access(self):
+        """Only the manifest processor may read or mutate centralized queue records."""
+        from gco.stacks.regional_stack import GCORegionalStack
+
+        app = cdk.App()
+        config = MockConfigLoader(app)
+        with (
+            patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
+            patch.object(
+                GCORegionalStack,
+                "_create_helm_installer_lambda",
+                TestRegionalStackSynthesis._mock_helm_installer,
+            ),
+        ):
+            mock_image = MagicMock()
+            mock_image.image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
+            mock_docker.return_value = mock_image
+            stack = GCORegionalStack(
+                app,
+                "test-manifest-processor-queue-iam",
+                config=config,
+                region="us-east-1",
+                auth_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:test-secret",  # nosec B106
+                env=cdk.Environment(account="123456789012", region="us-east-1"),
+            )
+
+        policies = assertions.Template.from_stack(stack).find_resources("AWS::IAM::Policy")
+
+        def _statements(logical_id_prefix):
+            return [
+                statement
+                for logical_id, policy in policies.items()
+                if logical_id.startswith(logical_id_prefix)
+                for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+            ]
+
+        manifest_statements = _statements("ManifestProcessorRoleDefaultPolicy")
+        shared_statements = _statements("ServiceAccountRoleDefaultPolicy")
+        assert manifest_statements
+        assert shared_statements
+
+        def _partitioned_dynamodb_arn(resource_suffix):
+            return {
+                "Fn::Join": [
+                    "",
+                    [
+                        "arn:",
+                        {"Ref": "AWS::Partition"},
+                        f":dynamodb:us-east-2:123456789012:{resource_suffix}",
+                    ],
+                ]
+            }
+
+        jobs_table_arn = _partitioned_dynamodb_arn("table/gco-test-jobs")
+        jobs_index_arn = _partitioned_dynamodb_arn("table/gco-test-jobs/index/*")
+        jobs_resources = [jobs_table_arn, jobs_index_arn]
+
+        def _references_jobs(resources):
+            return any(resource in jobs_resources for resource in resources)
+
+        manifest_jobs_statements = []
+        for statement in manifest_statements:
+            resources = statement.get("Resource", [])
+            if not isinstance(resources, list):
+                resources = [resources]
+            if _references_jobs(resources):
+                manifest_jobs_statements.append(statement)
+
+        assert len(manifest_jobs_statements) == 1
+        jobs_statement = manifest_jobs_statements[0]
+        actions = jobs_statement.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        resources = jobs_statement.get("Resource", [])
+        if not isinstance(resources, list):
+            resources = [resources]
+        assert set(actions) == {
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:Query",
+            "dynamodb:Scan",
+        }
+        assert resources == jobs_resources
+
+        for statement in shared_statements:
+            actions = statement.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            resources = statement.get("Resource", [])
+            if not isinstance(resources, list):
+                resources = [resources]
+            references_jobs = _references_jobs(resources)
+            assert not references_jobs
+            assert not (
+                references_jobs
+                and {"dynamodb:PutItem", "dynamodb:UpdateItem"}.intersection(actions)
+            )
+
+    def test_inference_proxy_role_and_manifest_replacements_are_exact(self):
+        """The inference data plane gets only secret and endpoint point-read access."""
+        from gco.stacks.regional_stack import GCORegionalStack
+
+        app = cdk.App()
+        config = MockConfigLoader(app)
+        with (
+            patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
+            patch.object(
+                GCORegionalStack,
+                "_create_helm_installer_lambda",
+                TestRegionalStackSynthesis._mock_helm_installer,
+            ),
+        ):
+            mock_image = MagicMock()
+            mock_image.image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
+            mock_docker.return_value = mock_image
+            stack = GCORegionalStack(
+                app,
+                "test-inference-proxy-iam",
+                config=config,
+                region="us-east-1",
+                auth_secret_arn=(
+                    "arn:aws:secretsmanager:us-east-2:123456789012:secret:"
+                    "gco-test/api-gateway-auth-token"
+                ),
+                env=cdk.Environment(account="123456789012", region="us-east-1"),
+            )
+
+        resources = assertions.Template.from_stack(stack).to_json()["Resources"]
+        proxy_role_id = next(
+            logical_id
+            for logical_id, resource in resources.items()
+            if logical_id.startswith("InferenceProxyRole") and resource["Type"] == "AWS::IAM::Role"
+        )
+        proxy_statements = [
+            statement
+            for logical_id, policy in resources.items()
+            if logical_id.startswith("InferenceProxyRoleDefaultPolicy")
+            and policy["Type"] == "AWS::IAM::Policy"
+            for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+        ]
+        by_actions = {}
+        for statement in proxy_statements:
+            actions = statement["Action"]
+            if isinstance(actions, str):
+                actions = [actions]
+            by_actions[frozenset(actions)] = statement["Resource"]
+
+        assert set(by_actions) == {
+            frozenset({"secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"}),
+            frozenset({"dynamodb:GetItem"}),
+        }
+        assert by_actions[frozenset({"dynamodb:GetItem"})] == {
+            "Fn::Join": [
+                "",
+                [
+                    "arn:",
+                    {"Ref": "AWS::Partition"},
+                    ":dynamodb:us-east-2:123456789012:table/gco-test-inference-endpoints",
+                ],
+            ]
+        }
+        assert by_actions[
+            frozenset({"secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"})
+        ] == {
+            "Fn::Join": [
+                "",
+                [
+                    "arn:",
+                    {"Ref": "AWS::Partition"},
+                    ":secretsmanager:us-east-2:123456789012:secret:"
+                    "gco-test/api-gateway-auth-token*",
+                ],
+            ]
+        }
+
+        replacements = resources["HelmInstallCharts"]["Properties"]["ImageReplacements"]
+        assert replacements["{{INFERENCE_PROXY_IMAGE}}"] == mock_image.image_uri
+        assert replacements["{{INFERENCE_PROXY_ROLE_ARN}}"] == {
+            "Fn::GetAtt": [proxy_role_id, "Arn"]
+        }
+        assert replacements["{{INFERENCE_PROXY_MAX_REQUEST_BODY_BYTES}}"] == "1048576"
 
     def test_regional_stack_creates_lambda_functions(self):
         """Test that RegionalStack creates Lambda functions."""
@@ -1642,6 +1976,44 @@ class TestGlobalStackDynamoDBTables:
             },
         )
 
+    def test_jobs_table_stages_one_new_worker_index(self):
+        """The unified work GSI is the only index added to deployed tables."""
+        from gco.stacks.global_stack import GCOGlobalStack
+
+        app = cdk.App()
+        config = MockConfigLoader(app)
+        stack = GCOGlobalStack(app, "test-dynamodb-jobs-queue-indexes", config=config)
+
+        tables = assertions.Template.from_stack(stack).find_resources("AWS::DynamoDB::Table")
+        jobs_tables = [
+            table
+            for table in tables.values()
+            if table["Properties"].get("TableName") == "gco-test-jobs"
+        ]
+        assert len(jobs_tables) == 1
+        indexes = {
+            index["IndexName"]: index
+            for index in jobs_tables[0]["Properties"]["GlobalSecondaryIndexes"]
+        }
+
+        expected_indexes = {
+            "region-status-index",
+            "region-status-work-index",
+            "namespace-index",
+            "status-index",
+        }
+        assert set(indexes) == expected_indexes
+
+        expected_key_schemas = {
+            "region-status-work-index": [
+                {"AttributeName": "region_status", "KeyType": "HASH"},
+                {"AttributeName": "work_sort", "KeyType": "RANGE"},
+            ],
+        }
+        for index_name, key_schema in expected_key_schemas.items():
+            assert indexes[index_name]["KeySchema"] == key_schema
+            assert indexes[index_name]["Projection"] == {"ProjectionType": "ALL"}
+
     def test_global_stack_creates_backup_plan(self):
         """Test that GlobalStack creates AWS Backup plan for DynamoDB tables."""
         from gco.stacks.global_stack import GCOGlobalStack
@@ -2236,12 +2608,13 @@ class TestClusterSharedBucketRegionalIntegration:
                     found_s3_rw_on_cluster_shared = True
 
                 # KMS grant — Decrypt + GenerateDataKey, scoped via kms:ViaService
-                # to s3.<region>.amazonaws.com. The region is a token
-                # (ReadClusterSharedBucketRegion AwsCustomResource).
+                # to s3.<region>.<AWS::URLSuffix>. Both values are tokens:
+                # the cross-region reader and the partition DNS pseudo-parameter.
                 if (
                     "kms:Decrypt" in actions
                     and "kms:GenerateDataKey" in actions
                     and "ReadClusterSharedBucketRegion" in str(statement)
+                    and "AWS::URLSuffix" in str(statement)
                 ):
                     found_kms_scoped_to_cluster_shared = True
 
@@ -2442,6 +2815,12 @@ class TestRegionalStackVolcanoImageMirror:
         mirror.update(overrides)
         return cdk.App(context={"volcano_image_mirror": mirror})
 
+    @staticmethod
+    def _expected_mirror_registry(stack, namespace):
+        return stack.resolve(
+            f"{stack.account}.dkr.ecr.{stack.deployment_region}.{stack.url_suffix}/{namespace}"
+        )
+
     def test_disabled_by_default_no_override_no_cache_resources(self):
         """No context -> no registry override, and (regression) no PTC resources."""
         stack = self._build(cdk.App())
@@ -2457,9 +2836,8 @@ class TestRegionalStackVolcanoImageMirror:
 
     def test_enabled_sets_mirror_registry(self):
         stack = self._build(self._enabled_app())
-        assert (
-            stack.volcano_mirror_registry
-            == "123456789012.dkr.ecr.us-east-1.amazonaws.com/gco-test/dockerhub"
+        assert stack.resolve(stack.volcano_mirror_registry) == self._expected_mirror_registry(
+            stack, "gco-test/dockerhub"
         )
         # Still creates no pull-through cache / registry policy resources.
         template = assertions.Template.from_stack(stack)
@@ -2468,7 +2846,8 @@ class TestRegionalStackVolcanoImageMirror:
 
     def test_enabled_redirects_volcano_image_registry(self):
         """The HelmInstallCharts custom resource carries the Volcano override."""
-        template = assertions.Template.from_stack(self._build(self._enabled_app()))
+        stack = self._build(self._enabled_app())
+        template = assertions.Template.from_stack(stack)
         template.has_resource_properties(
             "AWS::CloudFormation::CustomResource",
             {
@@ -2476,8 +2855,8 @@ class TestRegionalStackVolcanoImageMirror:
                     "volcano": {
                         "values": {
                             "basic": {
-                                "image_registry": (
-                                    "123456789012.dkr.ecr.us-east-1.amazonaws.com/gco-test/dockerhub"
+                                "image_registry": self._expected_mirror_registry(
+                                    stack, "gco-test/dockerhub"
                                 )
                             }
                         }
@@ -2488,8 +2867,8 @@ class TestRegionalStackVolcanoImageMirror:
 
     def test_custom_namespace_is_honored(self):
         stack = self._build(self._enabled_app(ecr_namespace="gco-test/mirror"))
-        assert stack.volcano_mirror_registry == (
-            "123456789012.dkr.ecr.us-east-1.amazonaws.com/gco-test/mirror"
+        assert stack.resolve(stack.volcano_mirror_registry) == self._expected_mirror_registry(
+            stack, "gco-test/mirror"
         )
 
     def test_namespace_outside_project_prefix_raises(self):

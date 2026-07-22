@@ -21,6 +21,12 @@ RBAC_MANIFEST_PATH = Path("lambda/kubectl-applier-simple/manifests/02-rbac.yaml"
 READ_ONLY_VERBS = {"get", "list", "watch"}
 WRITE_VERBS = {"create", "update", "patch", "delete", "deletecollection"}
 
+ROLE_ANNOTATION = "eks.amazonaws.com/role-arn"
+SHARED_ROLE_ANNOTATION_VALUE = "{{SERVICE_ACCOUNT_ROLE_ARN}}"
+MANIFEST_PROCESSOR_ROLE_ANNOTATION_VALUE = "{{MANIFEST_PROCESSOR_ROLE_ARN}}"
+INFERENCE_PROXY_ROLE_ANNOTATION_VALUE = "{{INFERENCE_PROXY_ROLE_ARN}}"
+HEALTH_ROLE_ANNOTATION_VALUE = "{{HEALTH_MONITOR_ROLE_ARN}}"
+
 
 @pytest.fixture(scope="module")
 def rbac_docs():
@@ -105,6 +111,39 @@ class TestHealthMonitorRole:
         resource_names = {r[1] for r in resources}
         expected = {"pods", "nodes", "deployments", "services", "events", "jobs"}
         assert expected.issubset(resource_names), f"Missing resources: {expected - resource_names}"
+
+    def test_health_monitor_self_healing_is_exactly_scoped(self, rbac_docs):
+        """Gateway repair and election access stay in gco-system and named resources."""
+        role = _find_doc(rbac_docs, "Role", "gco-health-monitor-self-healing")
+        assert role is not None
+        assert role["metadata"]["namespace"] == "gco-system"
+
+        rules = {
+            (tuple(rule["apiGroups"]), tuple(rule["resources"])): rule for rule in role["rules"]
+        }
+        gateway_rule = rules[(("gateway.networking.k8s.io",), ("gateways",))]
+        assert gateway_rule["verbs"] == ["get"]
+        assert gateway_rule["resourceNames"] == ["gco-gateway"]
+
+        lease_rule = rules[(("coordination.k8s.io",), ("leases",))]
+        assert set(lease_rule["verbs"]) == {"get", "update"}
+        assert lease_rule["resourceNames"] == ["gco-health-monitor-alb-sync"]
+        assert "create" not in lease_rule["verbs"]
+
+        lease = _find_doc(rbac_docs, "Lease", "gco-health-monitor-alb-sync")
+        assert lease is not None
+        assert lease["metadata"]["namespace"] == "gco-system"
+        assert lease["spec"]["leaseDurationSeconds"] == 90
+
+        binding = _find_doc(rbac_docs, "RoleBinding", "gco-health-monitor-self-healing")
+        assert binding["roleRef"]["name"] == "gco-health-monitor-self-healing"
+        assert binding["subjects"] == [
+            {
+                "kind": "ServiceAccount",
+                "name": "gco-health-monitor-sa",
+                "namespace": "gco-system",
+            }
+        ]
 
 
 # ─── Manifest Processor Role ───────────────────────────────────────
@@ -235,7 +274,7 @@ class TestInferenceMonitorRole:
         assert role["metadata"]["namespace"] == "gco-inference"
 
     def test_inference_monitor_covers_expected_resources(self, rbac_docs):
-        """Inference monitor should manage deployments, services, ingresses, HPAs, leases."""
+        """Inference monitor manages workloads and retains legacy Ingress cleanup."""
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
         resources = _get_all_resources(role)
         resource_names = {r[1] for r in resources}
@@ -243,20 +282,23 @@ class TestInferenceMonitorRole:
         assert expected.issubset(resource_names), f"Missing resources: {expected - resource_names}"
 
     def test_inference_monitor_has_patch_verb(self, rbac_docs):
-        """patch must be granted on every resource inference-monitor updates.
-
-        Regression: inference_monitor calls apps_v1.patch_namespaced_deployment,
-        networking_v1.patch_namespaced_ingress, and autoscaling_v2.
-        patch_namespaced_horizontal_pod_autoscaler. Without patch these 403.
-        """
+        """patch must be granted on every active resource inference-monitor updates."""
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
-        patched_resources = {"deployments", "ingresses", "horizontalpodautoscalers"}
+        patched_resources = {"deployments", "horizontalpodautoscalers"}
         for rule in role.get("rules", []):
             rule_resources = set(rule.get("resources", []))
             if rule_resources & patched_resources:
                 assert "patch" in rule.get("verbs", []), (
                     f"inference-monitor rule for {rule_resources} must include patch"
                 )
+
+    def test_inference_monitor_ingress_access_is_delete_only(self, rbac_docs):
+        """Historical endpoint Ingresses may only be removed during upgrades."""
+        role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
+        ingress_rules = [rule for rule in role["rules"] if "ingresses" in rule.get("resources", [])]
+        assert len(ingress_rules) == 1
+        assert ingress_rules[0]["apiGroups"] == ["networking.k8s.io"]
+        assert ingress_rules[0]["verbs"] == ["delete"]
 
     def test_inference_monitor_covers_mooncake_resources(self, rbac_docs):
         """Mooncake disaggregated/store endpoints need statefulsets, configmaps, secrets.
@@ -281,21 +323,21 @@ class TestInferenceMonitorRole:
                 f"inference-monitor Role must grant {needed!r} for Mooncake endpoints"
             )
 
-    def test_inference_monitor_secrets_limited_to_get_and_create(self, rbac_docs):
-        """The monitor reads named admin-key Secrets and creates auto-managed ones.
+    def test_inference_monitor_secrets_have_generated_key_lifecycle_verbs(self, rbac_docs):
+        """The monitor reads named Secrets and creates/deletes generated ones.
 
-        It reads a user-supplied proxy admin-key Secret by reference and, when an
-        endpoint names none, creates a per-endpoint ``{name}-admin`` Secret with a
-        generated key. It never updates or deletes Secrets, so access is limited
-        to ``get`` + ``create`` — keeping the blast radius minimal.
+        User-supplied proxy admin-key Secrets are only read. When an endpoint
+        names none, the monitor creates ``{name}-admin`` and deletes that owned
+        Secret during endpoint teardown. It never updates or lists Secrets.
         """
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
         secrets_verbs = set()
         for rule in role.get("rules", []):
             if "secrets" in rule.get("resources", []):
                 secrets_verbs.update(rule.get("verbs", []))
-        assert secrets_verbs == {"get", "create"}, (
-            f"inference-monitor secrets access must be {{'get', 'create'}}, got {secrets_verbs}"
+        assert secrets_verbs == {"get", "create", "delete"}, (
+            "inference-monitor secrets access must be "
+            f"{{'get', 'create', 'delete'}}, got {secrets_verbs}"
         )
 
     def test_inference_monitor_statefulsets_support_full_lifecycle(self, rbac_docs):
@@ -351,6 +393,16 @@ class TestRoleBindings:
         assert len(subjects) == 1
         assert subjects[0]["name"] == "gco-inference-monitor-sa"
         assert subjects[0]["namespace"] == "gco-system"
+
+    def test_inference_proxy_has_no_kubernetes_role_binding(self, bindings):
+        """The data-plane proxy uses AWS APIs and HTTP, never the Kubernetes API."""
+        bound_service_accounts = {
+            subject["name"]
+            for binding in bindings
+            for subject in binding.get("subjects", [])
+            if subject.get("kind") == "ServiceAccount"
+        }
+        assert "gco-inference-proxy-sa" not in bound_service_accounts
 
     def test_each_binding_references_correct_role(self, rbac_docs):
         """Each binding's roleRef should point to the matching role name."""
@@ -427,6 +479,7 @@ class TestDedicatedServiceAccounts:
         "gco-health-monitor-sa",
         "gco-manifest-processor-sa",
         "gco-inference-monitor-sa",
+        "gco-inference-proxy-sa",
     ]
 
     def test_all_dedicated_sas_exist(self, service_accounts):
@@ -450,35 +503,56 @@ class TestDedicatedServiceAccounts:
                     f"SA {sa['metadata']['name']} missing project=gco label"
                 )
 
+    @pytest.mark.parametrize(
+        ("service_account_name", "expected_annotation"),
+        [
+            ("gco-health-monitor-sa", HEALTH_ROLE_ANNOTATION_VALUE),
+            ("gco-manifest-processor-sa", MANIFEST_PROCESSOR_ROLE_ANNOTATION_VALUE),
+            ("gco-inference-monitor-sa", SHARED_ROLE_ANNOTATION_VALUE),
+            ("gco-inference-proxy-sa", INFERENCE_PROXY_ROLE_ANNOTATION_VALUE),
+        ],
+    )
+    def test_service_accounts_use_matching_role_annotations(
+        self, service_accounts, service_account_name, expected_annotation
+    ):
+        service_account = next(
+            sa for sa in service_accounts if sa["metadata"]["name"] == service_account_name
+        )
+        annotations = service_account["metadata"].get("annotations") or {}
+        assert annotations[ROLE_ANNOTATION] == expected_annotation
+
+    def test_inference_proxy_disables_default_token_automount(self, service_accounts):
+        proxy_sa = next(
+            sa for sa in service_accounts if sa["metadata"]["name"] == "gco-inference-proxy-sa"
+        )
+        assert proxy_sa["automountServiceAccountToken"] is False
+
 
 # ── IRSA trust policy regression tests ─────────────────────────────────────
 #
-# Bug history: The IRSA trust policy in gco/stacks/regional_stack.py must
-# list EVERY ServiceAccount that will be annotated with the role ARN. When
-# task 10 (RBAC restructuring) introduced gco-health-monitor-sa,
-# gco-manifest-processor-sa, and gco-inference-monitor-sa with
-# `eks.amazonaws.com/role-arn` annotations pointing at the shared role,
-# the trust policy was NOT updated to include them. Result: pods crash-
-# looped with `AccessDenied` on `sts:AssumeRoleWithWebIdentity`.
+# Bug history: every IRSA annotation in the kubectl-applier manifests must
+# select a CDK role whose trust policy includes that ServiceAccount. The
+# health monitor intentionally uses a dedicated role so its narrowly-scoped
+# SSM write cannot be assumed by general platform/job workloads.
 #
-# These tests pin the invariant: every SA that carries the role-arn
-# annotation in the kubectl-applier manifests MUST also be listed in the
-# trust policy's `service_account_names` argument.
+# These tests pin every trust domain and prevent an annotation from drifting
+# away from its matching `service_account_names` list.
 
 
-ROLE_ANNOTATION = "eks.amazonaws.com/role-arn"
-ROLE_ANNOTATION_VALUE = "{{SERVICE_ACCOUNT_ROLE_ARN}}"
-
-# SAs that the CDK stack declares as trusted for the shared IRSA role.
-# Keep in sync with gco/stacks/regional_stack.py::_create_service_account_role.
-CDK_TRUSTED_SAS = frozenset(
-    {
-        "gco-service-account",
-        "gco-health-monitor-sa",
-        "gco-manifest-processor-sa",
-        "gco-inference-monitor-sa",
-    }
-)
+# SAs that the CDK stack declares as trusted for each IRSA role. Keep in
+# sync with gco/stacks/regional_stack.py::_create_service_account_role.
+CDK_TRUSTED_SAS_BY_ANNOTATION = {
+    SHARED_ROLE_ANNOTATION_VALUE: frozenset(
+        {
+            "gco-service-account",
+            "gco-inference-monitor-sa",
+        }
+    ),
+    MANIFEST_PROCESSOR_ROLE_ANNOTATION_VALUE: frozenset({"gco-manifest-processor-sa"}),
+    INFERENCE_PROXY_ROLE_ANNOTATION_VALUE: frozenset({"gco-inference-proxy-sa"}),
+    HEALTH_ROLE_ANNOTATION_VALUE: frozenset({"gco-health-monitor-sa"}),
+}
+CDK_TRUSTED_SAS = frozenset().union(*CDK_TRUSTED_SAS_BY_ANNOTATION.values())
 
 MANIFEST_DIR = Path("lambda/kubectl-applier-simple/manifests")
 
@@ -498,23 +572,24 @@ def _load_all_manifest_sas():
 
 
 class TestIRSATrustPolicyCoverage:
-    """Verify every SA annotated with the shared IRSA role ARN is listed
-    in the CDK trust policy (`service_account_names=[...]`)."""
+    """Verify each role-annotated SA is trusted by the matching CDK role."""
 
-    def test_every_annotated_sa_is_trusted_by_cdk(self):
-        """Any SA carrying the role-arn annotation must be in CDK_TRUSTED_SAS,
-        otherwise pods using that SA will crash with AccessDenied."""
-        annotated = set()
+    def test_every_annotated_sa_is_trusted_by_matching_cdk_role(self):
+        """An annotation must select a known role that trusts that exact SA."""
+        missing = []
         for filename, doc in _load_all_manifest_sas():
             annotations = doc["metadata"].get("annotations") or {}
-            if annotations.get(ROLE_ANNOTATION) == ROLE_ANNOTATION_VALUE:
-                annotated.add((filename, doc["metadata"]["name"]))
+            annotation_value = annotations.get(ROLE_ANNOTATION)
+            if not annotation_value:
+                continue
+            trusted = CDK_TRUSTED_SAS_BY_ANNOTATION.get(annotation_value)
+            name = doc["metadata"]["name"]
+            if trusted is None or name not in trusted:
+                missing.append(f"{filename}: {name} -> {annotation_value}")
 
-        missing = [f"{fn}: {name}" for fn, name in sorted(annotated) if name not in CDK_TRUSTED_SAS]
         assert not missing, (
-            "ServiceAccounts annotated with the IRSA role ARN but NOT listed in "
-            "regional_stack.py::service_account_names. Pods using these SAs will "
-            "crash-loop with AccessDenied. Missing:\n  - " + "\n  - ".join(missing)
+            "ServiceAccounts select an IRSA role that does not trust them. Missing:\n  - "
+            + "\n  - ".join(sorted(missing))
         )
 
     def test_cdk_trusted_sas_are_declared_in_manifests(self):

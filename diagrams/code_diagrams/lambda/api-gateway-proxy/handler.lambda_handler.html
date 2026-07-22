@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
         <title>API Gateway Proxy Lambda</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -16,7 +17,7 @@
                 var btn = document.getElementById("run"),
                     cd = document.getElementById("code"),
                     chart;
-                    
+
                 (btn.onclick = function () {
                     var code = cd.value;
 
@@ -115,14 +116,14 @@
                     // output download link for base64 PNG converted on download from base64
                     var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
                     document.getElementById("pngbase64").innerHTML=pngOutHtml;
-                    });    
+                    });
                     // output download link for base64 SVG converted on download from base64
                     var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
                         document.getElementById("svgbase64").innerHTML=svgOutHtml;
                     })();
 
                             };
-                 
+
 
 // derived from https://stackoverflow.com/a/64800570
 // we need to use web browser canvas to generate a image. In this case png
@@ -190,7 +191,7 @@ function base64ToSvgDocument(base64) {
     svg = svg.substring(svg.indexOf('<svg'));
     let parser = new DOMParser();
     return parser.parseFromString(svg, "image/svg+xml");
-} 
+}
         </script>
 
         <script>
@@ -205,30 +206,60 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op239=>operation: '\n    Proxy authenticated API Gateway requests to Global Accelerator.\n\n    Args:\n        event: API Gateway proxy event containing HTTP request details\n        context: Lambda context object\n\n    Returns:\n        API Gateway proxy response with status code, headers, and body\n    '
-op241=>operation: ga_endpoint = os.environ['GLOBAL_ACCELERATOR_ENDPOINT']
-op243=>operation: secret_token = get_secret_token()
-op245=>operation: http_method = event['httpMethod']
-op247=>operation: path = event['path']
-op249=>operation: query_string = event.get('queryStringParameters') or {}
-op251=>operation: headers = dict(event.get('headers') or {})
-op253=>operation: body = event.get('body') or ''
-op255=>operation: target_url = build_target_url(ga_endpoint, path, query_string)
-op257=>operation: headers['X-GCO-Auth-Token'] = secret_token
-io262=>inputoutput: output: forward_request(target_url, http_method, headers, body)
-e260=>end: end function return
+        <div><textarea id="code" style="width: 100%;" rows="11">op245=>operation: 'Proxy one IAM-authenticated request through Global Accelerator.'
+op250=>operation: signing_key = get_secret_token()
+cond247=>condition: exception raised?
+cond252=>condition: except (KeyError, RuntimeError)
+io259=>inputoutput: output: _error_response(503, 'Backend authentication is temporarily unavailable')
+e257=>end: end function return
+op265=>operation: http_method = event['httpMethod']
+op267=>operation: path = event['path']
+op269=>operation: query_string = event.get('multiValueQueryStringParameters') or event.get('queryStringParameters') or {}
+op271=>operation: headers = dict(event.get('headers') or {})
+cond274=>condition: if _pop_header(headers, 'X-GCO-Target-Region') is not None
+io281=>inputoutput: output: _error_response(400, "X-GCO-Target-Region is not supported by the global endpoint; use the target region's regional API endpoint if authorized for direct access")
+e279=>end: end function return
+op287=>operation: body = event.get('body') or ''
+cond290=>condition: if event.get('isBase64Encoded')
+io297=>inputoutput: output: _error_response(415, 'Base64-encoded request bodies are not supported')
+e295=>end: end function return
+op306=>operation: target_url = build_target_url(os.environ['GLOBAL_ACCELERATOR_ENDPOINT'], path, query_string)
+cond303=>condition: exception raised?
+cond308=>condition: except (KeyError, ValueError)
+io315=>inputoutput: output: _error_response(503, 'Global backend routing is temporarily unavailable')
+e313=>end: end function return
+op321=>operation: headers = sanitize_request_headers(headers)
+sub323=>subroutine: headers.update(build_signed_headers(signing_key, http_method, target_url, body))
+io328=>inputoutput: output: forward_request(target_url, http_method, headers, body, timeout=_get_request_timeout_seconds(context))
+e326=>end: end function return
 
-op239->op241
-op241->op243
-op243->op245
-op245->op247
-op247->op249
-op249->op251
-op251->op253
-op253->op255
-op255->op257
-op257->io262
-io262->e260
+op245->op250
+op250->cond247
+cond247(yes)->cond252
+cond252(yes)->io259
+io259->e257
+cond252(no)->op265
+op265->op267
+op267->op269
+op269->op271
+op271->cond274
+cond274(yes)->io281
+io281->e279
+cond274(no)->op287
+op287->cond290
+cond290(yes)->io297
+io297->e295
+cond290(no)->op306
+op306->cond303
+cond303(yes)->cond308
+cond308(yes)->io315
+io315->e313
+cond308(no)->op321
+op321->sub323
+sub323->io328
+io328->e326
+cond303(no)->op321
+cond247(no)->op265
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -238,6 +269,12 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <div id="canvas"></div>
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
     </body>
 </html>

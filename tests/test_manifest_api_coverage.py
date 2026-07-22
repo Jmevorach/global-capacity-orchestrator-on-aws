@@ -4,34 +4,29 @@ Coverage-focused tests for gco/services/manifest_api.py.
 Targets edge-case branches the main manifest-api suites don't hit:
 the health endpoint returning 503 when the Kubernetes API is
 unreachable (list_namespace raises), job metrics when pod-metrics
-retrieval errors out, and similar error-path branches. Shares the
-same autouse auth-cache seeding pattern as test_manifest_api.py.
+retrieval errors out, and similar error-path branches. Authentication
+is bypassed explicitly because its cryptographic behavior has dedicated tests.
 """
 
-import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from kubernetes.client.rest import ApiException
 
-# Auth token used by all tests in this module.
-_TEST_AUTH_TOKEN = "test-manifest-coverage-token"  # nosec B105 - test fixture token, not a real credential
-_AUTH_HEADERS = {"x-gco-auth-token": _TEST_AUTH_TOKEN}
+from tests._auth import bypass_backend_auth
+
+# Call sites retain a common header mapping for concise request construction;
+# authentication itself is handled by the autouse fixture below.
+_AUTH_HEADERS: dict[str, str] = {}
 
 
 @pytest.fixture(autouse=True)
-def _seed_auth_cache():
-    """Seed the auth middleware token cache with a known token."""
-    import gco.services.auth_middleware as auth_module
-
-    original_tokens = auth_module._cached_tokens
-    original_timestamp = auth_module._cache_timestamp
-    auth_module._cached_tokens = {_TEST_AUTH_TOKEN}
-    auth_module._cache_timestamp = time.time()
-    yield
-    auth_module._cached_tokens = original_tokens
-    auth_module._cache_timestamp = original_timestamp
+def _bypass_authentication():
+    """Isolate route behavior from the separately tested HMAC verifier."""
+    with bypass_backend_auth():
+        yield
 
 
 @pytest.fixture
@@ -463,34 +458,219 @@ class TestCreateJobFromTemplateEdgeCases:
 class TestPollJobsEdgeCases:
     """Tests for poll jobs endpoint edge cases."""
 
-    def test_poll_jobs_processing_error(self, mock_manifest_processor):
-        """Test poll jobs when processing fails."""
-        mock_job_store = MagicMock()
-        # The actual code uses get_queued_jobs_for_region and claim_job (singular)
-        mock_job_store.get_queued_jobs_for_region.return_value = [
-            {
-                "job_id": "abc123",
-                "job_name": "test-job",
-                "manifest": {
-                    "apiVersion": "batch/v1",
-                    "kind": "Job",
-                    "metadata": {"name": "test-job"},
-                    "spec": {
-                        "template": {
-                            "spec": {
-                                "containers": [{"name": "main", "image": "test:latest"}],
-                                "restartPolicy": "Never",
-                            }
+    @staticmethod
+    def _claimed_job_store() -> MagicMock:
+        """Return a store holding one successfully fenced queued-job claim."""
+        queued_job = {
+            "job_id": "abc123",
+            "job_name": "test-job",
+            "manifest": {
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {"name": "test-job"},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [{"name": "main", "image": "test:latest"}],
+                            "restartPolicy": "Never",
                         }
-                    },
+                    }
                 },
-                "namespace": "gco-jobs",
-            }
-        ]
-        mock_job_store.claim_job.return_value = True  # Successfully claimed
+            },
+            "namespace": "gco-jobs",
+        }
+        mock_job_store = MagicMock(claim_lease_seconds=300)
+        mock_job_store.migrate_legacy_records_for_region.return_value = {
+            "evaluated": 0,
+            "migrated": 0,
+            "failed": 0,
+            "complete": True,
+        }
+        mock_job_store.get_queued_jobs_for_region.return_value = [queued_job]
+        mock_job_store.claim_job.return_value = {
+            **queued_job,
+            "claim_token": "claim-token",
+            "claim_generation": 1,
+        }
+        mock_job_store.transition_job.return_value = {"job_id": "abc123"}
+        return mock_job_store
 
-        mock_manifest_processor.process_manifest_submission = AsyncMock(
-            side_effect=Exception("Processing error")
+    def test_poll_jobs_processing_error(self, mock_manifest_processor):
+        """Test poll jobs when deterministic Kubernetes apply raises."""
+        mock_job_store = self._claimed_job_store()
+        mock_manifest_processor.apply_queued_job.side_effect = RuntimeError("Processing error")
+
+        with (
+            patch(
+                "gco.services.manifest_api.create_manifest_processor_from_env",
+                return_value=mock_manifest_processor,
+            ),
+            patch("gco.services.manifest_api.get_template_store", return_value=MagicMock()),
+            patch("gco.services.manifest_api.get_webhook_store", return_value=MagicMock()),
+            patch("gco.services.manifest_api.get_job_store", return_value=mock_job_store),
+        ):
+            import gco.services.manifest_api as api_module
+
+            api_module.manifest_processor = mock_manifest_processor
+            api_module.job_store = mock_job_store
+
+            from gco.services.manifest_api import app
+
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post("/api/v1/queue/poll?limit=5", headers=_AUTH_HEADERS)
+                assert response.status_code == 200
+                data = response.json()
+                assert len(data["results"]) == 1
+                assert data["results"][0]["status"] == "failed"
+
+    def test_poll_jobs_ambiguous_apply_remains_retryable(self, mock_manifest_processor):
+        """An inconclusive create keeps its lease instead of becoming terminal."""
+        from gco.services.manifest_processor import RetryableQueuedJobApplyError
+
+        mock_job_store = self._claimed_job_store()
+        mock_manifest_processor.apply_queued_job.side_effect = RetryableQueuedJobApplyError(
+            "Kubernetes Job create result was inconclusive"
+        )
+
+        with (
+            patch(
+                "gco.services.manifest_api.create_manifest_processor_from_env",
+                return_value=mock_manifest_processor,
+            ),
+            patch("gco.services.manifest_api.get_template_store", return_value=MagicMock()),
+            patch("gco.services.manifest_api.get_webhook_store", return_value=MagicMock()),
+            patch("gco.services.manifest_api.get_job_store", return_value=mock_job_store),
+        ):
+            import gco.services.manifest_api as api_module
+
+            api_module.manifest_processor = mock_manifest_processor
+            api_module.job_store = mock_job_store
+
+            from gco.services.manifest_api import app
+
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post("/api/v1/queue/poll?limit=5", headers=_AUTH_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["results"][0]["status"] == "retryable"
+        # The sole transition is CLAIMED -> APPLYING; no terminal write follows.
+        assert mock_job_store.transition_job.call_count == 1
+
+    def test_preflight_validation_proves_no_kubernetes_operation_started(self):
+        """A deterministic validation rejection is explicit no-workload evidence."""
+        from gco.services.manifest_processor import (
+            ManifestProcessor,
+            QueuedJobNotCreatedError,
+        )
+
+        processor = object.__new__(ManifestProcessor)
+        processor._k8s_timeout = 10
+        processor.batch_v1 = MagicMock()
+        processor.validate_manifest = MagicMock(return_value=(False, "policy denied"))
+        processor._inject_security_defaults = MagicMock()
+        manifest = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {"name": "training"},
+        }
+
+        with pytest.raises(QueuedJobNotCreatedError, match="policy denied"):
+            processor.apply_queued_job(manifest, "gco-jobs", "queue-job-123")
+
+        processor.batch_v1.read_namespaced_job.assert_not_called()
+        processor.batch_v1.create_namespaced_job.assert_not_called()
+        processor._inject_security_defaults.assert_not_called()
+
+    def test_timeout_after_create_is_adopted_on_retry(self):
+        """A lost create response converges on the persisted deterministic Job."""
+        from gco.services.manifest_processor import (
+            ManifestProcessor,
+            RetryableQueuedJobApplyError,
+        )
+
+        processor = object.__new__(ManifestProcessor)
+        processor._k8s_timeout = 10
+        processor.batch_v1 = MagicMock()
+        processor.validate_manifest = MagicMock(return_value=(True, None))
+        processor._inject_security_defaults = MagicMock()
+
+        queue_job_id = "queue-job-123"
+        deterministic_name = processor.queued_job_name("training", queue_job_id)
+        persisted_job = MagicMock()
+        persisted_job.metadata.name = deterministic_name
+        persisted_job.metadata.namespace = "gco-jobs"
+        persisted_job.metadata.uid = "k8s-uid-after-timeout"
+        persisted_job.metadata.annotations = {"gco.io/queue-job-id": queue_job_id}
+        processor.batch_v1.read_namespaced_job.side_effect = [
+            ApiException(status=404),
+            persisted_job,
+        ]
+        processor.batch_v1.create_namespaced_job.side_effect = TimeoutError(
+            "response lost after create"
+        )
+        manifest = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {"name": "training"},
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "main", "image": "example.invalid/test:1"}],
+                        "restartPolicy": "Never",
+                    }
+                }
+            },
+        }
+
+        with pytest.raises(RetryableQueuedJobApplyError, match="inconclusive"):
+            processor.apply_queued_job(manifest, "gco-jobs", queue_job_id)
+
+        adopted = processor.apply_queued_job(manifest, "gco-jobs", queue_job_id)
+        assert adopted.status == "unchanged"
+        assert adopted.name == deterministic_name
+        assert adopted.uid == "k8s-uid-after-timeout"
+        assert processor.batch_v1.create_namespaced_job.call_count == 1
+
+    def test_poll_jobs_with_k8s_uid(self, mock_manifest_processor):
+        """Test poll jobs when Kubernetes returns a UID."""
+        mock_job_store = self._claimed_job_store()
+        mock_resource = MagicMock()
+        mock_resource.name = "test-job-queue-id"
+        mock_resource.namespace = "gco-jobs"
+        mock_resource.uid = "k8s-uid-12345"
+        mock_manifest_processor.apply_queued_job.return_value = mock_resource
+
+        with (
+            patch(
+                "gco.services.manifest_api.create_manifest_processor_from_env",
+                return_value=mock_manifest_processor,
+            ),
+            patch("gco.services.manifest_api.get_template_store", return_value=MagicMock()),
+            patch("gco.services.manifest_api.get_webhook_store", return_value=MagicMock()),
+            patch("gco.services.manifest_api.get_job_store", return_value=mock_job_store),
+        ):
+            import gco.services.manifest_api as api_module
+
+            api_module.manifest_processor = mock_manifest_processor
+            api_module.job_store = mock_job_store
+
+            from gco.services.manifest_api import app
+
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post("/api/v1/queue/poll?limit=5", headers=_AUTH_HEADERS)
+                assert response.status_code == 200
+                data = response.json()
+                assert len(data["results"]) == 1
+                assert data["results"][0]["status"] == "applied"
+                assert data["results"][0]["k8s_job_uid"] == "k8s-uid-12345"
+
+    def test_poll_jobs_submission_failed(self, mock_manifest_processor):
+        """Test poll jobs when deterministic Job validation fails."""
+        from gco.services.manifest_processor import QueuedJobNotCreatedError
+
+        mock_job_store = self._claimed_job_store()
+        mock_manifest_processor.apply_queued_job.side_effect = QueuedJobNotCreatedError(
+            "Queued Job validation failed: Validation failed; Resource limit exceeded"
         )
 
         with (
@@ -515,120 +695,9 @@ class TestPollJobsEdgeCases:
                 data = response.json()
                 assert len(data["results"]) == 1
                 assert data["results"][0]["status"] == "failed"
-
-    def test_poll_jobs_with_k8s_uid(self, mock_manifest_processor):
-        """Test poll jobs when K8s returns UID."""
-        mock_job_store = MagicMock()
-        mock_job_store.get_queued_jobs_for_region.return_value = [
-            {
-                "job_id": "abc123",
-                "job_name": "test-job",
-                "manifest": {
-                    "apiVersion": "batch/v1",
-                    "kind": "Job",
-                    "metadata": {"name": "test-job"},
-                    "spec": {
-                        "template": {
-                            "spec": {
-                                "containers": [{"name": "main", "image": "test:latest"}],
-                                "restartPolicy": "Never",
-                            }
-                        }
-                    },
-                },
-                "namespace": "gco-jobs",
-            }
-        ]
-        mock_job_store.claim_job.return_value = True
-
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.errors = []
-        mock_resource = MagicMock()
-        mock_resource.uid = "k8s-uid-12345"
-        mock_result.resources = [mock_resource]
-
-        mock_manifest_processor.process_manifest_submission = AsyncMock(return_value=mock_result)
-
-        with (
-            patch(
-                "gco.services.manifest_api.create_manifest_processor_from_env",
-                return_value=mock_manifest_processor,
-            ),
-            patch("gco.services.manifest_api.get_template_store", return_value=MagicMock()),
-            patch("gco.services.manifest_api.get_webhook_store", return_value=MagicMock()),
-            patch("gco.services.manifest_api.get_job_store", return_value=mock_job_store),
-        ):
-            import gco.services.manifest_api as api_module
-
-            api_module.manifest_processor = mock_manifest_processor
-            api_module.job_store = mock_job_store
-
-            from gco.services.manifest_api import app
-
-            with TestClient(app, raise_server_exceptions=False) as client:
-                response = client.post("/api/v1/queue/poll?limit=5", headers=_AUTH_HEADERS)
-                assert response.status_code == 200
-                data = response.json()
-                assert len(data["results"]) == 1
-                assert data["results"][0]["status"] == "applied"
-                assert data["results"][0]["k8s_uid"] == "k8s-uid-12345"
-
-    def test_poll_jobs_submission_failed(self, mock_manifest_processor):
-        """Test poll jobs when submission fails."""
-        mock_job_store = MagicMock()
-        mock_job_store.get_queued_jobs_for_region.return_value = [
-            {
-                "job_id": "abc123",
-                "job_name": "test-job",
-                "manifest": {
-                    "apiVersion": "batch/v1",
-                    "kind": "Job",
-                    "metadata": {"name": "test-job"},
-                    "spec": {
-                        "template": {
-                            "spec": {
-                                "containers": [{"name": "main", "image": "test:latest"}],
-                                "restartPolicy": "Never",
-                            }
-                        }
-                    },
-                },
-                "namespace": "gco-jobs",
-            }
-        ]
-        mock_job_store.claim_job.return_value = True
-
-        mock_result = MagicMock()
-        mock_result.success = False
-        mock_result.errors = ["Validation failed", "Resource limit exceeded"]
-        mock_result.resources = []
-
-        mock_manifest_processor.process_manifest_submission = AsyncMock(return_value=mock_result)
-
-        with (
-            patch(
-                "gco.services.manifest_api.create_manifest_processor_from_env",
-                return_value=mock_manifest_processor,
-            ),
-            patch("gco.services.manifest_api.get_template_store", return_value=MagicMock()),
-            patch("gco.services.manifest_api.get_webhook_store", return_value=MagicMock()),
-            patch("gco.services.manifest_api.get_job_store", return_value=mock_job_store),
-        ):
-            import gco.services.manifest_api as api_module
-
-            api_module.manifest_processor = mock_manifest_processor
-            api_module.job_store = mock_job_store
-
-            from gco.services.manifest_api import app
-
-            with TestClient(app, raise_server_exceptions=False) as client:
-                response = client.post("/api/v1/queue/poll?limit=5", headers=_AUTH_HEADERS)
-                assert response.status_code == 200
-                data = response.json()
-                assert len(data["results"]) == 1
-                assert data["results"][0]["status"] == "failed"
                 assert "Validation failed" in data["results"][0]["error"]
+        terminal_write = mock_job_store.transition_job.call_args_list[-1]
+        assert terminal_write.kwargs["workload_not_created"] is True
 
 
 # =============================================================================
@@ -806,6 +875,42 @@ class TestJobsLogsCoverage:
 
 
 class TestJobsEventsCoverage:
+    def test_older_than_handles_aware_and_naive_timestamps(
+        self, jobs_mock_processor, jobs_api_client
+    ):
+        old_aware = (datetime.now(UTC) - timedelta(days=10)).isoformat().replace("+00:00", "Z")
+        recent_naive = (datetime.now(UTC) - timedelta(days=1)).replace(tzinfo=None).isoformat()
+        jobs_mock_processor.list_jobs = AsyncMock(
+            return_value=[
+                {
+                    "metadata": {
+                        "name": "old",
+                        "namespace": "gco-jobs",
+                        "creationTimestamp": old_aware,
+                        "labels": {},
+                    }
+                },
+                {
+                    "metadata": {
+                        "name": "recent",
+                        "namespace": "gco-jobs",
+                        "creationTimestamp": recent_naive,
+                        "labels": {},
+                    }
+                },
+            ]
+        )
+
+        resp = jobs_api_client.request(
+            "DELETE",
+            "/api/v1/jobs",
+            json={"older_than_days": 5, "dry_run": True},
+            headers=_AUTH_HEADERS,
+        )
+
+        assert resp.status_code == 200
+        assert [job["name"] for job in resp.json()["jobs"]] == ["old"]
+
     def test_error(self, jobs_mock_processor, jobs_api_client):
         jobs_mock_processor.core_v1.list_namespaced_event.side_effect = RuntimeError("fail")
         resp = jobs_api_client.get("/api/v1/jobs/gco-jobs/j/events", headers=_AUTH_HEADERS)
@@ -914,6 +1019,29 @@ class TestJobsBulkDeleteCoverage:
             headers=_AUTH_HEADERS,
         )
         assert resp.json()["total_matched"] == 1
+
+    def test_invalid_label_selector_fails_closed(self, jobs_mock_processor, jobs_api_client):
+        jobs_mock_processor.list_jobs = AsyncMock(
+            return_value=[
+                {
+                    "metadata": {
+                        "name": "must-not-delete",
+                        "namespace": "gco-jobs",
+                        "labels": {"team": "ml"},
+                    }
+                }
+            ]
+        )
+
+        resp = jobs_api_client.request(
+            "DELETE",
+            "/api/v1/jobs",
+            json={"label_selector": "team", "dry_run": False},
+            headers=_AUTH_HEADERS,
+        )
+
+        assert resp.status_code == 400
+        jobs_mock_processor.batch_v1.delete_namespaced_job.assert_not_called()
 
     def test_error(self, jobs_mock_processor, jobs_api_client):
         jobs_mock_processor.list_jobs = AsyncMock(side_effect=RuntimeError("fail"))

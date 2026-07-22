@@ -46,7 +46,7 @@ so Global Accelerator routing works consistently.
 
 ```bash
 gco inference deploy vllm-demo \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --gpu-count 1 \
   --replicas 1 \
   --extra-args '--model' --extra-args 'facebook/opt-125m'
@@ -62,7 +62,7 @@ You can also specify spot instances for cost savings on fault-tolerant workloads
 
 ```bash
 gco inference deploy vllm-spot \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --gpu-count 1 \
   --capacity-type spot \
   --extra-args '--model' --extra-args 'facebook/opt-125m'
@@ -71,7 +71,9 @@ gco inference deploy vllm-spot \
 ## Step 3: Monitor Deployment
 
 The inference_monitor in each region picks up the DynamoDB record and creates
-the Kubernetes Deployment, Service, and Ingress on the shared ALB.
+the Kubernetes Deployment and ClusterIP Service. The shared Gateway API
+`HTTPRoute` sends `/inference/*` through the dedicated authenticated inference
+proxy; the endpoint never receives a direct ALB rule.
 
 Watch status until all regions show "running", then list every endpoint:
 
@@ -112,13 +114,19 @@ gco inference invoke vllm-demo \
   -d '{"model": "facebook/opt-125m", "prompt": "Hello!", "max_tokens": 30}'
 ```
 
-Stream the response for lower time-to-first-token:
+Stream OpenAI-compatible output as it is generated:
 
 ```bash
 gco inference invoke vllm-demo \
-  -p "Tell me about EKS Auto Mode." \
+  -p "Write a haiku about Kubernetes." \
+  --max-tokens 50 \
   --stream
 ```
+
+Raw JSON with `"stream": true` also enables incremental transport when no
+explicit flag is present. `--no-stream` overrides it and keeps the friendly
+buffered JSON/text rendering. TGI images automatically switch from `/generate`
+to `/generate_stream`. Request bodies remain buffered; only responses stream.
 
 ## Step 5: Scale the Endpoint
 
@@ -135,7 +143,7 @@ Deploy a second endpoint with HPA-based autoscaling:
 
 ```bash
 gco inference deploy vllm-auto \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --gpu-count 1 \
   --replicas 2 \
   --min-replicas 1 --max-replicas 8 \
@@ -155,7 +163,7 @@ gco inference status vllm-auto
 Update the image, then watch the rollout:
 
 ```bash
-gco inference update-image vllm-demo -i vllm/vllm-openai:v0.22.0
+gco inference update-image vllm-demo -i vllm/vllm-openai:v0.24.0
 gco inference status vllm-demo
 ```
 
@@ -166,7 +174,7 @@ Send 10% of traffic to the canary, then monitor both primary and canary:
 
 ```bash
 gco inference canary vllm-demo \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --weight 10
 gco inference status vllm-demo
 ```
@@ -236,7 +244,7 @@ entry when you are done:
 
 ```bash
 gco inference deploy llama-endpoint \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --gpu-count 1 \
   --model-source $(gco models uri llama3-8b)
 gco models delete llama3-8b -y
@@ -339,6 +347,8 @@ gco inference list
 ## Architecture
 
 ```text
+Control plane
+
                     gco inference deploy
                              |
                              v
@@ -350,28 +360,39 @@ gco inference list
      us-east-1 monitor              eu-west-1 monitor
      +----------------+             +----------------+
      | Deployment     |             | Deployment     |
-     | Service        |             | Service        |
-     | Ingress (ALB)  |             | Ingress (ALB)  |
-     | HPA (optional) |             | HPA (optional) |
-     +-------+--------+             +-------+--------+
-             |                               |
-             +----------- ALB ---------------+
-                          |
-                   Global Accelerator
-                          |
-                    API Gateway
-                   (SigV4 auth)
-                          |
-              gco inference invoke
+     | ClusterIP Svc  |             | ClusterIP Svc  |
+     | HPA/KEDA (opt) |             | HPA/KEDA (opt) |
+     +----------------+             +----------------+
+
+Authenticated request plane
+
+ gco inference invoke
+          |
+          v
+ API Gateway (SigV4) -> global proxy Lambda -> Global Accelerator
+                                                    |
+                                                    v
+                                           internal regional ALB
+                                                    |
+                                                    v
+                                 shared gco-system/gco-gateway HTTPRoute
+                                                    |
+                                                    v
+                                  authenticated inference proxy
+                                                    |
+                                                    v
+                                  endpoint ClusterIP Service -> pod
 ```
 
-All inference endpoints share the main ALB via EKS Auto Mode's
-IngressClassParams `group.name`. Pods serve at the `/inference/{name}`
-prefix natively via `--root-path`.
+Each region has one shared internal ALB registered with Global Accelerator.
+The shared `HTTPRoute` owns `/inference/*`; the dedicated inference proxy
+validates the request-bound HMAC envelope and allowlisted serving path before
+it derives and contacts the endpoint Service. There are no endpoint-specific
+routes or public model Services.
 
-The inference_monitor continuously reconciles desired state (DynamoDB) with
-actual state (Kubernetes). If a Deployment, Service, or Ingress is deleted
-or modified, the monitor recreates it automatically (self-healing).
+The inference_monitor continuously reconciles DynamoDB desired state with the
+Deployment, Service, and optional autoscaler. If a workload resource is
+missing, it is recreated.
 
 ## Quick Reference
 
@@ -381,8 +402,8 @@ or modified, the monitor recreates it automatically (self-healing).
 | `gco inference deploy NAME -i IMAGE --capacity-type spot` | Deploy on spot instances |
 | `gco inference list` | List all endpoints |
 | `gco inference status NAME` | Per-region status |
-| `gco inference invoke NAME -p "..."` | Send a prompt |
-| `gco inference invoke NAME -p "..." --stream` | Stream response |
+| `gco inference invoke NAME -p "..."` | Send a buffered prompt |
+| `gco inference invoke NAME -p "..." --stream` | Stream model output incrementally |
 | `gco inference scale NAME --replicas N` | Set replica count |
 | `gco inference update-image NAME -i IMG` | Rolling update |
 | `gco inference canary NAME -i IMG --weight 10` | Start canary deployment |

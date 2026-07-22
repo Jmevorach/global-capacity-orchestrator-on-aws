@@ -1,6 +1,8 @@
 """Inference endpoint commands."""
 
+import codecs
 import sys
+from email.message import Message
 from typing import Any
 
 import click
@@ -24,7 +26,7 @@ def inference(config: Any) -> None:
     "--image",
     "-i",
     default=None,
-    help="Container image (e.g. vllm/vllm-openai:v0.8.0). Optional with "
+    help="Container image (e.g. vllm/vllm-openai:v0.24.0). Optional with "
     "--mooncake-mode: falls back to the default upstream Mooncake-enabled vLLM image.",
 )
 @click.option(
@@ -106,6 +108,20 @@ def inference(config: Any) -> None:
     help="Decode instance count (Y in an XpYd topology) for split modes.",
 )
 @click.option(
+    "--mooncake-protocol",
+    type=click.Choice(["rdma", "tcp"]),
+    default=None,
+    help="Mooncake transfer intent. 'rdma' (the default) schedules role pods "
+    "on EFA and configures vLLM's connector protocol as 'efa'; 'tcp' is the "
+    "non-EFA fallback. Requires --mooncake-mode.",
+)
+@click.option(
+    "--mooncake-device-name",
+    default=None,
+    help="Network device passed to Mooncake (for example efa_0 or eth0). "
+    "Omit or pass an empty value for auto-detection. Requires --mooncake-mode.",
+)
+@click.option(
     "--mooncake-autoscale",
     multiple=True,
     help="Per-role Mooncake autoscaling as ROLE:MIN:MAX[:METRIC:TARGET ...], "
@@ -163,6 +179,8 @@ def inference_deploy(
     mooncake_mode: Any,
     prefill_replicas: Any,
     decode_replicas: Any,
+    mooncake_protocol: Any,
+    mooncake_device_name: Any,
     mooncake_autoscale: Any,
     mooncake_cold_tier: Any,
     mooncake_proxy_image: Any,
@@ -174,10 +192,10 @@ def inference_deploy(
     in each target region creates the Kubernetes resources automatically.
 
     Examples:
-        gco inference deploy my-llm -i vllm/vllm-openai:v0.8.0
+        gco inference deploy my-llm -i vllm/vllm-openai:v0.24.0
 
         gco inference deploy llama3-70b \\
-            -i vllm/vllm-openai:v0.8.0 \\
+            -i vllm/vllm-openai:v0.24.0 \\
             -r us-east-1 -r eu-west-1 \\
             --replicas 2 --gpu-count 4 \\
             --model-path /mnt/gco/models/llama3-70b \\
@@ -222,6 +240,23 @@ def inference_deploy(
             "max_replicas": max_replicas or 10,
             "metrics": metrics,
         }
+
+    # Transfer overrides are meaningful only when a Mooncake block is being
+    # authored. With no override, the monitor resolves the default RDMA intent
+    # to vLLM's explicit EFA connector protocol and auto-detects the device.
+    if (mooncake_protocol is not None or mooncake_device_name is not None) and not mooncake_mode:
+        formatter.print_error(
+            "--mooncake-protocol and --mooncake-device-name require --mooncake-mode."
+        )
+        sys.exit(1)
+
+    mooncake_transfer_config: dict[str, Any] | None = None
+    if mooncake_protocol is not None or mooncake_device_name is not None:
+        mooncake_transfer_config = {}
+        if mooncake_protocol is not None:
+            mooncake_transfer_config["protocol"] = mooncake_protocol
+        if mooncake_device_name is not None:
+            mooncake_transfer_config["device_name"] = mooncake_device_name
 
     # Build per-role Mooncake autoscaling config (spec.mooncake.autoscaling).
     # This is distinct from the legacy single-Deployment autoscaling above:
@@ -331,6 +366,7 @@ def inference_deploy(
             prefill_replicas=prefill_replicas,
             decode_replicas=decode_replicas,
             mooncake_store=mooncake_store_config,
+            mooncake_transfer=mooncake_transfer_config,
             mooncake_proxy=mooncake_proxy_config,
             mooncake_autoscaling=mooncake_autoscaling_config,
         )
@@ -619,7 +655,7 @@ def inference_update_image(config: Any, endpoint_name: Any, image: Any) -> None:
     Triggers a rolling update across all target regions.
 
     Examples:
-        gco inference update-image my-llm -i vllm/vllm-openai:v0.9.0
+        gco inference update-image my-llm -i vllm/vllm-openai:v0.24.0
     """
     from ..inference import get_inference_manager
 
@@ -652,7 +688,12 @@ def inference_update_image(config: Any, endpoint_name: Any, image: Any) -> None:
 @click.option(
     "--max-tokens", type=int, default=100, help="Maximum tokens to generate (default: 100)"
 )
-@click.option("--stream/--no-stream", default=False, help="Stream the response")
+@click.option(
+    "--stream/--no-stream",
+    default=None,
+    help="Enable or disable incremental response streaming. Raw JSON with "
+    "'stream': true enables streaming automatically.",
+)
 @pass_config
 def inference_invoke(
     config: Any,
@@ -666,8 +707,9 @@ def inference_invoke(
 ) -> None:
     """Send a request to an inference endpoint and print the response.
 
-    Automatically discovers the endpoint's ingress path and routes the
-    request through the API Gateway with SigV4 authentication.
+    Automatically discovers the endpoint's stored API path (the legacy
+    ``ingress_path`` record field) and routes the request through API Gateway
+    with SigV4 authentication.
 
     Examples:
         gco inference invoke my-llm -p "What is GPU orchestration?"
@@ -688,42 +730,62 @@ def inference_invoke(
         sys.exit(1)
 
     try:
-        # Look up the endpoint to get its ingress path and spec
+        # Look up the endpoint's stored API prefix and serving spec. The record
+        # retains the historical ``ingress_path`` field name for compatibility;
+        # requests still traverse only the shared authenticated Ingress.
         manager = get_inference_manager(config)
         endpoint = manager.get_endpoint(endpoint_name)
         if not endpoint:
             formatter.print_error(f"Endpoint '{endpoint_name}' not found")
             sys.exit(1)
 
-        ingress_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
+        endpoint_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
         spec = endpoint.get("spec", {})
         image = spec.get("image", "") if isinstance(spec, dict) else ""
 
-        # Auto-detect the API sub-path based on the container image
+        parsed_data: dict[str, Any] | None = None
+        if data:
+            parsed_json = _json.loads(data)
+            if not isinstance(parsed_json, dict):
+                raise ValueError("--data must contain a JSON object")
+            parsed_data = parsed_json
+
+        # An explicit flag wins over the body. Without a flag, raw OpenAI JSON
+        # can opt into streamed transport by carrying its normal stream field.
+        if stream is None:
+            stream_response = parsed_data is not None and parsed_data.get("stream") is True
+        else:
+            stream_response = bool(stream)
+        if parsed_data is not None and stream is not None:
+            parsed_data["stream"] = stream_response
+
+        # Auto-detect the API sub-path based on the container image. TGI uses a
+        # distinct route for streamed token delivery; OpenAI-compatible servers
+        # use the same route and select streaming in the JSON body.
         if api_path is None:
             if "vllm" in image:
                 api_path = "/v1/completions"
             elif "text-generation-inference" in image or "tgi" in image:
-                api_path = "/generate"
+                api_path = "/generate_stream" if stream_response else "/generate"
             elif "tritonserver" in image or "triton" in image:
                 api_path = "/v2/models"
             else:
                 api_path = "/v1/completions"
 
-        full_path = f"{ingress_path}{api_path}"
+        full_path = f"{endpoint_path}{api_path}"
 
-        # Build the request body
-        body_str: str | None = None
-        if data:
-            body_str = data
-        elif prompt:
-            # Build a sensible default body based on framework
+        # Build the request body.
+        body: dict[str, Any]
+        if parsed_data is not None:
+            body = parsed_data
+        else:
+            assert prompt is not None
             if "generate" in api_path:
-                # TGI format
-                body_dict = {"inputs": prompt, "parameters": {"max_new_tokens": max_tokens}}
+                # TGI format; /generate_stream controls response streaming.
+                body = {"inputs": prompt, "parameters": {"max_new_tokens": max_tokens}}
             elif "/v2/" in api_path:
-                # Triton — just list models, prompt not used for this path
-                body_dict = {}
+                # Triton — just list models, prompt not used for this path.
+                body = {}
             else:
                 # OpenAI-compatible (vLLM, etc.)
                 # Determine model name for OpenAI-compatible request
@@ -754,26 +816,71 @@ def inference_invoke(
                                     model_name = models_data[0]["id"]
                         except Exception:
                             pass  # Fall through to endpoint_name as model
-                body_dict = {
+                body = {
                     "model": model_name,
                     "prompt": prompt,
                     "max_tokens": max_tokens,
-                    "stream": stream,
+                    "stream": stream_response,
                 }
-            body_str = _json.dumps(body_dict)
 
-        formatter.print_info(f"POST {full_path}")
+        if stream_response:
+            # Keep streamed stdout byte-for-byte pipeline-friendly; request
+            # metadata belongs on stderr when the response itself is streamed.
+            print(f"ℹ POST {full_path}", file=sys.stderr)
+        else:
+            formatter.print_info(f"POST {full_path}")
 
-        # Make the authenticated request
+        # Make the authenticated request. ``stream=True`` prevents requests
+        # from preloading the body so chunks can reach stdout as they arrive.
         client = get_aws_client(config)
         response = client.make_authenticated_request(
-            method="POST" if body_str else "GET",
+            method="POST",
             path=full_path,
-            body=_json.loads(body_str) if body_str else None,
+            body=body,
             target_region=region,
+            stream=stream_response,
         )
 
-        # Print the response
+        if stream_response:
+            try:
+                if not response.ok:
+                    formatter.print_error(f"HTTP {response.status_code}: {response.text[:500]}")
+                    sys.exit(1)
+
+                # Requests assumes ISO-8859-1 for text/* without a declared
+                # charset. Model token streams are UTF-8 in practice, so honor
+                # only an explicit response charset and otherwise use UTF-8.
+                content_type = response.headers.get("content-type", "")
+                encoding = "utf-8"
+                if isinstance(content_type, str):
+                    parsed_content_type = Message()
+                    parsed_content_type["content-type"] = content_type
+                    declared_charset = parsed_content_type.get_content_charset()
+                    if declared_charset is not None:
+                        try:
+                            codecs.lookup(declared_charset)
+                        except LookupError:
+                            pass
+                        else:
+                            encoding = declared_charset
+
+                decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+                for chunk in response.iter_content(chunk_size=8192, decode_unicode=False):
+                    if not chunk:
+                        continue
+                    output = chunk if isinstance(chunk, str) else decoder.decode(chunk)
+                    if output:
+                        sys.stdout.write(output)
+                        sys.stdout.flush()
+                remainder = decoder.decode(b"", final=True)
+                if remainder:
+                    sys.stdout.write(remainder)
+                    sys.stdout.flush()
+            finally:
+                response.close()
+            return
+
+        # Buffered responses retain the friendly extraction used by the CLI.
         if response.ok:
             try:
                 resp_json = response.json()
@@ -831,7 +938,7 @@ def inference_canary(
     the new primary, or 'rollback' to remove it.
 
     Examples:
-        gco inference canary my-llm -i vllm/vllm-openai:v0.9.0 --weight 10
+        gco inference canary my-llm -i vllm/vllm-openai:v0.24.0 --weight 10
         gco inference canary my-llm -i new-image:latest -w 25 -r 2
     """
     from ..inference import get_inference_manager
@@ -997,10 +1104,12 @@ def inference_health(config: Any, endpoint_name: Any, region: Any) -> None:
             formatter.print_error(f"Endpoint '{endpoint_name}' not found")
             sys.exit(1)
 
-        ingress_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
+        endpoint_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
         spec = endpoint.get("spec", {})
-        health_path = spec.get("health_path", "/health") if isinstance(spec, dict) else "/health"
-        full_path = f"{ingress_path}{health_path}"
+        health_path = (
+            spec.get("health_check_path", "/health") if isinstance(spec, dict) else "/health"
+        )
+        full_path = f"{endpoint_path}{health_path}"
 
         client = get_aws_client(config)
         start = _time.monotonic()

@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
+        <title>Deterministic queued Job create-or-adopt path</title>
+        <style type="text/css">
+          .end-element { fill : #FFCCFF; }
+        </style>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/raphael/2.3.0/raphael.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/flowchart/1.17.1/flowchart.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.1/js/bootstrap.bundle.min.js"></script>
+        <!-- <script src="../release/flowchart.min.js"></script> -->
+        <script>
+
+            window.onload = function () {
+                var btn = document.getElementById("run"),
+                    cd = document.getElementById("code"),
+                    chart;
+
+                (btn.onclick = function () {
+                    var code = cd.value;
+
+                    if (chart) {
+                      chart.clean();
+                    }
+
+                    chart = flowchart.parse(code);
+                    chart.drawSVG('canvas', {
+                      'x': 0,
+                      'y': 0,
+                      'line-width': 3,
+                      //'maxWidth': 15,//ensures the flowcharts fits within a certain width
+                      'line-length': 50,
+                      'text-margin': 10,
+                      'font-size': 14,
+                      'font': 'normal',
+                      'font-family': 'Helvetica',
+                      'font-weight': 'normal',
+                      'font-color': 'black',
+                      'line-color': 'black',
+                      'element-color': 'black',
+                      'fill': 'white',
+                      'yes-text': 'yes',
+                      'no-text': 'no',
+                      'arrow-end': 'block',
+                      'scale': 1,
+                      'symbols': {
+                        'start': {
+                          'font-size': 14,
+                          'font-color': 'yellow',
+                          'element-color': 'blue',
+                          'fill': 'green',
+                          'class': 'start-element'
+                        },
+                        'inputoutput': {
+                          'font-color': 'black',
+                          'element-color': 'black',
+                          'fill': 'bisque'
+                        },
+                        'operation': {
+                          'font-color': 'black',
+                          'element-color': 'black',
+                          'fill': 'linen'
+                        },
+                        'subroutine': {
+                          'font-color': 'black',
+                          'element-color': 'blue',
+                          'fill': 'lightgreen'
+                        },
+                        'condition': {
+                          'font-color': 'red',
+                          'element-color': 'black',
+                          'fill': 'yellow'
+                        },
+                        'end':{
+                          'font-size': 20,
+                          'class': 'end-element'
+                        }
+                      },
+                      'flowstate' : {
+                        //'past' : { 'fill' : '#CCCCCC', 'font-size' : 12},
+                        //'current' : {'fill' : 'yellow', 'font-color' : 'red', 'font-weight' : 'bold'},
+                        //'future' : { 'fill' : '#FFFF99'},
+                        'request' : { 'fill' : 'blue'},
+                        'invalid': {'fill' : '#444444'},
+                        'approved' : { 'fill' : '#58C4A3', 'font-size' : 12, 'yes-text' : 'APPROVED', 'no-text' : 'n/a' },
+                        'rejected' : { 'fill' : '#C45879', 'font-size' : 12, 'yes-text' : 'n/a', 'no-text' : 'REJECTED' }
+                      }
+                    });
+                    //create base64 encoding of SVG to generate download link for title(without html or htm).SVG
+                    var currentCanvasDIV = document.getElementById('canvas')
+                    var currentDrawSVG = currentCanvasDIV.innerHTML.replaceAll('ë','e');
+
+                    const OUTsvgBASE64 = btoa(currentDrawSVG)
+                    doctitle = document.title.replace('.html','');
+                    doctitle = doctitle.replace('.htm','');
+
+
+                    var currentCanvasDIV = document.getElementById('canvas')
+                    var currentDrawSVG = currentCanvasDIV.innerHTML.replaceAll('ë','e');
+                    svgSource = currentDrawSVG
+                    svgXML = currentDrawSVG;
+                    // Use SVG Height and Width from the SVG XML to set canvas size
+                    svgXMLsubstringHeight = svgXML.substring(svgXML.indexOf('height='), svgXML.indexOf('version='));
+                    svgXMLsubstringWidth = svgXML.substring(svgXML.indexOf('width='), svgXML.indexOf('xmlns='));
+                    HeightValue = svgXMLsubstringHeight.substring(svgXMLsubstringHeight.indexOf('"')+1,svgXMLsubstringHeight.lastIndexOf('"'));
+                    WidthValue = svgXMLsubstringWidth.substring(svgXMLsubstringWidth.indexOf('"')+1,svgXMLsubstringWidth.lastIndexOf('"'));
+                    HeightValueInt = Math.round(HeightValue)
+                    WidthValueInt = Math.round(WidthValue)
+                    // setup input for base64SvgToBase64Png
+                    let svgSrc = "data:image/svg+xml;base64,"+OUTsvgBASE64;
+                    var pngBase
+                    imageUtil.base64SvgToBase64Png(svgSrc, WidthValueInt, HeightValueInt).then(pngSrc => {
+                    pngBase = pngSrc
+                    // output download link for base64 PNG converted on download from base64
+                    var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
+                    document.getElementById("pngbase64").innerHTML=pngOutHtml;
+                    });
+                    // output download link for base64 SVG converted on download from base64
+                    var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
+                        document.getElementById("svgbase64").innerHTML=svgOutHtml;
+                    })();
+
+                            };
+
+
+// derived from https://stackoverflow.com/a/64800570
+// we need to use web browser canvas to generate a image. In this case png
+let imageUtil = {};
+/**
+ * converts a base64 encoded data url SVG image to a PNG image
+ * @param originalBase64 data url of svg image
+ * @param width target width in pixel of PNG image
+ * @param secondTry used internally to prevent endless recursion
+ * @return {Promise<unknown>} resolves to png data url of the image
+ */
+imageUtil.base64SvgToBase64Png = function (originalBase64, width, height, secondTry) {
+    return new Promise(resolve => {
+        let img = document.createElement('img');
+        img.onload = function () {
+            if (!secondTry && (img.naturalWidth === 0 || img.naturalHeight === 0)) {
+                let svgDoc = base64ToSvgDocument(originalBase64);
+                let fixedDoc = fixSvgDocumentFF(svgDoc);
+                return imageUtil.base64SvgToBase64Png(svgDocumentToBase64(fixedDoc), width, height, true).then(result => {
+                    resolve(result);
+                });
+            }
+            //document.body.appendChild(img);
+            let canvas2 = document.createElement("canvas");
+            //document.body.removeChild(img);
+            canvas2.width = width;
+            canvas2.height = height;
+            let ctx = canvas2.getContext("2d");
+            ctx.drawImage(img, 0, 0, canvas2.width, canvas2.height);
+            try {
+                let data = canvas2.toDataURL('image/png');
+                resolve(data);
+            } catch (e) {
+                resolve(null);
+            }
+        };
+        img.src = originalBase64;
+    });
+}
+
+//needed because Firefox doesn't correctly handle SVG with size = 0, see https://bugzilla.mozilla.org/show_bug.cgi?id=700533
+function fixSvgDocumentFF(svgDocument) {
+    try {
+        let widthInt = parseInt(svgDocument.documentElement.width.baseVal.value) || 500;
+        let heightInt = parseInt(svgDocument.documentElement.height.baseVal.value) || 500;
+        svgDocument.documentElement.width.baseVal.newValueSpecifiedUnits(SVGLength.SVG_LENGTHTYPE_PX, widthInt);
+        svgDocument.documentElement.height.baseVal.newValueSpecifiedUnits(SVGLength.SVG_LENGTHTYPE_PX, heightInt);
+        return svgDocument;
+    } catch (e) {
+        return svgDocument;
+    }
+}
+
+function svgDocumentToBase64(svgDocument) {
+    try {
+        let base64EncodedSVG = btoa(new XMLSerializer().serializeToString(svgDocument));
+        return 'data:image/svg+xml;base64,' + base64EncodedSVG;
+    } catch (e) {
+        return null;
+    }
+}
+
+function base64ToSvgDocument(base64) {
+    let svg = atob(base64.substring(base64.indexOf('base64,') + 7));
+    svg = svg.substring(svg.indexOf('<svg'));
+    let parser = new DOMParser();
+    return parser.parseFromString(svg, "image/svg+xml");
+}
+        </script>
+
+        <script>
+            function HelpText() {
+              var x = document.getElementById("HelpTextBlock");
+              if (x.style.display === "none") {
+                x.style.display = "block";
+              } else {
+                x.style.display = "none";
+              }
+            }
+        </script>
+    </head>
+    <body>
+        <div><textarea id="code" style="width: 100%;" rows="11">op3346=>operation: 'Create or adopt exactly one deterministic ``batch/v1`` Job.\n\n        This path deliberately bypasses generic manifest upsert semantics: it\n        never deletes, renames, or replaces an existing Job. An ambiguous API\n        result is safe to retry because the same queue ID always resolves to the\n        same Kubernetes name and adoption requires the full queue ID annotation.\n        '
+op3348=>operation: manifest = copy.deepcopy(manifest_data)
+cond3351=>operation: raise ValueError("Central queue accepts only apiVersion 'batch/v1', kind 'Job'") if  manifest.get('apiVersion') != 'batch/v1' or manifest.get('kind') != 'Job'
+op3361=>operation: metadata = manifest.get('metadata')
+cond3364=>operation: raise ValueError('Queued Job metadata must be an object') if  not isinstance(metadata, dict)
+op3374=>operation: declared_namespace = metadata.get('namespace')
+cond3377=>operation: raise ValueError('Queued Job namespace does not match the queue envelope') if  declared_namespace is not None and declared_namespace != namespace
+op3387=>operation: original_name = metadata.get('name')
+cond3390=>operation: raise ValueError('Queued Job metadata.name is required') if  not isinstance(original_name, str) or not original_name
+op3400=>operation: deterministic_name = self.queued_job_name(original_name, queue_job_id)
+op3402=>operation: metadata['name'] = deterministic_name
+op3404=>operation: metadata['namespace'] = namespace
+op3406=>operation: labels = metadata.setdefault('labels', {})
+op3408=>operation: annotations = metadata.setdefault('annotations', {})
+cond3411=>operation: raise ValueError('Queued Job metadata labels and annotations must be objects') if  not isinstance(labels, dict) or not isinstance(annotations, dict)
+op3421=>operation: labels['gco.io/managed-by'] = 'central-queue'
+op3423=>operation: labels['gco.io/queue-job-key'] = hashlib.sha256(queue_job_id.encode('utf-8')).hexdigest()[:32]
+op3425=>operation: annotations['gco.io/queue-job-id'] = queue_job_id
+op3427=>operation: annotations['gco.io/original-job-name'] = original_name
+op3429=>operation: is_valid, validation_error = self.validate_manifest(manifest, namespace)
+cond3432=>operation: raise ValueError(f'Queued Job validation failed: {validation_error}') if  not is_valid
+sub3442=>subroutine: self._inject_security_defaults(manifest)
+op3445=>operation: job = self.batch_v1.read_namespaced_job(name=deterministic_name, namespace=namespace, _request_timeout=self._k8s_timeout)
+operation = 'unchanged'
+message = 'Existing deterministic Kubernetes Job adopted'
+cond3444=>condition: exception raised?
+cond3447=>condition: except ApiException as error
+cond3452=>condition: if error.status != 404
+cond3457=>operation: raise RetryableQueuedJobApplyError('Kubernetes Job lookup was inconclusive; retry deterministic adoption') from error if  _is_retryable_kubernetes_api_error(error)
+sub3467=>subroutine: raise
+op3473=>operation: job = self.batch_v1.create_namespaced_job(namespace=namespace, body=manifest, _request_timeout=self._k8s_timeout)
+operation = 'created'
+message = 'Deterministic Kubernetes Job created'
+cond3472=>condition: exception raised?
+cond3475=>condition: except ApiException as create_error
+cond3480=>condition: if create_error.status == 409
+op3487=>operation: job = self.batch_v1.read_namespaced_job(name=deterministic_name, namespace=namespace, _request_timeout=self._k8s_timeout)
+cond3484=>condition: exception raised?
+cond3489=>condition: except ApiException as adoption_error
+cond3494=>operation: raise RetryableQueuedJobApplyError('Concurrent Kubernetes Job adoption was inconclusive') from adoption_error if  adoption_error.status == 404 or _is_retryable_kubernetes_api_error(adoption_error)
+sub3504=>subroutine: raise
+cond3506=>condition: except Exception as adoption_error
+sub3510=>subroutine: raise RetryableQueuedJobApplyError('Concurrent Kubernetes Job adoption was inconclusive') from adoption_error
+op3515=>operation: operation = 'unchanged'
+op3517=>operation: message = 'Concurrent deterministic Kubernetes Job adopted'
+op3552=>operation: actual_annotations = getattr(job.metadata, 'annotations', None) or {}
+cond3555=>operation: raise RuntimeError(f'Kubernetes Job name collision for {namespace}/{deterministic_name}') if  actual_annotations.get('gco.io/queue-job-id') != queue_job_id
+op3565=>operation: uid = str(getattr(job.metadata, 'uid', '') or '')
+op3567=>operation: actual_name = str(getattr(job.metadata, 'name', '') or deterministic_name)
+op3569=>operation: actual_namespace = str(getattr(job.metadata, 'namespace', '') or namespace)
+cond3572=>operation: raise RuntimeError('Kubernetes API returned a queued Job without a UID') if  not uid
+io3585=>inputoutput: output: ResourceStatus(api_version='batch/v1', kind='Job', name=actual_name, namespace=actual_namespace, status=operation, message=message, uid=uid)
+e3583=>end: end function return
+cond3522=>condition: if _is_retryable_kubernetes_api_error(create_error)
+sub3526=>subroutine: raise RetryableQueuedJobApplyError('Kubernetes Job create result was inconclusive; retry deterministic adoption') from create_error
+sub3530=>subroutine: raise
+cond3534=>condition: except Exception as create_error
+sub3538=>subroutine: raise RetryableQueuedJobApplyError('Kubernetes Job create result was inconclusive; retry deterministic adoption') from create_error
+cond3543=>condition: except Exception as read_error
+sub3547=>subroutine: raise RetryableQueuedJobApplyError('Kubernetes Job lookup was inconclusive; retry deterministic adoption') from read_error
+
+op3346->op3348
+op3348->cond3351
+cond3351->op3361
+op3361->cond3364
+cond3364->op3374
+op3374->cond3377
+cond3377->op3387
+op3387->cond3390
+cond3390->op3400
+op3400->op3402
+op3402->op3404
+op3404->op3406
+op3406->op3408
+op3408->cond3411
+cond3411->op3421
+op3421->op3423
+op3423->op3425
+op3425->op3427
+op3427->op3429
+op3429->cond3432
+cond3432->sub3442
+sub3442->op3445
+op3445->cond3444
+cond3444(yes)->cond3447
+cond3447(yes)->cond3452
+cond3452(yes)->cond3457
+cond3457->sub3467
+cond3452(no)->op3473
+op3473->cond3472
+cond3472(yes)->cond3475
+cond3475(yes)->cond3480
+cond3480(yes)->op3487
+op3487->cond3484
+cond3484(yes)->cond3489
+cond3489(yes)->cond3494
+cond3494->sub3504
+cond3489(no)->cond3506
+cond3506(yes)->sub3510
+cond3506(no)->op3515
+op3515->op3517
+op3517->op3552
+op3552->cond3555
+cond3555->op3565
+op3565->op3567
+op3567->op3569
+op3569->cond3572
+cond3572->io3585
+io3585->e3583
+cond3484(no)->op3515
+cond3480(no)->cond3522
+cond3522(yes)->sub3526
+cond3522(no)->sub3530
+cond3475(no)->cond3534
+cond3534(yes)->sub3538
+cond3534(no)->op3552
+cond3472(no)->op3552
+cond3447(no)->cond3543
+cond3543(yes)->sub3547
+cond3543(no)->op3552
+cond3444(no)->op3552
+</textarea></div>
+        <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
+        <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
+... and the other symbols too... like sub1(right)<br/>
+You can also tweak the <b>diagram.drawSVG('diagram', {});</b> script in this file for more changes<br/>
+This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on github</a> and <a href="http://flowchart.js.org">http://flowchart.js.org</a> more documentation can be found over there.
+</div><br/><div id="svgbase64"></div>
+        <div id="pngbase64"></div>
+
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
+    </body>
+</html>

@@ -1,16 +1,14 @@
 """
 Tests for the RequestSizeLimitMiddleware on the Manifest API.
 
-Verifies the middleware rejects POST/PUT/PATCH requests whose
-Content-Length exceeds DEFAULT_MAX_REQUEST_BODY_BYTES (1 MiB) with 413,
-rejects chunked/no-Content-Length requests whose body grows past the
-limit while streaming, and leaves GET/HEAD/OPTIONS/DELETE requests
-untouched. Uses a TestClient fixture with the manifest processor and
-auth middleware token cache pre-seeded; includes a Hypothesis sweep
-over Content-Length values around the boundary.
+Verifies the middleware rejects requests using any HTTP method when their
+declared or actual body exceeds DEFAULT_MAX_REQUEST_BODY_BYTES (1 MiB),
+including chunked, missing, and deliberately under-reported Content-Length
+requests. Uses a TestClient fixture with the manifest processor mocked and
+backend signature verification bypassed; includes a Hypothesis sweep over
+Content-Length values around the boundary.
 """
 
-import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -20,24 +18,18 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from gco.services.manifest_api import DEFAULT_MAX_REQUEST_BODY_BYTES
+from tests._auth import bypass_backend_auth
 
-# Auth token used by all tests in this module.
-_TEST_AUTH_TOKEN = "test-size-limit-token"  # nosec B105 - test fixture token
-_AUTH_HEADERS = {"x-gco-auth-token": _TEST_AUTH_TOKEN}
+# Call sites retain a common header mapping for concise request construction;
+# authentication itself is handled by the autouse fixture below.
+_AUTH_HEADERS: dict[str, str] = {}
 
 
 @pytest.fixture(autouse=True)
-def _seed_auth_cache():
-    """Seed the auth middleware token cache with a known token."""
-    import gco.services.auth_middleware as auth_module
-
-    original_tokens = auth_module._cached_tokens
-    original_timestamp = auth_module._cache_timestamp
-    auth_module._cached_tokens = {_TEST_AUTH_TOKEN}
-    auth_module._cache_timestamp = time.time()
-    yield
-    auth_module._cached_tokens = original_tokens
-    auth_module._cache_timestamp = original_timestamp
+def _bypass_authentication():
+    """Isolate size-limit behavior from the separately tested HMAC verifier."""
+    with bypass_backend_auth():
+        yield
 
 
 @pytest.fixture
@@ -103,6 +95,17 @@ class TestRequestSizeLimitContentLength:
         # Should not be 413 — may be 400/422 due to validation, but not size-limited
         assert response.status_code != 413
 
+    def test_rejects_body_larger_than_underreported_content_length(self, client):
+        """Actual received bytes remain authoritative when the header lies."""
+        oversized_body = b"x" * (DEFAULT_MAX_REQUEST_BODY_BYTES + 1)
+        response = client.post(
+            "/api/v1/manifests/validate",
+            content=oversized_body,
+            headers={**_AUTH_HEADERS, "content-length": "1"},
+        )
+        assert response.status_code == 413
+        assert "exceeds maximum size" in response.json()["detail"]
+
     def test_rejects_request_at_exact_boundary(self, client):
         """Request with Content-Length exactly 1 byte over limit should get 413."""
         from gco.services.manifest_api import DEFAULT_MAX_REQUEST_BODY_BYTES
@@ -158,22 +161,46 @@ class TestRequestSizeLimitNoContentLength:
         assert response.status_code != 413
 
 
-class TestRequestSizeLimitMethodSkipping:
-    """Tests that GET/HEAD/OPTIONS/DELETE skip size checks."""
+class TestRequestSizeLimitMethodHandling:
+    """Every HTTP method is bounded, including conventionally bodyless methods."""
 
-    def test_get_requests_skip_size_check(self, client):
-        """GET requests should not be size-checked."""
-        response = client.get("/api/v1/health")
+    @pytest.mark.parametrize("method", ("GET", "HEAD", "OPTIONS"))
+    def test_bodyless_requests_proceed(self, client, method):
+        """Normal bodyless requests are unaffected by all-method enforcement."""
+        response = client.request(method, "/api/v1/health")
         assert response.status_code != 413
 
-    def test_delete_requests_skip_size_check(self, client):
-        """DELETE requests should not be size-checked."""
+    @pytest.mark.parametrize("method", ("GET", "HEAD", "OPTIONS"))
+    def test_rejects_oversized_body_for_conventionally_bodyless_methods(self, client, method):
+        """GET, HEAD, and OPTIONS cannot carry an unchecked oversized body."""
+        oversized_body = b"x" * (DEFAULT_MAX_REQUEST_BODY_BYTES + 1)
+        response = client.request(
+            method,
+            "/api/v1/health",
+            content=oversized_body,
+            headers={**_AUTH_HEADERS, "content-length": "1"},
+        )
+        assert response.status_code == 413
+
+    def test_bodyless_delete_proceeds(self, client):
+        """A normal bodyless single-job DELETE still reaches its route."""
         response = client.delete(
             "/api/v1/jobs/gco-jobs/test-job",
             headers=_AUTH_HEADERS,
         )
-        # Should not be 413 regardless of any headers
         assert response.status_code != 413
+
+    def test_rejects_oversized_bulk_delete_body(self, client):
+        """The body-bearing bulk DELETE cannot bypass streamed-byte enforcement."""
+        oversized_body = b"x" * (DEFAULT_MAX_REQUEST_BODY_BYTES + 1)
+        response = client.request(
+            "DELETE",
+            "/api/v1/jobs",
+            content=oversized_body,
+            headers={**_AUTH_HEADERS, "content-length": "1"},
+        )
+        assert response.status_code == 413
+        assert "exceeds maximum size" in response.json()["detail"]
 
 
 class TestRequestSizeLimitConfiguration:

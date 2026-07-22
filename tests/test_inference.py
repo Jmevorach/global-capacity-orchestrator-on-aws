@@ -569,7 +569,6 @@ class TestInferenceMonitor:
         monitor.apps_v1.delete_namespaced_deployment.side_effect = ApiException(status=404)
         monitor.core_v1.delete_namespaced_service.side_effect = ApiException(status=404)
         monitor.core_v1.delete_namespaced_config_map.side_effect = ApiException(status=404)
-        monitor.networking_v1.delete_namespaced_ingress.side_effect = ApiException(status=404)
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
             patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
@@ -594,30 +593,31 @@ class TestInferenceMonitor:
             "ep", "ns", _request_timeout=30
         )
         monitor.core_v1.delete_namespaced_service.assert_any_call("ep", "ns", _request_timeout=30)
-        # The single-instance Ingress is one of several the cleanup attempts
-        # (the Mooncake PD proxy Ingress is also attempted), so assert presence
-        # rather than an exact single call.
-        monitor.networking_v1.delete_namespaced_ingress.assert_any_call(
-            "inference-ep", "ns", _request_timeout=30
-        )
+        # The shared Gateway API route is never touched by endpoint deletion.
+        monitor.networking_v1.delete_namespaced_ingress.assert_not_called()
+        monitor.networking_v1.create_namespaced_ingress.assert_not_called()
 
     def test_delete_resources_tears_down_mooncake_topology(self, monitor):
         """A disaggregated endpoint's role/proxy resources are all torn down.
 
         Regression: _reconcile_deleted/_delete_resources originally only deleted
-        the single Deployment named after the endpoint, so deleting a Mooncake
-        disaggregated endpoint orphaned its prefill/decode/proxy Deployments
-        (and the GPU nodes they held). Deletion must also remove the
-        ``-prefill``/``-decode`` workers, the ``-proxy`` Deployment+Service, the
-        proxy Ingress, the per-role HPAs, and the transport ConfigMap. The
-        shared per-region mooncake-master must NOT be deleted.
+        part of the split topology. Deletion must remove the prefill/decode/proxy
+        Deployments and Services, the proxy program and transport ConfigMaps,
+        native or KEDA per-role autoscalers, and an auto-managed admin Secret.
+        The shared regional mooncake-master and a user-named admin Secret must
+        NOT be deleted.
         """
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
-            patch("gco.services.inference_monitor.client.CustomObjectsApi"),
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
         ):
             hpa = mock_hpa_api.return_value
-            monitor._delete_resources("ep", "ns")
+            custom = mock_custom_api.return_value
+            monitor._delete_resources(
+                "ep",
+                "ns",
+                {"mooncake": {"mode": "disaggregated", "proxy": {}}},
+            )
 
         deleted_deploys = {
             c.args[0] for c in monitor.apps_v1.delete_namespaced_deployment.call_args_list
@@ -627,22 +627,26 @@ class TestInferenceMonitor:
         assert "mooncake-master" not in deleted_deploys
 
         deleted_svcs = {c.args[0] for c in monitor.core_v1.delete_namespaced_service.call_args_list}
-        assert {"ep", "ep-proxy"}.issubset(deleted_svcs)
-
-        deleted_ingresses = {
-            c.args[0] for c in monitor.networking_v1.delete_namespaced_ingress.call_args_list
-        }
-        assert {"inference-ep", "inference-ep-proxy"}.issubset(deleted_ingresses)
+        assert {"ep", "ep-prefill", "ep-decode", "ep-proxy"}.issubset(deleted_svcs)
 
         deleted_cms = {
             c.args[0] for c in monitor.core_v1.delete_namespaced_config_map.call_args_list
         }
-        assert "ep-mooncake" in deleted_cms
+        assert {"ep-mooncake", "ep-pd-proxy"}.issubset(deleted_cms)
 
         deleted_hpas = {
             c.args[0] for c in hpa.delete_namespaced_horizontal_pod_autoscaler.call_args_list
         }
         assert {"ep", "ep-prefill", "ep-decode"}.issubset(deleted_hpas)
+
+        deleted_scaled_objects = {
+            c.kwargs["name"] for c in custom.delete_namespaced_custom_object.call_args_list
+        }
+        assert {"ep", "ep-prefill", "ep-decode"}.issubset(deleted_scaled_objects)
+
+        monitor.core_v1.delete_namespaced_secret.assert_called_once_with(
+            "ep-admin", "ns", _request_timeout=30
+        )
 
     def test_reconcile_deleted_detects_disaggregated_role_deployments(self, monitor, mock_store):
         """A disaggregated endpoint is detected and torn down, not skipped.
@@ -688,13 +692,52 @@ class TestInferenceMonitor:
             "spec": {"image": "img:v1", "replicas": 2},
             "namespace": "gco-inference",
         }
-        result = await monitor._reconcile_endpoint(endpoint)
+        with patch("gco.services.inference_monitor.client.CustomObjectsApi") as custom_api:
+            result = await monitor._reconcile_endpoint(endpoint)
         assert result is not None
         assert result["action"] == "create"
         monitor.apps_v1.create_namespaced_deployment.assert_called_once()
-        # Service created in inference namespace
+
+        # Endpoint reconciliation creates only an internal ClusterIP Service.
         monitor.core_v1.create_namespaced_service.assert_called_once()
+        service = monitor.core_v1.create_namespaced_service.call_args.args[1]
+        assert service.spec.type == "ClusterIP"
+
+        # The shared gco-system/gco-gateway HTTPRoute owns /inference; the
+        # endpoint controller creates no Ingress, Gateway, or HTTPRoute.
+        monitor.networking_v1.create_namespaced_ingress.assert_not_called()
+        monitor.networking_v1.patch_namespaced_ingress.assert_not_called()
+        custom_api.return_value.create_namespaced_custom_object.assert_not_called()
         mock_store.update_region_status.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_rejects_persisted_mooncake_canary_spec(self, monitor, mock_store):
+        endpoint = {
+            "endpoint_name": "invalid-ep",
+            "desired_state": "running",
+            "target_regions": ["us-east-1"],
+            "spec": {
+                "image": "img:v1",
+                "mooncake": {"mode": "store"},
+                "canary": {"image": "img:v2", "weight": 10},
+            },
+            "namespace": "gco-inference",
+        }
+
+        result = await monitor._reconcile_endpoint(endpoint)
+
+        assert result == {
+            "action": "reject",
+            "endpoint": "invalid-ep",
+            "reason": "invalid_spec",
+        }
+        mock_store.update_region_status.assert_called_once_with(
+            "invalid-ep",
+            "us-east-1",
+            "failed",
+            error="endpoint spec cannot combine 'mooncake' and 'canary' blocks",
+        )
+        monitor.apps_v1.create_namespaced_deployment.assert_not_called()
 
     # -- _reconcile_endpoint: scale --
 
@@ -744,13 +787,25 @@ class TestInferenceMonitor:
     # -- _reconcile_endpoint: cleanup when region removed --
 
     @pytest.mark.asyncio
-    async def test_reconcile_cleans_up_when_region_removed(self, monitor, mock_store):
-        monitor.apps_v1.read_namespaced_deployment.return_value = MagicMock()
+    async def test_reconcile_cleans_up_split_endpoint_when_region_removed(
+        self, monitor, mock_store
+    ):
+        from kubernetes.client.rest import ApiException
+
+        def _read(deployment_name, _namespace, **_kwargs):
+            if deployment_name == "removed-ep-prefill":
+                return MagicMock()
+            raise ApiException(status=404)
+
+        monitor.apps_v1.read_namespaced_deployment.side_effect = _read
         endpoint = {
             "endpoint_name": "removed-ep",
             "desired_state": "running",
             "target_regions": ["eu-west-1"],  # us-east-1 not in list
-            "spec": {"image": "img:v1"},
+            "spec": {
+                "image": "img:v1",
+                "mooncake": {"mode": "disaggregated", "proxy": {}},
+            },
             "namespace": "gco-inference",
         }
         with (
@@ -1102,12 +1157,33 @@ class TestInferenceManager:
     # -- update_image --
 
     def test_update_image_success(self, manager, mock_store_instance):
-        mock_store_instance.get_endpoint.return_value = {"spec": {"image": "old:v1", "replicas": 2}}
+        original_spec = {
+            "image": "old:v1",
+            "replicas": 2,
+            "region_image_uris": {"us-east-1": "regional-old:v1"},
+            "env": {"MODEL_REVISION": "stable"},
+        }
+        mock_store_instance.get_endpoint.return_value = {"spec": original_spec}
         mock_store_instance.update_spec.return_value = {"endpoint_name": "ep"}
-        result = manager.update_image("ep", "new:v2")
+
+        result = manager.update_image("ep", " new:v2 ")
+
         assert result is not None
-        call_args = mock_store_instance.update_spec.call_args
-        assert call_args[0][1]["image"] == "new:v2"
+        submitted_spec = mock_store_instance.update_spec.call_args.args[1]
+        assert submitted_spec["image"] == "new:v2"
+        assert "region_image_uris" not in submitted_spec
+        assert submitted_spec is not original_spec
+        assert submitted_spec["env"] is not original_spec["env"]
+        assert original_spec["image"] == "old:v1"
+        assert "region_image_uris" in original_spec
+
+    @pytest.mark.parametrize("image", [None, "", "   ", 123])
+    def test_update_image_rejects_invalid_image(self, manager, mock_store_instance, image):
+        with pytest.raises(ValueError, match="Image must be a non-empty string"):
+            manager.update_image("ep", image)
+
+        mock_store_instance.get_endpoint.assert_not_called()
+        mock_store_instance.update_spec.assert_not_called()
 
     def test_update_image_not_found(self, manager, mock_store_instance):
         mock_store_instance.get_endpoint.return_value = None

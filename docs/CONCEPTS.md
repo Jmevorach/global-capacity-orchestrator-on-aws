@@ -19,6 +19,9 @@ This guide explains the fundamental concepts behind Global Capacity Orchestrator
   - [EFS (Elastic File System)](#efs-elastic-file-system)
   - [FSx for Lustre](#fsx-for-lustre)
 - [Security Model](#security-model)
+- [API Access Modes](#api-access-modes)
+  - [Global API (Default)](#global-api-default)
+  - [Regional API Bridge and Direct Access](#regional-api-bridge-and-direct-access)
 - [How Components Work Together](#how-components-work-together)
 - [Common Workflows](#common-workflows)
 
@@ -26,13 +29,14 @@ This guide explains the fundamental concepts behind Global Capacity Orchestrator
 
 GCO is a **multi-region Kubernetes platform** built on AWS EKS Auto Mode, designed specifically for AI/ML workloads that need GPU compute. It provides:
 
-- A single API endpoint that routes jobs to the best available region
-- Automatic GPU node provisioning (no manual scaling)
+- In commercial `aws`, one IAM-authenticated workload API with health-based regional failover; in other partitions, IAM-authenticated regional workload APIs
+- Capacity-aware CLI and queue workflows for selecting a target region
+- Automatic GPU node provisioning through EKS Auto Mode and purpose-built NodePools
 - Inference endpoint management across regions with a single command
 - Shared storage for job outputs that persists after pods terminate
 - Production-ready security with IAM authentication
 
-Think of it as a "GPU job submission service" — you submit a Kubernetes manifest, and GCO handles finding capacity, provisioning nodes, running your job, and storing outputs. For inference, you deploy an endpoint once and GCO serves it globally with automatic failover.
+Think of it as a GPU workload platform: you submit a Kubernetes manifest, and GCO validates it, provisions matching nodes, runs it, and can persist outputs when the workload mounts shared storage. Capacity-aware CLI/queue workflows can choose a Region. In commercial `aws`, the global workload API routes by network health and latency rather than inspecting GPU inventory; other partitions use explicitly selected regional workload APIs. For inference, GCO reconciles long-running endpoints across selected Regions and, in `aws`, provides health-based global failover.
 
 ## The Problem It Solves
 
@@ -40,19 +44,19 @@ Running GPU workloads at scale on Kubernetes is hard:
 
 | Challenge | Without GCO | With GCO |
 |-----------|-----------------|--------------|
-| GPU availability | Manually check each region | Auto-routes to available capacity |
+| GPU availability | Manually check each region | Capacity tools and auto-region workflows compare configured regions |
 | Node provisioning | Pre-provision or wait for scaling | EKS Auto Mode provisions on-demand |
-| Multi-region | Manage multiple clusters separately | Single API, automatic routing |
+| Multi-region | Manage multiple clusters separately | One platform across unlimited SDK-known Regions in one partition |
 | Authentication | Configure per-cluster access | IAM-based, works with existing AWS credentials |
-| Job outputs | Lost when pods terminate | Persisted to EFS/FSx storage |
-| Inference serving | Deploy and manage per-region | Deploy once, serve globally with auto-failover |
-| Failover | Manual intervention | Automatic via Global Accelerator |
+| Job outputs | Lost unless persisted | EFS/FSx available for workloads that mount persistent storage |
+| Inference serving | Deploy and manage per-region | Deploy once across selected Regions; global failover in `aws` |
+| Failover | Manual intervention | Automatic via Global Accelerator in `aws`; explicit regional selection elsewhere |
 
 ## Key Concepts
 
 ### Multi-Region Architecture
 
-GCO deploys identical infrastructure to multiple AWS regions:
+GCO deploys identical infrastructure to multiple AWS Regions in one AWS partition. In the commercial `aws` partition, workload traffic can use this global topology:
 
 ```text
                     ┌─────────────────────┐
@@ -69,14 +73,16 @@ GCO deploys identical infrastructure to multiple AWS regions:
     └─────────────┘     └─────────────┘     └─────────────┘
 ```
 
-Each region is independent - if one region has issues, traffic automatically routes to healthy regions.
+Other AWS partitions omit Global Accelerator and its workload proxy routes. Their global API remains available for aggregate operations, while callers use each selected Region's IAM-authenticated API bridge for control-plane and inference traffic.
+
+Each Region is independent. In `aws`, Global Accelerator routes new requests away from unhealthy registered Regions; elsewhere, clients select another healthy regional endpoint.
 
 ### EKS Auto Mode
 
 EKS Auto Mode is AWS's fully managed Kubernetes compute. Unlike traditional EKS where you manage node groups, Auto Mode:
 
 - **Automatically provisions nodes** when pods are pending
-- **Scales to zero** when no workloads are running (cost savings)
+- **Scales workload capacity down** when demand disappears, subject to NodePool and system-workload constraints
 - **Handles node updates** and security patches
 - **Supports GPU instances** via nodepools
 
@@ -86,14 +92,17 @@ You don't manage EC2 instances directly - you define what you need (CPU, memory,
 
 Nodepools define what types of nodes can be provisioned. GCO creates several:
 
-| nodepool | Purpose | Instance Types |
-|----------|---------|----------------|
-| `system` | Kubernetes system components | Managed by EKS |
-| `general-purpose` | Standard workloads | Various CPU instances |
-| `gpu-x86` | NVIDIA GPU workloads | g4dn, g5 (T4, A10G GPUs) |
-| `gpu-arm` | ARM64 GPU workloads | g5g (T4g GPUs) |
-| `inference` | Long-running inference endpoints | Same as gpu-x86, WhenEmpty consolidation |
-| `gpu-efa-pool` | Distributed training and high-performance inference | p4d, p5 (A100, H100 with EFA) |
+| NodePool | Purpose | Typical constraints |
+|----------|---------|---------------------|
+| `system` | EKS Auto Mode system components | AWS-managed built-in |
+| `general-purpose` | Standard workloads | AWS-managed built-in |
+| `gpu-x86-pool` | NVIDIA x86 GPU workloads | g4dn/g5 and configured GPU families |
+| `gpu-arm-pool` | NVIDIA ARM64 GPU workloads | g5g |
+| `gpu-inference-pool` | Long-running inference endpoints | conservative disruption/consolidation |
+| `gpu-efa-pool` | Distributed GPU workloads | EFA-capable GPU families |
+| `mooncake-efa-pool` | Disaggregated Mooncake inference | EFA/RDMA placement |
+| `neuron-pool` | Inferentia and Trainium workloads | AWS Neuron devices |
+| `cpu-general-pool` | Project-scoped CPU workloads | configured CPU families and limits |
 
 When you submit a job requesting a GPU, EKS Auto Mode finds the right nodepool and provisions an appropriate instance.
 
@@ -102,7 +111,7 @@ When you submit a job requesting a GPU, EKS Auto Mode finds the right nodepool a
 A "manifest" is a Kubernetes YAML file describing your workload. GCO accepts manifests via:
 
 1. **SQS Queue** (recommended for production) - Reliable, region-targeted submission
-2. **API Gateway** - IAM-authenticated REST API with global routing
+2. **API Gateway** - IAM-authenticated REST APIs: a global workload path in `aws`, aggregate-only globally plus regional workload bridges elsewhere
 3. **DynamoDB Job Queue** - Centralized global queue with priority, status tracking, and audit trail
 4. **Direct kubectl** - Requires cluster access, good for development
 
@@ -119,7 +128,7 @@ spec:
     spec:
       containers:
       - name: trainer
-        image: my-training-image:latest
+        image: my-training-image:v1.0.0
         resources:
           limits:
             nvidia.com/gpu: 1
@@ -128,14 +137,14 @@ spec:
 
 ### Global Routing
 
-AWS Global Accelerator provides a single endpoint that routes to the nearest healthy region:
+AWS Global Accelerator is the backend regional-routing layer behind the global workload API in the commercial `aws` partition:
 
-1. User submits job to global endpoint
-2. Global Accelerator checks health of each region
-3. Routes to nearest healthy region (lowest latency)
-4. If a region fails, automatically routes to next-best region
+1. A user sends a SigV4-signed request to the global API Gateway
+2. The proxy Lambda adds a request-bound HMAC envelope
+3. Global Accelerator evaluates registered internal ALBs using health, endpoint weights, and network proximity
+4. If an endpoint is unhealthy, it routes new requests to another healthy registered region
 
-This happens transparently - you always use the same endpoint.
+This routing is transparent to the client, but it is not a GPU-capacity scheduler. Use `gco capacity` and auto-region queue/CLI workflows when placement must consider available accelerator capacity. Outside `aws`, these accelerator resources and workload routes are omitted; clients call an authorized regional bridge and choose failover explicitly.
 
 ## Inference Serving
 
@@ -145,34 +154,35 @@ Beyond batch GPU jobs, GCO supports long-running inference endpoints — deploy 
 
 Inference serving uses a reconciliation pattern similar to Kubernetes controllers:
 
-1. You run `gco inference deploy my-llm -i vllm/vllm-openai:v0.22.0 --gpu-count 1`
+1. You run `gco inference deploy my-llm -i vllm/vllm-openai:v0.24.0 --gpu-count 1`
 2. The CLI writes the endpoint spec to a DynamoDB table (desired state)
 3. An `inference_monitor` service running in each target region polls the table
-4. The monitor creates Kubernetes Deployments, Services, and Ingress rules to match the desired state
-5. If anything drifts (pod deleted, resource missing), the monitor self-heals by recreating it
-6. Global Accelerator routes user requests to the nearest healthy region
+4. The monitor creates Kubernetes Deployments, Services, scaling objects, and supporting configuration to match the desired state
+5. The shared Gateway API `HTTPRoute` sends authenticated `/inference/*` traffic to the dedicated inference proxy, which validates the route and streams from the endpoint Service; per-endpoint public routes are not created
+6. If anything drifts (pod deleted, resource missing), the monitor self-heals by recreating it
+7. In `aws`, Global Accelerator routes proxy-signed requests to a healthy Region; elsewhere, callers invoke the selected regional API
 
 ```text
-gco inference deploy
-        │
-        ▼
-  DynamoDB (desired state)
-        │
-        ▼ (each region polls)
-  ┌──────────┐    ┌──────────┐
-  │us-east-1 │    │eu-west-1 │
-  │Deployment│    │Deployment│
-  │Service   │    │Service   │
-  │Ingress   │    │Ingress   │
-  └────┬─────┘    └────┬─────┘
-       └──────┬────────┘
-              ▼
-     Global Accelerator
-              │
-         End Users
+Control plane:
+  gco inference deploy → DynamoDB desired state
+                              │
+                              ├─→ us-east-1 monitor → Deployment + Service
+                              └─→ eu-west-1 monitor → Deployment + Service
+
+Request path in commercial `aws`:
+  Client → API Gateway streaming Lambda → Global Accelerator → Internal ALB
+                                                   │
+                                                   ▼
+                                      Authenticated inference proxy
+                                                   │
+                                                   ▼
+                                        Endpoint Service → model pods
+
+Request path in other partitions:
+  Client → Regional API Gateway → streaming VPC Lambda → Internal ALB
 ```
 
-All inference endpoints share the same ALB as the main GCO services — one ALB per region, cost-efficient, and already registered with Global Accelerator.
+All inference endpoints share the same ALB as the main GCO services—one ALB per Region and cost-efficient. In `aws`, that ALB is registered with Global Accelerator; in other partitions it is reached by the regional VPC proxies.
 
 Key capabilities:
 
@@ -264,19 +274,26 @@ GCO uses multiple security layers:
 └─────────────────────────────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────┐
-│ Layer 2: Secret Header                                  │
-│ - Lambda adds secret token from Secrets Manager         │
-│ - Token rotates daily (zero-downtime)                   │
+│ Layer 2: Request-Bound HMAC                             │
+│ - Lambda signs method, target, timestamp, nonce, body   │
+│ - Rotating key remains in trusted components            │
 └─────────────────────────────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────┐
-│ Layer 3: Network Isolation                              │
-│ - ALBs only accept Global Accelerator IPs               │
-│ - EKS runs in private subnets                           │
+│ Layer 3: Authenticated Backend TLS                      │
+│ - Private-root TLS with explicit SNI/hostname checks    │
+│ - Global Accelerator passes TCP/443 in `aws`; regional │
+│   VPC proxies connect directly in other partitions     │
 └─────────────────────────────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────┐
-│ Layer 4: Kubernetes RBAC                                │
+│ Layer 4: Network Isolation                              │
+│ - Regional platform ALBs are internal                   │
+│ - EKS nodes and service endpoints use private subnets   │
+└─────────────────────────────────────────────────────────┘
+                          │
+┌─────────────────────────▼───────────────────────────────┐
+│ Layer 5: Kubernetes RBAC                                │
 │ - Service accounts with least-privilege                 │
 │ - Namespace isolation for user jobs                     │
 └─────────────────────────────────────────────────────────┘
@@ -284,9 +301,12 @@ GCO uses multiple security layers:
 
 **Key points:**
 
-- All requests must be signed with AWS credentials
-- No anonymous access
-- Jobs run in isolated `gco-jobs` namespace
+- All public requests must be signed with AWS credentials
+- Backend TLS clients trust only the deployment's public root bundle and assert `backend.<project>.gco.internal`
+- The root private key remains in a customer-managed-KMS-encrypted secret readable only by the certificate manager
+- Backend requests must carry a fresh, integrity-bound HMAC envelope; HMAC is not encryption
+- Reused nonces, stale timestamps, body changes, and target changes are rejected
+- Jobs run in the isolated `gco-jobs` namespace
 - Platform services run in `gco-system` namespace
 
 ## API Access Modes
@@ -295,43 +315,64 @@ GCO supports two API access modes:
 
 ### Global API (Default)
 
-The default mode routes all requests through a global API Gateway and Global Accelerator:
+In the commercial `aws` partition, the default workload mode routes requests
+through the edge-optimized global API Gateway and Global Accelerator to an
+internal ALB. AWS-managed TLS protects the client hop; the proxy then uses
+deployment-local private-root TLS through the Layer 4 accelerator to the ALB:
 
 ```text
-User → Global API Gateway → Global Accelerator → Regional ALB → EKS
+User → Global API Gateway → HMAC-signing Lambda → Global Accelerator (TCP/443)
+  → Internal Regional ALB (private-root TLS) → EKS pod (HTTP)
 ```
 
-**Pros:**
+Outside `aws`, this global workload route is not created; the global API is regional and aggregate-only, and workload traffic uses the regional mode below.
 
-- Single global endpoint
-- Automatic failover between regions
-- Edge caching via CloudFront
+**Pros in `aws`:**
 
-**Cons:**
-
-- Requires public ALB exposure
-- Traffic routes through Global Accelerator
-
-### Regional API (Private Access)
-
-When public access is disabled, regional API Gateways provide direct access via VPC Lambdas:
-
-```text
-User → Regional API Gateway → VPC Lambda → Internal ALB → EKS
-```
-
-**Pros:**
-
+- Single IAM-authenticated endpoint
+- Health-based failover between registered regions
+- AWS-managed edge termination and network acceleration (dynamic API responses are not CloudFront-cached)
 - No public ALB exposure
-- Direct regional access
-- Maximum security posture
 
 **Cons:**
 
-- Must specify target region
-- No automatic cross-region failover
+- One shared API Gateway stage throttle and proxy hop
+- Global Accelerator selects by health/traffic policy, not GPU inventory
 
-**Enable Regional APIs:**
+### Regional API Bridge and Direct Access
+
+Every region has a regional API Gateway bridge so the centralized aggregator
+can reach its private ALB. Aggregator fan-out uses AWS-managed TLS and SigV4:
+
+```text
+Aggregator → Regional API Gateway → HMAC-signing VPC Lambda
+  → Internal Regional ALB (private-root TLS) → EKS pod (HTTP)
+```
+
+The bridge resource policy always admits the exact aggregator role. In the
+commercial `aws` partition, `regional_api_enabled=true` additionally allows
+IAM-authorized principals from the deployment account to invoke the
+region-pinned endpoint directly. In other partitions that same-account policy
+is enabled automatically because Global Accelerator is omitted:
+
+```text
+User (optional in `aws`; required ingress elsewhere) → Regional API Gateway → HMAC-signing VPC Lambda
+  → Internal Regional ALB (private-root TLS) → EKS pod (HTTP)
+```
+
+**Pros:**
+
+- Direct, explicitly selected regional route
+- Same IAM and request-bound HMAC model as the global path
+- Useful for deterministic regional operations
+
+**Cons:**
+
+- Separate endpoint per region
+- No automatic cross-region failover on a directly invoked endpoint
+- Direct callers require the explicit resource-policy opt-in in `aws`; other partitions enable it automatically
+
+**Enable Direct Regional Access in `aws`:**
 
 ```json
 // cdk.json
@@ -363,14 +404,14 @@ Here's what happens when you submit a job:
 2. CLI signs request with your AWS credentials (SigV4)
    └─► API Gateway validates your IAM permissions
 
-3. Lambda proxy adds secret header
-   └─► Ensures request came through authenticated path
+3. Lambda proxy signs the exact backend request
+   └─► Binds timestamp, nonce, method, target, and body digest without sending the key
 
-4. Global Accelerator routes to nearest healthy region
-   └─► Checks ALB health in each region
+4. In `aws`, private-root TLS traverses Global Accelerator to a healthy regional ALB; elsewhere, a regional VPC proxy connects directly
+   └─► Global Accelerator forwards TCP/443 without termination when present
 
-5. Regional ALB receives request
-   └─► Validates it came from Global Accelerator
+5. The ALB terminates TLS and forwards HTTP to the service
+   └─► Backend middleware verifies freshness, integrity, and nonce replay
 
 6. Manifest Processor pod processes the job
    └─► Validates YAML, applies to Kubernetes
@@ -458,7 +499,7 @@ GCO supports long-running inference endpoints across regions with automatic reco
 
 ```bash
 # Deploy a vLLM endpoint
-gco inference deploy my-llm -i vllm/vllm-openai:v0.22.0 --gpu-count 1
+gco inference deploy my-llm -i vllm/vllm-openai:v0.24.0 --gpu-count 1
 
 # Check status
 gco inference status my-llm

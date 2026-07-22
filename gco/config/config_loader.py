@@ -32,6 +32,13 @@ import boto3
 from aws_cdk import App
 
 from gco.models import ClusterConfig, ResourceThresholds
+from gco.stacks.constants import (
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
+    known_cloudformation_regions,
+    validated_deployment_partition,
+    validated_regional_deployment_regions,
+    validated_request_body_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,23 +54,10 @@ class ConfigLoader:
     Loads and validates configuration from CDK context (cdk.json)
     """
 
-    # Valid AWS regions (subset of commonly used regions)
-    VALID_REGIONS = {
-        "us-east-1",
-        "us-east-2",
-        "us-west-1",
-        "us-west-2",
-        "eu-west-1",
-        "eu-west-2",
-        "eu-west-3",
-        "eu-central-1",
-        "ap-southeast-1",
-        "ap-southeast-2",
-        "ap-northeast-1",
-        "ap-northeast-2",
-        "ca-central-1",
-        "sa-east-1",
-    }
+    # Keep the public class attribute for compatibility. Endpoint metadata
+    # covers every CloudFormation Region known to the installed AWS SDK; this
+    # is not a project-specific allowlist.
+    VALID_REGIONS = known_cloudformation_regions()
 
     def __init__(self, app: App):
         self.app = app
@@ -92,9 +86,9 @@ class ConfigLoader:
 
         # Check for deployment_regions
         deployment_regions = self.app.node.try_get_context("deployment_regions")
-        if not deployment_regions:
+        if not isinstance(deployment_regions, dict) or not deployment_regions:
             raise ConfigValidationError(
-                "Required configuration field 'deployment_regions' is missing"
+                "Required configuration field 'deployment_regions' must be a non-empty object"
             )
 
         # Validate regions
@@ -105,6 +99,9 @@ class ConfigLoader:
 
         # Validate Global Accelerator config
         self._validate_global_accelerator_config()
+
+        # Validate deployment-local backend TLS rotation policy
+        self._validate_backend_tls_config()
 
         # Validate ALB config
         self._validate_alb_config()
@@ -159,24 +156,30 @@ class ConfigLoader:
             )
 
     def _validate_regions(self) -> None:
-        """Validate region configuration"""
-        regions = self.get_regions()
-
-        if not regions:
-            raise ConfigValidationError("At least one region must be specified")
-
-        if len(regions) > 10:
-            raise ConfigValidationError("Maximum of 10 regions supported")
-
-        for region in regions:
-            if region not in self.VALID_REGIONS:
-                raise ConfigValidationError(
-                    f"Invalid region '{region}'. Valid regions: {sorted(self.VALID_REGIONS)}"
+        """Validate region configuration against the shared app/CLI contract."""
+        deployment_regions = self.get_deployment_regions()
+        try:
+            for field in ("global", "api_gateway", "monitoring"):
+                region = deployment_regions[field]
+                if not isinstance(region, str) or region not in self.VALID_REGIONS:
+                    raise ValueError(
+                        f"Invalid {field} region {region!r}; expected an AWS region with a "
+                        "CloudFormation endpoint known to the installed SDK"
+                    )
+            regional = validated_regional_deployment_regions(
+                deployment_regions["regional"],
+                known_regions=self.VALID_REGIONS,
+            )
+            validated_deployment_partition(
+                (
+                    deployment_regions["global"],
+                    deployment_regions["api_gateway"],
+                    deployment_regions["monitoring"],
+                    *regional,
                 )
-
-        # Check for duplicates
-        if len(regions) != len(set(regions)):
-            raise ConfigValidationError("Duplicate regions found in configuration")
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise ConfigValidationError(str(exc)) from exc
 
     def _validate_resource_thresholds(self) -> None:
         """Validate resource threshold configuration"""
@@ -247,6 +250,56 @@ class ConfigLoader:
                     f"client_affinity must be one of {sorted(allowed_affinity)}, got {value!r}"
                 )
 
+    def _validate_backend_tls_config(self) -> None:
+        """Validate private-root and leaf-certificate lifecycle settings."""
+        config = self.get_backend_tls_config()
+        ranges = {
+            "root_generation": (1, 1_000_000),
+            "root_validity_days": (365, 36_500),
+            "root_rotate_before_days": (30, 3_650),
+            "root_activation_delay_hours": (1, 168),
+            "root_overlap_days": (2, 365),
+            "leaf_validity_days": (2, 397),
+            "leaf_rotate_before_days": (1, 90),
+            "rotation_schedule_hours": (1, 24),
+            "trust_cache_ttl_seconds": (1, 3_600),
+            "trust_cache_max_stale_seconds": (1, 86_400),
+        }
+        for field, (minimum, maximum) in ranges.items():
+            value = config.get(field)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ConfigValidationError(
+                    f"backend_tls.{field} must be an integer between "
+                    f"{minimum} and {maximum}, got {value!r}"
+                )
+
+        if config["root_rotate_before_days"] >= config["root_validity_days"]:
+            raise ConfigValidationError(
+                "backend_tls.root_rotate_before_days must be less than root_validity_days"
+            )
+        if config["leaf_rotate_before_days"] >= config["leaf_validity_days"]:
+            raise ConfigValidationError(
+                "backend_tls.leaf_rotate_before_days must be less than leaf_validity_days"
+            )
+        if config["root_validity_days"] <= config["leaf_validity_days"]:
+            raise ConfigValidationError(
+                "backend_tls.root_validity_days must exceed leaf_validity_days"
+            )
+        if config["root_overlap_days"] <= config["leaf_validity_days"]:
+            raise ConfigValidationError(
+                "backend_tls.root_overlap_days must exceed leaf_validity_days so old leaves "
+                "remain trusted throughout root rollover"
+            )
+        if config["trust_cache_max_stale_seconds"] < config["trust_cache_ttl_seconds"]:
+            raise ConfigValidationError(
+                "backend_tls.trust_cache_max_stale_seconds must be at least trust_cache_ttl_seconds"
+            )
+        if config["root_activation_delay_hours"] * 3_600 <= config["trust_cache_max_stale_seconds"]:
+            raise ConfigValidationError(
+                "backend_tls.root_activation_delay_hours must exceed the maximum stale trust "
+                "cache window so every proxy can observe a pending root before leaf rollover"
+            )
+
     def _validate_alb_config(self) -> None:
         """Validate ALB configuration"""
         alb_config = self.app.node.try_get_context("alb_config")
@@ -293,6 +346,13 @@ class ConfigLoader:
         # Validate replicas
         if not isinstance(mp_config["replicas"], int) or mp_config["replicas"] <= 0:
             raise ConfigValidationError("manifest_processor replicas must be a positive integer")
+
+        try:
+            validated_request_body_limit(
+                mp_config.get("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES)
+            )
+        except ValueError as exc:
+            raise ConfigValidationError(f"manifest_processor.{exc}") from exc
 
         # Validate the shared policy section separately so a misconfigured
         # policy block surfaces a clear error pointing at the right key.
@@ -369,6 +429,11 @@ class ConfigLoader:
 
         if not isinstance(api_gw_config["tracing_enabled"], bool):
             raise ConfigValidationError("tracing_enabled must be a boolean")
+
+        if "regional_api_enabled" in api_gw_config and not isinstance(
+            api_gw_config["regional_api_enabled"], bool
+        ):
+            raise ConfigValidationError("regional_api_enabled must be a boolean")
 
     def _validate_eks_cluster_config(self) -> None:
         """Validate EKS cluster configuration"""
@@ -605,8 +670,28 @@ class ConfigLoader:
             "regional": deployment_regions.get("regional", ["us-east-1"]),
         }
 
+    def get_deployment_partition(self) -> str:
+        """Return the one SDK partition shared by every configured Region."""
+        deployment_regions = self.get_deployment_regions()
+        regional = validated_regional_deployment_regions(
+            deployment_regions["regional"],
+            known_regions=self.VALID_REGIONS,
+        )
+        return validated_deployment_partition(
+            (
+                deployment_regions["global"],
+                deployment_regions["api_gateway"],
+                deployment_regions["monitoring"],
+                *regional,
+            )
+        )
+
+    def supports_global_accelerator(self) -> bool:
+        """Return whether this partition exposes the Global Accelerator topology."""
+        return self.get_deployment_partition() == "aws"
+
     def get_global_region(self) -> str:
-        """Get the region for global resources (Global Accelerator, SSM params)."""
+        """Get the region for global resources and shared SSM parameters."""
         region = self.get_deployment_regions()["global"]
         return str(region)
 
@@ -672,6 +757,25 @@ class ConfigLoader:
             "client_affinity": "NONE",
         }
 
+    def get_backend_tls_config(self) -> dict[str, Any]:
+        """Return the mandatory deployment-local backend TLS lifecycle policy."""
+        defaults = {
+            "root_generation": 1,
+            "root_validity_days": 3_650,
+            "root_rotate_before_days": 180,
+            "root_activation_delay_hours": 24,
+            "root_overlap_days": 45,
+            "leaf_validity_days": 30,
+            "leaf_rotate_before_days": 10,
+            "rotation_schedule_hours": 12,
+            "trust_cache_ttl_seconds": 300,
+            "trust_cache_max_stale_seconds": 3_600,
+        }
+        configured = self.app.node.try_get_context("backend_tls") or {}
+        if not isinstance(configured, dict):
+            raise ConfigValidationError("backend_tls must be a mapping")
+        return {**defaults, **configured}
+
     def get_alb_config(self) -> dict[str, Any]:
         """Get ALB configuration"""
         return self.app.node.try_get_context("alb_config") or {
@@ -704,10 +808,17 @@ class ConfigLoader:
             "replicas": 3,
             "resource_limits": {"cpu": "1000m", "memory": "2Gi"},
             "validation_enabled": True,
+            "max_request_body_bytes": DEFAULT_MAX_REQUEST_BODY_BYTES,
+            "central_queue_worker_enabled": True,
+            "central_queue_poll_interval_seconds": 10,
+            "central_queue_batch_size": 5,
+            "central_queue_reconcile_limit": 100,
+            "central_queue_lease_seconds": 300,
+            "central_queue_lease_renewal_seconds": 60,
             # allowed_namespaces, resource_quotas, trusted_registries,
             # trusted_dockerhub_orgs, manifest_security_policy, and
             # allowed_kinds are merged in below from job_validation_policy.
-            "allowed_namespaces": ["default", "gco-jobs"],
+            "allowed_namespaces": ["gco-jobs"],
             "resource_quotas": {
                 "max_cpu_per_manifest": "10",
                 "max_memory_per_manifest": "32Gi",
@@ -741,7 +852,34 @@ class ConfigLoader:
         # them. We flatten them into the manifest processor's runtime config
         # so service code keeps its existing attribute layout.
         shared_policy = self.app.node.try_get_context("job_validation_policy") or {}
-        return {**default_config, **context_config, **shared_policy}
+        merged = {**default_config, **context_config, **shared_policy}
+
+        enabled = merged.get("central_queue_worker_enabled")
+        if not isinstance(enabled, bool):
+            raise ConfigValidationError(
+                "manifest_processor.central_queue_worker_enabled must be a boolean"
+            )
+        for key, minimum, maximum in (
+            ("central_queue_poll_interval_seconds", 1, 300),
+            ("central_queue_batch_size", 1, 20),
+            ("central_queue_reconcile_limit", 1, 500),
+            ("central_queue_lease_seconds", 30, 3600),
+            ("central_queue_lease_renewal_seconds", 1, 300),
+        ):
+            value = merged.get(key)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ConfigValidationError(
+                    f"manifest_processor.{key} must be an integer between {minimum} and {maximum}"
+                )
+        if (
+            merged["central_queue_lease_renewal_seconds"] * 2
+            > merged["central_queue_lease_seconds"]
+        ):
+            raise ConfigValidationError(
+                "manifest_processor.central_queue_lease_renewal_seconds must be no more than "
+                "half of central_queue_lease_seconds"
+            )
+        return merged
 
     def get_api_gateway_config(self) -> dict[str, Any]:
         """Get API Gateway configuration.
@@ -753,9 +891,11 @@ class ConfigLoader:
             - log_level: CloudWatch logging level (OFF, ERROR, INFO)
             - metrics_enabled: Enable CloudWatch metrics
             - tracing_enabled: Enable X-Ray tracing
-            - regional_api_enabled: Enable regional API Gateways for private access
-              When true, deploys a regional API Gateway with VPC Lambda in each
-              region, allowing API access when the ALB is internal-only.
+            - regional_api_enabled: In the commercial ``aws`` partition,
+              permit direct same-account callers to use the always-deployed
+              regional API bridges. Other partitions force this access on
+              because the bridges are the supported workload ingress without
+              Global Accelerator. Centralized aggregation always uses them.
         """
         default_config = {
             "throttle_rate_limit": 1000,
@@ -885,13 +1025,13 @@ class ConfigLoader:
 
         Returns:
             Valkey configuration dictionary with the following keys:
-            - enabled: Whether Valkey cache is enabled (default: True)
+            - enabled: Whether Valkey cache is enabled (default: False)
             - max_data_storage_gb: Maximum data storage in GB (default: 5)
             - max_ecpu_per_second: Maximum ECPUs per second (default: 5000)
             - snapshot_retention_limit: Daily snapshots to retain (default: 1)
         """
         default_config: dict[str, Any] = {
-            "enabled": True,
+            "enabled": False,
             "max_data_storage_gb": 5,
             "max_ecpu_per_second": 5000,
             "snapshot_retention_limit": 1,
@@ -1085,65 +1225,84 @@ class ConfigLoader:
             "capacity_block_duration_hours": 24,
             "capacity_block_long_duration_hours": 63 * 24,
             "watch_instance_types": [
+                "g4dn.12xlarge",
+                "g4dn.16xlarge",
+                "g4dn.2xlarge",
+                "g4dn.4xlarge",
+                "g4dn.8xlarge",
+                "g4dn.metal",
+                "g4dn.xlarge",
+                "g5.12xlarge",
+                "g5.16xlarge",
+                "g5.24xlarge",
+                "g5.2xlarge",
+                "g5.48xlarge",
+                "g5.4xlarge",
+                "g5.8xlarge",
+                "g5.xlarge",
+                "g5g.16xlarge",
+                "g5g.2xlarge",
+                "g5g.4xlarge",
+                "g5g.8xlarge",
+                "g5g.metal",
+                "g5g.xlarge",
+                "g6.12xlarge",
+                "g6.16xlarge",
+                "g6.24xlarge",
+                "g6.2xlarge",
+                "g6.48xlarge",
+                "g6.4xlarge",
+                "g6.8xlarge",
+                "g6.xlarge",
+                "g6e.12xlarge",
+                "g6e.16xlarge",
+                "g6e.24xlarge",
+                "g6e.2xlarge",
+                "g6e.48xlarge",
+                "g6e.4xlarge",
+                "g6e.8xlarge",
+                "g6e.xlarge",
+                "g6f.2xlarge",
+                "g6f.4xlarge",
+                "g6f.large",
+                "g6f.xlarge",
+                "g7.12xlarge",
+                "g7.24xlarge",
+                "g7.2xlarge",
+                "g7.48xlarge",
+                "g7.4xlarge",
+                "g7.8xlarge",
+                "g7e.12xlarge",
+                "g7e.24xlarge",
+                "g7e.2xlarge",
+                "g7e.48xlarge",
+                "g7e.4xlarge",
+                "g7e.8xlarge",
+                "gr6.4xlarge",
+                "gr6.8xlarge",
+                "gr6f.4xlarge",
+                "inf1.24xlarge",
+                "inf1.2xlarge",
+                "inf1.6xlarge",
+                "inf1.xlarge",
+                "inf2.24xlarge",
+                "inf2.48xlarge",
+                "inf2.8xlarge",
+                "inf2.xlarge",
+                "p3dn.24xlarge",
                 "p4d.24xlarge",
                 "p4de.24xlarge",
-                "p5.4xlarge",
                 "p5.48xlarge",
+                "p5.4xlarge",
                 "p5e.48xlarge",
                 "p5en.48xlarge",
                 "p6-b200.48xlarge",
                 "p6-b300.48xlarge",
-                "g5.xlarge",
-                "g5.2xlarge",
-                "g5.4xlarge",
-                "g5.8xlarge",
-                "g5.12xlarge",
-                "g5.16xlarge",
-                "g5.24xlarge",
-                "g5.48xlarge",
-                "g5g.xlarge",
-                "g5g.2xlarge",
-                "g5g.4xlarge",
-                "g5g.8xlarge",
-                "g5g.16xlarge",
-                "g5g.metal",
-                "g6.xlarge",
-                "g6.2xlarge",
-                "g6.4xlarge",
-                "g6.8xlarge",
-                "g6.12xlarge",
-                "g6.16xlarge",
-                "g6.24xlarge",
-                "g6.48xlarge",
-                "g6e.xlarge",
-                "g6e.2xlarge",
-                "g6e.4xlarge",
-                "g6e.8xlarge",
-                "g6e.12xlarge",
-                "g6e.16xlarge",
-                "g6e.24xlarge",
-                "g6e.48xlarge",
-                "g6f.large",
-                "g6f.xlarge",
-                "g6f.2xlarge",
-                "g6f.4xlarge",
-                "g7e.2xlarge",
-                "g7e.4xlarge",
-                "g7e.8xlarge",
-                "g7e.12xlarge",
-                "g7e.24xlarge",
-                "g7e.48xlarge",
                 "trn1.2xlarge",
                 "trn1.32xlarge",
                 "trn1n.32xlarge",
-                "inf1.xlarge",
-                "inf1.2xlarge",
-                "inf1.6xlarge",
-                "inf1.24xlarge",
-                "inf2.xlarge",
-                "inf2.8xlarge",
-                "inf2.24xlarge",
-                "inf2.48xlarge",
+                "trn2.3xlarge",
+                "trn2.48xlarge",
             ],
             "enabled_regions": [],
         }

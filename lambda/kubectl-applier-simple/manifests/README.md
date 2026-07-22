@@ -27,11 +27,19 @@ Two passes, driven by the convergence pipeline:
 
 Two behaviors are worth knowing:
 
-- **Feature gating by placeholder.** Every `{{VARIABLE}}` is substituted at
-  deploy time (see [Template Variables](#template-variables)). If a file still
+- **Feature convergence by placeholder.** Every `{{VARIABLE}}` is substituted
+  at deploy time (see [Template Variables](#template-variables)). If a file still
   contains an `UPPER_SNAKE` placeholder *after* substitution, the handler skips
-  it — that is how optional features (FSx, Valkey, Aurora pgvector, cluster
-  observability, the queue processor) turn themselves off.
+  applying that file and deletes only the exact resources inventoried for that
+  disabled feature. FSx convergence removes the three managed PVCs, PVs, and
+  StorageClass; Valkey and Aurora convergence removes their namespaced
+  ConfigMaps; observability convergence removes its managed storage, exporters,
+  dashboards, monitors, rotation job, service account, and bindings; queue
+  convergence removes its managed `ScaledJob`. Missing resources are no-ops,
+  while any other deletion error fails the deployment rather than leaving stale
+  resources silently active. Disabling FSx detaches the managed Kubernetes
+  storage objects and can disrupt workloads that still reference those claims;
+  it does not erase the external FSx file system itself.
 - **Numbers order files, they don't identify them.** The prefix only sets apply
   order within a pass. Gaps between decade blocks are intentional headroom for
   future inserts; a missing number has no effect.
@@ -50,17 +58,16 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 
 | Range | Group | Description |
 |-------|-------|-------------|
-| `00-09` | Foundation | Namespaces, service accounts, RBAC, network policies, resource quotas |
-| `10-19` | Networking | IngressClass, Ingress |
+| `00-19` | Foundation & networking | Namespaces, service accounts, RBAC, network policies, resource quotas |
 | `20-29` | Storage | EFS, FSx Lustre, cluster-shared bucket, Valkey, Aurora pgvector, observability gp3 |
 | `30-39` | System services | health-monitor, manifest-processor, inference-monitor |
 | `40-49` | NodePools | GPU (x86, ARM), inference, EFA (training + mooncake), Neuron, CPU |
 | `50-59` | Device plugins & GPU observability | NVIDIA device plugin, DCGM exporter |
-| `post-helm-*` | Post-Helm | Resources needing Helm CRDs: KEDA ScaledJob, Prometheus monitors, Grafana dashboards/rotation, Kueue metrics RBAC |
+| `post-helm-*` | Post-Helm | Resources needing Helm CRDs: Gateway API entrypoint, KEDA ScaledJob, Prometheus monitors, Grafana dashboards/rotation, Kueue metrics RBAC |
 
 ## Files
 
-### Foundation (00–09)
+### Foundation & Networking (00–19)
 
 | File | Contents |
 |------|----------|
@@ -70,23 +77,16 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 | `03-network-policies.yaml` | Default-deny ingress + allow rules for ALB, DNS, HTTPS egress |
 | `04-resource-quotas.yaml` | `ResourceQuota` + `LimitRange` for `gco-jobs` (namespace CPU/memory/GPU/pod caps + per-container defaults) |
 
-### Networking (10–19)
-
-| File | Contents |
-|------|----------|
-| `10-ingressclass.yaml` | `IngressClassParams` (ALB group) + `IngressClass` |
-| `11-ingress.yaml` | `gco-ingress` routing to health-monitor and manifest-processor |
-
 ### Storage (20–29)
 
 | File | Contents |
 |------|----------|
 | `20-storage-efs.yaml` | EFS `StorageClass` + PVCs in all namespaces (dynamic provisioning) |
-| `21-storage-fsx.yaml` | FSx Lustre `StorageClass` + PVs + PVCs — **skipped when FSx disabled** |
+| `21-storage-fsx.yaml` | FSx Lustre `StorageClass` + PVs + PVCs — **pruned when FSx is disabled** |
 | `22-storage-cluster-shared-bucket.yaml` | `gco-cluster-shared-bucket` `ConfigMap` (name/ARN/region) in all namespaces — always present |
-| `23-storage-valkey.yaml` | Valkey endpoint `ConfigMap` in all namespaces — **skipped when Valkey disabled** |
-| `24-storage-aurora-pgvector.yaml` | `gco-aurora-pgvector` `ConfigMap` (endpoint/port/secret/db) in all namespaces — **skipped when Aurora pgvector disabled** |
-| `25-storage-observability-gp3.yaml` | `gco-observability-gp3` `StorageClass` backing Prometheus/Grafana/Alertmanager PVCs — **skipped when observability disabled** |
+| `23-storage-valkey.yaml` | Valkey endpoint `ConfigMap` in all namespaces — **pruned when Valkey is disabled** |
+| `24-storage-aurora-pgvector.yaml` | `gco-aurora-pgvector` `ConfigMap` (endpoint/port/secret/db) in all namespaces — **pruned when Aurora pgvector is disabled** |
+| `25-storage-observability-gp3.yaml` | `gco-observability-gp3` `StorageClass` backing Prometheus/Grafana/Alertmanager PVCs — **pruned when observability is disabled** |
 
 ### System Services (30–39)
 
@@ -95,12 +95,13 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 | `30-health-monitor.yaml` | `Deployment` + `PodDisruptionBudget` + `Service` |
 | `31-manifest-processor.yaml` | `Deployment` + `PodDisruptionBudget` + `Service` |
 | `32-inference-monitor.yaml` | `Deployment` + `PodDisruptionBudget` |
+| `33-inference-proxy.yaml` | Dedicated inference `Deployment` (three replicas on create; HPA owns updates) + CPU/memory `HorizontalPodAutoscaler` + two-pod `PodDisruptionBudget` + 15-minute stream-drain lifecycle + `Service` |
 
 ### NodePools (40–49)
 
 | File | Contents |
 |------|----------|
-| `40-nodepool-gpu-x86.yaml` | x86_64 GPU pool (g4dn, g5, g6, g6e, g6f, gr6, gr6f, g7, g7e, p3, p3dn) — on-demand + spot |
+| `40-nodepool-gpu-x86.yaml` | x86_64 GPU pool (g4dn, g5, g6, g6e, g6f, gr6, gr6f, g7, g7e) — on-demand + spot; deprecated V100 p3/p3dn families are observation-only and excluded from new scheduling |
 | `41-nodepool-gpu-arm.yaml` | ARM64 GPU pool (g5g) — on-demand + spot |
 | `42-nodepool-inference.yaml` | Inference GPU pool (g4dn, g5, g6, g6e, g6f, gr6, gr6f, g7, g7e) — on-demand + spot, WhenEmpty consolidation |
 | `43-nodepool-efa.yaml` | EFA pool (p4d, p4de, p5/p5e/p5en, p6-b200/p6-b300/p6e-gb200) — high-performance distributed training (keeps p4d) |
@@ -113,14 +114,15 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 | File | Contents |
 |------|----------|
 | `50-nvidia-device-plugin.yaml` | NVIDIA device plugin `DaemonSet` (advertises `nvidia.com/gpu`) |
-| `51-dcgm-exporter.yaml` | DCGM exporter `DaemonSet` + device-counters `ConfigMap` (GPU metrics for Prometheus) — **skipped when observability disabled** |
+| `51-dcgm-exporter.yaml` | DCGM exporter `DaemonSet` + device-counters `ConfigMap` (GPU metrics for Prometheus) — **pruned when observability is disabled** |
 
 ### Post-Helm (applied after Helm installs CRDs)
 
 | File | Contents |
 |------|----------|
+| `post-helm-gateway.yaml` | Gateway API entrypoint: `GatewayClass`, `TargetGroupConfiguration` (`/healthz` target-group health checks + 900-second deregistration drain), `LoadBalancerConfiguration` (internal HTTPS ALB, `gco.aws/gateway` ownership tag, TLS certificate), `Gateway` `gco-system/gco-gateway`, and the shared `HTTPRoute` sending control traffic to manifest-processor and `/inference` to inference-proxy — applied after the AWS Load Balancer Controller chart installs the Gateway API CRDs |
 | `post-helm-sqs-consumer.yaml` | KEDA `ScaledJob` for the SQS queue processor — **skipped when queue_processor disabled** |
-| `post-helm-monitoring-servicemonitors.yaml` | `ServiceMonitor`s (schedulers/operators + DCGM) and `PodMonitor`s (GCO services) — **skipped when observability disabled** |
+| `post-helm-monitoring-servicemonitors.yaml` | `ServiceMonitor`s (schedulers/operators + DCGM) and `PodMonitor`s (GCO services, including inference-proxy) — **skipped when observability disabled** |
 | `post-helm-monitoring-kueue-rbac.yaml` | `ClusterRoleBinding` letting Prometheus scrape Kueue's authenticated metrics endpoint — **skipped when observability disabled** |
 | `post-helm-grafana-dashboards.yaml` | Curated GCO Grafana dashboard `ConfigMap`s (GPU/DCGM, schedulers, KEDA, services) — **skipped when observability disabled** |
 | `post-helm-grafana-credential-rotation.yaml` | `CronJob` (+ `ServiceAccount`/`Role`/`RoleBinding`) that rotates the Grafana admin password — **skipped when observability disabled** |

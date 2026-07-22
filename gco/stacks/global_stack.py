@@ -1,22 +1,14 @@
 """
-Global stack for GCO (Global Capacity Orchestrator on AWS) - AWS Global Accelerator configuration.
+Global shared-resources stack with optional commercial-partition routing.
 
-This stack creates the global-level resources that span all regions:
-- AWS Global Accelerator with TCP listeners on ports 80 and 443
-- Endpoint groups for each configured region
-- SSM parameters for cross-region endpoint group ARN sharing
-- DynamoDB tables for templates and webhooks (global, replicated)
+This stack always creates partition-wide shared state: SSM registries, DynamoDB
+tables, ECR/S3 resources, backups, and optional capacity history. In the
+commercial ``aws`` partition it also creates AWS Global Accelerator, its
+TCP/443 listener, and one endpoint group per workload region. Other AWS
+partitions omit those unavailable resources and use regional IAM APIs.
 
-The Global Accelerator provides:
-- Single global endpoint for all regions
-- Automatic health-based routing to nearest healthy region
-- DDoS protection via AWS Shield Standard
-- Reduced latency through AWS global network
-
-Architecture:
-    Global Accelerator → Listener (80, 443) → Endpoint Groups (per region)
-                                                    ↓
-                                            Regional ALBs (registered separately)
+Regional ALB registration is performed separately by each regional stack only
+when the accelerator topology exists.
 """
 
 from typing import Any
@@ -48,6 +40,7 @@ from gco.stacks.constants import (
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-07-18T01:03:40Z
 # Flowchart(s) generated from this file:
 #   * ``GCOGlobalStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/global_stack.GCOGlobalStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/global_stack.GCOGlobalStack___init__.png``)
@@ -150,19 +143,19 @@ def _parse_images_config(cdk_context: dict[str, Any] | None) -> dict[str, Any]:
 
 
 class GCOGlobalStack(Stack):
-    """
-    Global resources stack including AWS Global Accelerator.
+    """Global shared resources with optional AWS Global Accelerator.
 
-    This stack must be deployed before regional stacks. Regional stacks
-    will register their ALBs with the endpoint groups created here.
+    This stack must be deployed before regional stacks. In the commercial
+    ``aws`` partition, regional stacks register their ALBs with endpoint groups
+    created here. Other partitions omit the accelerator topology.
 
     Attributes:
-        accelerator: The Global Accelerator resource
-        listener: TCP listener for HTTP/HTTPS traffic
-        endpoint_groups: Dict mapping region names to endpoint groups
-        templates_table: DynamoDB table for job templates
-        webhooks_table: DynamoDB table for webhooks
-        missions_table: DynamoDB table for mission session state
+        accelerator: Optional Global Accelerator resource.
+        listener: Optional TCP/443 listener.
+        endpoint_groups: Region-to-endpoint-group mapping; empty without GA.
+        templates_table: DynamoDB table for job templates.
+        webhooks_table: DynamoDB table for webhooks.
+        missions_table: DynamoDB table for mission session state.
     """
 
     def __init__(
@@ -173,6 +166,10 @@ class GCOGlobalStack(Stack):
         self.config = config
         self.regional_endpoints: dict[str, str] = {}
         self.endpoint_groups: dict[str, ga.EndpointGroup] = {}
+        supports_global_accelerator = getattr(config, "supports_global_accelerator", None)
+        self.global_accelerator_enabled = (
+            bool(supports_global_accelerator()) if callable(supports_global_accelerator) else True
+        )
 
         ga_config = self.config.get_global_accelerator_config()
 
@@ -216,36 +213,35 @@ class GCOGlobalStack(Stack):
         if self.config.get_capacity_history_enabled():
             self._create_capacity_poller()
 
-        # Create Global Accelerator with TCP protocol for HTTP/HTTPS traffic
-        self.accelerator = ga.Accelerator(
-            self, "GCOAccelerator", accelerator_name=self.accelerator_name, enabled=True
-        )
-
-        # Store the accelerator ID for CloudWatch metrics
-        # CloudWatch uses the accelerator ID (UUID), not the name or ARN
-        # ARN format: arn:aws:globalaccelerator::<account>:accelerator/<accelerator-id>
-        # Use Fn.select and Fn.split to extract the ID at deploy time
-        self.accelerator_id = Fn.select(1, Fn.split("/", self.accelerator.accelerator_arn))
-
-        # Create listener for both HTTP (80) and HTTPS (443) traffic.
-        # Client affinity controls whether GA pins a client to the same
-        # endpoint across connections (see ``_resolve_client_affinity``).
-        self.listener = self.accelerator.add_listener(
-            "GCOListener",
-            port_ranges=[
-                ga.PortRange(from_port=80, to_port=80),
-                ga.PortRange(from_port=443, to_port=443),
-            ],
-            protocol=ga.ConnectionProtocol.TCP,
-            client_affinity=self._resolve_client_affinity(ga_config),
-        )
-
-        # Create endpoint groups for each configured region
-        for region in self.config.get_regions():
-            self._create_endpoint_group(region)
-
-        # Export Global Accelerator outputs for other stacks
-        self._create_outputs()
+        # Global Accelerator is available only in the commercial ``aws``
+        # partition. Other coherent AWS partitions retain all shared resources
+        # and use their IAM-authenticated regional API bridges directly rather
+        # than synthesizing an unavailable global service.
+        self.accelerator: ga.Accelerator | None = None
+        self.listener: ga.Listener | None = None
+        self.accelerator_id: str | None = None
+        if self.global_accelerator_enabled:
+            # There is deliberately no port-80 listener, so the backend path
+            # cannot downgrade from authenticated TLS.
+            self.accelerator = ga.Accelerator(
+                self,
+                "GCOAccelerator",
+                accelerator_name=self.accelerator_name,
+                enabled=True,
+            )
+            self.accelerator_id = Fn.select(
+                1,
+                Fn.split("/", self.accelerator.accelerator_arn),
+            )
+            self.listener = self.accelerator.add_listener(
+                "GCOListener",
+                port_ranges=[ga.PortRange(from_port=443, to_port=443)],
+                protocol=ga.ConnectionProtocol.TCP,
+                client_affinity=self._resolve_client_affinity(ga_config),
+            )
+            for region in self.config.get_regions():
+                self._create_endpoint_group(region)
+            self._create_outputs()
 
         # Apply cdk-nag suppressions
         self._apply_nag_suppressions()
@@ -503,6 +499,8 @@ class GCOGlobalStack(Stack):
 
     def _create_outputs(self) -> None:
         """Create CloudFormation outputs for cross-stack references."""
+        if self.accelerator is None or self.listener is None:
+            raise RuntimeError("Global Accelerator outputs require the commercial AWS partition")
         project_name = self.config.get_project_name()
 
         CfnOutput(
@@ -541,9 +539,10 @@ class GCOGlobalStack(Stack):
         """
         Create an endpoint group for a specific region.
 
-        Configures HTTP health checks using the path from cdk.json so
-        Global Accelerator can verify the ALB's backend services are
-        actually healthy (not just that the port is open).
+        Configures an HTTPS/443 health-check contract matching the ALB's only
+        listener. Global Accelerator derives ALB endpoint health from the ALB
+        target groups, but keeping the endpoint-group settings aligned prevents
+        an accidental plaintext fallback if the endpoint type changes later.
 
         Also stores the endpoint group ARN in SSM Parameter Store for
         cross-region access by regional stacks.
@@ -551,19 +550,23 @@ class GCOGlobalStack(Stack):
         Args:
             region: AWS region name (e.g., 'us-east-1')
         """
+        if self.listener is None:
+            raise RuntimeError(
+                "Global Accelerator endpoint groups are unavailable in this partition"
+            )
         project_name = self.config.get_project_name()
         region_id = region.replace("-", "").title()
         ga_config = self.config.get_global_accelerator_config()
 
-        # Use HTTP health checks so GA validates the backend services are
-        # actually responding, not just that the ALB port is open.
-        # The health_check_path from cdk.json (default: /api/v1/health)
-        # hits the health-monitor service behind the ALB.
+        # Keep the endpoint-group contract aligned with the HTTPS-only ALB.
+        # For ALB endpoints GA uses target-group health rather than actively
+        # applying these probe settings, but 443/HTTPS remains the safe default
+        # if an endpoint type is changed in a future deployment.
         endpoint_group = self.listener.add_endpoint_group(
             f"EndpointGroup{region_id}",
             region=region,
-            health_check_port=80,
-            health_check_protocol=ga.HealthCheckProtocol.HTTP,
+            health_check_port=443,
+            health_check_protocol=ga.HealthCheckProtocol.HTTPS,
             health_check_path=ga_config.get("health_check_path", "/api/v1/health"),
             health_check_interval=Duration.seconds(ga_config.get("health_check_interval", 30)),
             health_check_threshold=3,
@@ -603,16 +606,20 @@ class GCOGlobalStack(Stack):
         self.regional_endpoints[region] = alb_arn
         # Actual registration happens in regional stack via custom resource
 
-    def get_accelerator_dns_name(self) -> str:
-        """Get the Global Accelerator DNS name"""
-        return str(self.accelerator.dns_name)
+    def get_accelerator_dns_name(self) -> str | None:
+        """Return the Global Accelerator DNS name when this partition supports it."""
+        return str(self.accelerator.dns_name) if self.accelerator is not None else None
 
     def get_accelerator_arn(self) -> str:
-        """Get the Global Accelerator ARN"""
+        """Get the Global Accelerator ARN."""
+        if self.accelerator is None:
+            raise RuntimeError("Global Accelerator is unavailable in this partition")
         return str(self.accelerator.accelerator_arn)
 
     def get_listener_arn(self) -> str:
-        """Get the Global Accelerator Listener ARN"""
+        """Get the Global Accelerator Listener ARN."""
+        if self.listener is None:
+            raise RuntimeError("Global Accelerator is unavailable in this partition")
         return str(self.listener.listener_arn)
 
     def get_endpoint_group_arn(self, region: str) -> str:
@@ -688,7 +695,8 @@ class GCOGlobalStack(Stack):
             time_to_live_attribute="ttl",  # Auto-cleanup old completed jobs
         )
 
-        # GSI for querying jobs by region and status (for regional polling)
+        # Legacy GSI retained for compatibility with existing deployments and
+        # ad-hoc operational queries.
         self.jobs_table.add_global_secondary_index(
             index_name="region-status-index",
             partition_key=dynamodb.Attribute(
@@ -697,6 +705,24 @@ class GCOGlobalStack(Stack):
             ),
             sort_key=dynamodb.Attribute(
                 name="status",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+
+        # ``work_sort`` is priority/FIFO for queued records and lease expiry for
+        # claimed or applying records. This unified worker index is the only GSI
+        # added by this release because DynamoDB permits only one GSI creation or
+        # deletion per table update. Workers repeatedly backfill legacy rows
+        # through the retained region-status-index during mixed-version rollouts.
+        self.jobs_table.add_global_secondary_index(
+            index_name="region-status-work-index",
+            partition_key=dynamodb.Attribute(
+                name="region_status",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            sort_key=dynamodb.Attribute(
+                name="work_sort",
                 type=dynamodb.AttributeType.STRING,
             ),
             projection_type=dynamodb.ProjectionType.ALL,
@@ -1186,7 +1212,7 @@ class GCOGlobalStack(Stack):
             iam.PolicyStatement(
                 sid="AllowCloudWatchLogsEncryptDecrypt",
                 effect=iam.Effect.ALLOW,
-                principals=[iam.ServicePrincipal(f"logs.{self.region}.amazonaws.com")],
+                principals=[iam.ServicePrincipal("logs.amazonaws.com", region=self.region)],
                 actions=kms_actions,
                 resources=["*"],
             )
@@ -1522,7 +1548,7 @@ class GCOGlobalStack(Stack):
         # ECR repository APIs scope by repository name, not ARN, so the
         # ``gco/*`` prefix scope is enforced via the ARN pattern in the
         # policy resource list.
-        repo_arn = f"arn:aws:ecr:*:{self.account}:repository/{project_name}/*"
+        repo_arn = f"arn:{self.partition}:ecr:*:{self.account}:repository/{project_name}/*"
 
         self.image_lookup_lambda = lambda_.Function(
             self,
@@ -1568,7 +1594,8 @@ class GCOGlobalStack(Stack):
             export_name=f"{project_name}-image-lookup-function-arn",
         )
 
-        # The ECR repository policy uses ``arn:aws:ecr:*:<account>:repository/gco/*``
+        # The ECR repository policy uses a partition-aware
+        # ``arn:<partition>:ecr:*:<account>:repository/gco/*`` resource
         # which cdk-nag flags as ``AwsSolutions-IAM5`` because of the trailing
         # ``*``. The wildcard here is the documented IAM way to express
         # "every repository in this project's prefix", which is exactly the
@@ -1596,13 +1623,14 @@ class GCOGlobalStack(Stack):
                         "The ImageLookupFunction's contract is to look up "
                         "or create any ECR repository under the project's "
                         "``gco/*`` prefix. The ARN pattern "
-                        "``arn:aws:ecr:*:<account>:repository/gco/*`` is "
+                        "``arn:<partition>:ecr:*:<account>:repository/gco/*`` is "
                         "the documented IAM way to express that scope: it "
                         "covers exactly the repositories the function is "
                         "allowed to touch and nothing else."
                     ),
                     "appliesTo": [
-                        f"Resource::arn:aws:ecr:*:<AWS::AccountId>:repository/{project_name}/*",
+                        f"Resource::arn:<AWS::Partition>:ecr:*:<AWS::AccountId>:"
+                        f"repository/{project_name}/*",
                     ],
                 },
             ],

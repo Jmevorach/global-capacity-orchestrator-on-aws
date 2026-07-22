@@ -46,9 +46,14 @@ You'll additionally need:
 # Python 3.14+ (3.14 used in CI)
 python3 --version
 
-# Node.js LTS (v24) and CDK CLI
+# Node.js 24 and npm 11.18.0 (see .nvmrc and package.json)
 node --version
-cdk --version    # npm install -g aws-cdk if missing
+npm --version
+
+# Install and verify the repository's exact npm pin, then the locked CDK CLI
+bash .github/scripts/use-pinned-npm.sh package.json
+npm ci --ignore-scripts --no-audit --no-fund
+npm exec -- cdk --version
 ```
 
 You should install GCO into a **fresh** virtual environment or via pipx. Mixing it into an existing Python environment will frequently fail dependency resolution because of the project's pinned versions.
@@ -323,7 +328,7 @@ GCO can also deploy long-running inference endpoints across regions. Here's a qu
 ```bash
 # Deploy a vLLM inference endpoint
 gco inference deploy my-llm \
-  -i vllm/vllm-openai:v0.22.0 \
+  -i vllm/vllm-openai:v0.24.0 \
   --gpu-count 1 \
   -e MODEL=meta-llama/Llama-3.1-8B-Instruct \
   -r us-east-1
@@ -338,7 +343,7 @@ gco inference list
 gco inference delete my-llm -y
 ```
 
-The inference_monitor in each target region automatically creates the Kubernetes Deployment, Service, and Ingress. See [docs/INFERENCE.md](docs/INFERENCE.md) for the full inference guide including model weight management, multi-region deployment, and supported frameworks.
+The `inference_monitor` in each target region automatically creates the Kubernetes Deployment, Service, autoscaling objects, and supporting configuration. Inference requests remain behind the shared authenticated Gateway API route; the monitor does not create a direct per-endpoint route. See [docs/INFERENCE.md](docs/INFERENCE.md) for the full inference guide including model weight management, multi-region deployment, and supported frameworks.
 
 ## Next Steps
 
@@ -347,11 +352,11 @@ The inference_monitor in each target region automatically creates the Kubernetes
 - See [docs/INFERENCE.md](docs/INFERENCE.md) for inference serving guide
 - See [docs/CUSTOMIZATION.md](docs/CUSTOMIZATION.md) for customization options
 - Review [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architecture details
-- Enable [Regional API](docs/CUSTOMIZATION.md#regional-api-gateway-private-access) for private cluster access
+- Optionally enable [direct Regional API access](docs/CUSTOMIZATION.md#regional-api-gateway-aggregation-bridge-and-direct-regional-access) for IAM-authorized callers that need an explicitly region-pinned path; the bridge itself is always deployed for aggregation
 
 ### MCP Server (for Cursor / Kiro / LLM integration)
 
-GCO includes an MCP server with 95 tools by default (up to 127 with feature flags) that wrap the CLI. The dev container already has the `[mcp]` extras installed, so all you need is the client-side config. The most portable form passes an absolute path in `args` (works in Cursor, Kiro, Claude Desktop, etc.):
+GCO includes an MCP server with 125 tools by default (up to 165 with feature flags) spanning the CLI and project-aware resources. The dev container already has the `[mcp]` extras installed, so all you need is the client-side config. The most portable form passes an absolute path in `args` (works in Cursor, Kiro, Claude Desktop, etc.):
 
 ```jsonc
 // MCP client config file (for example, Cursor's ~/.cursor/mcp.json)
@@ -383,12 +388,14 @@ GCO pins exact versions of many Python packages (CDK, AWS SDKs, FastAPI, mypy, R
 
 ### CDK CLI version mismatch
 
-If you see `Cloud assembly schema version mismatch`, your CDK CLI is too old. Install the latest version:
+If you see `Cloud assembly schema version mismatch`, reinstall the exact repository-owned CDK graph rather than downloading a global latest release:
 
 ```bash
-npm install -g aws-cdk@latest
-cdk --version
+npm ci --ignore-scripts --no-audit --no-fund
+npm exec -- cdk --version
 ```
+
+The CLI prefers `node_modules/.bin/cdk` from this lockfile. If the local graph is absent, `gco` can still use an already-installed CDK on `PATH`, but contributors and CI should use the locked copy.
 
 ### "Stack already exists"
 

@@ -46,11 +46,19 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
+from gco.bedrock import (
+    BEDROCK_READ_TIMEOUT_SECONDS,
+    build_bedrock_converse_options,
+    extract_bedrock_converse_text,
+    get_default_bedrock_model_id,
+)
+
 from . import validation as _validation
 from .types import Criterion, CriterionResult, IterationRecord, Observation, Strategy
 from .validation import MissionValidationError
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-07-18T01:03:40Z
 # Flowchart(s) generated from this file:
 #   * ``maybe_sample_strategy_revision`` -> ``diagrams/code_diagrams/gco_mcp/mission/sampling.maybe_sample_strategy_revision.html``
 #     (PNG: ``diagrams/code_diagrams/gco_mcp/mission/sampling.maybe_sample_strategy_revision.png``)
@@ -59,6 +67,9 @@ from .validation import MissionValidationError
 
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
+    # Runtime access is provided lazily by ``__getattr__`` below.
+    DEFAULT_BEDROCK_MODEL_ID: str
+
     # ``fastmcp.Context`` is the concrete type expected by
     # :class:`MCPSamplingBackend`. Kept behind ``TYPE_CHECKING`` so the
     # runtime import surface stays pure-stdlib; the backend itself
@@ -67,6 +78,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
 
 __all__ = [
     "BEDROCK_MAX_TOKENS",
+    "BEDROCK_READ_TIMEOUT_SECONDS",
     "BEDROCK_TEMPERATURE",
     "DEFAULT_BEDROCK_MODEL_ID",
     "DEFAULT_BEDROCK_REGION",
@@ -95,6 +107,18 @@ __all__ = [
     "select_sampling_backend",
     "validate_strategy_against_catalog",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve the historical Mission default only when explicitly accessed."""
+    if name == "DEFAULT_BEDROCK_MODEL_ID":
+        return get_default_bedrock_model_id()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Advertise the lazy compatibility alias to introspection tools."""
+    return sorted({*globals(), "DEFAULT_BEDROCK_MODEL_ID"})
 
 
 # ---------------------------------------------------------------------------
@@ -193,17 +217,15 @@ def _summarise_environment_context(env: Mapping[str, Any]) -> dict[str, Any]:
 # Bedrock backend tunables
 # ---------------------------------------------------------------------------
 
-#: Default Bedrock model identifier. Mirrors
-#: ``cli.capacity.advisor.BedrockCapacityAdvisor.DEFAULT_MODEL`` so an
-#: operator gets the same model for Mission sampling and the capacity
-#: advisor. Amazon Nova Pro is a first-party Amazon model: access is
-#: enabled by default in commercial Regions and, unlike the Anthropic
-#: models, it needs no First-Time-Use (FTU) form, so the advisory path
-#: works out of the box on a fresh account. Operators with regulatory
-#: or model-governance requirements can override per call via the
-#: ``GCO_MISSION_BEDROCK_MODEL_ID`` env var or the ``--bedrock-model-id``
-#: CLI flag — see docs/CUSTOMIZATION.md ("Bedrock Model Selection").
-DEFAULT_BEDROCK_MODEL_ID: str = "us.amazon.nova-pro-v1:0"
+#: Default Bedrock model identifier, loaded lazily from
+#: ``cdk.json`` ``context.bedrock.default_model_id`` through the lightweight
+#: :mod:`gco.bedrock` resolver. The module-level compatibility attribute keeps
+#: existing Mission integrations stable without coupling unrelated imports to
+#: Bedrock configuration resolution.
+#:
+#: Operators with regulatory or model-governance requirements can override per
+#: call via ``GCO_MISSION_BEDROCK_MODEL_ID`` or ``--bedrock-model-id``; see
+#: docs/CUSTOMIZATION.md ("Bedrock Model Selection").
 
 #: Default Bedrock region. The capacity advisor pins ``us-east-1`` for
 #: the same reason: cross-region inference profiles routinely surface
@@ -216,19 +238,14 @@ ENV_BEDROCK_MODEL_ID: str = "GCO_MISSION_BEDROCK_MODEL_ID"
 #: Env var that overrides :data:`DEFAULT_BEDROCK_REGION` at runtime.
 ENV_BEDROCK_REGION: str = "GCO_MISSION_BEDROCK_REGION"
 
-#: Maximum response tokens for the Bedrock Converse call. Sized for the
-#: criteria-array prompt's worst case: a five-criterion array with
-#: predicates can be 800-1500 output tokens by itself, and reasoning
-#: models (DeepSeek R1, Claude reasoning variants) consume an
-#: additional 1500-3000 think tokens that count against the same
-#: budget. 8192 leaves comfortable headroom on every visible CRIS
-#: profile while staying well under any model's context window.
+#: Maximum response tokens for non-default Bedrock model overrides. The
+#: canonical Nova 2 default uses high reasoning, for which AWS requires
+#: maxTokens to be unset; :func:`build_bedrock_converse_options` removes it.
 BEDROCK_MAX_TOKENS: int = 8192
 
-#: Sampling temperature for the Bedrock Converse call. Low — the
-#: scaffolder asks for a strict JSON-array shape, not creative
-#: variety; high temperatures invite the model to wander into
-#: rejected attribute / method shapes.
+#: Sampling temperature for non-default Bedrock model overrides. The
+#: canonical Nova 2 default uses high reasoning, for which AWS requires
+#: temperature to be unset; :func:`build_bedrock_converse_options` removes it.
 BEDROCK_TEMPERATURE: float = 0.2
 
 
@@ -940,7 +957,7 @@ class BedrockSamplingBackend:
     from (in order of precedence) the explicit constructor argument,
     the matching environment variable
     (:data:`ENV_BEDROCK_MODEL_ID` / :data:`ENV_BEDROCK_REGION`), and
-    finally the module-level default
+    finally the shared ``cdk.json`` default
     (:data:`DEFAULT_BEDROCK_MODEL_ID` /
     :data:`DEFAULT_BEDROCK_REGION`). The ``boto3`` client itself is
     constructed lazily on the first :meth:`sample` call so that
@@ -960,11 +977,10 @@ class BedrockSamplingBackend:
       ``"bedrock_<ErrorCode>"`` where ``<ErrorCode>`` is read from the
       error envelope (defaulting to ``"Unknown"`` when the envelope is
       malformed).
-    * A response that does not have the expected
-      ``output.message.content[0].text`` shape — including ``None``
-      and empty ``content`` lists — surfaces as
-      :class:`SamplingTransportError` with code
-      ``"bedrock_malformed_response"``.
+    * A response without a non-empty ``text`` block under
+      ``output.message.content`` — including reasoning-only and empty
+      ``content`` lists — surfaces as :class:`SamplingTransportError`
+      with code ``"bedrock_malformed_response"``.
     """
 
     backend_name: Literal["mcp", "bedrock"] = "bedrock"
@@ -979,16 +995,23 @@ class BedrockSamplingBackend:
         Args:
             model_id: Optional explicit model id. When ``None``, falls
                 back to the :data:`ENV_BEDROCK_MODEL_ID` environment
-                variable, then to :data:`DEFAULT_BEDROCK_MODEL_ID`.
+                variable, then to the shared ``cdk.json`` default exposed as
+                :data:`DEFAULT_BEDROCK_MODEL_ID`.
             region: Optional explicit region. When ``None``, falls back
                 to :data:`ENV_BEDROCK_REGION`, then to
                 :data:`DEFAULT_BEDROCK_REGION`.
         """
-        self.model_id: str = (
-            model_id
-            if model_id is not None
-            else os.environ.get(ENV_BEDROCK_MODEL_ID, DEFAULT_BEDROCK_MODEL_ID)
-        )
+        if model_id is not None:
+            self.model_id = model_id
+            self._uses_default_model = False
+        elif ENV_BEDROCK_MODEL_ID in os.environ:
+            # Preserve the existing explicit-environment semantics, including
+            # an intentionally empty value, without evaluating the fallback.
+            self.model_id = os.environ[ENV_BEDROCK_MODEL_ID]
+            self._uses_default_model = False
+        else:
+            self.model_id = get_default_bedrock_model_id()
+            self._uses_default_model = True
         self._region: str = (
             region
             if region is not None
@@ -997,6 +1020,21 @@ class BedrockSamplingBackend:
         # The boto3 client is built on first ``sample`` call. ``None``
         # here is the sentinel for "not yet constructed".
         self._client: Any = None
+
+    @classmethod
+    def from_canonical_default(
+        cls,
+        region: str | None = None,
+    ) -> BedrockSamplingBackend:
+        """Build a backend that deliberately applies canonical reasoning.
+
+        Unlike ``cls(model_id=None)``, this bypasses the model environment
+        override. Fixture capture uses it to reproduce the checked-in default
+        exactly, while ordinary explicit model IDs retain override semantics.
+        """
+        backend = cls(model_id=get_default_bedrock_model_id(), region=region)
+        backend._uses_default_model = True
+        return backend
 
     def _get_client(self) -> Any:
         """Return the cached ``bedrock-runtime`` client, building it on first use.
@@ -1011,13 +1049,18 @@ class BedrockSamplingBackend:
             return self._client
         # Local import — keeps the module's import surface boto3-free.
         import boto3
+        from botocore.config import Config
         from botocore.exceptions import (
             NoCredentialsError,
             PartialCredentialsError,
         )
 
         try:
-            self._client = boto3.Session().client("bedrock-runtime", region_name=self._region)
+            self._client = boto3.Session().client(
+                "bedrock-runtime",
+                region_name=self._region,
+                config=Config(read_timeout=BEDROCK_READ_TIMEOUT_SECONDS),
+            )
         except (NoCredentialsError, PartialCredentialsError) as err:
             raise SamplingTransportError("bedrock_no_credentials") from err
         return self._client
@@ -1033,8 +1076,7 @@ class BedrockSamplingBackend:
                   a ``ClientError``; ``<ErrorCode>`` is the AWS error
                   code from the envelope.
                 * ``bedrock_malformed_response`` — the response did not
-                  contain the expected
-                  ``output.message.content[0].text`` shape.
+                  contain a non-empty final text content block.
         """
         # Local import — see ``_get_client`` for the rationale.
         from botocore.exceptions import ClientError
@@ -1042,15 +1084,20 @@ class BedrockSamplingBackend:
         client = self._get_client()
 
         text = prompt.assemble()
+        converse_options = build_bedrock_converse_options(
+            self.model_id,
+            inference_config={
+                "maxTokens": BEDROCK_MAX_TOKENS,
+                "temperature": BEDROCK_TEMPERATURE,
+            },
+            apply_default_reasoning=self._uses_default_model,
+        )
         try:
             response = await asyncio.to_thread(
                 client.converse,
                 modelId=self.model_id,
                 messages=[{"role": "user", "content": [{"text": text}]}],
-                inferenceConfig={
-                    "maxTokens": BEDROCK_MAX_TOKENS,
-                    "temperature": BEDROCK_TEMPERATURE,
-                },
+                **converse_options,
             )
         except ClientError as err:
             # ``e.response`` is documented to be present on ClientError
@@ -1073,7 +1120,7 @@ class BedrockSamplingBackend:
         self.last_output_tokens: int | None = usage.get("outputTokens")
 
         try:
-            return str(response["output"]["message"]["content"][0]["text"])
+            return extract_bedrock_converse_text(response)
         except (KeyError, IndexError, TypeError) as err:
             raise SamplingTransportError("bedrock_malformed_response") from err
 

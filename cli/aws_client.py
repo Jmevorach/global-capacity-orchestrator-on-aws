@@ -28,6 +28,14 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 1.0  # seconds
 
 
+def _validate_max_attempts(max_attempts: int | None) -> None:
+    """Validate an explicitly supplied request-attempt limit."""
+    if max_attempts is not None and (
+        isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0
+    ):
+        raise ValueError("max_attempts must be a positive integer")
+
+
 @dataclass
 class RegionalStack:
     """Information about a regional GCO stack."""
@@ -70,7 +78,7 @@ class GCOAWSClient:
         self._regional_api_cache: dict[str, ApiEndpoint] = {}
         self._regional_stacks_cache: dict[str, RegionalStack] | None = None
         self._cache_timestamp: float | None = None
-        self._use_regional_api: bool = False  # Set to True to use regional APIs
+        self._use_regional_api = getattr(self.config, "use_regional_api", False) is True
 
     def _is_cache_valid(self) -> bool:
         """Check if cache is still valid."""
@@ -291,6 +299,8 @@ class GCOAWSClient:
         region: str | None = None,
         body: dict[str, Any] | None = None,
         params: dict[str, str] | None = None,
+        *,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         """
         Make an API call and return the JSON response.
@@ -303,13 +313,19 @@ class GCOAWSClient:
             region: Target region for the request
             body: Request body (will be JSON encoded)
             params: Query parameters
+            max_attempts: Maximum attempts for read-only requests. Mutating
+                requests always make exactly one attempt. Defaults to the
+                existing retry limit.
 
         Returns:
             JSON response as dictionary
 
         Raises:
             RuntimeError: If the request fails with a descriptive error message
+            ValueError: If max_attempts is not a positive integer
         """
+        _validate_max_attempts(max_attempts)
+
         # Add URL-encoded query parameters to path
         if params:
             encoded_pairs = [
@@ -325,6 +341,7 @@ class GCOAWSClient:
             path=path,
             body=body,
             target_region=region,
+            max_attempts=max_attempts,
         )
 
         if not response.ok:
@@ -351,44 +368,94 @@ class GCOAWSClient:
         body: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         target_region: str | None = None,
+        stream: bool = False,
+        *,
+        max_attempts: int | None = None,
     ) -> requests.Response:
         """
         Make an authenticated request to the GCO API.
 
-        If use_regional_api is enabled and a target_region is specified,
-        the request will be routed through the regional API Gateway.
-        Otherwise, it uses the global API Gateway.
+        Requests with ``target_region`` always use that region's API Gateway so
+        exact region pinning is enforced without sending routing headers through
+        the global endpoint. Unpinned requests use the global API unless regional
+        mode is enabled, in which case they use ``config.default_region``. Global
+        aggregation paths are unavailable in regional mode. Missing regional
+        endpoints fail closed instead of silently using the global API.
 
         Args:
             method: HTTP method (GET, POST, etc.)
             path: API path (e.g., /api/v1/manifests)
             body: Request body (will be JSON encoded)
             headers: Additional headers
-            target_region: Target region for the request (added as header)
+            target_region: Exact region for the request. When set, the request
+                uses that region's API Gateway directly.
+            stream: Leave the response body unbuffered for incremental consumption.
+            max_attempts: Maximum attempts for read-only requests. Mutating
+                requests always make exactly one attempt. Defaults to the
+                existing retry limit.
 
         Returns:
             requests.Response object
+
+        Raises:
+            ValueError: If max_attempts is not a positive integer
         """
-        # Determine which endpoint to use
-        if self._use_regional_api and target_region:
-            regional_endpoint = self.get_regional_api_endpoint(target_region)
-            # Fall back to global API if regional not available
-            endpoint = regional_endpoint or self.get_api_endpoint()
+        _validate_max_attempts(max_attempts)
+
+        # Global aggregation endpoints exist only on the global API. Regional
+        # mode must reject them clearly rather than send a global path to a
+        # regional bridge and surface an opaque 404.
+        if self._use_regional_api and (
+            path == "/api/v1/global" or path.startswith("/api/v1/global/")
+        ):
+            raise ValueError("Global API operations are unavailable in regional API mode")
+
+        # Strict regional mode has no global fallback. Resolve an omitted
+        # optional ``--region`` to the configured default, then require a real
+        # non-blank Region before attempting endpoint discovery. Keep this as a
+        # separate branch so ``get_api_endpoint`` is unreachable in strict mode.
+        if self._use_regional_api:
+            effective_region = (
+                target_region if target_region is not None else self.config.default_region
+            )
+            if not isinstance(effective_region, str) or not effective_region.strip():
+                raise ValueError(
+                    "Regional API mode requires a non-empty target or default AWS region"
+                )
+            target_region = effective_region.strip()
+            endpoint = self.get_regional_api_endpoint(target_region)
+        elif target_region:
+            # Exact region pinning always uses the regional API. The global
+            # proxy is intentionally not VPC-attached and rejects
+            # X-GCO-Target-Region, so it cannot honor a pin without pretending
+            # success or weakening isolation.
+            endpoint = self.get_regional_api_endpoint(target_region)
         else:
             endpoint = self.get_api_endpoint()
 
+        if endpoint is None:
+            # Only regional discovery returns None; the global endpoint helper
+            # either returns an endpoint or raises its own actionable error.
+            assert target_region is not None
+            raise RuntimeError(
+                f"Regional API endpoint is not deployed in {target_region}; "
+                "exact region routing requires the regional API bridge"
+            )
+
         url = f"{endpoint.url}{path}"
 
-        # Prepare headers
-        request_headers = headers or {}
+        # Normalize the method once. Only read-only operations are eligible
+        # for automatic replay; retrying POST/PUT/PATCH/DELETE can duplicate a
+        # model invocation or state transition after an ambiguous response.
+        method = method.upper()
+        retryable_method = method in {"GET", "HEAD", "OPTIONS"}
+
+        # Prepare headers without mutating the caller's mapping.
+        request_headers = dict(headers or {})
         request_headers["Content-Type"] = "application/json"
 
-        # Add target region header if specified (for global API routing)
-        if target_region and not endpoint.is_regional:
-            request_headers["X-GCO-Target-Region"] = target_region
-
         # Prepare body
-        body_str = json.dumps(body) if body else ""
+        body_str = json.dumps(body) if body is not None else ""
 
         # Create AWS request for signing
         aws_request = AWSRequest(method=method, url=url, headers=request_headers, data=body_str)
@@ -402,24 +469,34 @@ class GCOAWSClient:
             )
         SigV4Auth(credentials, "execute-api", endpoint.region).add_auth(aws_request)
 
-        # Make the request with retry for transient failures
-        # Also retry 403 once with refreshed credentials (handles expired tokens from
-        # SSO, assumed roles, or instance metadata that rotated mid-request)
+        # Read-only requests retry transient failures and may refresh expired
+        # SigV4 credentials once. Mutating requests receive exactly one network
+        # attempt and return its response unchanged.
         last_response = None
-        _retried_auth = False
-        for attempt in range(_MAX_RETRIES):
+        retried_auth = False
+        attempt_limit = (
+            (max_attempts if max_attempts is not None else _MAX_RETRIES) if retryable_method else 1
+        )
+        for attempt in range(attempt_limit):
             response = requests.request(
                 method=method,
                 url=url,
                 headers=dict(aws_request.headers),
                 data=body_str,
-                timeout=30,
+                timeout=(10, 310) if stream else 30,
+                stream=stream,
             )
             last_response = response
 
-            # 403 may mean expired SigV4 signature — retry once with fresh credentials
-            if response.status_code == 403 and not _retried_auth:
-                _retried_auth = True
+            # A read-only 403 may mean an expired SigV4 signature. Refresh and
+            # retry once; mutating requests are never replayed automatically.
+            if (
+                response.status_code == 403
+                and retryable_method
+                and not retried_auth
+                and attempt < attempt_limit - 1
+            ):
+                retried_auth = True
                 logger.warning(
                     "Request to %s returned 403, refreshing credentials and retrying",
                     path,
@@ -433,13 +510,14 @@ class GCOAWSClient:
                 if credentials is None:
                     return response  # No credentials available, return the 403
                 SigV4Auth(credentials, "execute-api", endpoint.region).add_auth(aws_request)
+                response.close()
                 continue
 
-            if response.status_code not in _RETRYABLE_STATUS_CODES:
+            if response.status_code not in _RETRYABLE_STATUS_CODES or not retryable_method:
                 return response
 
-            # Retryable error — back off and retry
-            if attempt < _MAX_RETRIES - 1:
+            # Retryable read-only error — back off and retry.
+            if attempt < attempt_limit - 1:
                 wait_time = _RETRY_BACKOFF_BASE * (2**attempt)
                 logger.warning(
                     "Request to %s returned %d, retrying in %.1fs (attempt %d/%d)",
@@ -447,8 +525,9 @@ class GCOAWSClient:
                     response.status_code,
                     wait_time,
                     attempt + 1,
-                    _MAX_RETRIES,
+                    attempt_limit,
                 )
+                response.close()
                 time.sleep(wait_time)
 
                 # Re-sign the request for the retry (credentials/time may have changed)
@@ -606,7 +685,11 @@ class GCOAWSClient:
         return str(response.json().get("logs", ""))
 
     def delete_job(
-        self, job_name: str, namespace: str, region: str | None = None
+        self,
+        job_name: str,
+        namespace: str,
+        region: str | None = None,
+        expected_uid: str | None = None,
     ) -> dict[str, Any]:
         """
         Delete a job.
@@ -619,8 +702,13 @@ class GCOAWSClient:
         Returns:
             Deletion result dictionary
         """
+        path = f"/api/v1/jobs/{quote(namespace, safe='')}/{quote(job_name, safe='')}"
+        if expected_uid is not None:
+            path += f"?expected_uid={quote(expected_uid, safe='')}"
         response = self.make_authenticated_request(
-            method="DELETE", path=f"/api/v1/jobs/{namespace}/{job_name}", target_region=region
+            method="DELETE",
+            path=path,
+            target_region=region,
         )
 
         response.raise_for_status()
@@ -719,6 +807,7 @@ class GCOAWSClient:
         namespace: str | None = None,
         status: str | None = None,
         older_than_days: int | None = None,
+        label_selector: str | None = None,
         dry_run: bool = True,
     ) -> dict[str, Any]:
         """
@@ -728,6 +817,7 @@ class GCOAWSClient:
             namespace: Filter by namespace
             status: Filter by status
             older_than_days: Delete jobs older than N days
+            label_selector: Kubernetes label selector
             dry_run: If True, only return what would be deleted
 
         Returns:
@@ -740,6 +830,8 @@ class GCOAWSClient:
             body["status"] = status
         if older_than_days:
             body["older_than_days"] = older_than_days
+        if label_selector:
+            body["label_selector"] = label_selector
 
         response = self.make_authenticated_request(
             method="DELETE", path="/api/v1/global/jobs", body=body

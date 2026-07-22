@@ -125,15 +125,19 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: Run markdownlint-cli2
-        # Pin to a specific action version so a new major rev doesn't quietly
-        # start firing new rules. Configuration (rule set, globs, ignores) lives
-        # in .github/config/.markdownlint-cli2.yaml; see CONTRIBUTING.md for
-        # how to run the same check locally.
-        uses: DavidAnson/markdownlint-cli2-action@v24.0.0
+      - uses: actions/setup-node@v6.4.0
         with:
-          config: ".github/config/.markdownlint-cli2.yaml"
-          globs: "**/*.md"
+          node-version-file: ".nvmrc"
+          cache: "npm"
+          cache-dependency-path: "package-lock.json"
+      - name: Install and verify the declared npm version
+        run: bash .github/scripts/use-pinned-npm.sh package.json
+      - name: Install locked repository Node tooling
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run markdownlint-cli2
+        # The exact CLI and transitive graph come from package-lock.json so
+        # local runs and CI execute the same dependency set.
+        run: npm run lint:markdown
 
   lint-hadolint-dockerfile:
     name: "lint:hadolint:dockerfile"
@@ -147,9 +151,11 @@ jobs:
         # images switch to pip-tools-style pinning.
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD":/repo -w /repo \
+          # The image entrypoint is hadolint; override it so this shell loop
+          # executes instead of being parsed as hadolint file arguments.
+          docker run --rm --entrypoint bash -v "$PWD":/repo -w /repo \
             hadolint/hadolint:v2.14.0-debian \
-            bash -c '
+            -c '
               set -euo pipefail
               FOUND=0
               while IFS= read -r df; do
@@ -178,9 +184,11 @@ jobs:
         # -x follows source directives so sourced files are resolved.
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD":/repo -w /repo \
+          # The image entrypoint is shellcheck; override it so this shell loop
+          # executes instead of being parsed as shellcheck file arguments.
+          docker run --rm --entrypoint sh -v "$PWD":/repo -w /repo \
             koalaman/shellcheck-alpine:v0.11.0 \
-            sh -c '
+            -c '
               set -eu
               FOUND=0
               find . -name "*.sh" \
@@ -273,11 +281,14 @@ jobs:
         run: |
           set -uo pipefail
           FAILED=0
-          for d in lambda/alb-header-validator lambda/api-gateway-proxy \
+          for d in lambda/analytics-cleanup lambda/analytics-presigned-url \
+                   lambda/api-gateway-proxy lambda/capacity-poller \
                    lambda/cross-region-aggregator lambda/drift-detection \
                    lambda/ga-registration lambda/helm-installer \
+                   lambda/helm-orchestrator lambda/image-lookup \
                    lambda/kubectl-applier-simple lambda/proxy-shared \
-                   lambda/regional-api-proxy lambda/secret-rotation; do
+                   lambda/regional-api-proxy lambda/secret-rotation \
+                   lambda/tls-certificate-manager lambda/tls-shared; do
             echo "=== typecheck: $d ==="
             if ! mypy "$d"; then
               FAILED=1

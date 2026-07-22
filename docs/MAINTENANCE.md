@@ -9,10 +9,10 @@ flow, monitoring and alerting, day-to-day code health, and how a new maintainer
 gets oriented.
 
 This guide is the *how*. The monthly [`deps-scan` workflow](../.github/CI.md#dependency-scan-script)
-is the *when* — it opens an issue when a pinned version falls behind upstream.
-Some lists here (instance families, for example) are deliberately not
-auto-bumped: adding hardware is a human decision, so the scan leaves them to
-this runbook.
+is the *when* — it opens or refreshes one issue when a pinned version or the EC2
+accelerator catalog drifts. Accelerator discovery is automated, but lifecycle,
+architecture, replacement, and NodePool scheduling policy remain explicit human
+review decisions.
 
 ## Table of contents
 
@@ -35,93 +35,142 @@ this runbook.
 
 | Cadence | Task | Trigger |
 |---------|------|---------|
-| Monthly | Review the dependency-scan issue and bump flagged pins | Automated `deps-scan` issue |
-| When AWS ships new hardware | Add instance types / families to the lists below | AWS launch announcement |
+| Monthly | Review the dependency-scan issue, including accelerator catalog and NodePool findings | Automated `deps-scan` issue |
+| When EC2 accelerator drift appears | Review family policy, refresh the catalog, and update eligible NodePools/watch lists together | `deps-scan` **Accelerator Catalog and NodePools** row or AWS launch announcement |
 | When the scan flags EKS standard-support ending (or ~yearly) | Upgrade the EKS Kubernetes minor | `deps-scan` **EKS Kubernetes Version** row |
 | When the scan flags an epoch older than 45 days (or Trivy finds an OS CVE) | Bump the base-image security epoch | `deps-scan` **Base-image Security Epochs** row |
 | ~30 days before a suppression `exp:` date | Renew or drop the CVE suppression | `deps-scan` **Suppression Expiries** row |
 | When the scan flags a newer same-family model | Bump the Bedrock default model pin | `deps-scan` **Bedrock default model** row |
 | Weekly | Check the `cve-scan` result and act on new findings | Monday `cve-scan` run |
-| Every PR | Keep coverage ≥ 90% and label the PR so release notes categorize | Opening a pull request |
+| Every PR | Keep measured Python coverage ~92% and label the PR so release notes categorize | Opening a pull request |
 | Every release | Bump the version and confirm the generated GitHub Release notes | Cutting a version |
 | On alarm | Follow the matching runbook in `docs/RUNBOOKS.md` | CloudWatch alarm via the SNS alert topic |
 
 ## Adding a new instance type or family
 
-There is no single list of instance types. Which files you touch depends on
-*why* you are adding the hardware — CLI capacity analysis, a training pool, a
-serving pool, and so on. Use the table, then follow the matching recipe.
+GCO separates three concerns that must not be conflated:
 
-### Where instance types live
+1. **Discovery** — which NVIDIA GPU and AWS Neuron instance types EC2 currently
+   advertises in any enabled commercial Region.
+2. **Observation** — which types the capacity-history poller watches, including
+   types retained for historical visibility.
+3. **Scheduling policy** — which reviewed families each Karpenter NodePool may
+   select for new workloads.
 
-| Purpose | File(s) to edit | Format |
-|---------|-----------------|--------|
-| CLI capacity/spot analysis, `gco capacity` | `cli/capacity/models.py` → `GPU_INSTANCE_SPECS` | Python dict: exact type → `InstanceTypeInfo(vcpus, mem, gpu_count, gpu_type, gpu_mem, arch)` |
-| Default set the capacity advisor probes | `cli/capacity/advisor.py` → default `instance_types` list | Python list of exact types |
-| x86 general GPU pool | `lambda/kubectl-applier-simple/manifests/40-nodepool-gpu-x86.yaml` | Karpenter `instance-family` values |
-| ARM64 GPU pool | `.../41-nodepool-gpu-arm.yaml` | Karpenter `instance-family` values |
-| Inference-optimized GPU pool | `.../42-nodepool-inference.yaml` | Karpenter `instance-family` values |
-| EFA distributed-training pool | `.../43-nodepool-efa.yaml` | Karpenter `instance-family` values |
-| Neuron / Trainium / Inferentia pool | `.../44-nodepool-neuron.yaml` | Karpenter `instance-family` values |
-| Curated ≥80 GB FP8 serving pool (Mooncake) | `.../46-nodepool-mooncake-efa.yaml` | Karpenter `instance-family` values |
-| Example jobs that pin a family | `examples/*.yaml` (e.g. `trainium-job.yaml`, `inferentia-job.yaml`, `megatrain-sft-job.yaml`, `inference-sglang.yaml`) | `nodeSelector` / affinity |
-| Human-facing lists (keep accurate, not load-bearing) | `gco/stacks/regional_stack.py` (nodepool comment block), `README.md`, `docs/CUSTOMIZATION.md` | Prose / comments |
+The checked-in catalog makes the first two concerns complete and deterministic;
+NodePool family lists keep the third concern deliberate.
 
-`45-nodepool-cpu-general.yaml` selects by category and generation rather than a
-family list, so it does **not** need per-hardware edits.
+### Sources of truth
+
+| Purpose | Authoritative file(s) | Contract |
+|---------|-----------------------|----------|
+| EC2 accelerator inventory | `gco/config/accelerator_catalog.json` → `instance_types` | Sorted union of instance types with an NVIDIA GPU or AWS Neuron device across enabled commercial Regions |
+| Reviewed family policy | `gco/config/accelerator_catalog.json` → `families` | Accelerator, architecture, track, generation, lifecycle, scheduling eligibility, reason, and replacements |
+| Capacity-history observation | `cdk.json` → `historical.watch_instance_types`; fallback in `gco/config/config_loader.py` | Both copies must exactly equal the catalog's `instance_types` list |
+| Karpenter scheduling | `lambda/kubectl-applier-simple/manifests/40-*.yaml` through `46-*.yaml` | Explicit `eks.amazonaws.com/instance-family` policy per workload class |
+| Rich CLI hardware/pricing metadata | `cli/capacity/models.py` and the curated defaults in `cli/capacity/advisor.py` | Add only when the CLI needs local vCPU, memory, accelerator, or advisor metadata |
+| Pinned examples and prose | `examples/*.yaml`, `gco/stacks/regional_stack.py`, `README.md`, `docs/CUSTOMIZATION.md` | Keep selectors and human guidance aligned with reviewed scheduling support |
+
+`45-nodepool-cpu-general.yaml` selects by category and generation, so accelerator
+catalog maintenance does not require per-type CPU edits.
 
 > **Instance-family gotcha:** EKS Auto Mode labels a node with the exact family
-> segment AWS uses in its catalog, and a bare entry only matches that one
-> family. `p5`, `p5e`, and `p5en` are three separate families; `p6-b200`,
-> `p6-b300`, and `p6e-gb200` are three more. Enumerate every generation you
-> want — see the header note in `43-nodepool-efa.yaml`.
+> segment AWS uses in its catalog. `p5`, `p5e`, and `p5en` are separate families;
+> `p6-b200`, `p6-b300`, and `p6e-gb200` are separate as well. Catalog presence
+> never makes a family schedulable automatically. For example, `p3dn.24xlarge`
+> remains observable while the deprecated `p3dn` family is prohibited from new
+> NodePools.
 
-### Recipe: a new GPU instance type visible to the CLI
+### Deterministic offline validation
 
-1. Add an entry to `GPU_INSTANCE_SPECS` in `cli/capacity/models.py`. The
-   `gpu_type` field (for example `H100`, `B200`) is what ties the accelerator
-   to its family, so fill it in accurately.
-2. If the type belongs in the advisor's default probe set, add it to the
-   `instance_types` list in `cli/capacity/advisor.py`.
-3. Update the tests that assert on the specs (see [below](#tests-that-must-change-together)).
-
-### Recipe: a new accelerator family for a node pool
-
-1. Add the family string to the `values` list under the
-   `eks.amazonaws.com/instance-family` requirement in the matching NodePool
-   manifest from the table above.
-2. If the family is a new GPU generation, confirm the pool's other
-   requirements still apply (GPU manufacturer, architecture, EFA taint).
-3. For a serving-tier GPU, add it to `46-nodepool-mooncake-efa.yaml` **only** if
-   it is a ≥80 GB FP8-capable part, and keep `p4d` out of that curated pool.
-4. Refresh the human-facing lists (the nodepool comment block in
-   `regional_stack.py`, the `README.md` nodepool summary, and
-   `docs/CUSTOMIZATION.md`) so they stay accurate.
-
-### Tests that must change together
-
-These tests assert on the instance lists and will fail if you edit a list
-without updating them:
-
-- `tests/test_cli.py` — expects `GPU_INSTANCE_SPECS` to contain the baseline
-  types (`g4dn.xlarge`, `g5.xlarge`, `p3.2xlarge`, `p4d.24xlarge`).
-- `tests/test_capacity_history_config.py` — derives the family set from the
-  spec keys and asserts a baseline set is present.
-- `tests/test_mooncake_nodepool_manifest.py` — pins the pool 46 family set
-  **exactly** (`_EXPECTED_FAMILIES`) and requires `p4d` to stay in pool 43.
-  Edit this whenever you change either pool's families.
-- `tests/test_inference.py` — asserts an example's `nodeSelector` family
-  (for example `inf2`); update if you change the referenced example.
-- `tests/test_integration.py` — validates the shape of every manifest under
-  `lambda/kubectl-applier-simple/`, so a new pool must keep the NodePool schema.
-
-Run the focused set after editing:
+Run this before and after every accelerator or NodePool change:
 
 ```bash
-pytest tests/test_cli.py tests/test_capacity_history_config.py \
-  tests/test_mooncake_nodepool_manifest.py tests/test_inference.py \
-  tests/test_integration.py
+python scripts/accelerator_catalog.py validate
+python -m pytest tests/test_accelerator_catalog.py -q
 ```
+
+The validator needs no AWS credentials and fails with actionable guidance when:
+
+- a NodePool references a deprecated or end-of-life family, naming the exact
+  manifest and reviewed replacements;
+- a newer active generation in the same scheduling track is absent from every
+  eligible NodePool, naming the pools to review;
+- `cdk.json` or the `ConfigLoader` fallback omits or adds a watched type; or
+- the catalog, family metadata, architecture, lifecycle, or manifest policy is
+  malformed or contradictory.
+
+Normal pull-request CI runs both commands. Do not replace this deterministic gate
+with live EC2 calls.
+
+### Monthly online drift
+
+The monthly dependency scan always runs offline validation first. With valid OIDC
+credentials it then calls `DescribeRegions` and paginated
+`DescribeInstanceTypes` sequentially, using adaptive retries, and compares the
+live enabled-Region union with the checked-in catalog. Ordinary drift updates the
+same rolling dependency issue and does not fail the scheduled workflow; an API,
+credential, or parser failure becomes one explicit operational finding rather
+than a false “current” result.
+
+Run the same comparison manually with:
+
+```bash
+python scripts/accelerator_catalog.py check-online --json-summary
+
+# Optional human-readable report for review
+python scripts/accelerator_catalog.py check-online \
+  --report /tmp/accelerator-catalog-drift.md --json-summary
+```
+
+Exit code `0` means current, `1` means reviewed action is needed for catalog
+drift, and `2` means the online check itself failed.
+
+### Reviewing and refreshing catalog drift
+
+1. Read every added, removed, and family-metadata change in the report. Confirm
+   it against the AWS launch or lifecycle information; catalog output is
+   untrusted discovery data, not policy.
+2. For a new family, add explicit `accelerator`, `architectures`, `track`,
+   `generation`, and `lifecycle` metadata first. Add `manifest_allowed`,
+   `reason`, and `replacements` when the default active/allowed policy is not
+   correct.
+3. Decide which NodePools, if any, should schedule the family. Check CPU
+   architecture, accelerator class, EFA/RDMA requirements, memory and FP8
+   capability, workload fit, and regional support. Deprecated and end-of-life
+   families must not enter new scheduling.
+4. Refresh to a review file first. The command refuses unknown families and EC2
+   metadata that disagrees with reviewed family policy:
+
+   ```bash
+   python scripts/accelerator_catalog.py refresh \
+     --output /tmp/accelerator_catalog.json
+   ```
+
+   Successful refresh output embeds `last_refreshed_at` as a UTC ISO-8601
+   timestamp. Read-only `validate`, `capture`, and `check-online` runs never
+   rewrite that timestamp.
+
+5. Review the diff, then replace the catalog's `instance_types` with the approved
+   output. Synchronize `historical.watch_instance_types` in `cdk.json` and the
+   fallback in `gco/config/config_loader.py`; offline validation reports every
+   missing or extra type if either copy is incomplete.
+6. Update NodePools, CLI hardware metadata/advisor defaults, examples, and prose
+   only where the reviewed support decision requires it.
+7. Run the focused suite:
+
+   ```bash
+   python scripts/accelerator_catalog.py validate
+   pytest tests/test_accelerator_catalog.py \
+     tests/test_capacity_history_config.py \
+     tests/test_mooncake_nodepool_manifest.py \
+     tests/test_cli.py tests/test_inference.py tests/test_integration.py
+   ```
+
+For an existing family with a newly released size, no NodePool family edit may
+be necessary, but the catalog and both observation lists still move together.
+For a new generation, the validator intentionally remains advisory until a
+maintainer records the scheduling decision.
 
 ## Upgrading the EKS Kubernetes version
 
@@ -241,58 +290,86 @@ each carry an `exp:YYYY-MM-DD` marker and a justification. The rules:
 ## Routine dependency bumps
 
 The monthly [`deps-scan`](../.github/CI.md#dependency-scan-script) issue lists
-every surface that has drifted (Python packages, Docker images, Helm charts,
-EKS add-ons, CI tooling, and more), grouped with an urgency hint and per-row
-links to the upstream changelog. To act on it:
+every surface that has drifted (Python packages, npm graphs, Docker images,
+Helm charts, EKS add-ons, accelerator catalog/NodePool policy, CI tooling, and
+more), grouped with an urgency hint and per-row links to the upstream source.
+To act on it:
 
 1. Follow the report's **Ref** links to review changelogs for breaking changes.
-2. Update the version in `pyproject.toml`, the manifest, `charts.yaml`, or the
-   pinned `*_VERSION` env/ARG value.
-3. Regenerate `requirements-lock.txt` if Python dependencies changed.
+2. Update the exact version in `pyproject.toml`, the relevant `package.json`, a
+   manifest, `charts.yaml`, or the pinned `*_VERSION` env/ARG value.
+3. Regenerate the lock that belongs to the changed graph:
+   - Python: regenerate `requirements-lock.txt` with the supported container
+     workflow documented below.
+   - Root npm tooling: run
+     `npm install --save-dev --save-exact --ignore-scripts --no-audit --no-fund <package>@<version>`.
+   - Streaming Lambda: run
+     `npm --prefix lambda/inference-streaming-proxy install --save-exact --ignore-scripts --no-audit --no-fund <package>@<version>`.
 4. Reconcile any **Version Consistency** rows so every copy of a pin agrees.
-5. Run the test suite locally, then open a PR.
+5. Run the affected checks and open a PR; CI independently audits both npm
+   graphs and rejects lock, runtime, or dependency-management drift.
 
 Python dependencies are intentionally not tracked by Dependabot — they are
 pinned through `requirements-lock.txt` with `pip-compile` and reviewed
-deliberately. GitHub Actions and Docker base images *are* tracked by Dependabot;
-see [Dependabot](../.github/CI.md#dependabot) for the split.
+deliberately. GitHub Actions, Docker base images, and both repository-owned npm
+graphs *are* tracked by Dependabot; see
+[Dependabot](../.github/CI.md#dependabot) for the split.
 
 ## Refreshing the Bedrock default model
 
 GCO's two optional, advisory Bedrock features — Mission sampling (`gco mission
 ...`) and the capacity advisor (`gco capacity ai-recommend` / `predict` and the
-`ai_recommend` MCP tool) — default to **Amazon Nova Pro**
-(`us.amazon.nova-pro-v1:0`). That id is pinned as a Python constant in two
-places, kept byte-identical by a CI test:
+`ai_recommend` MCP tool) — default to **Amazon Nova 2 Lite** through its global
+cross-Region inference profile (`global.amazon.nova-2-lite-v1:0`). The model id
+and reasoning preference have one checked-in source: `cdk.json`
+`context.bedrock`, whose stock `thinking.effort` is `high` (Nova 2 Lite's maximum
+supported effort). Mission sampling and the capacity advisor resolve both
+values through the lightweight `gco.bedrock` module; the same file is shipped
+as package data for installed CLI/MCP use. The consistency test guards the
+compatibility aliases, reasoning translation, packaging, inference-profile
+shape, and captured default-model fixture.
 
-| File | Constant | Guard |
-|------|----------|-------|
-| `gco_mcp/mission/sampling.py` | `DEFAULT_BEDROCK_MODEL_ID` | `tests/test_default_bedrock_model_consistency.py` |
-| `cli/capacity/advisor.py` | `BedrockCapacityAdvisor.DEFAULT_MODEL` | (same test) |
+High reasoning maps to Converse
+`additionalModelRequestFields.reasoningConfig.maxReasoningEffort=high`. AWS
+requires `maxTokens`, `temperature`, and `topP` to be unset at this effort, so
+GCO omits those controls for the canonical default. Reasoning tokens are billed
+as output tokens and high effort can materially increase cost and latency.
+Explicit model overrides keep their existing inference controls and do not
+inherit Nova-specific reasoning fields.
 
-Because it is a Python constant — not a `pyproject.toml` entry, a Dockerfile
-`FROM`, or a manifest — Dependabot never sees it. The monthly
+Because it is a deployment configuration value — not a `pyproject.toml` entry,
+a Dockerfile `FROM`, or a manifest image — Dependabot never sees it. The monthly
 [`deps-scan`](../.github/CI.md#dependency-scan-script) closes that gap: its
-**Bedrock default model** check reads `DEFAULT_BEDROCK_MODEL_ID`, lists the
+**Bedrock default model** check reads the `cdk.json` context value, lists the
 system-defined inference profiles in `us-east-1`, and flags a newer release **in
-the same model family** — a future Nova Pro generation, never a jump to a
-different tier or provider (that is a choice, not drift). The check needs AWS
+the same model family** — a future global Nova Lite generation, never a jump to
+a different scope, tier, or provider (that is a choice, not drift). The check needs AWS
 credentials via OIDC; without them the scan skips it with a noted reason, so a
 credential-less run is not a false "up to date".
 
 When the scan flags a newer same-family model (or you decide to move the default
 deliberately):
 
-1. Bump **both** constants to the new id — keep them identical or
-   `test_default_bedrock_model_consistency.py` fails. The id must be a
-   system-defined **inference profile** (`us.` / `eu.` / `apac.` prefix), not a
-   bare model id, so requests route cross-Region.
-2. If the new model has no captured scaffolder fixture yet, refresh the replay
-   corpus: `python scripts/capture_scaffold_fixtures.py --model <id>`.
-3. Run the Mission and capacity suites, then open a PR.
+1. Change `cdk.json` `context.bedrock.default_model_id` to the new id and set
+   `context.bedrock.thinking.effort` to a level the model supports. The stock
+   value is a system-defined **global inference profile**; global profiles can
+   route worldwide and are unsuitable when a geography boundary is required.
+   Use an appropriate geography-scoped profile (`us.` / `eu.` / `jp.` / etc.)
+   where data residency requires it. Update the intentionally independent
+   `_EXPECTED_DEFAULT_MODEL_ID`, `_EXPECTED_FIXTURE_NAME`, and thinking review
+   pins in `tests/test_default_bedrock_model_consistency.py`; those assertions
+   are not runtime defaults, but they make model, fixture, and reasoning changes
+   explicit in review.
+2. Capture a genuine fixture for the exact profile id:
+   `python3 scripts/capture_scaffold_fixtures.py --model <id> --region us-east-1`.
+   The canonical directive set makes three paid calls; high reasoning can make
+   the run substantially slower and more expensive.
+3. Run the Mission and capacity suites, then open a PR. The consistency guard
+   proves both runtime aliases and the dependency scanner still resolve the
+   same `cdk.json` value.
 
 Picking a *different* model — for regulatory, data-residency, model-governance,
-or cost reasons — rather than tracking Nova Pro releases is an operator choice,
+or cost reasons — rather than tracking Nova Lite releases is an operator choice,
 not routine maintenance; the override paths (per-call flag,
 `GCO_MISSION_BEDROCK_MODEL_ID`, or changing the default) live in
 [Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). Both
@@ -311,6 +388,7 @@ the repo or CI fails — most of this is "when you add X, register it in Y":
 | Add a `docs/*.md` guide | `DOC_METADATA` in `gco_mcp/resources/docs.py` (keep `topics` from the existing small vocabulary; every `related` entry must reference a real key) | `tests/test_mcp_docs_index.py` |
 | Add an `examples/*.yaml` manifest | `EXAMPLE_METADATA` in `gco_mcp/resources/docs.py` | `find_examples` discovery |
 | Add a package README meant for agents | `PACKAGE_DOC_METADATA` in `gco_mcp/resources/docs.py` | `tests/test_mcp_docs_index.py` |
+| Add a normative root document | The root Markdown file, `ROOT_DOC_METADATA`, a static `docs://gco/{name}` resource, and `docs_index()` in `gco_mcp/resources/docs.py` | `tests/test_mcp_docs_index.py`, `tests/test_mcp_server.py`, `tests/test_mcp_integration.py` |
 | Add or rename an MCP tool | the Tool Reference table (and the per-module count) in `gco_mcp/tools/README.md` | `tests/test_docs_coverage.py` |
 | Gate a tool behind a feature flag | `gco_mcp/feature_flags.py`, and document the flag in `gco_mcp/README.md` | — |
 
@@ -335,25 +413,52 @@ resolved lockfile, so a clean checkout installs the same graph CI ran.
 - Direct Python deps and their extras (`cdk`, `diagrams`, `inference-monitor`,
   `mcp`, `lint`, `typecheck`, `test`, `security`, `dev`) — exact `==` pins in
   `pyproject.toml`.
-- The full transitive closure — `requirements-lock.txt`, generated by
+- The full Python transitive closure — `requirements-lock.txt`, generated by
   `pip-compile`.
+- Repository development tooling — exact `devDependencies` in the root
+  `package.json` with the full graph in the adjacent `package-lock.json`.
+- The deployable response-streaming Lambda — exact `dependencies` in
+  `lambda/inference-streaming-proxy/package.json` with a separate adjacent
+  lockfile, so development tools cannot enter the production asset.
+- Both npm manifests pin `engines.node` and `packageManager`; the monthly scan
+  keeps those values aligned with `.nvmrc`, `Dockerfile.dev`, and
+  `LAMBDA_NODEJS_RUNTIME` in `gco/stacks/constants.py`.
 - Versions that live outside `pyproject.toml` — workflow `*_VERSION` env pins,
   Dockerfile `ARG`s, `lambda/helm-installer/charts.yaml`,
-  `gco/stacks/constants.py`, and the Python-constant image/model pins (the
-  Mooncake default image in `cli/images.py`, and the Bedrock default model
-  `DEFAULT_BEDROCK_MODEL_ID` in `gco_mcp/mission/sampling.py` — see
+  `gco/stacks/constants.py`, the Python-constant Mooncake default image in
+  `cli/images.py`, and the Bedrock model at
+  `cdk.json` `context.bedrock.default_model_id` (see
   [Refreshing the Bedrock default model](#refreshing-the-bedrock-default-model)).
   These are tracked by the monthly scan rather than Dependabot.
 
-No open ranges. If a local `pip install` needs a range to resolve, the venv is
-dirty — fix the environment, don't loosen the pin.
+No open ranges. Every direct Python and npm dependency uses an exact version,
+and each graph commits its resolved lock. If a local install needs a range to
+resolve, the environment is dirty — fix the environment, don't loosen the pin.
 
 ### Updating a dependency
 
-1. Change the pin (`pyproject.toml`, a manifest, `charts.yaml`, or a
-   `*_VERSION`), reviewing the upstream changelog for breaking changes.
-2. Regenerate the lockfile through the container — the only supported path, so
-   the result matches CI's Linux resolution:
+1. Change the exact pin (`pyproject.toml`, the appropriate `package.json`, a
+   manifest, `charts.yaml`, or a `*_VERSION`), reviewing the upstream changelog
+   for breaking changes.
+2. For an npm dependency, update only its owning graph and adjacent lockfile:
+
+   ```bash
+   # Install and verify npm from the exact packageManager pin first.
+   bash .github/scripts/use-pinned-npm.sh package.json
+
+   # Root development tooling
+   npm install --save-dev --save-exact --ignore-scripts --no-audit --no-fund \
+     <package>@<version>
+
+   # Production streaming-Lambda dependencies
+   npm --prefix lambda/inference-streaming-proxy install \
+     --save-exact --ignore-scripts --no-audit --no-fund <package>@<version>
+   ```
+
+   Never copy root tooling into the Lambda graph. Commit both the changed
+   manifest and its `package-lock.json`.
+3. For a Python dependency, regenerate the lockfile through the container — the
+   only supported path, so the result matches CI's Linux resolution:
 
    ```bash
    docker build -f Dockerfile.dev -t gco-dev .
@@ -364,9 +469,8 @@ dirty — fix the environment, don't loosen the pin.
    '
    ```
 
-3. Run the suite locally, then open a PR. The lockfile-freshness check in
-   `unit-tests.yml` fails if `requirements-lock.txt` drifts from
-   `pyproject.toml`.
+4. Run the affected checks, then open a PR. CI rejects stale Python or npm
+   lockfiles, unmanaged npm graphs, and inconsistent Node/npm/CDK pins.
 
 See [Regenerating the Lockfile](../CONTRIBUTING.md#regenerating-the-lockfile)
 for the full rationale, and [Routine dependency bumps](#routine-dependency-bumps)
@@ -376,26 +480,34 @@ for acting on a monthly drift report.
 
 | Layer | What runs | Cadence |
 |-------|-----------|---------|
-| `security.yml` | bandit, pip-audit, Trivy (filesystem + per-image), semgrep, checkov, KICS, trufflehog, gitleaks, CodeQL | Every push + PR |
+| `security.yml` | bandit, pip-audit, npm audit (every owned graph), Trivy (filesystem + per-image), semgrep, checkov, KICS, trufflehog, gitleaks, CodeQL (Python + JavaScript) | Every push + PR |
 | `cve-scan.yml` | Trivy re-run against fresh CVE databases | Weekly (Mon 09:00 UTC) |
 | `deps-scan.yml` | Version drift across every pinned surface | Monthly |
 
 When a scanner flags a CVE with no upstream fix yet, suppress it with an
 expiring entry — see [Renewing CVE suppressions](#renewing-cve-suppressions).
 
-**Automated updates.** Dependabot is scoped to **GitHub Actions and Docker
-only** (`.github/dependabot.yml`); Python stays on the deliberate `pip-compile`
-path above. See [Dependabot](../.github/CI.md#dependabot) for the rationale.
+**Automated updates.** Dependabot is scoped to **GitHub Actions, Docker, and
+both repository-owned npm graphs** (`.github/dependabot.yml`); Python stays on
+the deliberate `pip-compile` path above. The security workflow runs
+`npm audit` independently in every discovered graph, and Advanced Setup CodeQL
+analyzes both Python and JavaScript. See
+[Dependabot](../.github/CI.md#dependabot) for the rationale.
 
 ## Testing and CI hygiene
 
 ### Coverage expectation
 
-Line + branch coverage must stay **≥ 90%** (`fail_under = 90` in
-`pyproject.toml` `[tool.coverage.report]`), enforced by the `unit:pytest:core`
-job with `--cov-fail-under=90` over `gco`, `cli`, and `gco_mcp`. The HTML report
-is published to GitHub Pages after each `main` run by `pages.yml`. Ship new code
-with tests that hold the line rather than lowering the threshold.
+Python line + branch coverage has an enforced floor of **90%** (`fail_under = 90`
+in `pyproject.toml` `[tool.coverage.report]`), applied by `unit:pytest:core`
+with `--cov-fail-under=90` over `gco`, `cli`, and `gco_mcp`. The project still
+targets **~92% measured coverage** for pull requests and releases; review the
+CI artifact against that target without raising the global failure floor. The
+dedicated `unit:node:inference-streaming-proxy` job separately requires at
+least 93% lines, functions, and branches from Node.js 24's built-in V8
+coverage. The Python HTML report is published to GitHub Pages after each
+`main` run by `pages.yml`. Ship new code with tests that hold the ~92% target
+rather than lowering the 90% floor.
 
 ### Test layout
 
@@ -408,10 +520,15 @@ with tests that hold the line rather than lowering the threshold.
   `GCO_HELM_CHART_VALIDATION=1` (needs `helm` + network).
 - `tests/BATS/` — Bash tests for the shell scripts (`dependency-scan.sh`, the
   demo recorders, cluster-access setup), run by the `unit:bats:*` jobs.
+- `tests/inference-streaming-proxy/` — native `node:test` coverage for the
+  production response-streaming Lambda. Its isolated Node.js 24 workflow runs
+  `npm ci` in the Lambda's dependency graph before enforcing 93%
+  line/function/branch coverage.
 - Many tests are **guard tests** that pin an invariant so a partial change
   fails loudly — version-skew guards, manifest-shape guards, the docs index,
-  the pip-audit-ignore validator. A guard failure means "you changed two things
-  that must move together," not "delete the assertion."
+  the pip-audit-ignore validator, and accelerator catalog/NodePool/watch-list
+  synchronization. A guard failure means "you changed things that must move
+  together," not "delete the assertion."
 
 ### Flaky-test triage
 
@@ -602,14 +719,20 @@ surfaces version drift as a single rolling issue.
 `diagrams/infra_diagrams/` (per-stack CDK views) and `diagrams/code_diagrams/`
 (per-function flowcharts) regenerate via their `generate.py` scripts. Refresh
 them when architecture or a charted handler changes so the visual docs don't
-rot.
+rot. One code-diagram generation uses one UTC timestamp across HTML metadata
+and visible content, PNG pixels, the generated README, and every source marker.
+Normal runs intentionally record their wall-clock invocation time and can
+produce metadata-only changes even when source code is unchanged. Set a fixed
+integer `SOURCE_DATE_EPOCH` when byte-reproducible output is required. Never
+hand-edit an individual artifact's timestamp — regenerate the complete target
+catalogue.
 
 ## Onboarding for maintainers
 
 A new maintainer should become productive from the docs alone. Read in this
 order:
 
-1. **Orientation** — [`README.md`](../README.md),
+1. **Orientation** — [`TENETS.md`](../TENETS.md), [`README.md`](../README.md),
    [`QUICKSTART.md`](../QUICKSTART.md), and the [docs index](README.md) (which
    carries a full reading order for users and operators).
 2. **How it is built** — [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) and

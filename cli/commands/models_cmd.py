@@ -38,17 +38,18 @@ def models_upload(config: Any, local_path: Any, name: Any) -> None:
 
     try:
         manager = get_model_manager(config)
-        formatter.print_info(f"Uploading {local_path} as '{name}'...")
+        if config.output_format == "table":
+            formatter.print_info(f"Uploading {local_path} as '{name}'...")
         result = manager.upload(local_path, name)
 
-        formatter.print_success(
-            f"Uploaded {result['files_uploaded']} file(s) to {result['s3_uri']}"
-        )
-        formatter.print_info(
-            f"Use --model-source {result['s3_uri']} when deploying inference endpoints"
-        )
-
-        if config.output_format != "table":
+        if config.output_format == "table":
+            formatter.print_success(
+                f"Uploaded {result['files_uploaded']} file(s) to {result['s3_uri']}"
+            )
+            formatter.print_info(
+                f"Use --model-source {result['s3_uri']} when deploying inference endpoints"
+            )
+        else:
             formatter.print(result)
 
     except Exception as e:
@@ -89,14 +90,15 @@ def models_upload_regional(config: Any, local_path: Any, region: Any, prefix: An
 
     try:
         manager = get_regional_bucket_manager(config)
-        formatter.print_info(f"Uploading {local_path} to region '{region}'...")
+        if config.output_format == "table":
+            formatter.print_info(f"Uploading {local_path} to region '{region}'...")
         result = manager.upload(local_path, region, prefix=prefix)
 
-        formatter.print_success(
-            f"Uploaded {result['files_uploaded']} file(s) to {result['s3_uri']}"
-        )
-
-        if config.output_format != "table":
+        if config.output_format == "table":
+            formatter.print_success(
+                f"Uploaded {result['files_uploaded']} file(s) to {result['s3_uri']}"
+            )
+        else:
             formatter.print(result)
 
     except Exception as e:
@@ -148,7 +150,11 @@ def models_list(config: Any) -> None:
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 @pass_config
 def models_delete(config: Any, model_name: Any, yes: Any) -> None:
-    """Delete a model from the central S3 bucket.
+    """Permanently delete a model and all object history from the central S3 bucket.
+
+    Every current object, historical version, and delete marker beneath the
+    model prefix is removed. Successful batches cannot be restored if a later
+    batch fails.
 
     Examples:
         gco models delete llama3-8b -y
@@ -158,7 +164,11 @@ def models_delete(config: Any, model_name: Any, yes: Any) -> None:
     formatter = get_output_formatter(config)
 
     if not yes:
-        click.confirm(f"Delete model '{model_name}' and all its files?", abort=True)
+        click.confirm(
+            f"Permanently delete model '{model_name}', including all current files "
+            "and historical S3 versions? This cannot be undone.",
+            abort=True,
+        )
 
     try:
         manager = get_model_manager(config)

@@ -257,13 +257,17 @@ class TestKubernetesManifests:
         valid_api_versions = {
             "v1",
             "apps/v1",
+            "autoscaling/v2",
             "batch/v1",
             "networking.k8s.io/v1",
+            "gateway.networking.k8s.io/v1",
+            "gateway.k8s.aws/v1beta1",
             "rbac.authorization.k8s.io/v1",
             "storage.k8s.io/v1",
             "policy/v1",
             "karpenter.sh/v1",
             "karpenter.k8s.aws/v1",
+            "coordination.k8s.io/v1",
             "eks.amazonaws.com/v1",
             "resource.k8s.io/v1beta1",
             "apiregistration.k8s.io/v1",
@@ -382,6 +386,7 @@ class TestKubernetesManifests:
             "gco-health-monitor-sa",
             "gco-manifest-processor-sa",
             "gco-inference-monitor-sa",
+            "gco-inference-proxy-sa",
         }
         gco_deployments_checked = 0
 
@@ -435,8 +440,8 @@ class TestKubernetesManifests:
                         "missing AWS_WEB_IDENTITY_TOKEN_FILE env var for IRSA"
                     )
 
-        assert gco_deployments_checked >= 3, (
-            f"Expected at least 3 GCO deployments with dedicated service accounts, "
+        assert gco_deployments_checked >= 4, (
+            f"Expected at least 4 GCO deployments with dedicated service accounts, "
             f"found {gco_deployments_checked}"
         )
 
@@ -463,6 +468,7 @@ class TestKubernetesManifests:
             ("gco-system", "gco-health-monitor-sa"),
             ("gco-system", "gco-manifest-processor-sa"),
             ("gco-system", "gco-inference-monitor-sa"),
+            ("gco-system", "gco-inference-proxy-sa"),
         }
         # User workload SAs
         required_workload_sas = {
@@ -483,6 +489,7 @@ class TestKubernetesManifests:
             "gco-health-monitor-sa",
             "gco-manifest-processor-sa",
             "gco-inference-monitor-sa",
+            "gco-inference-proxy-sa",
             "gco-service-account",
         }
         for filepath in manifest_files:
@@ -916,13 +923,14 @@ class TestLambdaHandlers:
             with patch("boto3.client"), patch("urllib3.PoolManager"):
                 sys.modules.pop("handler", None)
                 sys.modules.pop("proxy_utils", None)
+                sys.modules.pop("backend_tls", None)
                 import handler
 
                 assert hasattr(handler, "lambda_handler")
         finally:
             sys.path.remove(str(handler_path))
             sys.path.remove(str(proxy_path))
-            for mod in ["handler", "proxy_utils"]:
+            for mod in ["handler", "proxy_utils", "backend_tls"]:
                 sys.modules.pop(mod, None)
 
     def test_regional_api_proxy_handler_signature(self):
@@ -935,6 +943,7 @@ class TestLambdaHandlers:
             with patch("boto3.client"), patch("urllib3.PoolManager"):
                 sys.modules.pop("handler", None)
                 sys.modules.pop("proxy_utils", None)
+                sys.modules.pop("backend_tls", None)
                 import handler
 
                 sig = inspect.signature(handler.lambda_handler)
@@ -944,7 +953,7 @@ class TestLambdaHandlers:
         finally:
             sys.path.remove(str(handler_path))
             sys.path.remove(str(proxy_path))
-            for mod in ["handler", "proxy_utils"]:
+            for mod in ["handler", "proxy_utils", "backend_tls"]:
                 sys.modules.pop(mod, None)
 
     def test_cross_region_aggregator_handler_imports(self):
@@ -974,27 +983,6 @@ class TestLambdaHandlers:
                 assert hasattr(handler, "aggregate_health")
                 assert hasattr(handler, "aggregate_metrics")
                 assert hasattr(handler, "get_regional_endpoints")
-        finally:
-            sys.path.remove(str(handler_path))
-            sys.modules.pop("handler", None)
-
-    def test_alb_header_validator_handler_imports(self):
-        """Test that alb-header-validator handler can be imported."""
-        handler_path = LAMBDA_DIR / "alb-header-validator"
-        sys.path.insert(0, str(handler_path))
-        try:
-            with (
-                patch("boto3.client"),
-                patch.dict(
-                    "os.environ",
-                    {"SECRET_ARN": "arn:test", "SECRET_CACHE_TTL_SECONDS": "300"},
-                ),
-            ):
-                sys.modules.pop("handler", None)
-                import handler
-
-                assert hasattr(handler, "lambda_handler")
-                assert hasattr(handler, "get_valid_tokens")
         finally:
             sys.path.remove(str(handler_path))
             sys.modules.pop("handler", None)
@@ -1029,6 +1017,7 @@ class TestLambdaHandlers:
                 ),
             ):
                 sys.modules.pop("proxy_utils", None)
+                sys.modules.pop("backend_tls", None)
                 import proxy_utils
 
                 assert hasattr(proxy_utils, "get_secret_token")
@@ -1037,6 +1026,7 @@ class TestLambdaHandlers:
         finally:
             sys.path.remove(str(proxy_path))
             sys.modules.pop("proxy_utils", None)
+            sys.modules.pop("backend_tls", None)
 
 
 # =============================================================================

@@ -25,6 +25,7 @@ from botocore.exceptions import ClientError
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from cli._image_uri import aws_partition, aws_url_suffix, ecr_registry_host
 from cli.images import (
     _NAME_RE,
     _TAG_RE,
@@ -124,6 +125,28 @@ def test_rewrite_image_uri_swaps_region_for_ecr(
     src_uri = f"{account}.dkr.ecr.{src_region}.amazonaws.com/{repo}:{tag}"
     expected = f"{account}.dkr.ecr.{dst_region}.amazonaws.com/{repo}:{tag}"
     assert _rewrite_image_uri_for_region(src_uri, dst_region) == expected
+
+
+def test_ecr_helpers_use_partition_metadata() -> None:
+    """Registry hosts and ARNs must follow the target region's partition."""
+    assert aws_partition("cn-north-1") == "aws-cn"
+    assert aws_url_suffix("cn-north-1") == "amazonaws.com.cn"
+    assert (
+        ecr_registry_host("123456789012", "eusc-de-east-1")
+        == "123456789012.dkr.ecr.eusc-de-east-1.amazonaws.eu"
+    )
+
+
+def test_rewrite_image_uri_uses_target_partition_suffix() -> None:
+    src = "123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn/gco/model:v1"
+    assert _rewrite_image_uri_for_region(src, "cn-northwest-1") == (
+        "123456789012.dkr.ecr.cn-northwest-1.amazonaws.com.cn/gco/model:v1"
+    )
+
+
+def test_rewrite_image_uri_rejects_ecr_lookalike_suffix() -> None:
+    uri = "123456789012.dkr.ecr.us-east-1.registry.example.com/gco/model:v1"
+    assert _rewrite_image_uri_for_region(uri, "us-west-2") == uri
 
 
 @given(
@@ -342,11 +365,12 @@ def test_images_build_immutable_tag_rejection(manager: ImageManager, tmp_path: A
 # ---------------------------------------------------------------------------
 
 
-def test_region_falls_back_to_global_when_unset(mock_config: Any) -> None:
-    """Without an explicit region or AWS_DEFAULT_REGION, use config.regions[0]."""
+def test_region_falls_back_to_global_when_unset(mock_config: Any, monkeypatch: Any) -> None:
+    """Without an explicit region or AWS_DEFAULT_REGION, use the global region."""
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     with patch("cli.images.get_config", return_value=mock_config):
         mgr = ImageManager(config=mock_config)
-    assert mgr.region == mock_config.regions[0]
+    assert mgr.region == mock_config.global_region
 
 
 def test_region_uses_aws_default_region(mock_config: Any, monkeypatch: Any) -> None:

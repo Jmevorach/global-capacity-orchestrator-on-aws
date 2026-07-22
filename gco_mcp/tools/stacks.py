@@ -66,7 +66,9 @@ def _expected_stack_count_for_all() -> int | None:
         return None
     if not isinstance(cdk_regions, dict):
         return None
-    regional = cdk_regions.get("regional") or []
+    if "regional" not in cdk_regions:
+        return None
+    regional = cdk_regions["regional"]
     if not isinstance(regional, list):
         return None
     # Three fixed stacks (global / api-gateway / monitoring) plus one
@@ -105,7 +107,7 @@ def setup_cluster_access(cluster: str | None = None, region: str | None = None) 
     and associates the cluster admin policy. Handles assumed roles automatically.
 
     Args:
-        cluster: Cluster name (default: gco-{region}).
+        cluster: Cluster name (default: <project_name>-{region}).
         region: AWS region (default: first deployment region from cdk.json).
     """
     args = ["stacks", "access"]
@@ -170,6 +172,23 @@ async def stack_synth(stack_name: str | None = None, quiet: bool = True) -> str:
         args.append(stack_name)
     if quiet:
         args.append("--quiet")
+    return await asyncio.to_thread(cli_runner._run_cli, *args)
+
+
+@mcp.tool(tags={"safe", "stacks"})
+@audit_logged
+async def addons_status(region: str | None = None, all_regions: bool = False) -> str:
+    """`gco stacks addons status` — show per-chart Helm add-on status from SSM.
+
+    Args:
+        region: Region to inspect. Omit for the first deployment region.
+        all_regions: Inspect every configured deployment region.
+    """
+    args = ["stacks", "addons", "status"]
+    if all_regions:
+        args.append("--all-regions")
+    elif region:
+        args += ["-r", region]
     return await asyncio.to_thread(cli_runner._run_cli, *args)
 
 
@@ -274,6 +293,27 @@ if is_enabled(FLAG_INFRASTRUCTURE_DEPLOY):
     _deploy_decorator_kwargs: dict[str, Any] = {"tags": {"infrastructure", "stacks"}}
     if _TASK_CONFIG_OPTIONAL is not None:
         _deploy_decorator_kwargs["task"] = _TASK_CONFIG_OPTIONAL
+
+    @mcp.tool(tags={"infrastructure", "stacks"})
+    @audit_logged
+    async def addons_install(region: str | None = None, all_regions: bool = False) -> str:
+        """[gated by GCO_ENABLE_INFRASTRUCTURE_DEPLOY] infrastructure mutation.
+
+        `gco stacks addons install` — start an idempotent Helm add-on
+        re-convergence from the deployment input persisted in SSM. The command
+        starts each region's installer state machine and returns immediately;
+        inspect progress with ``addons_status``.
+
+        Args:
+            region: Region to re-converge. Omit for the first deployment region.
+            all_regions: Re-converge every configured deployment region.
+        """
+        args = ["stacks", "addons", "install"]
+        if all_regions:
+            args.append("--all-regions")
+        elif region:
+            args += ["-r", region]
+        return await asyncio.to_thread(cli_runner._run_cli, *args)
 
     if Progress is not None and CurrentContext is not None:
 

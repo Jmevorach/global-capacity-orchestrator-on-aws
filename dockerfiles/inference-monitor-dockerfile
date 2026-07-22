@@ -18,24 +18,33 @@ RUN groupadd -r gco && useradd -r -g gco -d /app -s /sbin/nologin gco
 
 WORKDIR /app
 
-# Copy project metadata and install inference-monitor dependencies only
-# Use the lockfile for reproducible transitive dependency versions,
-# then install the project with inference-monitor extras without re-resolving.
+# Install only this service's direct runtime roots. The roots live in the
+# image-inference-monitor optional-dependency group; Python 3.14's tomllib
+# emits a temporary requirements file so pyproject.toml remains the sole
+# direct-pin source. requirements-lock.txt constrains the transitive graph.
 #
 # pip flags + bash retry loop guard against transient PyPI/CDN drops
 # (see Dockerfile.dev for the rationale; same pattern across every
 # image build in the repo).
-COPY requirements-lock.txt ./
-COPY pyproject.toml ./
-COPY gco/ ./gco/
-RUN for attempt in 1 2 3; do \
-        pip install --no-cache-dir \
+COPY pyproject.toml requirements-lock.txt ./
+RUN python -c 'import pathlib, tomllib; config = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8")); dependencies = config["project"]["optional-dependencies"]["image-inference-monitor"]; pathlib.Path("requirements-runtime.txt").write_text("-c requirements-lock.txt\n" + "\n".join(dependencies) + "\n", encoding="utf-8")' \
+    && for attempt in 1 2 3; do \
+        if pip install --no-cache-dir \
             --retries 10 --timeout 120 --resume-retries 5 \
-            -r requirements-lock.txt && break; \
+            -r requirements-runtime.txt; then \
+            break; \
+        fi; \
+        if [ "${attempt}" -eq 3 ]; then \
+            echo "pip install failed after ${attempt} attempts" >&2; \
+            exit 1; \
+        fi; \
         echo "pip install attempt ${attempt} failed; retrying in 10s..."; \
         sleep 10; \
     done \
-    && pip install --no-cache-dir --no-deps ".[inference-monitor]"
+    && rm requirements-runtime.txt
+
+# Keep source-only edits from invalidating the expensive dependency layer.
+COPY gco/ ./gco/
 
 # Switch to non-root user
 USER gco

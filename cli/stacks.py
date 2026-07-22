@@ -11,7 +11,7 @@ This module handles:
     - CDK bootstrap across all target regions (idempotent)
     - Lambda source synchronization (copies handler code + dependencies before synth)
     - CDK stack deployment with proper dependency ordering:
-        1. Global stack (Global Accelerator, DynamoDB)
+        1. Global stack (partition-wide state, plus Global Accelerator in `aws`)
         2. API Gateway stack (auth secret, Lambda proxy)
         3. Regional stacks in parallel (EKS, VPC, ALB per region)
         4. Monitoring stack (CloudWatch dashboards, alarms)
@@ -34,24 +34,42 @@ Environment Variables:
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import importlib.util
+import json
 import logging
+import math
 import os
 import shutil
+import signal
 import site
+import stat
 import subprocess
 import sys
-from collections.abc import Callable
+import tempfile
+import time
+import uuid
+from collections.abc import Callable, Collection, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
-from threading import Event, Lock, Thread
-from typing import TYPE_CHECKING, Any
+from threading import Event, Lock, Thread, local
+from typing import TYPE_CHECKING, Any, BinaryIO, TypedDict
 
 from botocore.exceptions import ClientError
 
+from gco.stacks.constants import (
+    known_cloudformation_regions,
+    validated_deployment_partition,
+    validated_regional_deployment_regions,
+)
+
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-07-18T01:03:40Z
 # Flowchart(s) generated from this file:
 #   * ``StackManager.deploy_orchestrated`` -> ``diagrams/code_diagrams/cli/stacks.StackManager_deploy_orchestrated.html``
 #     (PNG: ``diagrams/code_diagrams/cli/stacks.StackManager_deploy_orchestrated.png``)
@@ -74,6 +92,427 @@ logger = logging.getLogger(__name__)
 # cannot synthesize or deploy. ``StackManager._ensure_cdk_toolchain`` checks
 # for these before invoking ``cdk`` so a missing toolchain is actionable.
 _CDK_TOOLCHAIN_MODULES = ("aws_cdk", "cdk_nag")
+_INFERENCE_STREAMING_PACKAGE_FILES = ("index.mjs", "package.json", "package-lock.json")
+_KUBECTL_PACKAGE_INPUTS = ("handler.py", "requirements.txt", "manifests")
+_LAMBDA_BUILD_MANIFEST = ".gco-build-manifest.json"
+_LAMBDA_BUILD_MANIFEST_VERSION = 1
+_LAMBDA_SOURCE_IGNORED_DIRECTORIES = frozenset({"__pycache__", ".mypy_cache", ".pytest_cache"})
+_LAMBDA_SOURCE_IGNORED_FILES = frozenset({".DS_Store"})
+_LAMBDA_SOURCE_COPY_IGNORE_PATTERNS = (
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".DS_Store",
+    "*.pyc",
+    "*.pyo",
+)
+_ASSET_LOCK_RETRY_SECONDS = 0.05
+_CDK_ASSET_CONSUMER_MAX_ATTEMPTS = 3
+_CLOUDFORMATION_DELETE_TIMEOUT_SECONDS = 7200.0
+_CLOUDFORMATION_DELETE_POLL_SECONDS = 15.0
+_CLOUDFORMATION_DELETE_HEARTBEAT_SECONDS = 60.0
+_BOOTSTRAP_HEALTHY_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE"})
+_LIVE_VALIDATION_PROVIDER_LOG_CONTEXT = "gco_live_validation_retain_provider_log_groups"
+StackAuthorizationCallback = Callable[[str, str, str], None]
+CleanupOutcomeCallback = Callable[[str, dict[str, Any]], None]
+ChangeSetPreparedCallback = Callable[[str, str, str, str, str], None]
+PreparedChangeSetAuthority = Mapping[str, Mapping[str, Mapping[str, str]]]
+EcrRepositoryCreatedCallback = Callable[[str, Mapping[str, Any]], None]
+
+
+class _StackOperationSafetyKwargs(TypedDict):
+    """Type-preserving keyword bundle shared by strict deploy and destroy calls."""
+
+    allow_bootstrap: bool
+    bootstrap_stacks: Mapping[str, Mapping[str, str]] | None
+    expected_stack_ids: Mapping[str, str | None] | None
+    prepared_change_sets: PreparedChangeSetAuthority | None
+    authorize_stack: StackAuthorizationCallback | None
+    strict_deployment_token: str | None
+    on_change_set_prepared: ChangeSetPreparedCallback | None
+    on_ecr_repository_created: EcrRepositoryCreatedCallback | None
+
+
+@dataclass(frozen=True)
+class _CdkAssetSpec:
+    """One canonical generated asset consumed by the CDK application."""
+
+    name: str
+    source_directory: str
+    build_directory: str
+    source_inputs: tuple[str, ...] | None
+
+    def paths(self, project_root: Path) -> tuple[Path, Path]:
+        lambda_dir = project_root / "lambda"
+        return lambda_dir / self.source_directory, lambda_dir / self.build_directory
+
+
+_KUBECTL_CDK_ASSET = _CdkAssetSpec(
+    name="kubectl-applier-simple",
+    source_directory="kubectl-applier-simple",
+    build_directory="kubectl-applier-simple-build",
+    source_inputs=_KUBECTL_PACKAGE_INPUTS,
+)
+_HELM_CDK_ASSET = _CdkAssetSpec(
+    name="helm-installer",
+    source_directory="helm-installer",
+    build_directory="helm-installer-build",
+    source_inputs=None,
+)
+_INFERENCE_STREAMING_CDK_ASSET = _CdkAssetSpec(
+    name="inference-streaming-proxy",
+    source_directory="inference-streaming-proxy",
+    build_directory="inference-streaming-proxy-build",
+    source_inputs=_INFERENCE_STREAMING_PACKAGE_FILES,
+)
+_CDK_ASSET_SPECS = (
+    _KUBECTL_CDK_ASSET,
+    _HELM_CDK_ASSET,
+    _INFERENCE_STREAMING_CDK_ASSET,
+)
+
+
+class _AssetThreadState(local):
+    """Per-thread nesting state; each OS lock still spans the full process."""
+
+    def __init__(self) -> None:
+        self.held: dict[str, tuple[bool, int]] = {}
+        self.active_consumers: dict[str, int] = {}
+
+
+_asset_thread_state = _AssetThreadState()
+
+
+def _asset_tree_paths(root: Path, source_inputs: tuple[str, ...] | None) -> Iterator[Path]:
+    """Yield deterministic source or build-tree entries below ``root``."""
+    selected: set[Path] = set()
+    if source_inputs is None:
+        selected.update(root.rglob("*"))
+    else:
+        for relative_name in source_inputs:
+            path = root / relative_name
+            if not path.exists() and not path.is_symlink():
+                raise FileNotFoundError(path)
+            selected.add(path)
+            if path.is_dir() and not path.is_symlink():
+                selected.update(path.rglob("*"))
+    yield from sorted(selected, key=lambda path: path.relative_to(root).as_posix())
+
+
+def _asset_tree_digest(
+    root: Path,
+    *,
+    source_inputs: tuple[str, ...] | None = None,
+) -> str | None:
+    """Hash every deployable entry in a source selection or complete build tree.
+
+    The completion manifest and local cache files are excluded. Regular-file
+    content, paths, modes, directory entries, and symlink targets are included
+    so removing any installed transitive dependency invalidates the build.
+    """
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256()
+    try:
+        for path in _asset_tree_paths(root, source_inputs):
+            relative = path.relative_to(root)
+            if any(part in _LAMBDA_SOURCE_IGNORED_DIRECTORIES for part in relative.parts):
+                continue
+            if (
+                path.name in _LAMBDA_SOURCE_IGNORED_FILES
+                or path.name == _LAMBDA_BUILD_MANIFEST
+                or path.suffix in {".pyc", ".pyo"}
+            ):
+                continue
+
+            metadata = path.lstat()
+            relative_bytes = relative.as_posix().encode("utf-8")
+            digest.update(len(relative_bytes).to_bytes(8, "big"))
+            digest.update(relative_bytes)
+            digest.update(stat.S_IMODE(metadata.st_mode).to_bytes(4, "big"))
+
+            if path.is_symlink():
+                target = os.readlink(path).encode("utf-8")
+                digest.update(b"L")
+                digest.update(len(target).to_bytes(8, "big"))
+                digest.update(target)
+            elif path.is_dir():
+                digest.update(b"D")
+            elif path.is_file():
+                file_digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        file_digest.update(chunk)
+                digest.update(b"F")
+                digest.update(file_digest.digest())
+            else:
+                return None
+    except OSError, UnicodeError:
+        return None
+    return digest.hexdigest()
+
+
+def _read_build_manifest(build_dir: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads((build_dir / _LAMBDA_BUILD_MANIFEST).read_text(encoding="utf-8"))
+    except OSError, UnicodeError, json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_build_manifest(build_dir: Path, source_digest: str) -> None:
+    """Write the completion marker only after the staged build is complete."""
+    build_digest = _asset_tree_digest(build_dir)
+    if build_digest is None:
+        raise RuntimeError(f"Unable to hash completed Lambda asset {build_dir.name}")
+    manifest = {
+        "schema_version": _LAMBDA_BUILD_MANIFEST_VERSION,
+        "source_digest": source_digest,
+        "build_digest": build_digest,
+    }
+    manifest_path = build_dir / _LAMBDA_BUILD_MANIFEST
+    with manifest_path.open("x", encoding="utf-8") as handle:
+        json.dump(manifest, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _asset_build_is_fresh_unlocked(
+    source_dir: Path,
+    build_dir: Path,
+    *,
+    source_inputs: tuple[str, ...] | None,
+) -> bool:
+    manifest = _read_build_manifest(build_dir)
+    if manifest is None or manifest.get("schema_version") != _LAMBDA_BUILD_MANIFEST_VERSION:
+        return False
+    source_digest = _asset_tree_digest(source_dir, source_inputs=source_inputs)
+    build_digest = _asset_tree_digest(build_dir)
+    return (
+        source_digest is not None
+        and build_digest is not None
+        and manifest.get("source_digest") == source_digest
+        and manifest.get("build_digest") == build_digest
+    )
+
+
+def _thread_asset_locks() -> dict[str, tuple[bool, int]]:
+    """Return locks held by the current thread for safe nested consumers."""
+    return _asset_thread_state.held
+
+
+def _ensure_windows_lock_byte(lock_file: BinaryIO) -> None:
+    """Ensure msvcrt has a real byte range to lock."""
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+
+
+def _windows_lock_is_contended(exc: OSError) -> bool:
+    return exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} or getattr(
+        exc,
+        "winerror",
+        None,
+    ) in {32, 33, 36}
+
+
+def _acquire_asset_file_lock(
+    lock_file: BinaryIO,
+    *,
+    exclusive: bool,
+) -> None:
+    """Acquire a platform-native interprocess lock."""
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt_api: Any = msvcrt
+        _ensure_windows_lock_byte(lock_file)
+        while True:
+            lock_file.seek(0)
+            try:
+                # msvcrt exposes only exclusive byte-range locks. Serializing
+                # Windows readers and writers preserves correctness while POSIX
+                # keeps true shared-reader concurrency through flock below.
+                msvcrt_api.locking(lock_file.fileno(), msvcrt_api.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if not _windows_lock_is_contended(exc):
+                    raise
+                time.sleep(_ASSET_LOCK_RETRY_SECONDS)
+
+    import fcntl
+
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    fcntl.flock(lock_file.fileno(), operation)
+
+
+def _release_asset_file_lock(lock_file: BinaryIO) -> None:
+    """Release the matching platform-native interprocess lock."""
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt_api: Any = msvcrt
+        lock_file.seek(0)
+        msvcrt_api.locking(lock_file.fileno(), msvcrt_api.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _lambda_asset_lock(build_dir: Path, *, exclusive: bool) -> Iterator[None]:
+    """Serialize publishers and keep freshness reads off rename windows."""
+    build_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = build_dir.with_name(f".{build_dir.name}.lock")
+    lock_key = os.path.normcase(os.path.abspath(lock_path))
+    held = _thread_asset_locks()
+    existing = held.get(lock_key)
+    if existing is not None:
+        held_exclusive, depth = existing
+        if exclusive and not held_exclusive:
+            raise RuntimeError(f"Cannot upgrade shared asset lock to exclusive: {lock_path}")
+        held[lock_key] = (held_exclusive, depth + 1)
+        try:
+            yield
+        finally:
+            held[lock_key] = (held_exclusive, depth)
+        return
+
+    with lock_path.open("a+b") as lock_file:
+        _acquire_asset_file_lock(lock_file, exclusive=exclusive)
+        held[lock_key] = (exclusive, 1)
+        try:
+            yield
+        finally:
+            held.pop(lock_key, None)
+            _release_asset_file_lock(lock_file)
+
+
+def _asset_build_is_fresh(
+    source_dir: Path,
+    build_dir: Path,
+    *,
+    source_inputs: tuple[str, ...] | None,
+) -> bool:
+    with _lambda_asset_lock(build_dir, exclusive=False):
+        return _asset_build_is_fresh_unlocked(
+            source_dir,
+            build_dir,
+            source_inputs=source_inputs,
+        )
+
+
+def _remove_asset_tree(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        _safe_rmtree(path)
+
+
+def _recover_interrupted_asset_publish(build_dir: Path) -> None:
+    """Restore a prior final tree and discard abandoned staging directories."""
+    staging_dirs = list(build_dir.parent.glob(f".{build_dir.name}.staging-*"))
+    backup_dirs = list(build_dir.parent.glob(f".{build_dir.name}.backup-*"))
+
+    if not build_dir.exists() and backup_dirs:
+        try:
+            newest_backup = max(backup_dirs, key=lambda path: path.stat().st_mtime_ns)
+        except OSError:
+            newest_backup = backup_dirs[0]
+        os.replace(newest_backup, build_dir)
+
+    for path in [*staging_dirs, *backup_dirs]:
+        _remove_asset_tree(path)
+
+
+def _publish_staged_asset(staging_dir: Path, build_dir: Path) -> None:
+    """Publish one complete staged tree with rollback to the previous final."""
+    backup_dir = build_dir.with_name(f".{build_dir.name}.backup-{uuid.uuid4().hex}")
+    had_previous = build_dir.exists()
+    if had_previous:
+        os.replace(build_dir, backup_dir)
+    try:
+        os.replace(staging_dir, build_dir)
+    except Exception:
+        if had_previous and backup_dir.exists() and not build_dir.exists():
+            os.replace(backup_dir, build_dir)
+        raise
+    if backup_dir.exists():
+        _remove_asset_tree(backup_dir)
+
+
+def _prepare_lambda_asset(
+    source_dir: Path,
+    build_dir: Path,
+    *,
+    source_inputs: tuple[str, ...] | None,
+    display_name: str,
+    builder: Callable[[Path], None],
+) -> bool:
+    """Build and atomically publish an asset when its completion proof is stale."""
+    with _lambda_asset_lock(build_dir, exclusive=True):
+        _recover_interrupted_asset_publish(build_dir)
+        source_digest = _asset_tree_digest(source_dir, source_inputs=source_inputs)
+        if source_digest is None:
+            raise RuntimeError(f"{display_name} source inputs are incomplete or unreadable")
+        if _asset_build_is_fresh_unlocked(
+            source_dir,
+            build_dir,
+            source_inputs=source_inputs,
+        ):
+            return False
+
+        print(f"  Building {display_name}...")
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=f".{build_dir.name}.staging-", dir=build_dir.parent)
+        )
+        try:
+            builder(staging_dir)
+            if _asset_tree_digest(source_dir, source_inputs=source_inputs) != source_digest:
+                raise RuntimeError(f"{display_name} sources changed while packaging")
+            _write_build_manifest(staging_dir, source_digest)
+            if not _asset_build_is_fresh_unlocked(
+                source_dir,
+                staging_dir,
+                source_inputs=source_inputs,
+            ):
+                raise RuntimeError(f"{display_name} completion manifest verification failed")
+            _publish_staged_asset(staging_dir, build_dir)
+        finally:
+            _remove_asset_tree(staging_dir)
+        print(f"  {display_name} built successfully")
+        return True
+
+
+def _atomic_copy_file(source: Path, target: Path) -> None:
+    """Replace one checked-in Lambda source copy without exposing partial bytes."""
+    temporary = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_bytes(target: Path, content: bytes, *, mode: int | None = None) -> None:
+    """Atomically restore exact bytes without exposing a partial configuration."""
+    temporary = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        temporary.write_bytes(content)
+        if mode is not None:
+            os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@lru_cache(maxsize=1)
+def _known_cloudformation_regions() -> frozenset[str]:
+    """Return every AWS SDK-known Region that exposes CloudFormation."""
+    return known_cloudformation_regions()
 
 
 class CdkToolchainError(RuntimeError):
@@ -123,9 +562,14 @@ def _safe_rmtree(path: Path) -> None:
     """
     resolved = path.resolve()
 
-    # Safety: refuse to remove anything that isn't clearly a build artifact
-    # inside the project.  The path must contain "lambda" and end with "-build".
-    if "lambda" not in resolved.parts or not resolved.name.endswith("-build"):
+    # Safety: refuse to remove anything that isn't clearly a final, staging,
+    # or rollback Lambda build artifact inside the project tree.
+    artifact_name = resolved.name
+    is_final = artifact_name.endswith("-build")
+    is_ephemeral = artifact_name.startswith(".") and (
+        ".staging-" in artifact_name or ".backup-" in artifact_name
+    )
+    if "lambda" not in resolved.parts or not (is_final or is_ephemeral):
         raise ValueError(f"Refusing to remove unexpected path: {resolved}")
 
     try:
@@ -167,16 +611,99 @@ def _detect_container_runtime() -> str | None:
     return _container_runtime_cache
 
 
+def prepare_cdk_assets(project_root: str | Path) -> None:
+    """Prepare every ignored Lambda asset consumed by the CDK application.
+
+    This is the shared entry point for build-only callers. CDK consumers must
+    use :func:`cdk_asset_consumer` so the resulting paths remain immutable
+    until app construction and synthesis finish.
+    """
+    manager = StackManager.__new__(StackManager)
+    manager.project_root = Path(project_root)
+    manager._ensure_lambda_build()
+
+
+def _thread_asset_consumers() -> dict[str, int]:
+    return _asset_thread_state.active_consumers
+
+
+@contextmanager
+def cdk_asset_consumer(project_root: str | Path) -> Iterator[None]:
+    """Hold source-current generated assets stable through CDK synthesis.
+
+    Preparation runs before any shared locks are acquired. The complete set of
+    canonical paths is then locked in deterministic order and every completion
+    manifest is revalidated while publishers are excluded. A stale observation
+    releases all locks and retries preparation; repeated source churn fails
+    closed instead of exposing CDK to a missing or mixed-version tree.
+    """
+    root = Path(project_root)
+    root_key = os.path.normcase(os.path.abspath(root))
+    active = _thread_asset_consumers()
+    if root_key in active:
+        active[root_key] += 1
+        try:
+            yield
+        finally:
+            active[root_key] -= 1
+        return
+
+    stale_assets: list[str] = []
+    for _attempt in range(_CDK_ASSET_CONSUMER_MAX_ATTEMPTS):
+        prepare_cdk_assets(root)
+        resolved_assets = []
+        for spec in _CDK_ASSET_SPECS:
+            source_dir, build_dir = spec.paths(root)
+            # Include a source-backed path even during the publisher's
+            # final-to-backup rename gap, when the canonical build is absent.
+            if source_dir.exists() or build_dir.exists():
+                resolved_assets.append((spec, source_dir, build_dir))
+
+        with ExitStack() as locks:
+            for _spec, _source_dir, build_dir in sorted(
+                resolved_assets,
+                key=lambda item: str(item[2]),
+            ):
+                locks.enter_context(_lambda_asset_lock(build_dir, exclusive=False))
+
+            stale_assets = [
+                spec.name
+                for spec, source_dir, build_dir in resolved_assets
+                if not _asset_build_is_fresh_unlocked(
+                    source_dir,
+                    build_dir,
+                    source_inputs=spec.source_inputs,
+                )
+            ]
+            if stale_assets:
+                continue
+
+            active[root_key] = 1
+            try:
+                yield
+            finally:
+                active.pop(root_key, None)
+            return
+
+    names = ", ".join(stale_assets) or "unknown assets"
+    raise RuntimeError(
+        "Generated CDK assets changed repeatedly while acquiring consumer locks: "
+        f"{names}. Stop concurrent source edits and retry."
+    )
+
+
 class StackManager:
     """Manages CDK stack operations."""
 
     def __init__(self, config: GCOConfig, project_root: Path | None = None):
         self.config = config
         self.project_root = project_root or self._find_project_root()
-        self._cdk_path = self._find_cdk()
-
-        # Ensure Lambda build directory exists before any CDK synth
-        self._ensure_lambda_build()
+        # Resolve CDK only when a CDK-backed operation runs. CloudFormation-only
+        # status/output commands must not require a local Node/CDK installation.
+        self._cdk_path: str | None = None
+        self._active_cdk_processes: dict[int, Any] = {}
+        self._active_cdk_lock = Lock()
+        self._cdk_cancel_event = Event()
 
     def _find_project_root(self) -> Path:
         """Find the project root by looking for cdk.json."""
@@ -187,84 +714,149 @@ class StackManager:
         return current
 
     def _find_cdk(self) -> str:
-        """Find CDK executable."""
-        # Check if cdk is in PATH
+        """Find the dependency-locked CDK executable when available."""
+        # Prefer the repository's locked tool when ``npm ci`` has populated it.
+        local_cdk = self.project_root / "node_modules" / ".bin" / "cdk"
+        if local_cdk.is_file():
+            return str(local_cdk)
+
+        # Fall back to PATH for installed distributions that do not include
+        # the repository's root npm graph.
         try:
             result = subprocess.run(["which", "cdk"], capture_output=True, text=True, check=True)
             return result.stdout.strip()
         except subprocess.CalledProcessError:
             pass
 
-        # Check common locations
+        # Check common global-install locations.
         for path in ["/usr/local/bin/cdk", "~/.npm-global/bin/cdk"]:
             expanded = os.path.expanduser(path)
             if os.path.exists(expanded):
                 return expanded
 
-        # Fall back to npx
-        return "npx cdk"
+        raise CdkToolchainError(
+            "AWS CDK CLI is not installed. Run "
+            "'npm ci --ignore-scripts --no-audit --no-fund' at the project root "
+            "to install the dependency-locked CLI."
+        )
+
+    @staticmethod
+    def _kubectl_build_is_fresh(source_dir: Path, build_dir: Path) -> bool:
+        """Return whether the kubectl build has a valid full-tree completion proof."""
+        return _asset_build_is_fresh(
+            source_dir,
+            build_dir,
+            source_inputs=_KUBECTL_CDK_ASSET.source_inputs,
+        )
+
+    @staticmethod
+    def _helm_build_is_fresh(source_dir: Path, build_dir: Path) -> bool:
+        """Return whether the Helm build has a valid full-tree completion proof."""
+        return _asset_build_is_fresh(
+            source_dir,
+            build_dir,
+            source_inputs=_HELM_CDK_ASSET.source_inputs,
+        )
+
+    @staticmethod
+    def _inference_streaming_build_is_fresh(source_dir: Path, build_dir: Path) -> bool:
+        """Return whether the Node build has a valid full-tree completion proof."""
+        return _asset_build_is_fresh(
+            source_dir,
+            build_dir,
+            source_inputs=_INFERENCE_STREAMING_CDK_ASSET.source_inputs,
+        )
 
     def _ensure_lambda_build(self) -> None:
-        """Ensure the Lambda build directories exist for CDK synthesis.
+        """Atomically prepare every generated Lambda asset when source-stale.
 
-        Called from __init__ so the directory is ready before any CDK synth
-        (even ``cdk list`` needs it because ``app.py`` references the asset).
-
-        This does a lightweight check — only builds if the directory is
-        missing or incomplete. It does NOT do a full rebuild (no rmtree).
-        The full rebuild happens in ``_rebuild_lambda_packages()``, which
-        is called by ``deploy()`` before the actual CDK deploy.
+        Every builder takes its per-asset interprocess lock, repairs an
+        interrupted publish, and rechecks freshness before doing installation
+        work. Concurrent app evaluations therefore either reuse one complete
+        final tree or publish another complete tree; they never share a
+        directory while pip/npm/copy operations are mutating it.
         """
-        kubectl_source = self.project_root / "lambda" / "kubectl-applier-simple"
-        kubectl_build = self.project_root / "lambda" / "kubectl-applier-simple-build"
-        helm_source = self.project_root / "lambda" / "helm-installer"
-        helm_build = self.project_root / "lambda" / "helm-installer-build"
-
-        # Only build if the directory is missing or deps aren't installed
-        if kubectl_source.exists() and (
-            not kubectl_build.exists() or not (kubectl_build / "yaml").exists()
+        for spec, builder in (
+            (_KUBECTL_CDK_ASSET, self._build_kubectl_lambda),
+            (_HELM_CDK_ASSET, self._build_helm_installer_lambda),
+            (_INFERENCE_STREAMING_CDK_ASSET, self._build_inference_streaming_proxy_lambda),
         ):
-            self._build_kubectl_lambda()
+            source_dir, _build_dir = spec.paths(self.project_root)
+            if source_dir.exists():
+                builder()
 
-        if helm_source.exists() and not helm_build.exists():
-            self._build_helm_installer_lambda()
-
-    def _check_and_fix_stuck_stack(self, stack_name: str) -> None:
-        """Check if a stack is in a stuck state and auto-recover.
-
-        Stacks can get stuck in REVIEW_IN_PROGRESS, ROLLBACK_COMPLETE, or
-        other non-deployable states. This detects those and cleans up so
-        the next deploy can succeed.
-        """
+    def _check_and_fix_stuck_stack(
+        self,
+        stack_name: str,
+        *,
+        expected_stack_id: str | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        strict_ownership: bool = False,
+    ) -> None:
+        """Delete a stuck stack only after revalidating its immutable identity."""
         import boto3
 
         region = self._get_deploy_region(stack_name)
         if not region:
+            if strict_ownership:
+                raise RuntimeError(f"Could not resolve deploy Region for {stack_name}")
             return
 
+        cfn = boto3.client("cloudformation", region_name=region)
         try:
-            cfn = boto3.client("cloudformation", region_name=region)
             response = cfn.describe_stacks(StackName=stack_name)
-            status = response["Stacks"][0]["StackStatus"]
+        except ClientError as exc:
+            error = exc.response.get("Error", {})
+            if (
+                error.get("Code") == "ValidationError"
+                and "does not exist" in str(error.get("Message", "")).lower()
+            ):
+                return
+            if strict_ownership:
+                raise
+            logger.debug("Stack pre-check for %s failed: %s", stack_name, exc)
+            return
+        except Exception as exc:
+            if strict_ownership:
+                raise
+            logger.debug("Stack pre-check for %s failed: %s", stack_name, exc)
+            return
 
-            stuck_states = {
-                "REVIEW_IN_PROGRESS",
-                "ROLLBACK_COMPLETE",
-                "ROLLBACK_FAILED",
-                "CREATE_FAILED",
-                "DELETE_FAILED",
-            }
+        stacks = response.get("Stacks", [])
+        if len(stacks) != 1:
+            raise RuntimeError(f"CloudFormation returned an invalid identity for {stack_name}")
+        stack = stacks[0]
+        stack_id = str(stack.get("StackId") or "")
+        if stack.get("StackName") != stack_name or not stack_id:
+            raise RuntimeError(f"CloudFormation returned an invalid identity for {stack_name}")
+        if strict_ownership and expected_stack_id is None:
+            raise RuntimeError(
+                f"Refusing to adopt uncheckpointed stack {region}:{stack_name} ({stack_id})"
+            )
+        if expected_stack_id is not None and stack_id != expected_stack_id:
+            raise RuntimeError(
+                f"Stack identity changed for {region}:{stack_name}; expected {expected_stack_id}, "
+                f"found {stack_id}"
+            )
 
-            if status in stuck_states:
-                print(f"  Stack {stack_name} is in {status} state, cleaning up...")
-                cfn.delete_stack(StackName=stack_name)
-                waiter = cfn.get_waiter("stack_delete_complete")
-                waiter.wait(StackName=stack_name, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
-                print(f"  Stack {stack_name} cleaned up, will recreate on deploy")
+        stuck_states = {
+            "REVIEW_IN_PROGRESS",
+            "ROLLBACK_COMPLETE",
+            "ROLLBACK_FAILED",
+            "CREATE_FAILED",
+            "DELETE_FAILED",
+        }
+        status = str(stack.get("StackStatus") or "")
+        if status not in stuck_states:
+            return
+        if authorize_stack is not None:
+            authorize_stack(stack_name, region, stack_id)
 
-        except Exception as e:
-            logger.debug("Stack pre-check for %s: %s", stack_name, e)
-            # Stack doesn't exist or can't be described — fine, deploy will create it
+        print(f"  Stack {stack_name} is in {status} state, cleaning up...")
+        cfn.delete_stack(StackName=stack_id)
+        waiter = cfn.get_waiter("stack_delete_complete")
+        waiter.wait(StackName=stack_id, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+        print(f"  Stack {stack_name} cleaned up, will recreate on deploy")
 
     def _diagnose_deploy_failure(self, stack_name: str) -> None:
         """Fetch CloudFormation events after a failed deploy and print diagnostics.
@@ -339,145 +931,198 @@ class StackManager:
             # Best effort — don't fail the deploy further
 
     def _sync_lambda_sources(self) -> None:
-        """
-        Sync latest handler code and manifests into the build directory.
+        """Atomically synchronize canonical shared files before asset ensures.
 
-        Called at the start of ``deploy()`` to ensure CDK picks up the
-        latest source changes. Only copies files — does NOT rebuild pip
-        deps or rmtree. Runs once per StackManager instance.
+        Checked-in copies keep raw CDK evaluation deterministic. Deploy updates
+        those copies before generated assets are checked, and never mutates a
+        generated final build tree in place.
         """
         if getattr(self, "_lambda_sources_synced", False):
             return
+
+        lambda_dir = self.project_root / "lambda"
+        shared_source_targets = {
+            lambda_dir / "proxy-shared" / "proxy_utils.py": [
+                lambda_dir / "api-gateway-proxy" / "proxy_utils.py",
+                lambda_dir / "regional-api-proxy" / "proxy_utils.py",
+            ],
+            lambda_dir / "tls-shared" / "backend_tls.py": [
+                lambda_dir / "proxy-shared" / "backend_tls.py",
+                lambda_dir / "api-gateway-proxy" / "backend_tls.py",
+                lambda_dir / "regional-api-proxy" / "backend_tls.py",
+            ],
+        }
+        for shared_source, targets in shared_source_targets.items():
+            if not shared_source.exists():
+                continue
+            for target in targets:
+                if target.parent.exists():
+                    _atomic_copy_file(shared_source, target)
         self._lambda_sources_synced = True
 
-        source_dir = self.project_root / "lambda" / "kubectl-applier-simple"
-        build_dir = self.project_root / "lambda" / "kubectl-applier-simple-build"
-
-        if not source_dir.exists() or not build_dir.exists():
-            return
-
-        # Sync handler.py
-        source_handler = source_dir / "handler.py"
-        build_handler = build_dir / "handler.py"
-        if source_handler.exists():
-            shutil.copy2(source_handler, build_handler)
-
-        # Sync manifests directory
-        source_manifests = source_dir / "manifests"
-        build_manifests = build_dir / "manifests"
-        if source_manifests.exists():
-            build_manifests.mkdir(parents=True, exist_ok=True)
-            for manifest_file in source_manifests.glob("*.yaml"):
-                shutil.copy2(manifest_file, build_manifests / manifest_file.name)
-
     def _rebuild_lambda_packages(self) -> None:
-        """Full rebuild of Lambda packages for deploy.
-
-        Nukes the build directories and recreates them from scratch with
-        fresh pip deps, handler code, and manifests. Called once at the
-        start of a deploy to ensure CDK picks up all changes.
-
-        Runs once per StackManager instance.
-        """
+        """Compatibility wrapper for a source-current atomic asset ensure."""
         if getattr(self, "_lambda_packages_rebuilt", False):
             return
+        self._ensure_lambda_build()
         self._lambda_packages_rebuilt = True
-        self._build_lambda_packages()
 
     def _build_lambda_packages(self) -> None:
-        """Build Lambda packages for kubectl-applier and helm-installer.
-
-        Creates build directories with fresh copies of handler code, manifests,
-        charts config, and pip dependencies. This ensures CDK always picks up
-        the latest content regardless of Docker/asset caching.
-        """
+        """Source-check and atomically publish all generated Lambda packages."""
         self._build_kubectl_lambda()
         self._build_helm_installer_lambda()
+        self._build_inference_streaming_proxy_lambda()
 
     def _build_kubectl_lambda(self) -> None:
         """Build the kubectl-applier-simple Lambda package."""
-        source_dir = self.project_root / "lambda" / "kubectl-applier-simple"
-        build_dir = self.project_root / "lambda" / "kubectl-applier-simple-build"
+        source_dir, build_dir = _KUBECTL_CDK_ASSET.paths(self.project_root)
         requirements = source_dir / "requirements.txt"
-
-        if not source_dir.exists() or not requirements.exists():
+        if not source_dir.is_dir() or not requirements.is_file():
             return
 
-        print("  Building kubectl-applier-simple Lambda package...")
+        def build(staging_dir: Path) -> None:
+            shutil.copy2(source_dir / "handler.py", staging_dir / "handler.py")
+            shutil.copy2(requirements, staging_dir / "requirements.txt")
+            shutil.copytree(source_dir / "manifests", staging_dir / "manifests")
+            result = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - static pip arguments and project-owned paths
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-r",
+                    str(requirements),
+                    "-t",
+                    str(staging_dir),
+                    "--upgrade",
+                    "--platform",
+                    "manylinux2014_x86_64",
+                    "--only-binary=:all:",
+                    "--quiet",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "kubectl Lambda dependency installation failed: " + result.stderr[:200]
+                )
 
-        # Clean stale build directory to avoid broken symlinks from previous
-        # pip installs (botocore/data/ is a common source of dangling symlinks
-        # that cause CDK's asset fingerprinting to fail with ENOENT).
-        if build_dir.exists():
-            _safe_rmtree(build_dir)
-
-        # Create build directory
-        build_dir.mkdir(parents=True, exist_ok=True)
-
-        # Copy handler and manifests (always overwrite to prevent stale content)
-        shutil.copy2(source_dir / "handler.py", build_dir / "handler.py")
-        build_manifests = build_dir / "manifests"
-        if (source_dir / "manifests").exists():
-            if build_manifests.exists():
-                shutil.rmtree(build_manifests)
-            shutil.copytree(source_dir / "manifests", build_manifests, dirs_exist_ok=True)
-
-        # Install pip dependencies for Lambda runtime
-        import sys
-
-        result = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - static list: sys.executable + pip args + Path objects, no user input
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                str(requirements),
-                "-t",
-                str(build_dir),
-                "--upgrade",
-                "--platform",
-                "manylinux2014_x86_64",
-                "--only-binary=:all:",
-                "--quiet",
-            ],
-            capture_output=True,
-            text=True,
+        _prepare_lambda_asset(
+            source_dir,
+            build_dir,
+            source_inputs=_KUBECTL_CDK_ASSET.source_inputs,
+            display_name="kubectl-applier-simple Lambda package",
+            builder=build,
         )
-        if result.returncode != 0:
-            print(f"  Warning: pip install failed: {result.stderr[:200]}")
-        else:
-            print("  Lambda package built successfully")
 
     def _build_helm_installer_lambda(self) -> None:
-        """Build the helm-installer Lambda Docker context.
-
-        Copies all source files into a clean build directory so CDK always
-        detects changes to charts.yaml, handler.py, Dockerfile, etc.
-        """
-        source_dir = self.project_root / "lambda" / "helm-installer"
-        build_dir = self.project_root / "lambda" / "helm-installer-build"
-
-        if not source_dir.exists():
+        """Build the complete helm-installer Lambda Docker context."""
+        source_dir, build_dir = _HELM_CDK_ASSET.paths(self.project_root)
+        if not source_dir.is_dir():
             return
 
-        print("  Building helm-installer Lambda package...")
+        def build(staging_dir: Path) -> None:
+            shutil.copytree(
+                source_dir,
+                staging_dir,
+                ignore=shutil.ignore_patterns(*_LAMBDA_SOURCE_COPY_IGNORE_PATTERNS),
+                dirs_exist_ok=True,
+            )
 
-        # Clean and recreate build directory
-        if build_dir.exists():
-            _safe_rmtree(build_dir)
-        build_dir.mkdir(parents=True, exist_ok=True)
+        _prepare_lambda_asset(
+            source_dir,
+            build_dir,
+            source_inputs=_HELM_CDK_ASSET.source_inputs,
+            display_name="helm-installer Lambda package",
+            builder=build,
+        )
 
-        # Copy all source files into the build directory
-        for item in source_dir.iterdir():
-            if item.name == "__pycache__":
-                continue
-            if item.is_file():
-                shutil.copy2(item, build_dir / item.name)
-            elif item.is_dir():
-                shutil.copytree(item, build_dir / item.name, dirs_exist_ok=True)
+    def _build_inference_streaming_proxy_lambda(self) -> None:
+        """Build the Node.js streaming Lambda with its pinned AWS SDK clients."""
+        source_dir, build_dir = _INFERENCE_STREAMING_CDK_ASSET.paths(self.project_root)
+        if not source_dir.is_dir():
+            return
 
-        print("  Helm installer package built successfully")
+        package_files = _INFERENCE_STREAMING_CDK_ASSET.source_inputs
+        assert package_files is not None
+        missing = [name for name in package_files if not (source_dir / name).is_file()]
+        if missing:
+            raise RuntimeError(
+                "Inference streaming Lambda package is incomplete; missing: " + ", ".join(missing)
+            )
+        try:
+            package_manager = str(
+                json.loads((source_dir / "package.json").read_text(encoding="utf-8")).get(
+                    "packageManager", ""
+                )
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Unable to read the inference streaming Lambda npm pin") from exc
+        required_npm = package_manager.removeprefix("npm@")
+        version_parts = required_npm.split(".")
+        if (
+            not package_manager.startswith("npm@")
+            or len(version_parts) != 3
+            or any(not part.isdigit() for part in version_parts)
+        ):
+            raise RuntimeError(
+                "Inference streaming Lambda packageManager must pin an exact npm version"
+            )
+
+        def build(staging_dir: Path) -> None:
+            npm = shutil.which("npm")
+            if npm is None:
+                raise RuntimeError(
+                    f"npm {required_npm} is required to package the inference streaming Lambda; "
+                    "install the Node.js version pinned in .nvmrc"
+                )
+            try:
+                version_result = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - resolved executable and project-owned cwd
+                    [npm, "--version"],
+                    cwd=source_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeError("Unable to verify the npm packaging version") from exc
+            actual_npm = version_result.stdout.strip()
+            if version_result.returncode != 0 or actual_npm != required_npm:
+                found = actual_npm or "unavailable"
+                raise RuntimeError(
+                    f"npm {required_npm} is required to package the inference streaming Lambda; "
+                    f"found {found}. Run: npm install --global npm@{required_npm}"
+                )
+
+            for name in package_files:
+                shutil.copy2(source_dir / name, staging_dir / name)
+            result = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - resolved npm path, static arguments, and project-owned cwd
+                [
+                    npm,
+                    "ci",
+                    "--omit=dev",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                ],
+                cwd=staging_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "Failed to install pinned inference streaming Lambda dependencies: "
+                    + result.stderr[:500]
+                )
+
+        _prepare_lambda_asset(
+            source_dir,
+            build_dir,
+            source_inputs=package_files,
+            display_name="inference-streaming-proxy Lambda package",
+            builder=build,
+        )
 
     def _get_python_path(self) -> str:
         """
@@ -536,6 +1181,62 @@ class StackManager:
             "See gco_mcp/README.md (Setup) for the deploy-capable configuration."
         )
 
+    @staticmethod
+    def _terminate_cdk_process(process: Any) -> None:
+        """Terminate one complete CDK process tree with a bounded grace period."""
+        if process.poll() is not None:
+            return
+
+        if os.name == "nt":
+            taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
+
+            def terminate_tree(*, force: bool) -> bool:
+                if taskkill is None:
+                    return False
+                command = [taskkill, "/PID", str(process.pid), "/T"]
+                if force:
+                    command.append("/F")
+                try:
+                    result = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - resolved Windows system utility and numeric child PID
+                        command,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except OSError, subprocess.TimeoutExpired:
+                    return False
+                return result.returncode == 0
+
+            terminate_tree(force=False)
+            try:
+                process.wait(timeout=30)
+            except OSError, subprocess.TimeoutExpired:
+                terminate_tree(force=True)
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            return
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=30)
+        except OSError, subprocess.TimeoutExpired:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                finally:
+                    process.wait()
+
+    def cancel_active_cdk_processes(self) -> None:
+        """Prevent new CDK work and terminate every process group currently registered."""
+        self._cdk_cancel_event.set()
+        with self._active_cdk_lock:
+            processes = list(self._active_cdk_processes.values())
+        for process in processes:
+            self._terminate_cdk_process(process)
+
     def _run_cdk(
         self,
         command: list[str],
@@ -565,6 +1266,12 @@ class StackManager:
         # a cryptic ImportError.
         self._ensure_cdk_toolchain()
 
+        # These commands all evaluate app.py, including list and destroy. The
+        # stack graph references ignored generated Lambda assets, so prepare
+        # them centrally rather than relying on individual command wrappers.
+        if command and command[0] in {"deploy", "destroy", "diff", "list", "synth"}:
+            self._ensure_lambda_build()
+
         full_env = os.environ.copy()
 
         # Inject PYTHONPATH so CDK's python3 subprocess can find aws_cdk
@@ -574,35 +1281,67 @@ class StackManager:
         if env:
             full_env.update(env)
 
-        cdk_cmd = self._cdk_path.split() + command
+        cdk_path = self._cdk_path
+        if cdk_path is None:
+            cdk_path = self._find_cdk()
+            self._cdk_path = cdk_path
+        cdk_cmd = [cdk_path, *command]
+
+        if self._cdk_cancel_event.is_set():
+            raise RuntimeError("CDK operation cancelled before process start")
+        popen_kwargs: dict[str, Any] = {
+            "cwd": self.project_root,
+            "stdout": subprocess.PIPE if capture_output else None,
+            "stderr": subprocess.PIPE if capture_output else None,
+            "text": True,
+            "env": full_env,
+            "start_new_session": os.name == "posix",
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(
+                subprocess,
+                "CREATE_NEW_PROCESS_GROUP",
+                0,
+            )
+        process = subprocess.Popen(  # nosemgrep: dangerous-subprocess-use-audit - static CDK argv, no shell
+            cdk_cmd,
+            **popen_kwargs,
+        )
+        with self._active_cdk_lock:
+            self._active_cdk_processes[process.pid] = process
+        if self._cdk_cancel_event.is_set():
+            self._terminate_cdk_process(process)
+            with self._active_cdk_lock:
+                self._active_cdk_processes.pop(process.pid, None)
+            raise RuntimeError("CDK operation cancelled during process start")
 
         try:
-            if capture_output:
-                return subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - cdk_cmd is a list of static CDK subcommands, no user-controlled shell injection
-                    cdk_cmd,
-                    cwd=self.project_root,
-                    capture_output=True,
-                    text=True,
-                    env=full_env,
-                    timeout=timeout,
-                )
-            return subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit - cdk_cmd is a list of static CDK subcommands, no user-controlled shell injection
-                cdk_cmd,
-                cwd=self.project_root,
-                env=full_env,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            # subprocess.run already sent SIGKILL and reaped the child by
-            # the time TimeoutExpired propagates. Surface the timeout so
-            # callers (deploy / destroy) can verify post-state via CFN.
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self._terminate_cdk_process(process)
             logger.warning(
                 "cdk command timed out after %ss: %s",
                 timeout,
                 " ".join(cdk_cmd),
             )
+            raise subprocess.TimeoutExpired(
+                cdk_cmd,
+                exc.timeout,
+                output=exc.output,
+                stderr=exc.stderr,
+            ) from exc
+        except BaseException:
+            self._terminate_cdk_process(process)
             raise
+        finally:
+            with self._active_cdk_lock:
+                self._active_cdk_processes.pop(process.pid, None)
+        return subprocess.CompletedProcess(
+            cdk_cmd,
+            process.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+        )
 
     def list_stacks(self) -> list[str]:
         """List all available CDK stacks."""
@@ -612,7 +1351,8 @@ class StackManager:
         return [s.strip() for s in result.stdout.strip().split("\n") if s.strip()]
 
     def synth(self, stack_name: str | None = None, quiet: bool = True) -> str:
-        """Synthesize CloudFormation templates."""
+        """Synthesize CloudFormation templates from source-current assets."""
+        self._ensure_lambda_build()
         cmd = ["synth"]
         if stack_name:
             cmd.append(stack_name)
@@ -625,7 +1365,8 @@ class StackManager:
         return str(result.stdout)
 
     def diff(self, stack_name: str | None = None) -> str:
-        """Show diff between deployed and local stacks."""
+        """Show diff between deployed and source-current local stacks."""
+        self._ensure_lambda_build()
         cmd = ["diff", "--no-color"]
         if stack_name:
             cmd.append(stack_name)
@@ -645,6 +1386,14 @@ class StackManager:
         progress: str = "events",
         output_dir: str | None = None,
         exclusively: bool = False,
+        allow_bootstrap: bool = True,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None = None,
+        expected_stack_ids: Mapping[str, str | None] | None = None,
+        prepared_change_sets: PreparedChangeSetAuthority | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
     ) -> bool:
         """Deploy CDK stacks.
 
@@ -665,14 +1414,94 @@ class StackManager:
                 to re-run each time, adding minutes per phase for no
                 actual change.
         """
-        # Full rebuild of Lambda packages on first deploy call (once per session),
-        # then sync latest source on subsequent calls
-        self._rebuild_lambda_packages()
+        # Synchronize canonical checked-in copies first, then source-check and
+        # atomically publish only stale generated assets. A deploy must never
+        # destructively rebuild a fresh tree while another CDK process may be
+        # fingerprinting it.
         self._sync_lambda_sources()
+        self._ensure_lambda_build()
 
-        # Check for stuck stacks and auto-recover
+        strict_deployment = (
+            strict_deployment_token is not None or on_change_set_prepared is not None
+        )
+        expected_stack_id: str | None = None
+        prepared_change_set_records: Mapping[str, Mapping[str, str]] = {}
+        change_set_name: str | None = None
+        if strict_deployment:
+            if not stack_name or all_stacks:
+                raise RuntimeError("Strict deployment requires exactly one named stack")
+            if not strict_deployment_token or on_change_set_prepared is None:
+                raise RuntimeError(
+                    "Strict deployment requires both a run token and a prepared-change-set callback"
+                )
+            if allow_bootstrap:
+                raise RuntimeError("Strict deployment cannot auto-bootstrap a Region")
+            if authorize_stack is None:
+                raise RuntimeError("Strict deployment requires an exact stack authorizer")
+            if expected_stack_ids is None or stack_name not in expected_stack_ids:
+                raise RuntimeError(
+                    f"Strict deployment lacks authoritative target state for {stack_name}"
+                )
+            expected_stack_id = expected_stack_ids[stack_name]
+            if prepared_change_sets is None or stack_name not in prepared_change_sets:
+                raise RuntimeError(
+                    f"Strict deployment lacks prepared change-set history for {stack_name}"
+                )
+            prepared_change_set_records = prepared_change_sets[stack_name]
+            change_set_name = self._strict_change_set_name(
+                stack_name,
+                strict_deployment_token,
+            )
+
+        # Validate bootstrap identity before any AWS mutation. In strict mode
+        # this also revalidates the expected stack ARN (or authoritative
+        # absence) before image mirroring or change-set preparation.
         if stack_name:
-            self._check_and_fix_stuck_stack(stack_name)
+            region = self._get_deploy_region(stack_name)
+            if not region:
+                raise RuntimeError(f"Could not resolve deploy Region for {stack_name}")
+            if allow_bootstrap:
+                if not self.ensure_bootstrapped(region):
+                    raise RuntimeError(
+                        f"Region {region} could not be bootstrapped. "
+                        "Run 'gco stacks bootstrap --region "
+                        f"{region}' manually to diagnose."
+                    )
+            else:
+                expected_bootstrap = (bootstrap_stacks or {}).get(region)
+                if expected_bootstrap is None:
+                    raise RuntimeError(
+                        f"Strict deployment lacks a checkpointed CDKToolkit identity for {region}"
+                    )
+                self._validate_bootstrap_stack(region, expected_bootstrap)
+            if strict_deployment:
+                target = self._describe_stack_target(
+                    stack_name,
+                    expected_stack_id=expected_stack_id,
+                    require_expected_identity=True,
+                )
+                if expected_stack_id is not None and target is None:
+                    raise RuntimeError(
+                        f"Checkpointed stack {expected_stack_id} is absent; refusing recreation"
+                    )
+                assert change_set_name is not None
+                self._preflight_strict_change_set(
+                    stack_name=stack_name,
+                    change_set_name=change_set_name,
+                    expected_stack_id=expected_stack_id,
+                    prepared_change_sets=prepared_change_set_records,
+                )
+
+        # Name-based stuck-stack recovery is intentionally disabled for strict
+        # deployments. A prepared change set must establish CREATE-vs-UPDATE
+        # authority without deleting or adopting anything by name.
+        if stack_name and not strict_deployment:
+            self._check_and_fix_stuck_stack(
+                stack_name,
+                expected_stack_id=(expected_stack_ids or {}).get(stack_name),
+                authorize_stack=authorize_stack,
+                strict_ownership=not allow_bootstrap,
+            )
 
         # Ensure container runtime is available for building images
         runtime = _detect_container_runtime()
@@ -684,23 +1513,15 @@ class StackManager:
                 "  - Podman: https://podman.io/getting-started/installation"
             )
 
-        # Mirror third-party images into ECR before the regional stack's Helm
-        # install runs (see volcano_image_mirror in cdk.json). Runs only for
-        # regional stacks, only when enabled, and skips images already present —
-        # so a fresh deploy seeds the mirror automatically and repeat deploys are
-        # a no-op. Raises before any CDK call if mirroring fails, so we never
-        # deploy a config whose images aren't in place.
-        self._mirror_images_if_enabled(stack_name=stack_name, all_stacks=all_stacks)
-
-        # Auto-bootstrap the target region if needed
-        if stack_name:
-            region = self._get_deploy_region(stack_name)
-            if region and not self.ensure_bootstrapped(region):
-                raise RuntimeError(
-                    f"Region {region} could not be bootstrapped. "
-                    "Run 'gco stacks bootstrap --region "
-                    f"{region}' manually to diagnose."
-                )
+        # Mirror third-party images into ECR only after strict bootstrap and
+        # target checks. Repository creation acknowledgements are persisted
+        # synchronously by the live-validation callback before any image copy.
+        self._mirror_images_if_enabled(
+            stack_name=stack_name,
+            all_stacks=all_stacks,
+            repository_tags=tags,
+            on_repository_created=on_ecr_repository_created,
+        )
 
         cmd = ["deploy"]
 
@@ -716,6 +1537,19 @@ class StackManager:
         # re-evaluate globals on every pass.
         if exclusively and stack_name and not all_stacks:
             cmd.append("--exclusively")
+
+        if strict_deployment:
+            assert change_set_name is not None
+            cmd.extend(
+                [
+                    "--method",
+                    "prepare-change-set",
+                    "--change-set-name",
+                    change_set_name,
+                    "--context",
+                    f"{_LIVE_VALIDATION_PROVIDER_LOG_CONTEXT}=true",
+                ]
+            )
 
         if not require_approval:
             cmd.extend(["--require-approval", "never"])
@@ -764,6 +1598,54 @@ class StackManager:
                 f"{stack_name or 'all stacks'}; verifying CloudFormation state..."
             )
             success = False
+
+        if self._cdk_cancel_event.is_set():
+            raise RuntimeError("CDK deployment cancelled before AWS-side reconciliation")
+
+        if strict_deployment:
+            assert stack_name is not None
+            assert change_set_name is not None
+            assert on_change_set_prepared is not None
+            try:
+                success = self._execute_prepared_change_set(
+                    stack_name=stack_name,
+                    change_set_name=change_set_name,
+                    expected_stack_id=expected_stack_id,
+                    expected_tags=tags,
+                    prepared_change_sets=prepared_change_set_records,
+                    preparation_succeeded=success,
+                    authorize_stack=authorize_stack,
+                    on_change_set_prepared=on_change_set_prepared,
+                    allow_noop=success,
+                    timeout=timeout_s,
+                )
+            except Exception:
+                self._diagnose_deploy_failure(stack_name)
+                raise
+            if not success:
+                self._diagnose_deploy_failure(stack_name)
+
+            if success and "analytics" in stack_name:
+                api_gateway_stack = f"{self.config.project_name}-api-gateway"
+                print(f"  Updating {api_gateway_stack} with analytics routes...")
+                success = self.deploy(
+                    stack_name=api_gateway_stack,
+                    require_approval=require_approval,
+                    outputs_file=outputs_file,
+                    parameters=parameters,
+                    tags=tags,
+                    progress=progress,
+                    exclusively=True,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    expected_stack_ids=expected_stack_ids,
+                    prepared_change_sets=prepared_change_sets,
+                    authorize_stack=authorize_stack,
+                    strict_deployment_token=(f"{strict_deployment_token}-analytics-routes"),
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
+                )
+            return success
 
         # Reconcile a cdk failure/timeout against CloudFormation. cdk's
         # client-side polling can give up (a transient ``read EADDRNOTAVAIL``
@@ -850,10 +1732,19 @@ class StackManager:
         if success and stack_name and "analytics" in stack_name and not all_stacks:
             api_gateway_stack = f"{self.config.project_name}-api-gateway"
             print(f"  Updating {api_gateway_stack} with analytics routes...")
-            self.deploy(
+            success = self.deploy(
                 stack_name=api_gateway_stack,
                 require_approval=require_approval,
+                outputs_file=outputs_file,
+                parameters=parameters,
+                tags=tags,
+                progress=progress,
                 exclusively=True,
+                allow_bootstrap=allow_bootstrap,
+                bootstrap_stacks=bootstrap_stacks,
+                expected_stack_ids=expected_stack_ids,
+                authorize_stack=authorize_stack,
+                on_ecr_repository_created=on_ecr_repository_created,
             )
 
         return success
@@ -864,6 +1755,61 @@ class StackManager:
         all_stacks: bool = False,
         force: bool = False,
         output_dir: str | None = None,
+        expected_stack_id: str | None = None,
+        expected_stack_ids: Mapping[str, str | None] | None = None,
+        prepared_change_sets: PreparedChangeSetAuthority | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        allow_bootstrap: bool = True,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None = None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
+    ) -> bool:
+        """Destroy stacks while restoring any temporary config mutation exactly."""
+        config_path: Path | None = None
+        original_bytes: bytes | None = None
+        original_mode: int | None = None
+        if stack_name and not all_stacks and "analytics" in stack_name:
+            config_path = _find_cdk_json()
+            if config_path is None:
+                raise RuntimeError("cdk.json not found before analytics destroy")
+            original_bytes = config_path.read_bytes()
+            original_mode = stat.S_IMODE(config_path.stat().st_mode)
+        try:
+            return self._destroy(
+                stack_name=stack_name,
+                all_stacks=all_stacks,
+                force=force,
+                output_dir=output_dir,
+                expected_stack_id=expected_stack_id,
+                expected_stack_ids=expected_stack_ids,
+                prepared_change_sets=prepared_change_sets,
+                authorize_stack=authorize_stack,
+                allow_bootstrap=allow_bootstrap,
+                bootstrap_stacks=bootstrap_stacks,
+                strict_deployment_token=strict_deployment_token,
+                on_change_set_prepared=on_change_set_prepared,
+                on_ecr_repository_created=on_ecr_repository_created,
+            )
+        finally:
+            if config_path is not None and original_bytes is not None:
+                _atomic_write_bytes(config_path, original_bytes, mode=original_mode)
+
+    def _destroy(
+        self,
+        stack_name: str | None = None,
+        all_stacks: bool = False,
+        force: bool = False,
+        output_dir: str | None = None,
+        expected_stack_id: str | None = None,
+        expected_stack_ids: Mapping[str, str | None] | None = None,
+        prepared_change_sets: PreparedChangeSetAuthority | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        allow_bootstrap: bool = True,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None = None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
     ) -> bool:
         """Destroy CDK stacks.
 
@@ -879,6 +1825,24 @@ class StackManager:
             force: Skip confirmation prompts
             output_dir: Custom CDK output directory (for parallel deployments)
         """
+        if all_stacks and (expected_stack_id is not None or expected_stack_ids is not None):
+            raise RuntimeError("Identity-fenced teardown cannot use all_stacks=True")
+        if stack_name is None and (expected_stack_id is not None or expected_stack_ids is not None):
+            raise RuntimeError("Identity-fenced teardown requires exactly one named stack")
+
+        strict_identity = expected_stack_id is not None or expected_stack_ids is not None
+        if stack_name is not None and expected_stack_ids is not None:
+            if stack_name not in expected_stack_ids:
+                raise RuntimeError(
+                    f"Strict teardown lacks authoritative target state for {stack_name}"
+                )
+            mapped_stack_id = expected_stack_ids[stack_name]
+            if expected_stack_id is not None and expected_stack_id != mapped_stack_id:
+                raise RuntimeError(f"Conflicting expected stack identities for {stack_name}")
+            expected_stack_id = mapped_stack_id
+        if strict_identity and authorize_stack is None:
+            raise RuntimeError("Identity-fenced teardown requires an exact stack authorizer")
+
         # Image-registry pre-destroy guards. Only fires for the global
         # stack (where the registry lives) and only when the operator
         # has explicitly chosen ``removal_policy: "destroy"``. The
@@ -891,6 +1855,60 @@ class StackManager:
             and not self._image_registry_destroy_preflight(force=force)
         ):
             return False
+
+        # Strict callers never enter CDK's name-based destroy or toggle-based
+        # recovery paths. Analytics may first require one strict prepared
+        # change set on the exact API stack to remove cross-stack imports.
+        if strict_identity and stack_name and not all_stacks:
+            if self._cdk_cancel_event.is_set():
+                raise RuntimeError(f"Strict teardown cancelled before deleting {stack_name}")
+            if "analytics" in stack_name:
+                if expected_stack_ids is None:
+                    raise RuntimeError(
+                        "Identity-fenced analytics teardown requires the complete expected "
+                        "stack identity map"
+                    )
+                safe_to_destroy = self._remove_api_gateway_analytics_dependency(
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    expected_stack_ids=expected_stack_ids,
+                    prepared_change_sets=prepared_change_sets,
+                    authorize_stack=authorize_stack,
+                    strict_deployment_token=(
+                        f"{strict_deployment_token}-drop-analytics-routes"
+                        if strict_deployment_token is not None
+                        else None
+                    ),
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
+                )
+                if not safe_to_destroy:
+                    return False
+            return self._cloudformation_delete_stack(
+                stack_name,
+                expected_stack_id=expected_stack_id,
+                authorize_stack=authorize_stack,
+                require_expected_identity=True,
+            )
+
+        # A regional API bridge disappears from the CDK app when its Region is
+        # removed from configuration. Only this exact project-scoped shape with
+        # an SDK-known CloudFormation Region may bypass CDK; configured bridges,
+        # arbitrary suffixes, and every other stack keep the normal CDK path.
+        if stack_name and not all_stacks:
+            orphan_region = self._get_orphan_regional_api_region(stack_name)
+            if orphan_region is not None:
+                if not self._stack_exists_in_cloudformation(stack_name):
+                    return True
+                print(
+                    f"  {stack_name} is absent from the configured CDK app; "
+                    f"deleting it directly in {orphan_region}..."
+                )
+                return self._cloudformation_delete_stack(
+                    stack_name,
+                    expected_stack_id=expected_stack_id,
+                    authorize_stack=authorize_stack,
+                )
 
         # If destroying a specific stack that exists in CloudFormation but
         # might not be in the CDK app, temporarily enable its toggle.
@@ -908,7 +1926,16 @@ class StackManager:
         # with consumed exports. To break the dependency, redeploy the API
         # gateway with analytics disabled first, then destroy analytics.
         if stack_name and not all_stacks and "analytics" in stack_name:
-            safe_to_destroy = self._remove_api_gateway_analytics_dependency()
+            safe_to_destroy = self._remove_api_gateway_analytics_dependency(
+                allow_bootstrap=allow_bootstrap,
+                bootstrap_stacks=bootstrap_stacks,
+                expected_stack_ids=expected_stack_ids,
+                prepared_change_sets=prepared_change_sets,
+                authorize_stack=authorize_stack,
+                strict_deployment_token=strict_deployment_token,
+                on_change_set_prepared=on_change_set_prepared,
+                on_ecr_repository_created=on_ecr_repository_created,
+            )
             if not safe_to_destroy:
                 # Restore analytics toggle before bailing out.
                 if toggle_restored:
@@ -920,6 +1947,8 @@ class StackManager:
                 )
                 return False
 
+        # Non-strict callers may still use CDK's name-based path. Strict calls
+        # returned above after exact-ARN deletion.
         cmd = ["destroy"]
 
         if all_stacks:
@@ -959,30 +1988,52 @@ class StackManager:
             )
             cdk_succeeded = False
 
+        if self._cdk_cancel_event.is_set():
+            raise RuntimeError("CDK teardown cancelled before AWS-side reconciliation")
+
         # Restore the toggle if we changed it
         if toggle_restored:
             self._restore_analytics_disabled()
 
-        # Reconcile against CloudFormation. Three outcomes:
-        # 1. cdk succeeded AND stack is gone → success
-        # 2. stack is gone (regardless of cdk return code or timeout) → success
-        # 3. stack still exists → fall back to direct CFN delete or surface failure
+        # Reconcile against CloudFormation. A local CDK timeout/failure is not
+        # an AWS failure when the delete operation is still healthy. Once AWS
+        # reports DELETE_IN_PROGRESS, wait for bounded server-side convergence
+        # instead of letting the orchestrator advance into dependent stacks.
         if stack_name and not all_stacks:
             still_present = self._stack_exists_in_cloudformation(stack_name)
             if not still_present:
-                # Whatever cdk did or didn't do, AWS confirms the stack
-                # is gone. Treat as success.
                 if not cdk_succeeded:
                     print(
                         f"  cdk reported a non-zero exit but {stack_name} is "
-                        f"already deleted in CloudFormation — treating as success."
+                        "already deleted in CloudFormation — treating as success."
                     )
                 return True
-            # Stack still there. If cdk succeeded but CFN still has it,
-            # fall back to a direct CFN delete (existing behaviour).
+
+            status = self._get_stack_status(stack_name, expected_stack_id)
+            if status == "DELETE_IN_PROGRESS":
+                return self._wait_for_stack_delete_convergence(
+                    stack_name,
+                    initial_status=status,
+                )
+            if status == "DELETE_FAILED":
+                self._print_stack_delete_heartbeat(
+                    stack_name,
+                    status,
+                    expected_stack_id,
+                )
+                print(f"  {stack_name} reached DELETE_FAILED; refusing to continue teardown.")
+                return False
+
+            # A zero CDK exit with a still-present, non-deleting stack is a rare
+            # client-side false success. Start deletion directly and then use
+            # the same bounded convergence loop. A non-zero exit in any other
+            # state means CDK failed before it started a delete operation.
             if cdk_succeeded:
                 return self._cloudformation_delete_stack(stack_name)
-            # cdk failed AND stack is still present → real failure.
+            print(
+                f"  cdk failed and {stack_name} is still {status or 'in an unknown state'}; "
+                "no active CloudFormation delete operation was confirmed."
+            )
             return False
 
         return cdk_succeeded
@@ -1135,32 +2186,92 @@ class StackManager:
             return False
         return True
 
-    def _stack_exists_in_cloudformation(self, stack_name: str) -> bool:
-        """Check whether a stack still exists in CloudFormation.
+    @staticmethod
+    def _stack_missing(exc: ClientError) -> bool:
+        error = exc.response.get("Error", {})
+        return bool(
+            error.get("Code") == "ValidationError"
+            and "does not exist" in str(error.get("Message", "")).lower()
+        )
 
-        Only ``DELETE_COMPLETE`` — or a missing stack, which
-        ``describe_stacks`` surfaces as an error — counts as "gone". A stack
-        in ``DELETE_FAILED`` or ``DELETE_IN_PROGRESS`` still exists with
-        live/partial resources and must report as present.
+    @staticmethod
+    def _change_set_missing(exc: ClientError) -> bool:
+        """Return whether CloudFormation authoritatively reports an absent change set."""
+        return bool(exc.response.get("Error", {}).get("Code") == "ChangeSetNotFound")
 
-        The previous ``"DELETE" not in status`` test was too broad: it also
-        matched ``DELETE_FAILED`` and ``DELETE_IN_PROGRESS``, so a failed
-        ``cdk destroy`` whose stack landed in ``DELETE_FAILED`` was reconciled
-        as a success (the CLI printed "destroyed successfully" for a stack
-        that was still very much present).
-        """
+    def _describe_stack_target(
+        self,
+        stack_name: str,
+        *,
+        expected_stack_id: str | None = None,
+        require_expected_identity: bool = False,
+    ) -> tuple[str, Any, dict[str, Any]] | None:
+        """Resolve live/absent/tombstone/replacement state without name adoption."""
         import boto3
 
         region = self._get_destroy_region(stack_name)
         cfn = boto3.client("cloudformation", region_name=region)
-        try:
-            resp = cfn.describe_stacks(StackName=stack_name)
-            status = resp["Stacks"][0]["StackStatus"]
-            return bool(status != "DELETE_COMPLETE")
-        except Exception:
-            return False
 
-    def _get_stack_status(self, stack_name: str) -> str | None:
+        def describe(identifier: str) -> dict[str, Any] | None:
+            try:
+                response = cfn.describe_stacks(StackName=identifier)
+            except ClientError as exc:
+                if self._stack_missing(exc):
+                    return None
+                raise
+            stacks = response.get("Stacks", [])
+            if len(stacks) != 1:
+                raise RuntimeError(f"CloudFormation returned an invalid identity for {stack_name}")
+            stack = stacks[0]
+            if not isinstance(stack, dict):
+                raise RuntimeError(f"CloudFormation returned an invalid identity for {stack_name}")
+            stack_id = str(stack.get("StackId") or "")
+            if stack.get("StackName") != stack_name or not stack_id:
+                raise RuntimeError(f"CloudFormation returned an invalid identity for {stack_name}")
+            return stack
+
+        exact = describe(expected_stack_id) if expected_stack_id else None
+        if exact is not None and str(exact.get("StackStatus") or "") != "DELETE_COMPLETE":
+            if str(exact.get("StackId") or "") != expected_stack_id:
+                raise RuntimeError(f"Stack identity changed for {region}:{stack_name}")
+            return region, cfn, exact
+
+        by_name = describe(stack_name)
+        if by_name is None or str(by_name.get("StackStatus") or "") == "DELETE_COMPLETE":
+            return None
+        actual_id = str(by_name.get("StackId") or "")
+        if expected_stack_id is not None and actual_id != expected_stack_id:
+            raise RuntimeError(
+                f"Checkpointed stack {expected_stack_id} is absent or deleted but same-name "
+                f"replacement {actual_id} exists; refusing adoption"
+            )
+        if expected_stack_id is None and require_expected_identity:
+            raise RuntimeError(
+                f"Refusing name-authorized access to uncheckpointed stack "
+                f"{region}:{stack_name} ({actual_id})"
+            )
+        return region, cfn, by_name
+
+    def _stack_exists_in_cloudformation(
+        self,
+        stack_name: str,
+        expected_stack_id: str | None = None,
+        *,
+        require_expected_identity: bool = False,
+    ) -> bool:
+        """Return whether the exact live target exists, rejecting replacements."""
+        target = self._describe_stack_target(
+            stack_name,
+            expected_stack_id=expected_stack_id,
+            require_expected_identity=require_expected_identity,
+        )
+        return target is not None
+
+    def _get_stack_status(
+        self,
+        stack_name: str,
+        stack_identifier: str | None = None,
+    ) -> str | None:
         """Return the live CloudFormation status of ``stack_name`` or None.
 
         Used by ``deploy()`` to reconcile against AWS-side state when ``cdk
@@ -1176,7 +2287,7 @@ class StackManager:
         try:
             region = self._get_destroy_region(stack_name)
             cfn = boto3.client("cloudformation", region_name=region)
-            resp = cfn.describe_stacks(StackName=stack_name)
+            resp = cfn.describe_stacks(StackName=stack_identifier or stack_name)
             return str(resp["Stacks"][0]["StackStatus"])
         except Exception:
             return None
@@ -1206,7 +2317,12 @@ class StackManager:
         except Exception:
             return None
 
-    def _wait_for_stack_settle(self, stack_name: str, timeout: float | None = None) -> str | None:
+    def _wait_for_stack_settle(
+        self,
+        stack_name: str,
+        timeout: float | None = None,
+        stack_identifier: str | None = None,
+    ) -> str | None:
         """Poll CloudFormation until ``stack_name`` leaves a ``*_IN_PROGRESS`` state.
 
         When ``cdk deploy`` dies on a transient client-side error (e.g. a
@@ -1227,38 +2343,336 @@ class StackManager:
         if timeout is None:
             timeout = float(os.environ.get("GCO_CDK_SETTLE_TIMEOUT_SECONDS", "1200"))
         deadline = time.monotonic() + timeout
-        status = self._get_stack_status(stack_name)
+        status = self._get_stack_status(stack_name, stack_identifier)
         while status is not None and status.endswith("_IN_PROGRESS"):
+            if self._cdk_cancel_event.is_set():
+                return status
             if time.monotonic() >= deadline:
                 break
             time.sleep(15.0)
-            status = self._get_stack_status(stack_name)
+            status = self._get_stack_status(stack_name, stack_identifier)
         return status
 
-    def _cloudformation_delete_stack(self, stack_name: str) -> bool:
-        """Delete a stack directly via CloudFormation API."""
+    def _get_latest_stack_event(
+        self,
+        stack_name: str,
+        stack_identifier: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the newest CloudFormation event for delete heartbeats."""
         import boto3
 
-        region = self._get_destroy_region(stack_name)
-        cfn = boto3.client("cloudformation", region_name=region)
         try:
-            cfn.delete_stack(StackName=stack_name)
-            waiter = cfn.get_waiter("stack_delete_complete")
-            waiter.wait(
-                StackName=stack_name,
-                WaiterConfig={"Delay": 15, "MaxAttempts": 120},
+            region = self._get_destroy_region(stack_name)
+            cfn = boto3.client("cloudformation", region_name=region)
+            events = cfn.describe_stack_events(StackName=stack_identifier or stack_name).get(
+                "StackEvents", []
             )
-            return True
+            return events[0] if events else None
         except Exception:
+            logger.debug("Could not read delete events for %s", stack_name, exc_info=True)
+            return None
+
+    def _print_stack_delete_heartbeat(
+        self,
+        stack_name: str,
+        status: str | None,
+        stack_identifier: str | None = None,
+    ) -> None:
+        """Print the latest AWS-side state while a long delete converges."""
+        event = self._get_latest_stack_event(stack_name, stack_identifier)
+        if not event:
+            print(f"  {stack_name}: CloudFormation status {status or 'unknown'}")
+            return
+
+        timestamp = event.get("Timestamp")
+        timestamp_text = (
+            timestamp.isoformat() if isinstance(timestamp, datetime) else str(timestamp or "")
+        )
+        logical_id = str(event.get("LogicalResourceId") or stack_name)
+        resource_status = str(event.get("ResourceStatus") or status or "unknown")
+        reason = " ".join(str(event.get("ResourceStatusReason") or "").split())
+        if len(reason) > 400:
+            reason = reason[:397] + "..."
+        suffix = f" — {reason}" if reason else ""
+        print(
+            f"  {stack_name}: {status or 'unknown'}; latest event "
+            f"{timestamp_text} {logical_id} {resource_status}{suffix}"
+        )
+
+    def _wait_for_stack_delete_convergence(
+        self,
+        stack_name: str,
+        *,
+        timeout: float | None = None,
+        poll_interval: float = _CLOUDFORMATION_DELETE_POLL_SECONDS,
+        heartbeat_interval: float = _CLOUDFORMATION_DELETE_HEARTBEAT_SECONDS,
+        initial_status: str = "DELETE_IN_PROGRESS",
+        expected_stack_id: str | None = None,
+        require_expected_identity: bool = False,
+    ) -> bool:
+        """Wait for an AWS-side stack delete to finish without trusting CDK polling.
+
+        The caller must already have evidence that a delete operation started.
+        Transient status-read failures are tolerated after that proof, but a
+        terminal ``DELETE_FAILED`` or the overall deadline fails closed.
+        """
+        if timeout is None:
+            try:
+                timeout = float(
+                    os.environ.get(
+                        "GCO_CLOUDFORMATION_DELETE_TIMEOUT_SECONDS",
+                        str(_CLOUDFORMATION_DELETE_TIMEOUT_SECONDS),
+                    )
+                )
+            except ValueError:
+                timeout = _CLOUDFORMATION_DELETE_TIMEOUT_SECONDS
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("CloudFormation delete timeout must be positive and finite")
+        if (
+            not math.isfinite(poll_interval)
+            or not math.isfinite(heartbeat_interval)
+            or poll_interval <= 0
+            or heartbeat_interval <= 0
+        ):
+            raise ValueError("CloudFormation delete polling intervals must be positive and finite")
+
+        deadline = time.monotonic() + timeout
+        next_heartbeat = time.monotonic()
+        status: str | None = initial_status
+        last_printed_status: str | None = None
+
+        while True:
+            if self._cdk_cancel_event.is_set():
+                logger.warning("CloudFormation delete wait cancelled for %s", stack_name)
+                return False
+            try:
+                if not self._stack_exists_in_cloudformation(
+                    stack_name,
+                    expected_stack_id=expected_stack_id,
+                    require_expected_identity=require_expected_identity,
+                ):
+                    print(f"  {stack_name} is absent from CloudFormation.")
+                    return True
+            except RuntimeError:
+                raise
+            except Exception:
+                logger.debug(
+                    "CloudFormation presence check failed for %s",
+                    stack_name,
+                    exc_info=True,
+                )
+
+            now = time.monotonic()
+            if status == "DELETE_COMPLETE":
+                return True
+            if status == "DELETE_FAILED":
+                self._print_stack_delete_heartbeat(
+                    stack_name,
+                    status,
+                    expected_stack_id,
+                )
+                return False
+            if status not in (None, "DELETE_IN_PROGRESS"):
+                self._print_stack_delete_heartbeat(
+                    stack_name,
+                    status,
+                    expected_stack_id,
+                )
+                print(
+                    f"  {stack_name} left DELETE_IN_PROGRESS without being deleted; "
+                    "refusing to continue teardown."
+                )
+                return False
+            if now >= deadline:
+                self._print_stack_delete_heartbeat(
+                    stack_name,
+                    status,
+                    expected_stack_id,
+                )
+                print(
+                    f"  Timed out after {timeout:.0f}s waiting for {stack_name} "
+                    "to disappear from CloudFormation."
+                )
+                return False
+            if status != last_printed_status or now >= next_heartbeat:
+                self._print_stack_delete_heartbeat(
+                    stack_name,
+                    status,
+                    expected_stack_id,
+                )
+                last_printed_status = status
+                next_heartbeat = now + heartbeat_interval
+
+            time.sleep(min(poll_interval, max(0.0, deadline - now)))
+            status = self._get_stack_status(stack_name, expected_stack_id)
+
+    def _cloudformation_delete_stack(
+        self,
+        stack_name: str,
+        *,
+        expected_stack_id: str | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        require_expected_identity: bool = False,
+    ) -> bool:
+        """Delete an immediately revalidated stack by immutable ARN."""
+        if self._cdk_cancel_event.is_set():
+            raise RuntimeError(f"CloudFormation deletion cancelled before {stack_name}")
+        target = self._describe_stack_target(
+            stack_name,
+            expected_stack_id=expected_stack_id,
+            require_expected_identity=require_expected_identity,
+        )
+        if target is None:
+            return True
+        region, cfn, stack = target
+        stack_id = str(stack["StackId"])
+        status = str(stack.get("StackStatus") or "")
+        if authorize_stack is not None:
+            authorize_stack(stack_name, region, stack_id)
+        if status == "DELETE_IN_PROGRESS":
+            return self._wait_for_stack_delete_convergence(
+                stack_name,
+                initial_status=status,
+                expected_stack_id=stack_id,
+                require_expected_identity=require_expected_identity,
+            )
+        try:
+            cfn.delete_stack(StackName=stack_id)
+        except Exception:
+            logger.debug("Direct CloudFormation delete failed for %s", stack_id, exc_info=True)
             return False
+        return self._wait_for_stack_delete_convergence(
+            stack_name,
+            expected_stack_id=stack_id,
+            require_expected_identity=require_expected_identity,
+        )
+
+    def _validated_regional_api_region(self, stack_name: str) -> str | None:
+        """Return an exact project bridge's SDK-known CloudFormation Region."""
+        bridge_prefix = f"{self.config.project_name}-regional-api-"
+        if not stack_name.startswith(bridge_prefix):
+            return None
+
+        region = stack_name[len(bridge_prefix) :]
+        if not region:
+            return None
+        try:
+            return region if region in _known_cloudformation_regions() else None
+        except Exception:
+            logger.debug(
+                "Could not validate regional API bridge Region for %s",
+                stack_name,
+                exc_info=True,
+            )
+            return None
+
+    def _configured_regional_api_regions(
+        self,
+    ) -> tuple[frozenset[str], str] | None:
+        """Read valid root regions and their partition for orphan deletion.
+
+        Returning ``None`` means the configuration could not prove anything:
+        missing, unreadable, malformed, wrong-project, incomplete, empty, and
+        duplicate Region configurations all fail closed under the same contract
+        used by :class:`ConfigLoader`.
+        """
+        path = self.project_root / "cdk.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
+            context = data.get("context")
+            if not isinstance(context, dict):
+                return None
+            configured_project = context.get("project_name")
+            if (
+                not isinstance(configured_project, str)
+                or not configured_project
+                or configured_project != self.config.project_name
+            ):
+                return None
+            deployment_regions = context.get("deployment_regions")
+            if not isinstance(deployment_regions, dict):
+                return None
+
+            known_regions = _known_cloudformation_regions()
+            for key in ("global", "api_gateway", "monitoring"):
+                region = deployment_regions.get(key)
+                if not isinstance(region, str) or region not in known_regions:
+                    return None
+
+            try:
+                regional = validated_regional_deployment_regions(
+                    deployment_regions.get("regional"),
+                    known_regions=known_regions,
+                )
+                deployment_partition = validated_deployment_partition(
+                    (
+                        deployment_regions["global"],
+                        deployment_regions["api_gateway"],
+                        deployment_regions["monitoring"],
+                        *regional,
+                    )
+                )
+            except RuntimeError, ValueError:
+                return None
+            return frozenset(regional), deployment_partition
+        except OSError, UnicodeError, json.JSONDecodeError, TypeError:
+            logger.debug(
+                "Could not read authoritative regional configuration from %s",
+                path,
+                exc_info=True,
+            )
+            return None
+
+    def _get_orphan_regional_api_region(self, stack_name: str) -> str | None:
+        """Return a bridge Region only when valid root config proves it absent.
+
+        This result authorizes bypassing CDK and deleting a stack directly via
+        CloudFormation. Merely failing a normal configuration lookup can never
+        be interpreted as proof that the stack is orphaned.
+        """
+        region = self._validated_regional_api_region(stack_name)
+        if region is None:
+            return None
+        configured = self._configured_regional_api_regions()
+        if configured is None:
+            return None
+        configured_regions, deployment_partition = configured
+        if region in configured_regions:
+            return None
+        try:
+            candidate_partition = validated_deployment_partition((region,))
+        except RuntimeError, ValueError:
+            return None
+        if candidate_partition != deployment_partition:
+            return None
+        return region
 
     def _get_destroy_region(self, stack_name: str) -> str:
-        """Determine the region for a stack based on its name."""
+        """Determine a configured or cryptographically bounded destroy Region.
+
+        Deploy resolution intentionally requires bridge Regions to remain in
+        ``cdk.json``. A removed bridge may still resolve through the orphan
+        path, but that path validates the exact project-scoped name, SDK-known
+        CloudFormation Region, authoritative root configuration, and matching
+        AWS partition. Reconciliation must reuse that same proof rather than
+        trusting a bridge-shaped suffix independently.
+        """
         try:
             region = self._get_deploy_region(stack_name)
-            return region or self.config.api_gateway_region
         except Exception:
-            return self.config.api_gateway_region
+            logger.debug(
+                "Configured deploy Region lookup failed for %s; checking orphan shape",
+                stack_name,
+                exc_info=True,
+            )
+        else:
+            if region:
+                return region
+
+        orphan_region = self._get_orphan_regional_api_region(stack_name)
+        return orphan_region or self.config.api_gateway_region
 
     def _ensure_analytics_enabled_for_destroy(self) -> bool:
         """Temporarily enable analytics so CDK includes the stack for destroy."""
@@ -1286,7 +2700,18 @@ class StackManager:
                 exc_info=True,
             )
 
-    def _remove_api_gateway_analytics_dependency(self) -> bool:
+    def _remove_api_gateway_analytics_dependency(
+        self,
+        *,
+        allow_bootstrap: bool = True,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None = None,
+        expected_stack_ids: Mapping[str, str | None] | None = None,
+        prepared_change_sets: PreparedChangeSetAuthority | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
+    ) -> bool:
         """Redeploy gco-api-gateway with analytics disabled to drop cross-stack imports.
 
         The analytics stack exports values (Cognito pool ARN, presigned-URL
@@ -1305,10 +2730,25 @@ class StackManager:
         api_gateway_stack = f"{self.config.project_name}-api-gateway"
         analytics_stack = f"{self.config.project_name}-analytics"
 
+        strict_identity = expected_stack_ids is not None
+        if strict_identity:
+            assert expected_stack_ids is not None
+            if api_gateway_stack not in expected_stack_ids:
+                raise RuntimeError(
+                    f"Strict teardown lacks authoritative target state for {api_gateway_stack}"
+                )
+            api_gateway_expected_id = expected_stack_ids[api_gateway_stack]
+        else:
+            api_gateway_expected_id = None
+
         # Fast path: if the api-gateway stack doesn't exist (or has already
         # been deleted/rolled-back into a non-consuming state), there's
         # nothing importing the analytics exports. Skip the redeploy entirely.
-        if not self._stack_exists_in_cloudformation(api_gateway_stack):
+        if not self._stack_exists_in_cloudformation(
+            api_gateway_stack,
+            expected_stack_id=api_gateway_expected_id,
+            require_expected_identity=strict_identity,
+        ):
             logger.info(
                 "%s does not exist in CloudFormation; skipping redeploy before analytics destroy.",
                 api_gateway_stack,
@@ -1326,6 +2766,14 @@ class StackManager:
             )
             return True
 
+        if strict_identity and (
+            not strict_deployment_token or on_change_set_prepared is None or authorize_stack is None
+        ):
+            raise RuntimeError(
+                "Strict analytics teardown cannot remove API imports without "
+                "prepared-change-set authority"
+            )
+
         try:
             # Temporarily disable analytics so CDK drops the /studio/* routes.
             current = get_analytics_config()
@@ -1342,6 +2790,14 @@ class StackManager:
                     require_approval=False,
                     exclusively=True,
                     output_dir=tmp_out,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    expected_stack_ids=expected_stack_ids,
+                    prepared_change_sets=prepared_change_sets,
+                    authorize_stack=authorize_stack,
+                    strict_deployment_token=strict_deployment_token,
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
                 )
 
             # Re-enable analytics so CDK can synthesize the analytics stack
@@ -1499,6 +2955,392 @@ class StackManager:
         self._bootstrap_cache[region] = False
         return False
 
+    def _validate_bootstrap_stack(
+        self,
+        region: str,
+        expected: Mapping[str, str],
+    ) -> None:
+        """Require the exact preflighted CDKToolkit ARN and healthy status."""
+        import boto3
+
+        expected_id = str(expected.get("stack_id") or "")
+        expected_status = str(expected.get("status") or "")
+        if not expected_id or expected_status not in _BOOTSTRAP_HEALTHY_STATUSES:
+            raise RuntimeError(f"Invalid checkpointed CDKToolkit identity for {region}")
+        cfn = boto3.client("cloudformation", region_name=region)
+        try:
+            response = cfn.describe_stacks(StackName=expected_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not revalidate checkpointed CDKToolkit {expected_id} in {region}"
+            ) from exc
+        stacks = response.get("Stacks", [])
+        if len(stacks) != 1:
+            raise RuntimeError(f"CDKToolkit {expected_id} returned an invalid identity")
+        stack = stacks[0]
+        actual_id = str(stack.get("StackId") or "")
+        actual_status = str(stack.get("StackStatus") or "")
+        if stack.get("StackName") != "CDKToolkit" or actual_id != expected_id:
+            raise RuntimeError(f"CDKToolkit identity changed in {region}")
+        if actual_status != expected_status or actual_status not in _BOOTSTRAP_HEALTHY_STATUSES:
+            raise RuntimeError(
+                f"CDKToolkit {expected_id} status changed from {expected_status} "
+                f"to {actual_status or 'unknown'}"
+            )
+
+    @staticmethod
+    def _strict_change_set_name(stack_name: str, token: str) -> str:
+        """Return one deterministic, run-scoped CloudFormation change-set name."""
+        safe_token = "".join(
+            character if character.isascii() and character.isalnum() else "-" for character in token
+        )
+        safe_token = "-".join(part for part in safe_token.split("-") if part)
+        digest = hashlib.sha256(f"{token}:{stack_name}".encode()).hexdigest()[:16]
+        namespace = "gco"
+        max_token_length = 128 - len(namespace) - len(digest) - 2
+        safe_token = (safe_token or "live-validation")[:max_token_length]
+        return f"{namespace}-{safe_token}-{digest}"
+
+    def _preflight_strict_change_set(
+        self,
+        *,
+        stack_name: str,
+        change_set_name: str,
+        expected_stack_id: str | None,
+        prepared_change_sets: Mapping[str, Mapping[str, str]],
+    ) -> None:
+        """Reject an existing deterministic change set without checkpoint authority."""
+        import boto3
+
+        region = self._get_deploy_region(stack_name)
+        if not region:
+            raise RuntimeError(f"Could not resolve deploy Region for {stack_name}")
+        cfn = boto3.client("cloudformation", region_name=region)
+        try:
+            change_set = cfn.describe_change_set(
+                ChangeSetName=change_set_name,
+                StackName=stack_name,
+            )
+        except ClientError as exc:
+            if self._change_set_missing(exc):
+                return
+            # DescribeChangeSet reports a stack-style ValidationError when both
+            # the deterministic change set and its fresh target stack are absent.
+            # The target was authoritatively checked immediately above; only an
+            # empty create history can safely interpret this as "not prepared".
+            if expected_stack_id is None and not prepared_change_sets and self._stack_missing(exc):
+                return
+            raise RuntimeError(
+                f"Could not preflight strict change set {change_set_name} for {stack_name}"
+            ) from exc
+
+        change_set_id = str(change_set.get("ChangeSetId") or "")
+        observed_change_set_name = str(change_set.get("ChangeSetName") or "")
+        stack_id = str(change_set.get("StackId") or "")
+        if not change_set_id or not stack_id or observed_change_set_name != change_set_name:
+            raise RuntimeError(
+                f"Existing strict change set {change_set_name} omitted immutable identities"
+            )
+        self._validate_strict_change_set_arns(
+            stack_name=stack_name,
+            change_set_name=change_set_name,
+            stack_id=stack_id,
+            change_set_id=change_set_id,
+            region=region,
+        )
+        prepared_record = prepared_change_sets.get(change_set_id)
+        if prepared_record is None:
+            raise RuntimeError(
+                f"Existing strict change set {change_set_id} lacks checkpoint authority"
+            )
+        recorded_change_set_id = str(prepared_record.get("change_set_id") or "")
+        recorded_stack_id = str(prepared_record.get("stack_id") or "")
+        recorded_type = str(prepared_record.get("change_set_type") or "")
+        if (
+            expected_stack_id is None
+            or stack_id != expected_stack_id
+            or recorded_change_set_id != change_set_id
+            or recorded_stack_id != stack_id
+            or recorded_type not in {"CREATE", "UPDATE"}
+        ):
+            raise RuntimeError(f"Existing strict change-set authority changed for {stack_name}")
+
+    @staticmethod
+    def _validate_strict_change_set_arns(
+        *,
+        stack_name: str,
+        change_set_name: str,
+        stack_id: str,
+        change_set_id: str,
+        region: str,
+    ) -> None:
+        """Require both prepared identities to be exact, related CloudFormation ARNs."""
+
+        def split_arn(identifier: str, label: str) -> tuple[str, str, str, str]:
+            parts = identifier.split(":", 5)
+            if (
+                len(parts) != 6
+                or parts[0] != "arn"
+                or not (parts[1] == "aws" or parts[1].startswith("aws-"))
+                or parts[2] != "cloudformation"
+                or parts[3] != region
+                or not parts[4]
+                or not parts[5]
+            ):
+                raise RuntimeError(f"Strict {label} has an invalid CloudFormation ARN")
+            return parts[1], parts[3], parts[4], parts[5]
+
+        stack_partition, _stack_region, stack_account, stack_resource = split_arn(
+            stack_id,
+            "stack identity",
+        )
+        stack_prefix = f"stack/{stack_name}/"
+        if not stack_resource.startswith(stack_prefix) or not stack_resource.removeprefix(
+            stack_prefix
+        ):
+            raise RuntimeError(
+                f"Strict stack identity {stack_id} does not name expected stack {stack_name}"
+            )
+
+        change_partition, _change_region, change_account, change_resource = split_arn(
+            change_set_id,
+            "change-set identity",
+        )
+        change_prefix = f"changeSet/{change_set_name}/"
+        if not change_resource.startswith(change_prefix) or not change_resource.removeprefix(
+            change_prefix
+        ):
+            raise RuntimeError(
+                f"Strict change-set identity {change_set_id} does not name {change_set_name}"
+            )
+        if change_partition != stack_partition or change_account != stack_account:
+            raise RuntimeError(
+                "Strict stack and change-set identities belong to different AWS authorities"
+            )
+
+    def _execute_prepared_change_set(
+        self,
+        *,
+        stack_name: str,
+        change_set_name: str,
+        expected_stack_id: str | None,
+        expected_tags: Mapping[str, str] | None,
+        prepared_change_sets: Mapping[str, Mapping[str, str]],
+        preparation_succeeded: bool,
+        authorize_stack: StackAuthorizationCallback | None,
+        on_change_set_prepared: ChangeSetPreparedCallback,
+        allow_noop: bool,
+        timeout: float,
+    ) -> bool:
+        """Validate, checkpoint, and execute only the deterministic CDK change set."""
+        import boto3
+
+        region = self._get_deploy_region(stack_name)
+        if not region:
+            raise RuntimeError(f"Could not resolve deploy Region for {stack_name}")
+        cfn = boto3.client("cloudformation", region_name=region)
+        try:
+            change_set = cfn.describe_change_set(
+                ChangeSetName=change_set_name,
+                StackName=stack_name,
+            )
+        except ClientError as exc:
+            if not self._change_set_missing(exc):
+                raise RuntimeError(
+                    f"Could not inspect strict change set {change_set_name} for {stack_name}"
+                ) from exc
+            if allow_noop and expected_stack_id:
+                target = self._describe_stack_target(
+                    stack_name,
+                    expected_stack_id=expected_stack_id,
+                    require_expected_identity=True,
+                )
+                if target is not None:
+                    stack = target[2]
+                    status = str(stack.get("StackStatus") or "")
+                    if status in _BOOTSTRAP_HEALTHY_STATUSES:
+                        if authorize_stack is None:
+                            raise RuntimeError(
+                                f"Strict no-op for {stack_name} lacks exact authorization"
+                            ) from exc
+                        authorize_stack(stack_name, region, expected_stack_id)
+                        return True
+            raise RuntimeError(
+                f"CDK did not create the strict change set {change_set_name} for {stack_name}"
+            ) from exc
+
+        change_set_id = str(change_set.get("ChangeSetId") or "")
+        observed_change_set_name = str(change_set.get("ChangeSetName") or "")
+        stack_id = str(change_set.get("StackId") or "")
+        status = str(change_set.get("Status") or "")
+        execution_status = str(change_set.get("ExecutionStatus") or "")
+        if not change_set_id or not stack_id:
+            raise RuntimeError(f"Strict change set {change_set_name} omitted immutable identities")
+        if observed_change_set_name != change_set_name:
+            raise RuntimeError(
+                f"Strict change set identity changed from {change_set_name} "
+                f"to {observed_change_set_name or 'unknown'}"
+            )
+        self._validate_strict_change_set_arns(
+            stack_name=stack_name,
+            change_set_name=change_set_name,
+            stack_id=stack_id,
+            change_set_id=change_set_id,
+            region=region,
+        )
+        prepared_record = prepared_change_sets.get(change_set_id)
+        if prepared_record is None:
+            # DescribeChangeSet does not expose ChangeSetType. For a newly
+            # prepared change set, the pre-CDK exact target state is the only
+            # authoritative source: absence means CREATE; an exact stack means
+            # UPDATE. Resumes use the persisted per-change-set record below.
+            change_set_type = "CREATE" if expected_stack_id is None else "UPDATE"
+        else:
+            recorded_change_set_id = str(prepared_record.get("change_set_id") or "")
+            recorded_stack_id = str(prepared_record.get("stack_id") or "")
+            change_set_type = str(prepared_record.get("change_set_type") or "")
+            if recorded_change_set_id != change_set_id or recorded_stack_id != stack_id:
+                raise RuntimeError(
+                    f"Persisted strict change-set authority changed for {stack_name}"
+                )
+            if change_set_type not in {"CREATE", "UPDATE"}:
+                raise RuntimeError(
+                    f"Persisted strict change set for {stack_name} has invalid type "
+                    f"{change_set_type or 'unknown'}"
+                )
+        if change_set_type == "UPDATE" and expected_stack_id is None:
+            raise RuntimeError(
+                f"Strict change set for absent {stack_name} unexpectedly performs UPDATE"
+            )
+        if expected_stack_id is not None and stack_id != expected_stack_id:
+            raise RuntimeError(
+                f"Strict change set targets replacement {stack_id}; expected {expected_stack_id}"
+            )
+        observed_tags = {
+            str(tag.get("Key")): str(tag.get("Value"))
+            for tag in change_set.get("Tags", [])
+            if tag.get("Key") is not None
+        }
+        for key, value in (expected_tags or {}).items():
+            if observed_tags.get(str(key)) != str(value):
+                raise RuntimeError(f"Strict change set {change_set_id} omitted required tag {key}")
+
+        status_reason = " ".join(str(change_set.get("StatusReason") or "").split()).lower()
+        empty_change_set = (
+            "submitted information didn't contain changes" in status_reason
+            or "no updates are to be performed" in status_reason
+        )
+        if (
+            status == "FAILED"
+            and empty_change_set
+            and (allow_noop or prepared_record is not None)
+            and expected_stack_id
+        ):
+            if stack_id != expected_stack_id:
+                raise RuntimeError(
+                    f"Empty strict change set targets {stack_id}; expected {expected_stack_id}"
+                )
+            target = self._describe_stack_target(
+                stack_name,
+                expected_stack_id=expected_stack_id,
+                require_expected_identity=True,
+            )
+            if target is None or str(target[2].get("StackStatus") or "") not in (
+                _BOOTSTRAP_HEALTHY_STATUSES
+            ):
+                raise RuntimeError(
+                    f"Empty strict change set {change_set_id} has no healthy exact stack"
+                )
+            if authorize_stack is None:
+                raise RuntimeError(f"Strict no-op for {stack_name} lacks exact authorization")
+            authorize_stack(stack_name, region, expected_stack_id)
+            on_change_set_prepared(
+                stack_name,
+                region,
+                stack_id,
+                change_set_id,
+                change_set_type,
+            )
+            return True
+        if status != "CREATE_COMPLETE" or execution_status not in {
+            "AVAILABLE",
+            "EXECUTE_COMPLETE",
+        }:
+            raise RuntimeError(
+                f"Strict change set {change_set_id} is {status}/{execution_status}, not usable"
+            )
+
+        if execution_status == "AVAILABLE" and (
+            prepared_record is None and not preparation_succeeded
+        ):
+            raise RuntimeError(
+                f"Strict change set {change_set_id} was not produced by this preparation"
+            )
+        if execution_status == "EXECUTE_COMPLETE" and (
+            prepared_record is None or expected_stack_id is None
+        ):
+            raise RuntimeError(
+                f"Executed strict change set {change_set_id} lacks prior checkpoint authority"
+            )
+
+        if expected_stack_id is not None:
+            if authorize_stack is None:
+                raise RuntimeError(f"Strict change set for {stack_name} lacks exact authorization")
+            authorize_stack(stack_name, region, stack_id)
+
+        if execution_status == "EXECUTE_COMPLETE":
+            target = self._describe_stack_target(
+                stack_name,
+                expected_stack_id=stack_id,
+                require_expected_identity=True,
+            )
+            if target is None or str(target[2].get("StackStatus") or "") not in (
+                _BOOTSTRAP_HEALTHY_STATUSES
+            ):
+                raise RuntimeError(
+                    f"Executed strict change set {change_set_id} has no healthy exact stack"
+                )
+        elif change_set_type == "CREATE":
+            target = self._describe_stack_target(
+                stack_name,
+                expected_stack_id=stack_id,
+                require_expected_identity=True,
+            )
+            if target is None or str(target[2].get("StackStatus") or "") != "REVIEW_IN_PROGRESS":
+                raise RuntimeError(
+                    f"Prepared CREATE change set {change_set_id} has no exact review stack"
+                )
+
+        on_change_set_prepared(
+            stack_name,
+            region,
+            stack_id,
+            change_set_id,
+            change_set_type,
+        )
+        if execution_status == "EXECUTE_COMPLETE":
+            return True
+        if self._cdk_cancel_event.is_set():
+            raise RuntimeError(
+                f"Strict change set {change_set_id} was checkpointed but execution was cancelled"
+            )
+
+        cfn.execute_change_set(ChangeSetName=change_set_id)
+        settled = self._wait_for_stack_settle(
+            stack_name,
+            timeout=timeout,
+            stack_identifier=stack_id,
+        )
+        if settled not in _BOOTSTRAP_HEALTHY_STATUSES:
+            logger.error(
+                "Strict change set %s for %s settled as %s",
+                change_set_id,
+                stack_name,
+                settled or "unknown",
+            )
+            return False
+        return True
+
     def ensure_bootstrapped(self, region: str) -> bool:
         """Ensure a region is CDK-bootstrapped, auto-bootstrapping if needed.
 
@@ -1547,7 +3389,18 @@ class StackManager:
             region = cdk_regions.get("api_gateway") or self.config.api_gateway_region
             return region
 
-        # Regional stacks: {project}-{region}. The region is whatever
+        # Regional API bridges use ``<project>-regional-api-<region>``. Resolve
+        # this exact shape before generic regional stacks; otherwise the generic
+        # project-prefix branch returns the malformed ``regional-api-<region>``.
+        # Requiring a configured deployment region also prevents bridge-shaped
+        # typos from being treated as valid AWS regions.
+        bridge_prefix = f"{self.config.project_name}-regional-api-"
+        if stack_name.startswith(bridge_prefix):
+            region = stack_name[len(bridge_prefix) :]
+            configured_regions = {str(item) for item in (cdk_regions.get("regional") or [])}
+            return region if region in configured_regions else None
+
+        # Base regional stacks: {project}-{region}. The region is whatever
         # follows the project prefix (regions contain hyphens, so we strip
         # the known prefix rather than guess a split point).
         prefix = f"{self.config.project_name}-"
@@ -1581,12 +3434,26 @@ class StackManager:
 
             regional = _load_cdk_json().get("regional") or []
             return list(dict.fromkeys(str(r) for r in regional))
+
+        # Bridge stacks contain no regional Helm consumers and must not trigger
+        # image mirroring. Match the exact project-scoped prefix so a project
+        # name containing ``regional-api`` remains unambiguous.
+        bridge_prefix = f"{self.config.project_name}-regional-api-"
+        if stack_name and stack_name.startswith(bridge_prefix):
+            return []
+
         if stack_name and stack_name.startswith(prefix) and stack_name not in named:
             region = self._get_deploy_region(stack_name)
             return [region] if region else []
         return []
 
-    def _mirror_images_if_enabled(self, stack_name: str | None, all_stacks: bool) -> None:
+    def _mirror_images_if_enabled(
+        self,
+        stack_name: str | None,
+        all_stacks: bool,
+        repository_tags: Mapping[str, str] | None = None,
+        on_repository_created: EcrRepositoryCreatedCallback | None = None,
+    ) -> None:
         """Mirror third-party images into ECR before a regional stack deploys.
 
         No-op unless ``volcano_image_mirror.enabled`` is set in cdk.json. Mirrors
@@ -1608,7 +3475,11 @@ class StackManager:
             print(f"Mirroring third-party images into ECR for {region} ...")
             try:
                 image_mirror.mirror_images(
-                    region, ecr_namespace=cfg["ecr_namespace"], skip_existing=True
+                    region,
+                    ecr_namespace=cfg["ecr_namespace"],
+                    skip_existing=True,
+                    repository_tags=repository_tags,
+                    on_repository_created=on_repository_created,
                 )
             except Exception as exc:  # noqa: BLE001 - surface a clear, actionable failure
                 raise RuntimeError(
@@ -1671,12 +3542,21 @@ class StackManager:
         on_stack_complete: Callable[[str, bool], None] | None = None,
         parallel: bool = False,
         max_workers: int = 4,
+        allow_bootstrap: bool = True,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None = None,
+        expected_stack_ids: Mapping[str, str | None] | None = None,
+        prepared_change_sets: PreparedChangeSetAuthority | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
     ) -> tuple[bool, list[str], list[str]]:
         """
         Deploy all stacks in the correct order.
 
-        Deploys global stacks first, then regional stacks (optionally in parallel),
-        then the monitoring stack (which depends on regional stacks).
+        Deploys global stacks first, then base regional stacks, regional API
+        bridges, and finally monitoring. Parallelism never crosses a dependency
+        level.
 
         Args:
             require_approval: Whether to require approval for changes
@@ -1693,22 +3573,110 @@ class StackManager:
             Tuple of (overall_success, successful_stacks, failed_stacks)
         """
         stacks = self.list_stacks()
-        ordered_stacks = get_stack_deployment_order(stacks)
+        stack_names = set(stacks)
+        project_name = self.config.project_name
+        ordered_stacks = get_stack_deployment_order(stacks, project_name=project_name)
 
-        # Separate stacks into three groups by suffix so ordering is
-        # independent of project_name (#139) — a non-``gco`` deployment
-        # (``acme-global`` …) orders identically:
+        strict_deployment = (
+            strict_deployment_token is not None or on_change_set_prepared is not None
+        )
+        if strict_deployment:
+            if not strict_deployment_token or on_change_set_prepared is None:
+                raise RuntimeError(
+                    "Strict deployment requires both a run token and a prepared-change-set callback"
+                )
+            if allow_bootstrap:
+                raise RuntimeError("Strict orchestrated deployment cannot auto-bootstrap")
+            if authorize_stack is None:
+                raise RuntimeError("Strict orchestrated deployment requires an exact authorizer")
+            if expected_stack_ids is None:
+                raise RuntimeError("Strict orchestrated deployment lacks target identities")
+            if prepared_change_sets is None:
+                raise RuntimeError("Strict orchestrated deployment lacks change-set history")
+            missing = sorted(set(stacks) - set(expected_stack_ids))
+            unexpected = sorted(set(expected_stack_ids) - set(stacks))
+            if missing or unexpected:
+                raise RuntimeError(
+                    "Strict deployment target map does not match the CDK graph; "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            missing_history = sorted(set(stacks) - set(prepared_change_sets))
+            unexpected_history = sorted(set(prepared_change_sets) - set(stacks))
+            if missing_history or unexpected_history:
+                raise RuntimeError(
+                    "Strict change-set history does not match the CDK graph; "
+                    f"missing={missing_history}, unexpected={unexpected_history}"
+                )
+
+            # Validate every toolkit and every expected stack before the first
+            # repository copy, stuck-stack recovery, or CloudFormation mutation.
+            validated_regions: set[str] = set()
+            for target_name in ordered_stacks:
+                region = self._get_deploy_region(target_name)
+                if not region:
+                    raise RuntimeError(f"Could not resolve deploy Region for {target_name}")
+                if region not in validated_regions:
+                    expected_bootstrap = (bootstrap_stacks or {}).get(region)
+                    if expected_bootstrap is None:
+                        raise RuntimeError(
+                            f"Strict deployment lacks a checkpointed CDKToolkit identity for {region}"
+                        )
+                    self._validate_bootstrap_stack(region, expected_bootstrap)
+                    validated_regions.add(region)
+
+                expected_id = expected_stack_ids[target_name]
+                target = self._describe_stack_target(
+                    target_name,
+                    expected_stack_id=expected_id,
+                    require_expected_identity=True,
+                )
+                if expected_id is not None and target is None:
+                    raise RuntimeError(
+                        f"Checkpointed stack {expected_id} is absent; refusing recreation"
+                    )
+                if target is not None:
+                    authorize_stack(target_name, region, str(target[2]["StackId"]))
+
+        # Separate stacks into four dependency levels by suffix/marker so
+        # ordering is independent of project_name (#139):
         # 1. Pre-regional global stacks (<project>-global, <project>-api-gateway)
-        # 2. Regional stacks (<project>-<region>, can be parallelized)
-        # 3. Post-regional stacks (<project>-monitoring - depends on regional)
+        # 2. Base regional stacks (<project>-<region>, parallel-safe)
+        # 3. Regional API bridges (<project>-regional-api-<region>, depend on base)
+        # 4. Monitoring (depends on regional stacks)
         pre_regional_stacks = [s for s in ordered_stacks if s.endswith(("-global", "-api-gateway"))]
+        regional_api_stacks = [
+            s
+            for s in ordered_stacks
+            if _is_regional_api_bridge_stack(
+                s,
+                project_name=project_name,
+                stack_names=stack_names,
+            )
+        ]
         regional_stacks = [
-            s for s in ordered_stacks if not s.endswith(("-global", "-api-gateway", "-monitoring"))
+            s
+            for s in ordered_stacks
+            if not s.endswith(("-global", "-api-gateway", "-monitoring"))
+            and not _is_regional_api_bridge_stack(
+                s,
+                project_name=project_name,
+                stack_names=stack_names,
+            )
         ]
         post_regional_stacks = [s for s in ordered_stacks if s.endswith("-monitoring")]
 
         successful: list[str] = []
         failed: list[str] = []
+        deployment_safety: _StackOperationSafetyKwargs = {
+            "allow_bootstrap": allow_bootstrap,
+            "bootstrap_stacks": bootstrap_stacks,
+            "expected_stack_ids": expected_stack_ids,
+            "prepared_change_sets": prepared_change_sets,
+            "authorize_stack": authorize_stack,
+            "strict_deployment_token": strict_deployment_token,
+            "on_change_set_prepared": on_change_set_prepared,
+            "on_ecr_repository_created": on_ecr_repository_created,
+        }
 
         # Phase 1: Deploy pre-regional global stacks sequentially
         for stack_name in pre_regional_stacks:
@@ -1722,6 +3690,7 @@ class StackManager:
                 parameters=parameters,
                 tags=tags,
                 progress=progress,
+                **deployment_safety,
             )
 
             if success:
@@ -1756,6 +3725,14 @@ class StackManager:
                     on_stack_start=on_stack_start,
                     on_stack_complete=on_stack_complete,
                     max_workers=max_workers,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    expected_stack_ids=expected_stack_ids,
+                    prepared_change_sets=prepared_change_sets,
+                    authorize_stack=authorize_stack,
+                    strict_deployment_token=strict_deployment_token,
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
                 )
                 successful.extend(successful_regional)
                 failed.extend(failed_regional)
@@ -1777,6 +3754,7 @@ class StackManager:
                         tags=tags,
                         progress=progress,
                         exclusively=True,
+                        **deployment_safety,
                     )
 
                     if success:
@@ -1791,7 +3769,58 @@ class StackManager:
                     if not success:
                         return False, successful, failed
 
-        # Phase 3: Deploy post-regional stacks (monitoring) sequentially.
+        # Phase 3: Deploy regional API bridges only after every base regional
+        # stack is complete. Bridges within this level remain parallel-safe.
+        if regional_api_stacks:
+            if parallel and len(regional_api_stacks) > 1:
+                successful_api, failed_api = self._deploy_stacks_parallel(
+                    stacks=regional_api_stacks,
+                    require_approval=require_approval,
+                    outputs_file=outputs_file,
+                    parameters=parameters,
+                    tags=tags,
+                    progress=progress,
+                    on_stack_start=on_stack_start,
+                    on_stack_complete=on_stack_complete,
+                    max_workers=max_workers,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    expected_stack_ids=expected_stack_ids,
+                    prepared_change_sets=prepared_change_sets,
+                    authorize_stack=authorize_stack,
+                    strict_deployment_token=strict_deployment_token,
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
+                )
+                successful.extend(successful_api)
+                failed.extend(failed_api)
+                if failed_api:
+                    return False, successful, failed
+            else:
+                for stack_name in regional_api_stacks:
+                    if on_stack_start:
+                        on_stack_start(stack_name)
+
+                    success = self.deploy(
+                        stack_name=stack_name,
+                        require_approval=require_approval,
+                        outputs_file=outputs_file,
+                        parameters=parameters,
+                        tags=tags,
+                        progress=progress,
+                        exclusively=True,
+                        **deployment_safety,
+                    )
+                    if success:
+                        successful.append(stack_name)
+                    else:
+                        failed.append(stack_name)
+                    if on_stack_complete:
+                        on_stack_complete(stack_name, success)
+                    if not success:
+                        return False, successful, failed
+
+        # Phase 4: Deploy post-regional stacks (monitoring) sequentially.
         # Same rationale as Phase 2: every upstream stack is already
         # deployed, so --exclusively prevents a redundant pass over
         # global/api-gateway/regional.
@@ -1807,6 +3836,7 @@ class StackManager:
                 tags=tags,
                 progress=progress,
                 exclusively=True,
+                **deployment_safety,
             )
 
             if success:
@@ -1833,6 +3863,14 @@ class StackManager:
         on_stack_start: Callable[[str], None] | None,
         on_stack_complete: Callable[[str, bool], None] | None,
         max_workers: int,
+        allow_bootstrap: bool,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None,
+        expected_stack_ids: Mapping[str, str | None] | None,
+        prepared_change_sets: PreparedChangeSetAuthority | None,
+        authorize_stack: StackAuthorizationCallback | None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
     ) -> tuple[list[str], list[str]]:
         """Deploy multiple stacks in parallel using separate CDK output directories."""
         import tempfile
@@ -1845,34 +3883,43 @@ class StackManager:
             # Use a unique output directory in /tmp for each parallel deployment
             # This avoids CDK copying cdk.out.* directories into assets
             output_dir = tempfile.mkdtemp(prefix=f"cdk-{stack_name}-")
-
-            if on_stack_start:
-                with lock:
-                    on_stack_start(stack_name)
-
-            success = self.deploy(
-                stack_name=stack_name,
-                require_approval=require_approval,
-                outputs_file=outputs_file,
-                parameters=parameters,
-                tags=tags,
-                progress=progress,
-                output_dir=output_dir,
-                exclusively=True,
-            )
-
-            # Clean up the temporary output directory
             try:
-                import shutil
+                if on_stack_start:
+                    with lock:
+                        on_stack_start(stack_name)
 
-                if os.path.exists(output_dir):
-                    shutil.rmtree(output_dir)
-            except Exception as e:
-                logger.debug("Cleanup of %s failed: %s", output_dir, e)
+                success = self.deploy(
+                    stack_name=stack_name,
+                    require_approval=require_approval,
+                    outputs_file=outputs_file,
+                    parameters=parameters,
+                    tags=tags,
+                    progress=progress,
+                    output_dir=output_dir,
+                    exclusively=True,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    expected_stack_ids=expected_stack_ids,
+                    prepared_change_sets=prepared_change_sets,
+                    authorize_stack=authorize_stack,
+                    strict_deployment_token=strict_deployment_token,
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
+                )
+                return stack_name, success
+            finally:
+                try:
+                    import shutil
 
-            return stack_name, success
+                    if os.path.exists(output_dir):
+                        shutil.rmtree(output_dir)
+                except Exception as e:
+                    logger.debug("Cleanup of %s failed: %s", output_dir, e)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        self._cdk_cancel_event.clear()
+        futures: dict[Any, str] = {}
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {executor.submit(deploy_single, stack): stack for stack in stacks}
 
             for future in as_completed(futures):
@@ -1886,8 +3933,178 @@ class StackManager:
 
                     if on_stack_complete:
                         on_stack_complete(stack_name, success)
+        except BaseException:
+            # Terminate registered process groups before waiting for executor
+            # shutdown; the context-manager form waits first and can deadlock an
+            # interrupted orchestration behind a still-running CDK worker.
+            self.cancel_active_cdk_processes()
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+        finally:
+            self._cdk_cancel_event.clear()
 
         return successful, failed
+
+    def _resolve_strict_teardown_resources(
+        self,
+        *,
+        stacks: Collection[str],
+        regional_stacks: Collection[str],
+        expected_stack_ids: Mapping[str, str | None],
+        authorize_stack: StackAuthorizationCallback,
+    ) -> dict[str, dict[str, str]]:
+        """Authorize every live stack, then resolve helper IDs from exact stack ARNs."""
+        import boto3
+
+        live_targets: dict[str, tuple[str, Any, dict[str, Any]]] = {}
+        for stack_name in stacks:
+            expected_stack_id = expected_stack_ids[stack_name]
+            target = self._describe_stack_target(
+                stack_name,
+                expected_stack_id=expected_stack_id,
+                require_expected_identity=True,
+            )
+            if target is None:
+                continue
+            region, _cloudformation, stack = target
+            stack_id = str(stack["StackId"])
+            authorize_stack(stack_name, region, stack_id)
+            live_targets[stack_name] = target
+
+        project_name = self.config.project_name
+        base_regional_stacks: list[str] = []
+        for stack_name in regional_stacks:
+            deploy_region = self._get_deploy_region(stack_name)
+            if deploy_region and stack_name == f"{project_name}-{deploy_region}":
+                base_regional_stacks.append(stack_name)
+
+        resolved: dict[str, dict[str, str]] = {}
+        for stack_name in base_regional_stacks:
+            target = live_targets.get(stack_name)
+            if target is None:
+                continue
+            region, cloudformation, stack = target
+            stack_id = str(stack["StackId"])
+            summaries: list[dict[str, Any]] = []
+            paginator = cloudformation.get_paginator("list_stack_resources")
+            for page in paginator.paginate(StackName=stack_id):
+                summaries.extend(page.get("StackResourceSummaries", []))
+
+            vpc_ids = {
+                str(item["PhysicalResourceId"])
+                for item in summaries
+                if item.get("ResourceType") == "AWS::EC2::VPC" and item.get("PhysicalResourceId")
+            }
+            cluster_names = {
+                str(item["PhysicalResourceId"])
+                for item in summaries
+                if item.get("ResourceType") == "AWS::EKS::Cluster"
+                and item.get("PhysicalResourceId")
+            }
+            if len(vpc_ids) > 1 or len(cluster_names) > 1:
+                raise RuntimeError(f"Exact stack {stack_id} returned ambiguous VPC/EKS resources")
+
+            details = {
+                "stack_name": stack_name,
+                "stack_id": stack_id,
+                "region": region,
+            }
+            vpc_id = next(iter(vpc_ids), "")
+            cluster_name = next(iter(cluster_names), "")
+            if vpc_id:
+                details["vpc_id"] = vpc_id
+            if cluster_name:
+                details["cluster_name"] = cluster_name
+                cluster: dict[str, Any] | None
+                try:
+                    cluster = boto3.client("eks", region_name=region).describe_cluster(
+                        name=cluster_name
+                    )["cluster"]
+                except ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                        cluster = None
+                    else:
+                        raise
+                if cluster is not None:
+                    if str(cluster.get("name") or "") != cluster_name:
+                        raise RuntimeError(
+                            f"EKS returned a changed identity for {region}:{cluster_name}"
+                        )
+                    networking = cluster.get("resourcesVpcConfig") or {}
+                    cluster_vpc_id = str(networking.get("vpcId") or "")
+                    security_group_id = str(networking.get("clusterSecurityGroupId") or "")
+                    if vpc_id and cluster_vpc_id != vpc_id:
+                        raise RuntimeError(
+                            f"EKS cluster {cluster_name} no longer belongs to exact VPC {vpc_id}"
+                        )
+                    if not security_group_id:
+                        raise RuntimeError(
+                            f"EKS cluster {cluster_name} omitted its security-group identity"
+                        )
+                    details["cluster_security_group_id"] = security_group_id
+                elif vpc_id:
+                    # On teardown resume the cluster may already be gone while
+                    # its managed SG remains. Resolve the SG ID inside the exact
+                    # stack VPC using the exact cluster physical ID.
+                    ec2 = boto3.client("ec2", region_name=region)
+                    groups = ec2.describe_security_groups(
+                        Filters=[
+                            {"Name": "vpc-id", "Values": [vpc_id]},
+                            {
+                                "Name": "tag:aws:eks:cluster-name",
+                                "Values": [cluster_name],
+                            },
+                        ]
+                    ).get("SecurityGroups", [])
+                    group_ids = {str(group["GroupId"]) for group in groups if group.get("GroupId")}
+                    if len(group_ids) > 1:
+                        raise RuntimeError(
+                            f"Exact VPC {vpc_id} has ambiguous EKS security groups for "
+                            f"{cluster_name}"
+                        )
+                    if group_ids:
+                        details["cluster_security_group_id"] = next(iter(group_ids))
+            resolved[stack_name] = details
+        return resolved
+
+    def _destroy_phase_remaining_stacks(
+        self,
+        phase_name: str,
+        stacks: Collection[str],
+        expected_stack_ids: Mapping[str, str | None] | None = None,
+    ) -> list[str]:
+        """Return stacks still present after a dependency phase.
+
+        A lookup error is treated as present: advancing when absence cannot be
+        proven is less safe than stopping for an operator retry.
+        """
+        remaining: list[str] = []
+        for stack_name in stacks:
+            try:
+                present = self._stack_exists_in_cloudformation(
+                    stack_name,
+                    expected_stack_id=(expected_stack_ids or {}).get(stack_name),
+                    require_expected_identity=expected_stack_ids is not None,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not verify %s absence after %s",
+                    stack_name,
+                    phase_name,
+                )
+                present = True
+            if present:
+                remaining.append(stack_name)
+        if remaining:
+            print(
+                f"  {phase_name} barrier blocked: stack absence was not confirmed for "
+                + ", ".join(remaining)
+            )
+        return remaining
 
     def destroy_orchestrated(
         self,
@@ -1896,154 +4113,316 @@ class StackManager:
         on_stack_complete: Callable[[str, bool], None] | None = None,
         parallel: bool = False,
         max_workers: int = 4,
+        expected_stack_ids: Mapping[str, str | None] | None = None,
+        prepared_change_sets: PreparedChangeSetAuthority | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        allow_bootstrap: bool = True,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None = None,
+        on_cleanup_complete: CleanupOutcomeCallback | None = None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
     ) -> tuple[bool, list[str], list[str]]:
-        """
-        Destroy all stacks in the correct order.
+        """Destroy stacks in dependency order with optional exact-ARN authority."""
+        app_stacks = self.list_stacks()
+        strict_identity = expected_stack_ids is not None
+        if strict_identity:
+            assert expected_stack_ids is not None
+            missing = sorted(set(app_stacks) - set(expected_stack_ids))
+            if missing:
+                raise RuntimeError(
+                    f"Strict teardown target map is incomplete before cleanup; missing={missing}"
+                )
+            if authorize_stack is None:
+                raise RuntimeError("Strict teardown requires an exact stack authorizer")
+            invalid = sorted(
+                name
+                for name, stack_id in expected_stack_ids.items()
+                if stack_id is not None and not str(stack_id).startswith("arn:")
+            )
+            if invalid:
+                raise RuntimeError(
+                    f"Strict teardown has invalid stack identities for: {', '.join(invalid)}"
+                )
 
-        Destroys monitoring stack first, then regional stacks (optionally in parallel),
-        then global stacks.
+        strict_prepared_deployment = (
+            strict_deployment_token is not None or on_change_set_prepared is not None
+        )
+        if strict_prepared_deployment:
+            if not strict_deployment_token or on_change_set_prepared is None:
+                raise RuntimeError(
+                    "Strict teardown dependency deployment requires both a run token "
+                    "and a prepared-change-set callback"
+                )
+            if prepared_change_sets is None:
+                raise RuntimeError("Strict teardown lacks prepared change-set history")
+            expected_history_keys = set(expected_stack_ids or {})
+            if set(prepared_change_sets) != expected_history_keys:
+                raise RuntimeError(
+                    "Strict teardown change-set history does not match target identities"
+                )
 
-        Args:
-            force: Skip confirmation prompts
-            on_stack_start: Callback(stack_name) called when starting a stack
-            on_stack_complete: Callback(stack_name, success) called when stack completes
-            parallel: Destroy regional stacks in parallel
-            max_workers: Maximum number of parallel destructions (default: 4)
+        stacks = list(app_stacks)
+        if expected_stack_ids is not None:
+            for stack_name in expected_stack_ids:
+                if stack_name not in stacks:
+                    stacks.append(stack_name)
+        project_name = self.config.project_name
+        (
+            post_regional_stacks,
+            regional_api_stacks,
+            regional_stacks,
+            pre_regional_stacks,
+        ) = _get_stack_destroy_phases(stacks, project_name=project_name)
 
-        Returns:
-            Tuple of (overall_success, successful_stacks, failed_stacks)
-        """
-        stacks = self.list_stacks()
+        strict_resources: dict[str, dict[str, str]] = {}
+        if strict_identity:
+            assert expected_stack_ids is not None
+            assert authorize_stack is not None
+            strict_resources = self._resolve_strict_teardown_resources(
+                stacks=stacks,
+                regional_stacks=regional_stacks,
+                expected_stack_ids=expected_stack_ids,
+                authorize_stack=authorize_stack,
+            )
 
-        # Image-registry pre-destroy guard — fires before ANY teardown so
-        # operators don't end up with monitoring + regional + api-gateway
-        # already destroyed when the global-stack ECR delete fails on a
-        # non-empty repo. Skipped entirely under the default
-        # ``removal_policy: "retain"`` posture. See
-        # ``_image_registry_destroy_preflight`` for the exact rules.
+        destroy_safety: _StackOperationSafetyKwargs = {
+            "expected_stack_ids": expected_stack_ids,
+            "prepared_change_sets": prepared_change_sets,
+            "authorize_stack": authorize_stack,
+            "allow_bootstrap": allow_bootstrap,
+            "bootstrap_stacks": bootstrap_stacks,
+            "strict_deployment_token": strict_deployment_token,
+            "on_change_set_prepared": on_change_set_prepared,
+            "on_ecr_repository_created": on_ecr_repository_created,
+        }
+
+        def record_cleanup(name: str, details: dict[str, Any]) -> None:
+            if on_cleanup_complete is not None:
+                on_cleanup_complete(name, details)
+
         if not self._image_registry_destroy_preflight(force=force):
             return False, [], list(stacks)
 
-        # Phase 0a: The CLI creates SSM bastions outside CloudFormation. A
-        # crashed tunnel process can therefore leave an instance (and its
-        # primary ENI) in a regional VPC, which blocks VPC deletion. Terminate
-        # every project-scoped ephemeral bastion and wait for its ENIs before
-        # asking CloudFormation to delete anything.
-        self.cleanup_orphaned_bastions(stacks)
-
-        # Phase 0b: Clean up backup vault recovery points so the global stack
-        # can be deleted cleanly by CloudFormation.
-        self._cleanup_backup_vault()
-
-        # Separate stacks into three groups (reverse of deploy order) by
-        # suffix so a non-``gco`` deployment orders correctly (#139).
-        post_regional_stacks = [s for s in stacks if s.endswith("-monitoring")]
-        regional_stacks = [
-            s for s in stacks if not s.endswith(("-global", "-api-gateway", "-monitoring"))
-        ]
-        pre_regional_stacks = [s for s in stacks if s.endswith(("-global", "-api-gateway"))]
-
-        # Sort regional stacks alphabetically (reversed for destroy)
-        regional_stacks.sort(reverse=True)
-        # Sort pre-regional stacks in reverse priority order: api-gateway
-        # (1) before global (2), independent of project_name.
-        pre_regional_stacks.sort(
-            key=lambda x: 1 if x.endswith("-api-gateway") else (2 if x.endswith("-global") else 0)
+        bastion_targets = {
+            name: details for name, details in strict_resources.items() if details.get("vpc_id")
+        }
+        bastions = self.cleanup_orphaned_bastions(
+            stacks,
+            parallel=parallel,
+            resource_targets=bastion_targets if strict_identity else None,
         )
+        record_cleanup("bastions", {"terminated_instances": bastions})
+
+        global_stack_name = f"{project_name}-global"
+        backup = self._cleanup_backup_vault(
+            expected_stack_id=(expected_stack_ids or {}).get(global_stack_name),
+            authorize_stack=authorize_stack,
+            require_expected_identity=strict_identity,
+        )
+        record_cleanup("backup-vault", backup)
+        if strict_identity and backup.get("errors"):
+            raise RuntimeError(
+                "Strict backup-vault cleanup failed before stack deletion: "
+                + json.dumps(backup["errors"], sort_keys=True)
+            )
 
         successful: list[str] = []
         failed: list[str] = []
 
-        # Phase 1: Destroy post-regional stacks (monitoring) first
         for stack_name in post_regional_stacks:
             if on_stack_start:
                 on_stack_start(stack_name)
-
             success = self.destroy(
                 stack_name=stack_name,
                 force=force,
+                expected_stack_id=(expected_stack_ids or {}).get(stack_name),
+                **destroy_safety,
             )
-
-            if success:
-                successful.append(stack_name)
-            else:
-                failed.append(stack_name)
-
+            (successful if success else failed).append(stack_name)
             if on_stack_complete:
                 on_stack_complete(stack_name, success)
 
-        # Phase 2: Destroy regional stacks (parallel or sequential)
-        # Each regional destroy has a background watchdog that proactively
-        # deletes EKS-managed security groups + orphaned ENIs as soon as
-        # they appear. Without this, CloudFormation's VPC delete step sits
-        # in DELETE_IN_PROGRESS for ~10 min waiting for EKS to GC the
-        # ``eks-cluster-sg-<cluster>-*`` security group and its cluster
-        # ENIs. The SG is owned by the EKS service (not CloudFormation),
-        # so CFN can't delete it directly — it just polls the VPC's
-        # dependencies until they drain. See ``_start_eks_sg_watchdog``.
-        watchdog_stops: dict[str, Event] = {}
-        watchdog_threads: dict[str, Thread] = {}
-        for stack_name in regional_stacks:
-            stop_event = Event()
-            thread = self._start_eks_sg_watchdog(stack_name, stop_event)
-            watchdog_stops[stack_name] = stop_event
-            watchdog_threads[stack_name] = thread
+        phase_remaining = self._destroy_phase_remaining_stacks(
+            "post-regional",
+            post_regional_stacks,
+            expected_stack_ids,
+        )
+        for stack_name in phase_remaining:
+            if stack_name not in failed:
+                failed.append(stack_name)
+        if any(stack in failed for stack in post_regional_stacks) or phase_remaining:
+            return False, successful, failed
 
-        if regional_stacks:
-            if parallel and len(regional_stacks) > 1:
-                # Parallel destruction of regional stacks
-                successful_regional, failed_regional = self._destroy_stacks_parallel(
-                    stacks=regional_stacks,
+        if regional_api_stacks:
+            if parallel and len(regional_api_stacks) > 1:
+                successful_api, failed_api = self._destroy_stacks_parallel(
+                    stacks=regional_api_stacks,
                     force=force,
                     on_stack_start=on_stack_start,
                     on_stack_complete=on_stack_complete,
                     max_workers=max_workers,
+                    expected_stack_ids=expected_stack_ids,
+                    authorize_stack=authorize_stack,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    prepared_change_sets=prepared_change_sets,
+                    strict_deployment_token=strict_deployment_token,
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
                 )
-                successful.extend(successful_regional)
-                failed.extend(failed_regional)
+                successful.extend(successful_api)
+                failed.extend(failed_api)
             else:
-                # Sequential destruction
-                for stack_name in regional_stacks:
+                for stack_name in regional_api_stacks:
                     if on_stack_start:
                         on_stack_start(stack_name)
-
                     success = self.destroy(
                         stack_name=stack_name,
                         force=force,
+                        expected_stack_id=(expected_stack_ids or {}).get(stack_name),
+                        **destroy_safety,
                     )
-
-                    if success:
-                        successful.append(stack_name)
-                    else:
-                        failed.append(stack_name)
-
+                    (successful if success else failed).append(stack_name)
                     if on_stack_complete:
                         on_stack_complete(stack_name, success)
+            phase_remaining = self._destroy_phase_remaining_stacks(
+                "regional API bridge",
+                regional_api_stacks,
+                expected_stack_ids,
+            )
+            for stack_name in phase_remaining:
+                if stack_name not in failed:
+                    failed.append(stack_name)
+            if any(stack in failed for stack in regional_api_stacks) or phase_remaining:
+                return False, successful, failed
 
-        # Stop all watchdogs and do one final cleanup pass per stack to
-        # catch anything EKS re-created during the destroy flow.
-        for stack_name in regional_stacks:
-            watchdog_stops[stack_name].set()
-            watchdog_threads[stack_name].join(timeout=5)
-            self._cleanup_eks_security_groups(stack_name)
+        watchdog_stops: dict[str, Event] = {}
+        watchdog_threads: dict[str, Thread] = {}
+        watchdog_targets = (
+            [
+                name
+                for name in regional_stacks
+                if strict_resources.get(name, {}).get("cluster_security_group_id")
+            ]
+            if strict_identity
+            else list(regional_stacks)
+        )
+        try:
+            for stack_name in watchdog_targets:
+                details = strict_resources.get(stack_name, {})
+                stop_event = Event()
+                watchdog_stops[stack_name] = stop_event
+                watchdog_threads[stack_name] = self._start_eks_sg_watchdog(
+                    stack_name,
+                    stop_event,
+                    region=details.get("region"),
+                    security_group_id=details.get("cluster_security_group_id"),
+                    vpc_id=details.get("vpc_id"),
+                )
 
-        # Phase 3: Destroy pre-regional global stacks last
+            if regional_stacks:
+                if parallel and len(regional_stacks) > 1:
+                    successful_regional, failed_regional = self._destroy_stacks_parallel(
+                        stacks=regional_stacks,
+                        force=force,
+                        on_stack_start=on_stack_start,
+                        on_stack_complete=on_stack_complete,
+                        max_workers=max_workers,
+                        expected_stack_ids=expected_stack_ids,
+                        authorize_stack=authorize_stack,
+                        allow_bootstrap=allow_bootstrap,
+                        bootstrap_stacks=bootstrap_stacks,
+                        prepared_change_sets=prepared_change_sets,
+                        strict_deployment_token=strict_deployment_token,
+                        on_change_set_prepared=on_change_set_prepared,
+                        on_ecr_repository_created=on_ecr_repository_created,
+                    )
+                    successful.extend(successful_regional)
+                    failed.extend(failed_regional)
+                else:
+                    for stack_name in regional_stacks:
+                        if on_stack_start:
+                            on_stack_start(stack_name)
+                        success = self.destroy(
+                            stack_name=stack_name,
+                            force=force,
+                            expected_stack_id=(expected_stack_ids or {}).get(stack_name),
+                            **destroy_safety,
+                        )
+                        (successful if success else failed).append(stack_name)
+                        if on_stack_complete:
+                            on_stack_complete(stack_name, success)
+        finally:
+            for stop_event in watchdog_stops.values():
+                stop_event.set()
+            for stack_name, thread in watchdog_threads.items():
+                try:
+                    thread.join(timeout=5)
+                except Exception as exc:
+                    logger.exception("Could not join teardown watchdog for %s", stack_name)
+                    record_cleanup(
+                        "eks-security-group",
+                        {"stack": stack_name, "errors": [f"{type(exc).__name__}: {exc}"]},
+                    )
+                    if strict_identity and stack_name not in failed:
+                        failed.append(stack_name)
+                    continue
+                details = strict_resources.get(stack_name, {})
+                if strict_identity and thread.is_alive():
+                    outcome = {
+                        "stack": stack_name,
+                        "errors": ["watchdog thread did not stop"],
+                    }
+                else:
+                    outcome = self._cleanup_eks_security_groups(
+                        stack_name,
+                        region=details.get("region"),
+                        security_group_id=details.get("cluster_security_group_id"),
+                        vpc_id=details.get("vpc_id"),
+                    )
+                record_cleanup("eks-security-group", outcome)
+                if (
+                    strict_identity
+                    and (outcome.get("errors") or outcome.get("blocked_by_enis"))
+                    and stack_name not in failed
+                ):
+                    failed.append(stack_name)
+
+        phase_remaining = self._destroy_phase_remaining_stacks(
+            "regional",
+            regional_stacks,
+            expected_stack_ids,
+        )
+        for stack_name in phase_remaining:
+            if stack_name not in failed:
+                failed.append(stack_name)
+        if any(stack in failed for stack in regional_stacks) or phase_remaining:
+            return False, successful, failed
+
         for stack_name in pre_regional_stacks:
             if on_stack_start:
                 on_stack_start(stack_name)
-
             success = self.destroy(
                 stack_name=stack_name,
                 force=force,
+                expected_stack_id=(expected_stack_ids or {}).get(stack_name),
+                **destroy_safety,
             )
-
-            if success:
-                successful.append(stack_name)
-            else:
-                failed.append(stack_name)
-
+            (successful if success else failed).append(stack_name)
             if on_stack_complete:
                 on_stack_complete(stack_name, success)
+
+            phase_remaining = self._destroy_phase_remaining_stacks(
+                "pre-regional global",
+                [stack_name],
+                expected_stack_ids,
+            )
+            for remaining_stack in phase_remaining:
+                if remaining_stack not in failed:
+                    failed.append(remaining_stack)
+            if not success or phase_remaining:
+                return False, successful, failed
 
         return len(failed) == 0, successful, failed
 
@@ -2054,6 +4433,14 @@ class StackManager:
         on_stack_start: Callable[[str], None] | None,
         on_stack_complete: Callable[[str, bool], None] | None,
         max_workers: int,
+        expected_stack_ids: Mapping[str, str | None] | None,
+        authorize_stack: StackAuthorizationCallback | None,
+        allow_bootstrap: bool,
+        bootstrap_stacks: Mapping[str, Mapping[str, str]] | None,
+        prepared_change_sets: PreparedChangeSetAuthority | None,
+        strict_deployment_token: str | None = None,
+        on_change_set_prepared: ChangeSetPreparedCallback | None = None,
+        on_ecr_repository_created: EcrRepositoryCreatedCallback | None = None,
     ) -> tuple[list[str], list[str]]:
         """Destroy multiple stacks in parallel using separate CDK output directories."""
         import tempfile
@@ -2065,29 +4452,39 @@ class StackManager:
         def destroy_single(stack_name: str) -> tuple[str, bool]:
             # Use a unique output directory in /tmp for each parallel destruction
             output_dir = tempfile.mkdtemp(prefix=f"cdk-{stack_name}-")
-
-            if on_stack_start:
-                with lock:
-                    on_stack_start(stack_name)
-
-            success = self.destroy(
-                stack_name=stack_name,
-                force=force,
-                output_dir=output_dir,
-            )
-
-            # Clean up the temporary output directory
             try:
-                import shutil
+                if on_stack_start:
+                    with lock:
+                        on_stack_start(stack_name)
 
-                if os.path.exists(output_dir):
-                    shutil.rmtree(output_dir)
-            except Exception as e:
-                logger.debug("Cleanup of %s failed: %s", output_dir, e)
+                success = self.destroy(
+                    stack_name=stack_name,
+                    force=force,
+                    output_dir=output_dir,
+                    expected_stack_id=(expected_stack_ids or {}).get(stack_name),
+                    expected_stack_ids=expected_stack_ids,
+                    authorize_stack=authorize_stack,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    prepared_change_sets=prepared_change_sets,
+                    strict_deployment_token=strict_deployment_token,
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
+                )
+                return stack_name, success
+            finally:
+                try:
+                    import shutil
 
-            return stack_name, success
+                    if os.path.exists(output_dir):
+                        shutil.rmtree(output_dir)
+                except Exception as e:
+                    logger.debug("Cleanup of %s failed: %s", output_dir, e)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        self._cdk_cancel_event.clear()
+        futures: dict[Any, str] = {}
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {executor.submit(destroy_single, stack): stack for stack in stacks}
 
             for future in as_completed(futures):
@@ -2101,91 +4498,180 @@ class StackManager:
 
                     if on_stack_complete:
                         on_stack_complete(stack_name, success)
+        except BaseException:
+            self.cancel_active_cdk_processes()
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+        finally:
+            self._cdk_cancel_event.clear()
 
         return successful, failed
 
-    def _cleanup_backup_vault(self) -> None:
-        """Delete all recovery points from the GCO backup vault.
-
-        This is called before destroy-all so CloudFormation can delete the
-        backup vault cleanly. Without this, the vault deletion fails because
-        it contains recovery points.
-        """
+    def _cleanup_backup_vault(
+        self,
+        *,
+        expected_stack_id: str | None = None,
+        authorize_stack: StackAuthorizationCallback | None = None,
+        require_expected_identity: bool = False,
+    ) -> dict[str, Any]:
+        """Delete points only from the exact stack resource's physical vault."""
         import boto3
 
         global_region = self.config.global_region
-        project_name = self.config.project_name
+        global_stack_name = f"{self.config.project_name}-global"
+        result: dict[str, Any] = {
+            "stack_name": global_stack_name,
+            "stack_id": expected_stack_id,
+            "status": "not-needed",
+            "deleted_recovery_points": 0,
+            "errors": [],
+        }
 
         try:
-            backup_client = boto3.client("backup", region_name=global_region)
+            target = self._describe_stack_target(
+                global_stack_name,
+                expected_stack_id=expected_stack_id,
+                require_expected_identity=require_expected_identity,
+            )
+            if target is None:
+                result["status"] = "stack-absent"
+                return result
+            region, cloudformation, stack = target
+            stack_id = str(stack["StackId"])
+            result["stack_id"] = stack_id
+            if region != global_region:
+                raise RuntimeError(f"Global stack resolved to {region}, expected {global_region}")
+            if authorize_stack is not None:
+                authorize_stack(global_stack_name, region, stack_id)
 
-            # Find the backup vault by listing vaults with the project prefix
-            paginator = backup_client.get_paginator("list_backup_vaults")
-            vault_name = None
-            for page in paginator.paginate():
-                for vault in page.get("BackupVaultList", []):
-                    if project_name in vault["BackupVaultName"].lower():
-                        vault_name = vault["BackupVaultName"]
-                        break
-                if vault_name:
-                    break
+            resources: list[dict[str, Any]] = []
+            for page in cloudformation.get_paginator("list_stack_resources").paginate(
+                StackName=stack_id
+            ):
+                resources.extend(
+                    resource
+                    for resource in page.get("StackResourceSummaries", [])
+                    if resource.get("ResourceType") == "AWS::Backup::BackupVault"
+                    and resource.get("PhysicalResourceId")
+                )
+            if not resources:
+                result["status"] = "vault-resource-absent"
+                return result
+            if len(resources) != 1:
+                raise RuntimeError(
+                    f"Expected one AWS::Backup::BackupVault in {stack_id}; found {len(resources)}"
+                )
 
+            resource = resources[0]
+            physical_id = str(resource["PhysicalResourceId"])
+            if physical_id.startswith("arn:"):
+                parts = physical_id.split(":", 5)
+                if len(parts) != 6 or not parts[5].startswith("backup-vault:"):
+                    raise RuntimeError(f"Invalid backup vault physical ARN: {physical_id}")
+                vault_name = parts[5].removeprefix("backup-vault:")
+            else:
+                vault_name = physical_id
             if not vault_name:
-                return
+                raise RuntimeError("CloudFormation returned an empty backup vault physical ID")
 
-            # Delete all recovery points in the vault
-            rp_paginator = backup_client.get_paginator("list_recovery_points_by_backup_vault")
-            deleted = 0
-            for page in rp_paginator.paginate(BackupVaultName=vault_name):
-                for rp in page.get("RecoveryPoints", []):
+            backup_client = boto3.client("backup", region_name=global_region)
+            described_vault = backup_client.describe_backup_vault(BackupVaultName=vault_name)
+            vault_arn = str(described_vault.get("BackupVaultArn") or "")
+            arn_parts = vault_arn.split(":", 5)
+            if (
+                len(arn_parts) != 6
+                or arn_parts[2] != "backup"
+                or arn_parts[3] != global_region
+                or arn_parts[5] != f"backup-vault:{vault_name}"
+            ):
+                raise RuntimeError(
+                    "AWS Backup identity does not match the CloudFormation physical resource"
+                )
+            if physical_id.startswith("arn:") and physical_id != vault_arn:
+                raise RuntimeError("Backup vault ARN changed after CloudFormation resolution")
+
+            result.update(
+                {
+                    "status": "inspected",
+                    "logical_id": str(resource.get("LogicalResourceId") or ""),
+                    "physical_id": physical_id,
+                    "vault_name": vault_name,
+                    "vault_arn": vault_arn,
+                }
+            )
+            paginator = backup_client.get_paginator("list_recovery_points_by_backup_vault")
+            for page in paginator.paginate(BackupVaultName=vault_name):
+                for recovery_point in page.get("RecoveryPoints", []):
+                    recovery_point_arn = recovery_point.get("RecoveryPointArn")
+                    if not recovery_point_arn:
+                        continue
                     try:
                         backup_client.delete_recovery_point(
                             BackupVaultName=vault_name,
-                            RecoveryPointArn=rp["RecoveryPointArn"],
+                            RecoveryPointArn=recovery_point_arn,
                         )
-                        deleted += 1
-                    except Exception as e:
-                        logger.debug("Failed to delete recovery point: %s", e)
+                        result["deleted_recovery_points"] += 1
+                    except Exception as exc:
+                        result["errors"].append(
+                            {
+                                "recovery_point_arn": str(recovery_point_arn),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+            if result["deleted_recovery_points"]:
+                print(
+                    f"  Cleaned up {result['deleted_recovery_points']} backup recovery "
+                    f"points from {vault_name}"
+                )
+            result["status"] = "completed" if not result["errors"] else "partial"
+        except Exception as exc:
+            result["status"] = "failed"
+            result["errors"].append({"error": f"{type(exc).__name__}: {exc}"})
+            print(f"  Warning: Backup vault cleanup failed (non-fatal): {exc}")
+        return result
 
-            if deleted > 0:
-                print(f"  Cleaned up {deleted} backup recovery points from {vault_name}")
-
-        except Exception as e:
-            print(f"  Warning: Backup vault cleanup failed (non-fatal): {e}")
-
-    def cleanup_orphaned_bastions(self, stacks: list[str] | None = None) -> int:
-        """Terminate CLI-managed ephemeral bastions before regional teardown.
-
-        The bastion is intentionally outside CloudFormation, so a crashed
-        tunnel process can leave its EC2 instance and primary ENI in a stack's
-        VPC. This sweep is scoped by the regional stack's VPC plus the
-        ``gco:ephemeral`` / purpose / project tags. It runs before every
-        ``destroy-all`` attempt and waits for both instance termination and ENI
-        release so VPC deletion does not race EC2 cleanup.
-
-        Returns the number of instances for which termination was requested.
-        All AWS errors are non-fatal: CloudFormation still gets a chance to
-        delete the stack and the destroy-all retry loop will run this sweep
-        again if necessary.
-        """
+    def cleanup_orphaned_bastions(
+        self,
+        stacks: list[str] | None = None,
+        *,
+        parallel: bool = True,
+        resource_targets: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> int:
+        """Terminate CLI bastions, using exact stack VPC IDs in strict mode."""
         if stacks is None:
             stacks = self.list_stacks()
-        regional_stacks = [
-            stack
-            for stack in stacks
-            if not stack.endswith(("-global", "-api-gateway", "-monitoring", "-analytics"))
-        ]
+        if resource_targets is not None:
+            regional_stacks = [name for name in stacks if name in resource_targets]
+        else:
+            regional_stacks = [
+                stack
+                for stack in stacks
+                if not stack.endswith(("-global", "-api-gateway", "-monitoring", "-analytics"))
+            ]
+
+        def cleanup_one(stack_name: str) -> int:
+            details = (resource_targets or {}).get(stack_name, {})
+            return self._cleanup_orphaned_bastions(
+                stack_name,
+                region=details.get("region"),
+                vpc_id=details.get("vpc_id"),
+                fail_closed=resource_targets is not None,
+            )
 
         if not regional_stacks:
             return 0
-        if len(regional_stacks) == 1:
-            terminated = self._cleanup_orphaned_bastions(regional_stacks[0])
+        if len(regional_stacks) == 1 or not parallel:
+            terminated = sum(cleanup_one(stack_name) for stack_name in regional_stacks)
         else:
             # Each region has independent EC2 waiters. Run them concurrently so
             # one slow termination does not add its full timeout to every other
             # region before CloudFormation can start deleting stacks.
             with ThreadPoolExecutor(max_workers=min(4, len(regional_stacks))) as executor:
-                terminated = sum(executor.map(self._cleanup_orphaned_bastions, regional_stacks))
+                terminated = sum(executor.map(cleanup_one, regional_stacks))
         if terminated:
             print(
                 f"  Requested termination for {terminated} orphaned ephemeral "
@@ -2193,8 +4679,15 @@ class StackManager:
             )
         return terminated
 
-    def _cleanup_orphaned_bastions(self, stack_name: str) -> int:
-        """Terminate this regional stack's tagged bastions and release their ENIs."""
+    def _cleanup_orphaned_bastions(
+        self,
+        stack_name: str,
+        *,
+        region: str | None = None,
+        vpc_id: str | None = None,
+        fail_closed: bool = False,
+    ) -> int:
+        """Terminate tagged bastions only inside a resolved stack VPC."""
         import boto3
 
         from .ephemeral_bastion import (
@@ -2205,31 +4698,47 @@ class StackManager:
             bastion_instance_name,
         )
 
-        region = self._get_deploy_region(stack_name)
+        region = region or self._get_deploy_region(stack_name)
         if not region:
+            if fail_closed:
+                raise RuntimeError(f"Strict bastion cleanup lacks a Region for {stack_name}")
             return 0
 
         project_name = str(self.config.project_name)
         expected_name = bastion_instance_name(project_name)
         try:
             ec2 = boto3.client("ec2", region_name=region)
-            vpcs = ec2.describe_vpcs(
-                Filters=[{"Name": "tag:aws:cloudformation:stack-name", "Values": [stack_name]}]
-            ).get("Vpcs", [])
-        except Exception as exc:  # noqa: BLE001 - destroy cleanup is best-effort
+            if vpc_id:
+                vpcs = [{"VpcId": vpc_id}]
+            else:
+                vpcs = ec2.describe_vpcs(
+                    Filters=[
+                        {
+                            "Name": "tag:aws:cloudformation:stack-name",
+                            "Values": [stack_name],
+                        }
+                    ]
+                ).get("Vpcs", [])
+        except Exception as exc:
+            if fail_closed:
+                raise RuntimeError(
+                    f"Strict bastion cleanup could not inspect {stack_name}"
+                ) from exc
             print(f"  Warning: Bastion cleanup could not inspect {stack_name}: {exc}")
             return 0
 
         instance_ids: list[str] = []
         eni_ids: list[str] = []
         for vpc in vpcs:
-            vpc_id = vpc.get("VpcId")
-            if not vpc_id:
+            candidate_vpc_id = str(vpc.get("VpcId") or "")
+            if not candidate_vpc_id:
+                if fail_closed:
+                    raise RuntimeError(f"Strict bastion cleanup has no VPC ID for {stack_name}")
                 continue
             try:
                 reservations = ec2.describe_instances(
                     Filters=[
-                        {"Name": "vpc-id", "Values": [vpc_id]},
+                        {"Name": "vpc-id", "Values": [candidate_vpc_id]},
                         {"Name": f"tag:{TAG_EPHEMERAL_KEY}", "Values": ["true"]},
                         {"Name": f"tag:{TAG_PURPOSE_KEY}", "Values": [BASTION_PURPOSE]},
                         {
@@ -2244,8 +4753,17 @@ class StackManager:
                         },
                     ]
                 ).get("Reservations", [])
-            except Exception as exc:  # noqa: BLE001 - continue with other VPCs
-                logger.warning("Bastion lookup failed in %s (%s): %s", stack_name, vpc_id, exc)
+            except Exception as exc:
+                if fail_closed:
+                    raise RuntimeError(
+                        f"Strict bastion lookup failed in {stack_name} ({candidate_vpc_id})"
+                    ) from exc
+                logger.warning(
+                    "Bastion lookup failed in %s (%s): %s",
+                    stack_name,
+                    candidate_vpc_id,
+                    exc,
+                )
                 continue
 
             for reservation in reservations:
@@ -2256,9 +4774,6 @@ class StackManager:
                         if tag.get("Key") is not None
                     }
                     tagged_project = tags.get(TAG_PROJECT_KEY)
-                    # New bastions carry gco:project. For bastions created by an
-                    # older CLI, use the project-scoped Name tag as the safe
-                    # backwards-compatible ownership check.
                     if tagged_project != project_name and not (
                         tagged_project is None and tags.get("Name") == expected_name
                     ):
@@ -2268,9 +4783,6 @@ class StackManager:
                         instance_ids.append(str(instance_id))
                     for interface in instance.get("NetworkInterfaces", []):
                         attachment = interface.get("Attachment") or {}
-                        # Only the primary ENI is owned by the ephemeral
-                        # instance lifecycle. Never delete an operator-attached
-                        # secondary ENI, even if it later becomes detached.
                         if not (
                             attachment.get("DeviceIndex") == 0
                             and attachment.get("DeleteOnTermination") is True
@@ -2287,7 +4799,9 @@ class StackManager:
 
         try:
             ec2.terminate_instances(InstanceIds=instance_ids)
-        except Exception as exc:  # noqa: BLE001 - report and let destroy retry
+        except Exception as exc:
+            if fail_closed:
+                raise RuntimeError(f"Strict bastion termination failed in {stack_name}") from exc
             print(f"  Warning: Failed to terminate ephemeral bastion(s) in {stack_name}: {exc}")
             return 0
 
@@ -2300,16 +4814,22 @@ class StackManager:
                 InstanceIds=instance_ids,
                 WaiterConfig={"Delay": 5, "MaxAttempts": 60},
             )
-        except Exception as exc:  # noqa: BLE001 - ENI polling below may still succeed
+        except Exception as exc:
+            if fail_closed:
+                raise RuntimeError(
+                    f"Strict bastion termination did not converge in {stack_name}"
+                ) from exc
             logger.warning("Timed out waiting for bastion termination in %s: %s", stack_name, exc)
 
         remaining_enis = self._wait_for_bastion_network_interfaces(ec2, eni_ids)
         if remaining_enis:
-            print(
-                f"  Warning: {len(remaining_enis)} bastion network interface(s) in "
-                f"{stack_name} have not released yet: {', '.join(sorted(remaining_enis))}. "
-                "The destroy retry will check again."
+            message = (
+                f"{len(remaining_enis)} bastion network interface(s) in {stack_name} "
+                f"have not released: {', '.join(sorted(remaining_enis))}"
             )
+            if fail_closed:
+                raise RuntimeError(message)
+            print(f"  Warning: {message}. The destroy retry will check again.")
         return len(instance_ids)
 
     @staticmethod
@@ -2514,95 +5034,122 @@ class StackManager:
                 "proceeds once they drain."
             )
 
-    def _cleanup_eks_security_groups(self, stack_name: str) -> None:
-        """Clean up EKS-managed security groups that block VPC deletion.
-
-        EKS creates a cluster security group (eks-cluster-sg-<cluster-name>-*)
-        that is owned by EKS, not CloudFormation. When the stack is destroyed,
-        this SG and its attached ENIs can linger, causing VPC deletion to fail.
-
-        This method finds and deletes these orphaned security groups and their
-        ENIs before the stack destroy runs.
-        """
-        import time as _time
-
+    def _cleanup_eks_security_groups(
+        self,
+        stack_name: str,
+        *,
+        region: str | None = None,
+        security_group_id: str | None = None,
+        vpc_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete empty EKS SGs, optionally by one exact preauthorized ID."""
         import boto3
 
-        # Extract region from stack name (e.g., gco-us-east-1 -> us-east-1)
         project_name = self.config.project_name
-        region = stack_name.replace(f"{project_name}-", "", 1)
-        cluster_name = stack_name  # cluster name matches stack name
+        region = region or stack_name.replace(f"{project_name}-", "", 1)
+        cluster_name = stack_name
+        outcome: dict[str, Any] = {
+            "stack": stack_name,
+            "region": region,
+            "security_group_id": security_group_id,
+            "inspected": 0,
+            "deleted": [],
+            "blocked_by_enis": [],
+            "errors": [],
+        }
 
         try:
             ec2 = boto3.client("ec2", region_name=region)
-
-            # Find EKS-managed security groups by name pattern
-            response = ec2.describe_security_groups(
-                Filters=[
-                    {
-                        "Name": "group-name",
-                        "Values": [f"eks-cluster-sg-{cluster_name}-*"],
-                    }
-                ]
-            )
-
-            sgs = response.get("SecurityGroups", [])
-            if not sgs:
-                return
-
-            for sg in sgs:
-                sg_id = sg["GroupId"]
-                sg_name = sg.get("GroupName", "")
-
-                # First, detach and delete any ENIs using this SG
-                eni_response = ec2.describe_network_interfaces(
-                    Filters=[{"Name": "group-id", "Values": [sg_id]}]
-                )
-
-                for eni in eni_response.get("NetworkInterfaces", []):
-                    eni_id = eni["NetworkInterfaceId"]
-                    try:
-                        if eni.get("Attachment"):
-                            ec2.detach_network_interface(
-                                AttachmentId=eni["Attachment"]["AttachmentId"],
-                                Force=True,
-                            )
-                            _time.sleep(5)
-                        ec2.delete_network_interface(NetworkInterfaceId=eni_id)
-                        logger.debug("Deleted ENI %s from SG %s", eni_id, sg_name)
-                    except Exception as e:
-                        logger.debug("Failed to delete ENI %s: %s", eni_id, e)
-
-                # Now delete the security group
-                try:
-                    ec2.delete_security_group(GroupId=sg_id)
-                    print(f"  Cleaned up EKS security group: {sg_name} ({sg_id})")
-                except Exception as e:
-                    logger.debug(
-                        "Failed to delete SG %s: %s (will retry on next attempt)", sg_id, e
+            try:
+                if security_group_id:
+                    response = ec2.describe_security_groups(GroupIds=[security_group_id])
+                else:
+                    response = ec2.describe_security_groups(
+                        Filters=[
+                            {
+                                "Name": "group-name",
+                                "Values": [f"eks-cluster-sg-{cluster_name}-*"],
+                            }
+                        ]
                     )
+            except ClientError as exc:
+                if (
+                    security_group_id
+                    and exc.response.get("Error", {}).get("Code") == "InvalidGroup.NotFound"
+                ):
+                    outcome["absent"] = True
+                    return outcome
+                raise
 
-        except Exception as e:
-            # Non-fatal — the retry loop will handle it
-            logger.debug("EKS security group cleanup for %s failed: %s", stack_name, e)
+            for security_group in response.get("SecurityGroups", []):
+                outcome["inspected"] += 1
+                group_id = str(security_group["GroupId"])
+                group_name = str(security_group.get("GroupName", ""))
+                if security_group_id and group_id != security_group_id:
+                    raise RuntimeError(
+                        f"EC2 returned changed security-group identity for {security_group_id}"
+                    )
+                if vpc_id and str(security_group.get("VpcId") or "") != vpc_id:
+                    raise RuntimeError(
+                        f"Security group {group_id} no longer belongs to exact VPC {vpc_id}"
+                    )
+                interfaces = ec2.describe_network_interfaces(
+                    Filters=[{"Name": "group-id", "Values": [group_id]}]
+                ).get("NetworkInterfaces", [])
+                if interfaces:
+                    outcome["blocked_by_enis"].append(
+                        {
+                            "group_id": group_id,
+                            "group_name": group_name,
+                            "network_interface_ids": sorted(
+                                str(interface.get("NetworkInterfaceId") or "")
+                                for interface in interfaces
+                                if interface.get("NetworkInterfaceId")
+                            ),
+                        }
+                    )
+                    logger.debug(
+                        "Waiting for AWS to release %d EKS-managed ENI(s) from %s",
+                        len(interfaces),
+                        group_name,
+                    )
+                    continue
+                try:
+                    ec2.delete_security_group(GroupId=group_id)
+                    outcome["deleted"].append({"group_id": group_id, "group_name": group_name})
+                    print(f"  Cleaned up empty EKS security group: {group_name} ({group_id})")
+                except ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") == "InvalidGroup.NotFound":
+                        outcome["absent"] = True
+                        continue
+                    outcome["errors"].append(
+                        {"group_id": group_id, "error": f"{type(exc).__name__}: {exc}"}
+                    )
+                except Exception as exc:
+                    outcome["errors"].append(
+                        {"group_id": group_id, "error": f"{type(exc).__name__}: {exc}"}
+                    )
+        except Exception as exc:
+            outcome["errors"].append({"error": f"{type(exc).__name__}: {exc}"})
+            logger.debug("EKS security group cleanup for %s failed: %s", stack_name, exc)
+        return outcome
 
-    def _start_eks_sg_watchdog(self, stack_name: str, stop_event: Event) -> Thread:
+    def _start_eks_sg_watchdog(
+        self,
+        stack_name: str,
+        stop_event: Event,
+        *,
+        region: str | None = None,
+        security_group_id: str | None = None,
+        vpc_id: str | None = None,
+    ) -> Thread:
         """Start a background thread that polls for orphaned EKS security groups.
 
         EKS creates an ``eks-cluster-sg-<cluster-name>-*`` security group that
-        is owned by the EKS service (not CloudFormation). When the stack's
-        EKS cluster resource deletes, the SG is supposed to GC along with its
-        cluster ENIs — but on EKS Auto Mode there's a window where the SG
-        lingers after the cluster is gone, blocking the subsequent VPC
-        delete with ``DependencyViolation``. CloudFormation then sits in
-        ``DELETE_IN_PROGRESS`` on the VPC for ~10 minutes retrying.
-
-        This watchdog runs for the full duration of the regional-stack
-        destroy, polling every 30 seconds. As soon as an orphaned SG appears
-        (which only happens after the cluster delete has progressed past
-        the cluster resource itself), it deletes the SG and any ENIs still
-        attached. That unblocks the VPC delete immediately instead of
-        waiting for EKS's own GC timer.
+        is owned by the EKS service (not CloudFormation). The watchdog observes
+        it throughout regional teardown and removes it only after AWS has
+        released every attached ENI. Service-managed interfaces are never
+        detached or deleted by the CLI.
 
         The thread exits when ``stop_event`` is set by the orchestrator at
         the end of the regional phase.
@@ -2611,7 +5158,12 @@ class StackManager:
         def _watchdog() -> None:
             while not stop_event.is_set():
                 try:
-                    self._cleanup_eks_security_groups(stack_name)
+                    self._cleanup_eks_security_groups(
+                        stack_name,
+                        region=region,
+                        security_group_id=security_group_id,
+                        vpc_id=vpc_id,
+                    )
                 except Exception as e:
                     logger.debug(
                         "EKS SG watchdog tick for %s failed (non-fatal): %s",
@@ -2636,7 +5188,85 @@ def get_stack_manager(config: GCOConfig) -> StackManager:
     return StackManager(config)
 
 
-def get_stack_deployment_order(stacks: list[str]) -> list[str]:
+def _is_regional_api_bridge_stack(
+    stack: str,
+    *,
+    project_name: str,
+    stack_names: Collection[str],
+) -> bool:
+    """Return whether ``stack`` is a configured per-Region API bridge.
+
+    A bare ``"-regional-api-"`` substring is ambiguous because it is valid
+    inside ``project_name``. Match the exact project-scoped bridge prefix and
+    require the corresponding configured ``<project>-<region>`` base stack.
+    """
+    bridge_prefix = f"{project_name}-regional-api-"
+    if not stack.startswith(bridge_prefix):
+        return False
+    region = stack.removeprefix(bridge_prefix)
+    return bool(region) and f"{project_name}-{region}" in stack_names
+
+
+def _get_stack_destroy_phases(
+    stacks: list[str],
+    *,
+    project_name: str,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Classify and order the exact phases used by orchestrated destroy.
+
+    Returns monitoring, regional API bridge, base regional, and pre-regional
+    global phases. The public preview helper and the execution path both flatten
+    this result, so custom project names and bridge dependencies cannot drift.
+    """
+    stack_names = set(stacks)
+    monitoring_stacks = sorted(
+        (stack for stack in stacks if stack.endswith("-monitoring")),
+        reverse=True,
+    )
+    regional_api_stacks = sorted(
+        (
+            stack
+            for stack in stacks
+            if _is_regional_api_bridge_stack(
+                stack,
+                project_name=project_name,
+                stack_names=stack_names,
+            )
+        ),
+        reverse=True,
+    )
+    regional_stacks = sorted(
+        (
+            stack
+            for stack in stacks
+            if not stack.endswith(("-global", "-api-gateway", "-monitoring"))
+            and not _is_regional_api_bridge_stack(
+                stack,
+                project_name=project_name,
+                stack_names=stack_names,
+            )
+        ),
+        reverse=True,
+    )
+    pre_regional_stacks = sorted(
+        (stack for stack in stacks if stack.endswith(("-global", "-api-gateway"))),
+        key=lambda stack: (
+            1 if stack.endswith("-api-gateway") else (2 if stack.endswith("-global") else 0)
+        ),
+    )
+    return (
+        monitoring_stacks,
+        regional_api_stacks,
+        regional_stacks,
+        pre_regional_stacks,
+    )
+
+
+def get_stack_deployment_order(
+    stacks: list[str],
+    *,
+    project_name: str = "gco",
+) -> list[str]:
     """
     Get the correct deployment order for stacks.
 
@@ -2650,8 +5280,10 @@ def get_stack_deployment_order(stacks: list[str]) -> list[str]:
     orders identically. Regional stacks are ``<project>-<region>`` and match
     no named suffix, so they fall through to the regional bucket.
     """
+    stack_names = set(stacks)
     global_stacks = []
     regional_stacks = []
+    regional_api_stacks = []
 
     # Named (non-regional) stack priority by suffix (lower = deploy first).
     suffix_priority = {
@@ -2671,24 +5303,32 @@ def get_stack_deployment_order(stacks: list[str]) -> list[str]:
         priority = _named_priority(stack)
         if priority is not None:
             global_stacks.append((priority, stack))
+        elif _is_regional_api_bridge_stack(
+            stack,
+            project_name=project_name,
+            stack_names=stack_names,
+        ):
+            regional_api_stacks.append(stack)
         else:
             regional_stacks.append(stack)
 
-    # Sort global stacks by priority, regional stacks alphabetically
+    # Keep bridge dependencies after every base regional stack. The
+    # orchestrated lifecycle further separates monitoring into its own phase.
     global_stacks.sort(key=lambda x: x[0])
     regional_stacks.sort()
+    regional_api_stacks.sort()
 
-    return [s[1] for s in global_stacks] + regional_stacks
+    return [s[1] for s in global_stacks] + regional_stacks + regional_api_stacks
 
 
-def get_stack_destroy_order(stacks: list[str]) -> list[str]:
-    """
-    Get the correct destroy order for stacks.
-
-    Order: regional stacks first, then global stacks (reverse of deploy).
-    """
-    deployment_order = get_stack_deployment_order(stacks)
-    return list(reversed(deployment_order))
+def get_stack_destroy_order(
+    stacks: list[str],
+    *,
+    project_name: str = "gco",
+) -> list[str]:
+    """Return the exact project-aware order used by orchestrated destroy."""
+    phases = _get_stack_destroy_phases(stacks, project_name=project_name)
+    return [stack for phase in phases for stack in phase]
 
 
 # =============================================================================
@@ -2827,8 +5467,12 @@ def _update_feature_config(
             if value is not None or key == "enabled":
                 cdk_config["context"][feature_key][key] = value
 
-    with open(cdk_json_path, "w", encoding="utf-8") as f:
-        json.dump(cdk_config, f, indent=2)
+    serialized = json.dumps(cdk_config, indent=2).encode("utf-8")
+    _atomic_write_bytes(
+        cdk_json_path,
+        serialized,
+        mode=stat.S_IMODE(cdk_json_path.stat().st_mode),
+    )
 
 
 # =============================================================================

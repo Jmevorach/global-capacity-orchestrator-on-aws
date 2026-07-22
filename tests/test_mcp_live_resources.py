@@ -3,9 +3,9 @@ Tests for the live-state resources under gco_mcp/resources/.
 
 Covers the six live-state resource paths:
 
-* ``gco://jobs/{job_name}`` — wraps ``kubectl get job ... -o yaml``.
+* ``gco://jobs/{region}/{job_name}`` — wraps region-pinned ``kubectl get job``.
 * ``gco://inference/{endpoint_name}`` — reads the inference DynamoDB store.
-* ``gco://k8s/{namespace}/{kind}/{name}`` — wraps ``kubectl get`` for any kind.
+* ``gco://k8s/{region}/{namespace}/{kind}/{name}`` — wraps region-pinned ``kubectl get``.
 * ``gco://cluster/{region}/topology`` — nodepools + Pending pods aggregator.
 * ``costs://gco/summary/{days_window}`` — wraps ``gco costs summary``.
 * ``tasks://gco/{task_id}`` — FastMCP task-state lookup.
@@ -25,10 +25,14 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # Ensure gco_mcp/ is importable, mirroring the other test modules.
 sys.path.insert(0, str(Path(__file__).parent.parent / "gco_mcp"))
 
 import run_mcp  # noqa: E402
+
+_EKS_CONTEXT = "arn:aws:eks:us-east-1:123456789012:cluster/gco-us-east-1"
 
 
 def _read_resource(uri: str) -> str:
@@ -37,27 +41,96 @@ def _read_resource(uri: str) -> str:
     return result.contents[0].content
 
 
+class TestEksContextResolution:
+    @pytest.mark.parametrize(
+        ("region", "partition"),
+        [
+            ("us-gov-west-1", "aws-us-gov"),
+            ("eusc-de-east-1", "aws-eusc"),
+            ("us-iso-east-1", "aws-iso"),
+        ],
+    )
+    def test_builds_configured_project_account_and_partition_aware_arn(
+        self,
+        region: str,
+        partition: str,
+    ):
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        session = MagicMock()
+        session.get_partition_for_region.return_value = partition
+        config = MagicMock(project_name="foo-regional-api-bar")
+
+        with (
+            patch("resources._eks.get_config", return_value=config) as get_config,
+            patch("resources._eks.boto3.client", return_value=sts) as client,
+            patch("resources._eks.boto3.session.Session", return_value=session),
+        ):
+            from resources._eks import eks_context_for_region
+
+            arn = eks_context_for_region(region)
+
+        assert arn == (
+            f"arn:{partition}:eks:{region}:123456789012:cluster/foo-regional-api-bar-{region}"
+        )
+        get_config.assert_called_once_with()
+        client.assert_called_once_with("sts", region_name=region)
+        session.get_partition_for_region.assert_called_once_with(region)
+
+    def test_rejects_invalid_sts_account(self):
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "not-an-account"}
+        with (
+            patch("resources._eks.boto3.client", return_value=sts),
+            pytest.raises(ValueError, match="account ID"),
+        ):
+            from resources._eks import eks_context_for_region
+
+            eks_context_for_region("us-east-1", project_name="gco")
+
+    def test_rejects_invalid_project_before_aws_calls(self):
+        from resources._eks import eks_context_for_region
+
+        with (
+            patch("resources._eks.boto3.client") as client,
+            pytest.raises(ValueError, match="project name"),
+        ):
+            eks_context_for_region("us-east-1", project_name="../other")
+
+        client.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
-# gco://jobs/{job_name}
+# gco://jobs/{region}/{job_name}
 # ---------------------------------------------------------------------------
 
 
 class TestJobsLiveResource:
     def test_jobs_resource_returns_kubectl_yaml(self):
         fake = MagicMock(returncode=0, stdout="apiVersion: batch/v1\nkind: Job\n", stderr="")
-        with patch("cli_runner.subprocess.run", return_value=fake) as mock:
-            content = _read_resource("gco://jobs/my-job")
+        with (
+            patch("resources.jobs.eks_context_for_region", return_value=_EKS_CONTEXT),
+            patch("cli_runner.subprocess.run", return_value=fake) as mock,
+        ):
+            content = _read_resource("gco://jobs/us-east-1/my-job")
         assert "kind: Job" in content
         argv = mock.call_args[0][0]
         assert argv[:3] == ["kubectl", "get", "job"]
         assert "my-job" in argv
         assert "-n" in argv
         assert "gco-jobs" in argv
-        assert argv[-2:] == ["-o", "yaml"]
+        assert argv[-2:] == ["--context", _EKS_CONTEXT]
+
+    def test_jobs_legacy_uri_requires_region(self):
+        with patch("cli_runner.subprocess.run") as mock:
+            content = _read_resource("gco://jobs/my-job")
+        mock.assert_not_called()
+        parsed = json.loads(content)
+        assert parsed["code"] == "eks_region_required"
 
     def test_jobs_resource_rejects_invalid_name(self):
         with patch("cli_runner.subprocess.run") as mock:
-            content = _read_resource("gco://jobs/Bad_Name")
+            content = _read_resource("gco://jobs/us-east-1/Bad_Name")
         mock.assert_not_called()
         parsed = json.loads(content)
         assert parsed["error"] == "invalid job_name"
@@ -65,16 +138,22 @@ class TestJobsLiveResource:
 
     def test_jobs_resource_reports_kubectl_failure(self):
         fake = MagicMock(returncode=1, stdout="", stderr="not found\n")
-        with patch("cli_runner.subprocess.run", return_value=fake):
-            content = _read_resource("gco://jobs/missing-job")
+        with (
+            patch("resources.jobs.eks_context_for_region", return_value=_EKS_CONTEXT),
+            patch("cli_runner.subprocess.run", return_value=fake),
+        ):
+            content = _read_resource("gco://jobs/us-east-1/missing-job")
         parsed = json.loads(content)
         assert "not found" in parsed["error"]
         assert parsed["exit_code"] == 1
 
     def test_jobs_resource_reports_kubectl_not_found(self):
         """When ``kubectl`` is missing from PATH, return a structured error."""
-        with patch("cli_runner.subprocess.run", side_effect=FileNotFoundError):
-            content = _read_resource("gco://jobs/some-job")
+        with (
+            patch("resources.jobs.eks_context_for_region", return_value=_EKS_CONTEXT),
+            patch("cli_runner.subprocess.run", side_effect=FileNotFoundError),
+        ):
+            content = _read_resource("gco://jobs/us-east-1/some-job")
         parsed = json.loads(content)
         assert parsed["error"] == "kubectl not found"
 
@@ -82,11 +161,14 @@ class TestJobsLiveResource:
         """A ``kubectl`` invocation that exceeds the timeout returns a structured error."""
         import subprocess as _subprocess
 
-        with patch(
-            "cli_runner.subprocess.run",
-            side_effect=_subprocess.TimeoutExpired(cmd="kubectl", timeout=30),
+        with (
+            patch("resources.jobs.eks_context_for_region", return_value=_EKS_CONTEXT),
+            patch(
+                "cli_runner.subprocess.run",
+                side_effect=_subprocess.TimeoutExpired(cmd="kubectl", timeout=30),
+            ),
         ):
-            content = _read_resource("gco://jobs/some-job")
+            content = _read_resource("gco://jobs/us-east-1/some-job")
         parsed = json.loads(content)
         assert "timed out" in parsed["error"]
 
@@ -147,15 +229,18 @@ class TestInferenceLiveResource:
 
 
 # ---------------------------------------------------------------------------
-# gco://k8s/{namespace}/{kind}/{name}
+# gco://k8s/{region}/{namespace}/{kind}/{name}
 # ---------------------------------------------------------------------------
 
 
 class TestK8sLiveResource:
     def test_k8s_resource_returns_kubectl_yaml(self):
         fake = MagicMock(returncode=0, stdout="apiVersion: apps/v1\nkind: Deployment\n", stderr="")
-        with patch("cli_runner.subprocess.run", return_value=fake) as mock:
-            content = _read_resource("gco://k8s/gco-jobs/deployment/my-app")
+        with (
+            patch("resources.k8s.eks_context_for_region", return_value=_EKS_CONTEXT),
+            patch("cli_runner.subprocess.run", return_value=fake) as mock,
+        ):
+            content = _read_resource("gco://k8s/us-east-1/gco-jobs/deployment/my-app")
         assert "kind: Deployment" in content
         argv = mock.call_args[0][0]
         # ``kubectl get <kind> <name> -n <ns> -o yaml``
@@ -163,24 +248,32 @@ class TestK8sLiveResource:
         assert argv[2] == "deployment"
         assert argv[3] == "my-app"
         assert "gco-jobs" in argv
+        assert argv[-2:] == ["--context", _EKS_CONTEXT]
+
+    def test_k8s_legacy_uri_requires_region(self):
+        with patch("cli_runner.subprocess.run") as mock:
+            content = _read_resource("gco://k8s/gco-jobs/deployment/my-app")
+        mock.assert_not_called()
+        parsed = json.loads(content)
+        assert parsed["code"] == "eks_region_required"
 
     def test_k8s_resource_rejects_invalid_kind(self):
         with patch("cli_runner.subprocess.run") as mock:
-            content = _read_resource("gco://k8s/gco-jobs/bad;kind/my-app")
+            content = _read_resource("gco://k8s/us-east-1/gco-jobs/bad;kind/my-app")
         mock.assert_not_called()
         parsed = json.loads(content)
         assert parsed["error"] == "invalid kind"
 
     def test_k8s_resource_rejects_invalid_namespace(self):
         with patch("cli_runner.subprocess.run") as mock:
-            content = _read_resource("gco://k8s/Bad_NS/pod/my-pod")
+            content = _read_resource("gco://k8s/us-east-1/Bad_NS/pod/my-pod")
         mock.assert_not_called()
         parsed = json.loads(content)
         assert parsed["error"] == "invalid namespace"
 
     def test_k8s_resource_rejects_invalid_name(self):
         with patch("cli_runner.subprocess.run") as mock:
-            content = _read_resource("gco://k8s/gco-jobs/pod/Bad_Pod")
+            content = _read_resource("gco://k8s/us-east-1/gco-jobs/pod/Bad_Pod")
         mock.assert_not_called()
         parsed = json.loads(content)
         assert parsed["error"] == "invalid name"
@@ -199,6 +292,7 @@ class TestClusterTopologyResource:
         pending_pods_payload = json.dumps({"items": [{"metadata": {"name": "stuck-pod"}}]})
         kubectl_result = MagicMock(returncode=0, stdout=pending_pods_payload, stderr="")
         with (
+            patch("resources.cluster.eks_context_for_region", return_value=_EKS_CONTEXT),
             patch("cli_runner._run_cli", return_value=nodepools_payload) as mock_cli,
             patch("cli_runner.subprocess.run", return_value=kubectl_result) as mock_run,
         ):
@@ -214,6 +308,7 @@ class TestClusterTopologyResource:
         kubectl_argv = mock_run.call_args[0][0]
         assert kubectl_argv[:3] == ["kubectl", "get", "pods"]
         assert "status.phase=Pending" in kubectl_argv
+        assert kubectl_argv[-2:] == ["--context", _EKS_CONTEXT]
 
     def test_topology_rejects_invalid_region(self):
         with (

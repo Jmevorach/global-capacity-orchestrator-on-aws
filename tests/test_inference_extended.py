@@ -455,8 +455,15 @@ class TestCreateService:
     def test_create_service_success(self):
         monitor = _make_monitor()
         spec = {"port": 8000}
-        monitor._create_service("ep", "ns", spec)
+        with patch("gco.services.inference_monitor.client.CustomObjectsApi") as custom_api:
+            monitor._create_service("ep", "ns", spec)
+
         monitor.core_v1.create_namespaced_service.assert_called_once()
+        service = monitor.core_v1.create_namespaced_service.call_args.args[1]
+        assert service.spec.type == "ClusterIP"
+        monitor.networking_v1.create_namespaced_ingress.assert_not_called()
+        monitor.networking_v1.patch_namespaced_ingress.assert_not_called()
+        custom_api.return_value.create_namespaced_custom_object.assert_not_called()
 
     def test_create_service_already_exists(self):
         from kubernetes.client.rest import ApiException
@@ -466,32 +473,6 @@ class TestCreateService:
         spec = {"port": 8000}
         # Should not raise
         monitor._create_service("ep", "ns", spec)
-
-
-# =============================================================================
-# Update Ingress Tests
-# =============================================================================
-
-
-class TestUpdateIngress:
-    """Tests for _update_ingress_rule."""
-
-    def test_create_ingress(self):
-        monitor = _make_monitor()
-        spec = {"health_check_path": "/health"}
-        endpoint = {"ingress_path": "/inference/ep"}
-        monitor._update_ingress_rule("ep", "ns", spec, endpoint)
-        monitor.networking_v1.create_namespaced_ingress.assert_called_once()
-
-    def test_update_ingress_on_conflict(self):
-        from kubernetes.client.rest import ApiException
-
-        monitor = _make_monitor()
-        monitor.networking_v1.create_namespaced_ingress.side_effect = ApiException(status=409)
-        spec = {"health_check_path": "/health"}
-        endpoint = {"ingress_path": "/inference/ep"}
-        monitor._update_ingress_rule("ep", "ns", spec, endpoint)
-        monitor.networking_v1.patch_namespaced_ingress.assert_called_once()
 
 
 # =============================================================================
@@ -774,7 +755,6 @@ class TestDeleteResourcesExtended:
         monitor = _make_monitor()
         monitor.apps_v1.delete_namespaced_deployment.side_effect = ApiException(status=500)
         monitor.core_v1.delete_namespaced_service.side_effect = ApiException(status=500)
-        monitor.networking_v1.delete_namespaced_ingress.side_effect = ApiException(status=500)
 
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa,

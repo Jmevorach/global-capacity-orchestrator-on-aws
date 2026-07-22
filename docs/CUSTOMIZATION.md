@@ -39,7 +39,7 @@ This guide shows you how to customize GCO (Global Capacity Orchestrator on AWS) 
 - [Helm Chart Configuration](#helm-chart-configuration)
   - [Enable EKS Logging](#enable-eks-logging)
   - [Add CloudWatch Container Insights](#add-cloudwatch-container-insights)
-  - [Enable AWS Load Balancer Controller](#enable-aws-load-balancer-controller)
+  - [Load Balancer Configuration](#load-balancer-configuration)
   - [Add Prometheus Monitoring](#add-prometheus-monitoring)
 - [FSx for Lustre Configuration](#fsx-for-lustre-configuration)
   - [Enable FSx](#enable-fsx)
@@ -66,22 +66,24 @@ This guide shows you how to customize GCO (Global Capacity Orchestrator on AWS) 
 
 ## Deployment Regions
 
-GCO deploys multiple stacks to different AWS regions. All regions are configurable via `cdk.json`.
+GCO deploys multiple stacks to configurable AWS Regions. Every configured Region must expose CloudFormation in the installed AWS SDK, and all Regions in one deployment must belong to the same AWS partition. There is no project-specific Region allowlist or count limit.
 
 ### Understanding Stack Regions
 
 | Stack | Default Region | Purpose |
 |-------|---------------|---------|
-| `gco-global` | us-east-2 | Global Accelerator, SSM parameters for cross-region coordination |
-| `gco-api-gateway` | us-east-2 | Edge-optimized API Gateway with IAM authentication |
+| `gco-global` | us-east-2 | Partition-wide state and SSM coordination; Global Accelerator in commercial `aws` only |
+| `gco-api-gateway` | us-east-2 | Edge-optimized workload + aggregate API in `aws`; regional aggregate-only API elsewhere |
+| `gco-regional-api-{region}` | workload Region | Aggregator bridge; optional direct access in `aws`, required workload ingress elsewhere |
 | `gco-monitoring` | us-east-2 | Cross-region CloudWatch dashboards and alarms |
-| `gco-{region}` | (configurable) | Regional EKS clusters, ALBs, and workload infrastructure |
+| `gco-analytics` | API Gateway region | Optional SageMaker Studio and EMR Serverless environment |
+| `gco-{region}` | (configurable) | Regional EKS clusters, internal ALBs, and workload infrastructure |
 
 **Why separate regions?**
 
-- Global infrastructure (API Gateway, Global Accelerator) is kept separate from workload regions
+- Partition-wide API and state resources are kept separate from workload Regions
 - Prevents resource conflicts and simplifies management
-- Edge-optimized API Gateway uses CloudFront, so the "home" region has minimal latency impact
+- In commercial `aws`, Global Accelerator and the edge-optimized API provide the global workload path; other partitions use regional IAM-authenticated workload APIs
 - Allows workload regions to be added/removed without affecting global infrastructure
 
 ### Configuring Deployment Regions
@@ -109,7 +111,7 @@ Edit `cdk.json` to customize where each stack type deploys:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `global` | string | `us-east-2` | Region for Global Accelerator and SSM parameters |
+| `global` | string | `us-east-2` | Region for partition-wide state and SSM parameters; also homes Global Accelerator in `aws` |
 | `api_gateway` | string | `us-east-2` | Region for API Gateway stack |
 | `monitoring` | string | `us-east-2` | Region for Monitoring stack |
 | `regional` | array | `["us-east-1"]` | Regions for EKS cluster deployment |
@@ -224,7 +226,7 @@ Changing `project_name` re-scopes all of the following (shown for
 | WAF WebACL + log groups | `acme-api-gateway-waf`, `/aws/apigateway/acme-global`, `aws-waf-logs-acme-api-gateway` |
 | CloudFormation exports | `acme-global-api-endpoint`, `acme-auth-secret-arn`, `acme-waf-webacl-arn`, … |
 | ECR image namespace | repos under `acme/*` (e.g. `acme/dockerhub/…`), ECR replication filter `acme/`, `gco images` / mirror namespace |
-| Global Accelerator | `acme-accelerator` (defaults to `<project>-accelerator` when `global_accelerator.name` is unset in `cdk.json`) |
+| Global Accelerator (`aws` only) | `acme-accelerator` (defaults to `<project>-accelerator` when `global_accelerator.name` is unset in `cdk.json`) |
 | API Gateway names | REST API `acme-global-api`, Studio Cognito authorizer `acme-studio-cognito-authorizer`, request validator `acme-studio-request-validator` |
 | Valkey cache (opt-in) | ElastiCache serverless cache `acme-<region>` |
 | Analytics (opt-in) | Studio bucket `acme-analytics-studio-*`, SageMaker role `AmazonSageMaker-acme-analytics-exec-<region>`, Studio domain `acme-studio-<region>`, EMR app `acme-spark-<region>`, Cognito domain `acme-studio-<account>` |
@@ -300,9 +302,9 @@ If you prefer to bootstrap manually first:
 gco stacks bootstrap -r ap-southeast-1
 ```
 
-### 3. Verify Global Accelerator
+### 3. Verify Regional Routing
 
-The new region is automatically added to Global Accelerator endpoints.
+In the commercial `aws` partition, the new Region is automatically added to Global Accelerator and can be verified with:
 
 ```bash
 aws globalaccelerator list-endpoint-groups \
@@ -311,6 +313,8 @@ aws globalaccelerator list-endpoint-groups \
     --query 'Stacks[0].Outputs[?OutputKey==`GlobalAcceleratorListenerArn`].OutputValue' \
     --output text)
 ```
+
+In every other partition, no accelerator resources or outputs are created. Verify the new `<project>-regional-api-<region>` stack and its `RegionalApiEndpoint` output instead; that IAM-authenticated bridge is the supported workload ingress.
 
 ## EKS Cluster Configuration
 
@@ -599,7 +603,7 @@ Global Accelerator uses HTTP health checks to determine if a region is healthy. 
 
 The `/api/v1/health` endpoint returns 200 when the cluster is within resource thresholds and 503 when overloaded. This enables intelligent routing — GA automatically routes traffic away from overloaded regions.
 
-The health check path must be listed in `UNAUTHENTICATED_PATHS` in `gco/services/auth_middleware.py` so GA can reach it without the secret header. A CI test (`tests/test_health_check_coverage.py`) validates this automatically.
+The health check path must be listed in `UNAUTHENTICATED_PATHS` in `gco/services/auth_middleware.py` so Global Accelerator can probe it without a per-request HMAC envelope. A CI test (`tests/test_health_check_coverage.py`) validates this automatically.
 
 #### Client Affinity
 
@@ -612,7 +616,7 @@ The value is validated at synth time — anything other than `NONE` or `SOURCE_I
 
 #### Inference Health Watchdog
 
-The inference monitor includes a health watchdog that protects the ALB from unhealthy endpoints. If an inference endpoint has zero ready replicas for longer than the configured threshold, the watchdog removes its Ingress to prevent the unhealthy target group from marking the ALB as unhealthy in Global Accelerator.
+The inference monitor tracks how long each endpoint has zero ready replicas. Inference traffic uses the shared Gateway API route but terminates at the dedicated authenticated inference-proxy service, so an individual model does not own an ALB target group and the watchdog never changes shared ALB rules.
 
 Configure in `cdk.json`:
 
@@ -626,21 +630,15 @@ Configure in `cdk.json`:
 | Setting | Default | Description |
 |---|---|---|
 | `reconcile_interval` | `15` | Seconds between reconciliation cycles |
-| `unhealthy_threshold_seconds` | `300` | Seconds an endpoint can be unready before its Ingress is removed (5 minutes) |
+| `unhealthy_threshold_seconds` | `300` | Seconds at zero ready replicas before the monitor emits an explicit degraded-state warning |
 
-When the endpoint recovers (pods become ready), the Ingress is automatically re-created on the next reconciliation cycle. The watchdog logs a warning when it removes an Ingress so operators can investigate.
+Before the threshold, the monitor records the start of the outage. After the threshold, it logs that the authenticated inference proxy will return 503 until the model recovers. When a replica becomes ready, the timer is cleared. Reconciliation never creates endpoint-specific public routes.
 
 #### ALB Architecture
 
-GCO uses a single ALB per region for all traffic (platform services and inference endpoints). All Ingresses share the `gco` ingress group via `IngressClassParams`.
+GCO uses one internal application ALB per region, created by the AWS Load Balancer Controller from the `gco-system/gco-gateway` Gateway API resources. The shared `HTTPRoute` sends health and control-plane traffic to their platform services and `/inference/*` to the dedicated inference proxy. The proxy authenticates and validates an inference route before streaming from the selected endpoint's ClusterIP Service, so endpoint Deployments and Services do not create public or endpoint-specific routes.
 
-| Component | Ingress Group | Services |
-|---|---|---|
-| Platform ALB | `gco` | health-monitor, manifest-processor, inference endpoints |
-
-The inference health watchdog ensures that unhealthy inference endpoints don't tank the ALB's health in Global Accelerator. When an endpoint goes unhealthy, the watchdog removes its Ingress (and the associated target group) before GA can detect the failure. This keeps the ALB healthy for platform traffic even when inference endpoints are down.
-
-The GA registration Lambda deterministically registers only this single platform ALB. On every deploy, it scrubs any stale endpoints (e.g., leftover NLBs from Helm charts) to ensure GA routes exclusively to the correct ALB.
+The GA registration Lambda resolves the ALB from the Gateway status address (with an exact `gco.aws/gateway` + cluster ownership-tag fallback) and verifies its type (`application`) and scheme (`internal`) before publishing its hostname and registering it. It also removes stale Global Accelerator endpoint attachments so only the current verified platform ALB remains registered.
 
 ### Manifest Processor
 
@@ -657,7 +655,7 @@ def validate_manifest(manifest: dict) -> bool:
 
 ## Security Policy Configuration
 
-The `manifest_processor` section in `cdk.json` includes a `manifest_security_policy` object and an `allowed_kinds` list that control which Kubernetes manifest patterns are accepted or rejected.
+The shared `job_validation_policy` section in `cdk.json` includes a `manifest_security_policy` object, an `allowed_namespaces` list, and an `allowed_kinds` list that control which Kubernetes manifest patterns are accepted or rejected. The stock namespace allowlist is only `gco-jobs`, matching the deployed namespace-scoped write Role; adding another namespace also requires an intentionally scoped Role/RoleBinding there.
 
 This policy is enforced on **both** submission paths:
 
@@ -671,7 +669,7 @@ CDK wires the same configuration values into both services at deploy time, so a 
 Each toggle controls a specific security check. Set a toggle to `false` to allow the corresponding pattern, or `true` to block it.
 
 ```json
-"manifest_processor": {
+"job_validation_policy": {
   "manifest_security_policy": {
     "block_privileged": true,
     "block_privilege_escalation": true,
@@ -713,7 +711,7 @@ Many GPU containers (NVIDIA CUDA, PyTorch) run as root by default. The default c
 The `allowed_kinds` list controls which Kubernetes resource kinds can be submitted through the manifest processor. Manifests with a `kind` not in this list are rejected.
 
 ```json
-"manifest_processor": {
+"job_validation_policy": {
   "allowed_kinds": ["Job", "CronJob", "Deployment", "StatefulSet", "DaemonSet", "Service", "ConfigMap", "Pod"]
 }
 ```
@@ -793,16 +791,14 @@ post-helm-name.yaml     # Post-Helm pass (applied after Helm installs CRDs)
 
 **Number ranges:**
 
-- `00-09` — Foundation (namespaces, service accounts, RBAC, network policies)
-- `10-19` — Networking (IngressClass, Ingress)
+- `00-19` — Foundation & networking (namespaces, service accounts, RBAC, network policies)
 - `20-29` — Storage (EFS, FSx, Valkey)
 - `30-39` — System services (health-monitor, manifest-processor, inference-monitor)
 - `40-49` — NodePools (GPU, EFA, Neuron, CPU)
 - `50-59` — Device plugins (NVIDIA)
-- `post-helm-*` — Resources requiring Helm CRDs (KEDA ScaledJob, etc.)
+- `post-helm-*` — Resources requiring Helm CRDs (Gateway API entrypoint, KEDA ScaledJob, etc.)
 
-**Optional features:** Files with unreplaced `{{PLACEHOLDER}}` values are automatically
-skipped, so you can gate features on CDK config without touching the handler.
+**Optional features:** Files with unresolved uppercase `{{PLACEHOLDER}}` feature gates are skipped. For shipped optional features, the applier also prunes an exact, audited list of resources previously owned by that feature. It does not use broad label deletion, so unrelated resources are left untouched. When adding a new optional platform feature, add its exact owned-resource inventory to the applier so disable-time convergence is explicit.
 
 See `lambda/kubectl-applier-simple/manifests/README.md` for the full file listing.
 
@@ -941,14 +937,7 @@ self.vpc.add_interface_endpoint(
 
 ### Modify Security Groups
 
-```python
-# Add custom ingress rule
-alb_security_group.add_ingress_rule(
-    peer=ec2.Peer.ipv4("YOUR-OFFICE-IP/32"),
-    connection=ec2.Port.tcp(443),
-    description="Allow from office"
-)
-```
+The platform ALB and its security group are created by the AWS Load Balancer Controller from the `gco-system/gco-gateway` Gateway API resources; there is no `alb_security_group` CDK construct to edit in `regional_stack.py`. Keep the platform Gateway internal (`LoadBalancerConfiguration.spec.scheme: internal`) and make network changes through the Gateway API configuration in `post-helm-gateway.yaml`, VPC routing, and Kubernetes NetworkPolicies. After any change, verify that Global Accelerator health checks can still reach `/api/v1/health` and that direct unsigned backend requests remain rejected.
 
 ## Adjusting Resource Limits
 
@@ -998,13 +987,13 @@ kubectl_lambda = lambda_.Function(
 
 ## Helm Chart Configuration
 
-GCO installs scheduler and infrastructure Helm charts via the `helm` section in `cdk.json`. Each chart can be toggled independently:
+GCO installs add-ons in dependency order through the Helm installer. KEDA is a mandatory platform component because it backs the built-in SQS consumer and external-metrics path. The remaining scheduler and device-plugin charts are controlled under `helm`; in-cluster observability is controlled separately by `cluster_observability.enabled`.
 
 ```json
 {
   "context": {
+    "cluster_observability": { "enabled": true },
     "helm": {
-      "keda": { "enabled": true },
       "aws_efa_device_plugin": { "enabled": true },
       "aws_neuron_device_plugin": { "enabled": true },
       "volcano": { "enabled": true },
@@ -1020,17 +1009,18 @@ GCO installs scheduler and infrastructure Helm charts via the `helm` section in 
 
 | Chart | Default | Description |
 |-------|---------|-------------|
-| `keda` | Enabled | Event-driven autoscaling (SQS, Prometheus, etc.) |
-| `aws_efa_device_plugin` | Enabled | EFA device management for high-performance networking |
-| `aws_neuron_device_plugin` | Enabled | Trainium/Inferentia device management |
-| `volcano` | Enabled | Gang scheduling for distributed training |
-| `kuberay` | Enabled | Ray distributed computing operator |
-| `cert_manager` | Enabled | TLS certificate management |
-| `slurm` | Disabled | Slurm on Kubernetes (operator + cluster) |
-| `yunikorn` | Disabled | App-aware scheduler with hierarchical queues |
-| `kueue` | Enabled | Job queueing with quotas and fair sharing |
+| KEDA | Mandatory | Event-driven autoscaling and the external-metrics bridge; always installed |
+| AWS EFA device plugin | Enabled | EFA device management for high-performance networking |
+| AWS Neuron device plugin | Enabled | Trainium/Inferentia device management |
+| Volcano | Enabled | Gang scheduling for distributed training |
+| KubeRay | Enabled | Ray distributed computing operator |
+| cert-manager | Enabled | Certificate management for cluster webhooks |
+| kube-prometheus-stack | Enabled | Prometheus, Alertmanager, and Grafana when `cluster_observability.enabled` is true |
+| Slurm/Slinky | Disabled | Slurm operator and cluster |
+| YuniKorn | Disabled | App-aware scheduler with hierarchical queues |
+| Kueue | Enabled | Job queueing with quotas and fair sharing; installed last |
 
-A useful subset of charts is enabled by default, but every cluster is different. Experiment to find which tools best suit your workloads and disable the ones you don't need — each enabled chart runs controller pods that consume CPU and memory on your system nodes. For example, if you don't use gang scheduling, disable Volcano. If you don't need event-driven autoscaling, disable KEDA. Fewer charts means less system overhead and faster deploys.
+Disable optional charts you do not use to reduce system-node overhead and deployment time. KEDA cannot be disabled without replacing platform features that depend on it.
 
 > **⚠️ Helm charts install asynchronously — give them time to finish.**
 >
@@ -1063,7 +1053,7 @@ A few add-on charts pull their images directly from Docker Hub (`docker.io`) —
 
 > **Why a mirror and not an ECR pull-through cache?** ECR pull-through cache for Docker Hub *requires* a stored Docker Hub credential (anonymous Docker Hub PTC isn't supported), and on EKS Auto Mode the pull-only, service-managed node role complicates cache-miss imports. Mirroring sidesteps both: no credential, and the images are plain `gco/*` ECR repos the nodes can already pull.
 
-When enabled, the regional stack injects one Volcano value override — `basic.image_registry` → `<account>.dkr.ecr.<region>.amazonaws.com/<ecr_namespace>` — so every Volcano image (controller, scheduler, admission webhook, and the pre-install admission-init hook, which all render from `basic.image_registry`) resolves from ECR. It creates **no** CloudFormation resources; the mirror is populated by `gco stacks deploy` (automatically, see below) or the `gco images mirror` CLI.
+When enabled, the regional stack injects one Volcano value override — `basic.image_registry` → `<account>.dkr.ecr.<region>.<url-suffix>/<ecr_namespace>` — so every Volcano image (controller, scheduler, admission webhook, and the pre-install admission-init hook, which all render from `basic.image_registry`) resolves from ECR. It creates **no** CloudFormation resources; the mirror is populated by `gco stacks deploy` (automatically, see below) or the `gco images mirror` CLI.
 
 **1. Default `cdk.json` config** (on by default; the default `ecr_namespace` of `gco/dockerhub` is fine). To disable, set `enabled` to `false`:
 
@@ -1135,17 +1125,18 @@ self.cluster = eks.Cluster(
 kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/quickstart/cwagent-fluentd-quickstart.yaml
 ```
 
-### Enable AWS Load Balancer Controller
+### Load Balancer Configuration
 
-Already included in EKS Auto Mode! Just add annotations to your Ingress:
+GCO installs the AWS Load Balancer Controller with Gateway API support and intentionally creates one internal ALB from the `gco-system/gco-gateway` Gateway (see `lambda/kubectl-applier-simple/manifests/post-helm-gateway.yaml`). If you add another operator-owned Gateway, keep its exposure explicit and do not create endpoint-specific inference routes that bypass the authenticated proxy:
 
 ```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: gateway.k8s.aws/v1beta1
+kind: LoadBalancerConfiguration
 metadata:
-  annotations:
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
+  name: my-gateway-load-balancer
+  namespace: my-namespace
+spec:
+  scheme: internal
 ```
 
 ### Add Prometheus Monitoring
@@ -1486,11 +1477,26 @@ GCO uses an Amazon Bedrock model for two optional, **advisory** features:
 - **Mission sampling** — the goal-directed Mission engine can ask a model for strategy-revision rationales and final-report lessons (`gco mission ...`).
 - **Capacity advisor** — `gco capacity ai-recommend` and `gco capacity predict` send capacity data to a model for a placement/timing recommendation, and the `ai_recommend` MCP tool does the same.
 
-Both default to **Amazon Nova Pro** (`us.amazon.nova-pro-v1:0`). Nova Pro is the default because:
+Both default to **Amazon Nova 2 Lite** through its system-defined global
+cross-Region inference profile (`global.amazon.nova-2-lite-v1:0`). It is the
+default because:
 
-- It is a system-defined cross-Region inference profile that is **enabled by default** in commercial AWS Regions with the standard AWS Marketplace permissions.
-- As a first-party Amazon model it does **not** require the one-time **First-Time-Use (FTU)** form that Anthropic asks each account (or organization) to submit before first invocation — so the advisory paths work on a fresh account with no extra onboarding step.
+- The global profile maximizes throughput by allowing Bedrock to route across
+  supported worldwide Regions. Choose a geography-scoped profile instead when
+  your workload has data-residency constraints.
+- As a first-party Amazon model it does **not** require the one-time
+  **First-Time-Use (FTU)** form that Anthropic asks each account (or
+  organization) to submit before first invocation.
+- The stock `cdk.json` configuration enables Nova 2 Lite extended thinking at
+  `high`, its maximum supported reasoning effort. GCO translates that setting
+  to Converse `reasoningConfig` and skips the leading `reasoningContent` block
+  when reading the final answer.
 
+> **Cost and latency:** reasoning tokens are billed as output tokens. High
+> effort can materially increase latency and token usage. AWS requires
+> `maxTokens`, `temperature`, and `topP` to be unset at high effort, so GCO
+> omits them for the canonical default.
+>
 > These Bedrock features are advisory and degrade gracefully. When no model is reachable (no credentials, model not enabled, or access denied) the Mission engine falls back to its deterministic templates and the capacity advisor surfaces a clear error. Core orchestration never depends on Bedrock.
 
 ### Choosing a different model
@@ -1517,98 +1523,111 @@ export GCO_MISSION_BEDROCK_MODEL_ID="us.anthropic.claude-sonnet-4-5-20250929-v1:
 export GCO_MISSION_BEDROCK_REGION="eu-west-1"   # default: us-east-1
 ```
 
-**3. Change the default for everyone** — edit the two constants that pin it. They are deliberately kept identical by a CI test (`tests/test_default_bedrock_model_consistency.py`):
+**3. Change the default for everyone** — edit the one canonical value:
 
-| File | Constant |
-|------|----------|
-| `gco_mcp/mission/sampling.py` | `DEFAULT_BEDROCK_MODEL_ID` |
-| `cli/capacity/advisor.py` | `BedrockCapacityAdvisor.DEFAULT_MODEL` |
+| File | Keys |
+|------|------|
+| `cdk.json` | `context.bedrock.default_model_id`, `context.bedrock.thinking.effort` |
 
-Resolution order: per-call flag (`--model` / `--bedrock-model-id` / MCP `model=`) → `GCO_MISSION_BEDROCK_MODEL_ID` (Mission path only) → the pinned default constant.
+Both Python consumers resolve those values through `gco.bedrock`. The same
+`cdk.json` is shipped as package data so installed CLI and MCP entry points
+retain the default when they run outside a source checkout.
+`tests/test_default_bedrock_model_consistency.py` guards the resolver,
+compatibility aliases, package-data declaration, inference-profile shape,
+reasoning translation, and captured fixture.
+
+The canonical thinking setting applies only when the selected model id equals
+the configured default. A per-call or environment override for Anthropic or
+another model keeps that caller's normal inference controls and receives no
+Nova-specific `reasoningConfig`.
+
+Resolution order: per-call flag (`--model` / `--bedrock-model-id` / MCP `model=`) → `GCO_MISSION_BEDROCK_MODEL_ID` (Mission path only) → `cdk.json` `context.bedrock.default_model_id`.
 
 ### What to check when choosing a model
 
 - **Access** — the model (or its cross-Region inference profile) must be enabled in your account and reachable from the configured Region. Third-party models may require AWS Marketplace subscription permissions and, for Anthropic, the FTU form. See the AWS guide on [model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
-- **Inference profile vs base id** — GCO pins a system-defined **inference profile** id (the `us.` / `eu.` / `apac.` prefix) so requests route across Regions. Prefer a profile id over a bare model id where one exists.
+- **Inference profile vs base id** — GCO pins a system-defined **global
+  inference profile** id (`global.`) for maximum throughput. Global profiles
+  may route worldwide; use a geography-scoped profile (`us.`, `eu.`, `jp.`,
+  etc.) where a residency boundary is required. Prefer a profile id over a
+  bare model id where one exists.
 - **Converse API support** — GCO calls the Bedrock **Converse** API, so the model must support it (the defaults and every entry in the curated set in `scripts/capture_scaffold_fixtures.py` do).
 
 ### Staying current
 
-The monthly **deps-scan** workflow compares the pinned default against the newest system-defined inference profile in the *same model family* (for example, a newer Amazon Nova Pro release) and opens a GitHub issue when a newer one is available, so the default never silently falls behind. It uses read-only Bedrock list permissions on the CI OIDC role; see [CI documentation](../.github/CI.md#dependency-scan-script) and `.github/scripts/dependency-scan.sh`.
+The monthly **deps-scan** workflow compares the pinned default against the
+newest system-defined inference profile in the *same scope and model family*
+(for example, a newer global Amazon Nova Lite release) and opens a GitHub issue
+when one is available. It will not cross-suggest a geographic profile, another
+tier, or another provider. It uses read-only Bedrock list permissions on the CI
+OIDC role; see [CI documentation](../.github/CI.md#dependency-scan-script) and
+`.github/scripts/dependency-scan.sh`.
 
 ## CDK-nag Compliance
 
-GCO uses CDK-nag to validate infrastructure against multiple compliance frameworks during synthesis and deployment.
+GCO runs five cdk-nag v3 rule packs through CDK's policy-validation framework. These are automated infrastructure checks, not certifications; passing them does not by itself establish regulatory compliance.
 
 ### Enabled Frameworks
 
-The following compliance frameworks are enabled in `app.py`:
+The following rule packs are returned by `nag_validation_plugins()` in `gco/stacks/nag_suppressions.py` and registered in `app.py` with `cdk.Validations.of(app).add_plugins(...)`:
 
-| Framework | Description |
-|-----------|-------------|
-| AWS Solutions | Best practices for AWS architectures |
-| HIPAA Security | Healthcare compliance requirements |
-| NIST 800-53 Rev 5 | Federal security controls |
-| PCI DSS 3.2.1 | Payment card industry standards |
-| Serverless | Best practices for serverless architectures |
-
-All checks run automatically during `cdk synth` and `cdk deploy`.
+| Rule pack | Focus |
+|-----------|-------|
+| AWS Solutions | AWS architecture best practices |
+| HIPAA Security | Findings mapped to HIPAA Security Rule controls |
+| NIST 800-53 Rev 5 | Findings mapped to NIST controls |
+| PCI DSS 3.2.1 | Findings mapped to PCI DSS controls |
+| Serverless | Serverless architecture best practices |
 
 ### Customizing Suppressions
 
-Suppressions are centralized in `gco/stacks/nag_suppressions.py`. Each suppression includes:
+Finding acknowledgments are centralized in `gco/stacks/nag_suppressions.py`. The removed cdk-nag v2 `NagSuppressions` and `NagPackSuppression` APIs are not available. GCO uses `acknowledge_nag_findings()`, which records cdk-nag v3 acknowledgment metadata on the narrowest relevant construct.
 
-- The rule ID being suppressed
-- A detailed reason explaining why the suppression is justified
-- The specific resources the suppression applies to (when applicable)
-
-To view current suppressions:
-
-```bash
-# View all suppressions
-cat gco/stacks/nag_suppressions.py
-```
+Each acknowledgment must include a rule ID and a specific justification. Array-style findings such as `AwsSolutions-IAM5[Resource::*]` also require every exact finding detail in `appliesTo`; cdk-nag v3 does not apply regex or bare-ID fallback matching to those details.
 
 ### Adding New Suppressions
 
-If you add new infrastructure that triggers cdk-nag warnings, add suppressions with proper justification:
+Place the acknowledgment next to the construct that owns the intentional finding, or add a focused helper in `nag_suppressions.py`:
 
 ```python
-# In gco/stacks/nag_suppressions.py
+from gco.stacks.nag_suppressions import acknowledge_nag_findings
 
-def add_my_custom_suppressions(stack: Stack) -> None:
-    """Add suppressions for my custom resources."""
-    NagSuppressions.add_stack_suppressions(
-        stack,
-        [
-            NagPackSuppression(
-                id="AwsSolutions-XXX",
-                reason="Detailed explanation of why this suppression is justified. "
-                "Include references to documentation or architectural decisions.",
+acknowledge_nag_findings(
+    my_role,
+    [
+        {
+            "id": "AwsSolutions-IAM5",
+            "reason": (
+                "The service's read-only Describe API does not support "
+                "resource-level permissions; this role uses it only for ..."
             ),
-        ],
-    )
+            "appliesTo": ["Resource::*"],
+        }
+    ],
+)
 ```
 
-Then call your function in `apply_all_suppressions()`:
-
-```python
-def apply_all_suppressions(stack: Stack, stack_type: str = "regional") -> None:
-    # ... existing code ...
-    add_my_custom_suppressions(stack)
-```
+Scope acknowledgments to the resource or role whenever possible. An acknowledgment on a stack applies to all descendants and can hide unrelated findings.
 
 ### Disabling Compliance Checks
 
-To disable specific frameworks (not recommended for production):
+Disabling rule packs weakens the policy-validation gate and is not recommended. If a deployment intentionally excludes one, edit the list returned by `nag_validation_plugins()` rather than using the removed `cdk.Aspects` registration pattern:
 
 ```python
-# In app.py, comment out unwanted checks
-cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
-cdk.Aspects.of(app).add(HIPAASecurityChecks(verbose=True))
-# cdk.Aspects.of(app).add(NIST80053R5Checks(verbose=True))  # Disabled
-# cdk.Aspects.of(app).add(PCIDSS321Checks(verbose=True))    # Disabled
-cdk.Aspects.of(app).add(ServerlessChecks(verbose=True))
+def nag_validation_plugins(scope, *, verbose=True):
+    return [
+        AwsSolutionsChecks(scope, verbose=verbose),
+        HIPAASecurityChecks(scope, verbose=verbose),
+        NIST80053R5Checks(scope, verbose=verbose),
+        PCIDSS321Checks(scope, verbose=verbose),
+        # ServerlessChecks(scope, verbose=verbose),  # intentionally excluded
+    ]
+```
+
+`app.py` should continue registering the resulting plugins with:
+
+```python
+cdk.Validations.of(app).add_plugins(*nag_validation_plugins(app, verbose=True))
 ```
 
 ## Configuration Best Practices
@@ -1704,6 +1723,48 @@ When enabled, this provides:
   A100-40GB `p4d` family, which OOMs on many models and cannot run FP8 KV-cache
   configs. Mooncake role pods select its `mooncake-efa=true` label automatically,
   so they never land on `p4d`. See [docs/INFERENCE.md](INFERENCE.md).
+
+### Mooncake Protocol and Device Selection
+
+Mooncake has two related transport settings that use different vocabularies:
+
+- The endpoint spec and mounted `mooncake.json` use `protocol: rdma|tcp`, as
+  required by the Mooncake store configuration.
+- vLLM's point-to-point `MooncakeConnector` separately reads
+  `kv_connector_extra_config.mooncake_protocol`. On AWS, GCO translates the
+  default `rdma` intent to `mooncake_protocol: efa` and pins the pod to the
+  dedicated EFA nodepool. This avoids silently using vLLM's generic `rdma`
+  default on an EFA deployment.
+
+| CLI selection | Point-to-point connector | Pod placement |
+|---------------|---------------------------|---------------|
+| Omitted (default) or `--mooncake-protocol rdma` | `mooncake_protocol: efa` | Dedicated `mooncake-efa-pool`; requests an EFA device |
+| `--mooncake-protocol tcp` | `mooncake_protocol: tcp` | No EFA selector, toleration, or device request |
+
+Use `--mooncake-device-name` only when the Mooncake/libfabric runtime must bind
+to a specific provider-visible interface. GCO forwards the value to both the
+vLLM connector and `mooncake.json`; when omitted (or explicitly empty),
+Mooncake auto-detects the device. Device names are image and instance dependent,
+so do not assume that a host interface name is valid inside the pod.
+
+```bash
+gco inference deploy my-llm \
+  --mooncake-mode disaggregated \
+  --mooncake-protocol rdma \
+  --mooncake-device-name <DEVICE_NAME>
+
+# Portable fallback when EFA is unavailable
+gco inference deploy my-llm \
+  --mooncake-mode disaggregated \
+  --mooncake-protocol tcp
+```
+
+Both override flags require `--mooncake-mode`. The default EFA path also
+requires `helm.aws_efa_device_plugin.enabled = true`; select TCP if the target
+cluster intentionally has no EFA device plugin. See vLLM's
+[MooncakeConnector API](https://docs.vllm.ai/en/stable/api/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector/)
+and [Mooncake store configuration](https://docs.vllm.ai/en/stable/features/mooncake_store_connector_usage/)
+for the two upstream configuration surfaces.
 
 ### Using EFA in Jobs
 
@@ -1810,17 +1871,33 @@ See `examples/trainium-job.yaml` and `examples/inferentia-job.yaml` for complete
 
 ### Manifest Application Failures
 
-1. Check Lambda logs: `aws logs tail /aws/lambda/gco-*-KubectlApplier*`
-2. Validate YAML syntax
-3. Ensure image placeholders match CDK configuration
+1. Resolve the generated log-group name from CloudFormation (physical names are not fixed):
 
-## Regional API Gateway (Private Access)
+   ```bash
+   aws cloudformation list-stack-resources \
+     --stack-name gco-REGION --region REGION \
+     --query "StackResourceSummaries[?ResourceType=='AWS::Logs::LogGroup'].{Logical:LogicalResourceId,Physical:PhysicalResourceId}"
+   aws logs tail <EXACT_LOG_GROUP_NAME> --region REGION --since 30m
+   ```
 
-When public access is disabled (internal ALB only), you can enable regional API Gateways to provide authenticated API access via VPC Lambdas.
+2. Validate YAML syntax.
+3. Ensure image placeholders match CDK configuration.
 
-### Enable Regional APIs
+## Regional API Gateway (Aggregation Bridge and Direct Regional Access)
 
-Edit `cdk.json` to enable regional API Gateways:
+A regional API bridge is always deployed in every workload region. The
+centralized aggregator is not VPC-attached and uses these reachable API Gateway
+endpoints to fan out to each region. In the commercial `aws` partition,
+`api_gateway.regional_api_enabled` controls whether other IAM-authorized
+principals in the deployment account may invoke a bridge directly. In every
+other AWS partition, Global Accelerator is omitted and same-account direct
+regional access is enabled automatically as the supported workload ingress.
+
+### Enable Direct Regional Access in the `aws` Partition
+
+Edit `cdk.json` to admit direct same-account callers to every regional bridge.
+Outside `aws`, no opt-in is needed and this setting cannot disable the required
+regional ingress:
 
 ```json
 {
@@ -1840,43 +1917,55 @@ gco stacks deploy-all -y
 
 ### How It Works
 
-Regional API Gateways deploy a VPC Lambda in each region that can reach the internal ALB directly:
+Each bridge uses an IAM-authorized API Gateway and a Lambda in the workload
+VPC. The global aggregator reaches it over AWS-managed TLS with SigV4; an
+opted-in user follows the same first hop:
 
 ```text
-User → Regional API Gateway (IAM Auth) → VPC Lambda → Internal ALB → EKS pods
+Aggregator or authorized direct user
+  → Regional API Gateway (AWS-managed TLS + IAM SigV4)
+  → VPC Lambda (request-bound HMAC)
+  → Internal ALB (private-root TLS) → EKS pod (HTTP)
 ```
 
-This bypasses the need for Global Accelerator and public ALB exposure.
+The Lambda resolves the current ALB from
+`/<project>/alb-hostname-<region>` in the global-region SSM registry and verifies
+that it is this account and region's internal application ALB for the exact GCO
+EKS cluster and platform Gateway. It reads the public root bundle from SSM,
+connects with explicit `backend.<project>.gco.internal` SNI/hostname assertion,
+and never receives the root private key. This path bypasses Global Accelerator,
+not a public ALB.
 
 ### Using Regional APIs
 
-**CLI:**
-
 ```bash
-# Use --regional-api flag
+# Use --regional-api with an explicit deployed region
 gco --regional-api jobs list --region us-east-1
 gco --regional-api jobs submit job.yaml --region us-east-1
 
-# Or set environment variable
+# Or select regional mode for subsequent commands
 export GCO_REGIONAL_API=true
 gco jobs list --region us-east-1
 ```
 
-**When to Use:**
+**When to use:**
 
-- ALB is internal-only (no public exposure)
-- Maximum security posture required
-- Compliance requirements prohibit public endpoints
-- Direct regional access preferred over global routing
+- A caller needs an explicitly region-pinned request path
+- An operation should bypass Global Accelerator health/latency routing
+- The deployment is outside the commercial `aws` partition, where regional APIs are the required workload ingress
+- An organizational control requires use of the regional API endpoint
 
 ### Security Considerations
 
-Regional APIs maintain the same security model as the global API:
+Regional APIs preserve the backend authentication model used by the global path:
 
-- IAM authentication (SigV4) at API Gateway
-- Secret header injection by VPC Lambda
-- Backend validation of secret header
-- No public exposure of ALB or EKS API
+- AWS-managed TLS and IAM authentication (SigV4) at API Gateway
+- Exact-request HMAC signing by the VPC Lambda with a rotating key that is never forwarded
+- Deployment-local private-root TLS to the ALB with explicit SNI and hostname verification
+- Backend freshness, integrity, body-digest, and nonce-replay validation; HMAC is not encryption
+- Runtime verification of the SSM-registered internal ALB
+- Public SSM trust only; the root private key remains in the certificate-manager's KMS-encrypted secret
+- No public exposure of the ALB or EKS API
 
 ---
 
@@ -1904,7 +1993,7 @@ Queue-processor-specific settings live in `cdk.json` under `queue_processor`. Va
 | `enabled` | `true` | Set to `false` to disable the built-in consumer entirely |
 | `polling_interval` | `10` | How often KEDA checks the SQS queue for new messages (seconds) |
 | `max_concurrent_jobs` | `10` | Maximum consumer pods running in parallel |
-| `messages_per_job` | `1` | Number of SQS messages that trigger one consumer pod |
+| `messages_per_job` | `1` | KEDA target queue messages per active consumer Job (`queueLength`); each built-in worker still receives one message |
 | `successful_jobs_history` | `20` | How many completed consumer jobs to keep in history |
 | `failed_jobs_history` | `10` | How many failed consumer jobs to keep in history |
 
@@ -1912,7 +2001,7 @@ For namespace allowlisting, resource caps, and security toggles (shared between 
 
 ```json
 "job_validation_policy": {
-  "allowed_namespaces": ["default", "gco-jobs"],
+  "allowed_namespaces": ["gco-jobs"],
   "resource_quotas": {
     "max_cpu_per_manifest": "10",
     "max_memory_per_manifest": "32Gi",
@@ -1931,13 +2020,9 @@ If you want to implement your own SQS consumer (e.g., with custom validation log
 }
 ```
 
-Then redeploy. On a fresh deploy this prevents the ScaledJob from being created. If you're disabling it on an existing cluster, you'll also need to manually delete the ScaledJob:
+Then redeploy. The post-Helm applier treats the absent queue-processor image gate as a disabled feature and deletes the exact managed `gco-system/sqs-queue-processor` ScaledJob if it exists; unrelated ScaledJobs are untouched.
 
-```bash
-kubectl delete scaledjob sqs-queue-processor -n gco-system
-```
-
-Then deploy your own KEDA ScaledJob. See `examples/keda-scaled-job.yaml` for a starting point. The SQS queue URL is available as a CloudFormation output (`JobQueueUrl`) and the KEDA operator already has IRSA permissions to read queue metrics.
+The shipped `examples/keda-scaled-job.yaml` is a safe **non-consuming scaling demonstration**, not a custom consumer implementation. It uses an explicit disposable-queue placeholder, has no AWS credentials, and never receives or deletes messages. Do not point it at the GCO `JobQueueUrl`. For a real custom consumer, implement validation and processing first, and acknowledge a message only after processing succeeds. The KEDA operator will also need metric-read permission for the custom queue.
 
 ### How It Works
 

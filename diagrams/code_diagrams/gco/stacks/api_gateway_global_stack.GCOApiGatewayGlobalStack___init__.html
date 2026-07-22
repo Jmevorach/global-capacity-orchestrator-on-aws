@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
         <title>API Gateway stack constructor (REST API + IAM + WAF)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -16,7 +17,7 @@
                 var btn = document.getElementById("run"),
                     cd = document.getElementById("code"),
                     chart;
-                    
+
                 (btn.onclick = function () {
                     var code = cd.value;
 
@@ -115,14 +116,14 @@
                     // output download link for base64 PNG converted on download from base64
                     var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
                     document.getElementById("pngbase64").innerHTML=pngOutHtml;
-                    });    
+                    });
                     // output download link for base64 SVG converted on download from base64
                     var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
                         document.getElementById("svgbase64").innerHTML=svgOutHtml;
                     })();
 
                             };
-                 
+
 
 // derived from https://stackoverflow.com/a/64800570
 // we need to use web browser canvas to generate a image. In this case png
@@ -190,7 +191,7 @@ function base64ToSvgDocument(base64) {
     svg = svg.substring(svg.indexOf('<svg'));
     let parser = new DOMParser();
     return parser.parseFromString(svg, "image/svg+xml");
-} 
+}
         </script>
 
         <script>
@@ -205,32 +206,65 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">sub1822=>subroutine: super().__init__(scope, construct_id, **kwargs)
-op1824=>operation: self.project_name = project_name
-op1826=>operation: self.ga_dns = global_accelerator_dns
-op1828=>operation: self.regional_endpoints = regional_endpoints or {}
-op1830=>operation: self.analytics_config: AnalyticsApiConfig | None = analytics_config
-op1832=>operation: self.secret = self._create_secret()
-op1834=>operation: self.proxy_lambda = self._create_proxy_lambda()
-op1836=>operation: self.aggregator_lambda = self._create_aggregator_lambda()
-op1838=>operation: self.api = self._create_api_gateway()
-sub1840=>subroutine: self._create_waf()
-sub1842=>subroutine: self._create_outputs()
-cond1845=>operation: self._wire_studio_routes() if  self.analytics_config is not None
-sub1855=>subroutine: self._apply_nag_suppressions()
+        <div><textarea id="code" style="width: 100%;" rows="11">sub2185=>subroutine: super().__init__(scope, construct_id, **kwargs)
+op2187=>operation: self.project_name = project_name
+op2189=>operation: self.ga_dns = str(global_accelerator_dns).strip() if global_accelerator_dns else None
+op2191=>operation: self.regional_endpoints = regional_endpoints or {}
+op2193=>operation: self.registry_region = registry_region or self.region
+op2195=>operation: self.certificate_regions = tuple(dict.fromkeys(certificate_regions if certificate_regions is not None else ['us-east-1']))
+op2197=>operation: default_backend_tls_config: dict[str, int] = {'root_generation': 1, 'root_validity_days': 3650, 'root_rotate_before_days': 180, 'root_activation_delay_hours': 24, 'root_overlap_days': 45, 'leaf_validity_days': 30, 'leaf_rotate_before_days': 10, 'rotation_schedule_hours': 12, 'trust_cache_ttl_seconds': 300, 'trust_cache_max_stale_seconds': 3600}
+op2199=>operation: self.backend_tls_config = {**default_backend_tls_config, **(backend_tls_config or {})}
+op2201=>operation: self.backend_tls_server_name = backend_tls_server_name(self.project_name)
+op2203=>operation: self.backend_tls_root_ca_parameter_name = backend_tls_root_ca_parameter_name(self.project_name)
+op2205=>operation: self.backend_tls_certificate_parameter_prefix = backend_tls_certificate_parameter_prefix(self.project_name)
+op2207=>operation: self.max_request_body_bytes = validated_request_body_limit(max_request_body_bytes)
+op2209=>operation: default_api_gateway_config: dict[str, Any] = {'throttle_rate_limit': 1000, 'throttle_burst_limit': 2000, 'log_level': 'INFO', 'metrics_enabled': True, 'tracing_enabled': True}
+cond2212=>condition: if api_gateway_config is not None
+op2216=>operation: configured_api_gateway = api_gateway_config
+op2225=>operation: self.api_gateway_config = {**default_api_gateway_config, **configured_api_gateway}
+op2227=>operation: self.analytics_config: AnalyticsApiConfig | None = analytics_config
+sub2229=>subroutine: self._create_backend_tls()
+op2231=>operation: self.secret = self._create_secret()
+op2233=>operation: self.proxy_lambda = self._create_proxy_lambda() if self.ga_dns is not None else None
+op2235=>operation: self.inference_proxy_lambda = self._create_inference_proxy_lambda() if self.ga_dns is not None else None
+op2237=>operation: self.aggregator_lambda = self._create_aggregator_lambda()
+op2239=>operation: self.api = self._create_api_gateway()
+sub2241=>subroutine: self._create_waf()
+sub2243=>subroutine: self._create_outputs()
+cond2246=>operation: self._wire_studio_routes() if  self.analytics_config is not None
+sub2256=>subroutine: self._apply_nag_suppressions()
+op2220=>operation: context_config = self.node.try_get_context('api_gateway')
+op2222=>operation: configured_api_gateway = context_config if isinstance(context_config, dict) else {}
 
-sub1822->op1824
-op1824->op1826
-op1826->op1828
-op1828->op1830
-op1830->op1832
-op1832->op1834
-op1834->op1836
-op1836->op1838
-op1838->sub1840
-sub1840->sub1842
-sub1842->cond1845
-cond1845->sub1855
+sub2185->op2187
+op2187->op2189
+op2189->op2191
+op2191->op2193
+op2193->op2195
+op2195->op2197
+op2197->op2199
+op2199->op2201
+op2201->op2203
+op2203->op2205
+op2205->op2207
+op2207->op2209
+op2209->cond2212
+cond2212(yes)->op2216
+op2216->op2225
+op2225->op2227
+op2227->sub2229
+sub2229->op2231
+op2231->op2233
+op2233->op2235
+op2235->op2237
+op2237->op2239
+op2239->sub2241
+sub2241->sub2243
+sub2243->cond2246
+cond2246->sub2256
+cond2212(no)->op2220
+op2220->op2222
+op2222->op2225
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -240,6 +274,12 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <div id="canvas"></div>
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
     </body>
 </html>

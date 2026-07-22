@@ -3,7 +3,7 @@
 The happy-path flows are covered by ``tests/test_analytics_cmd.py``; this
 module fills in the error/recovery branches (ClientError paths, missing
 confirmation prompts, HTTP/URL errors in studio login, missing lifecycle
-script) to bring the module's coverage to >=90%.
+script).
 """
 
 from __future__ import annotations

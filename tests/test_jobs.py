@@ -422,9 +422,19 @@ class TestJobManagerOperations:
                 mock_aws.return_value = mock_aws_client
 
                 manager = JobManager()
-                result = manager.delete_job("test-job", "gco-jobs")
+                result = manager.delete_job(
+                    "test-job",
+                    "gco-jobs",
+                    expected_uid="uid-123",
+                )
 
                 assert result["status"] == "deleted"
+                mock_aws_client.delete_job.assert_called_once_with(
+                    job_name="test-job",
+                    namespace="gco-jobs",
+                    region="us-east-1",
+                    expected_uid="uid-123",
+                )
 
 
 class TestJobManagerWait:
@@ -857,11 +867,13 @@ class TestJobManagerSubmitJobDirect:
                 MagicMock(returncode=0, stdout="job/test-job created", stderr=""),
             ]
 
-            result = manager.submit_job_direct(manifests, region="us-east-1", namespace="default")
+            result = manager.submit_job_direct(manifests, region="us-east-1")
 
             assert result["status"] == "success"
             assert result["method"] == "kubectl"
             assert result["region"] == "us-east-1"
+            assert result["namespace"] == "gco-jobs"
+            assert manifests[0]["metadata"]["namespace"] == "gco-jobs"
             assert "warnings" not in result
 
     def test_submit_job_direct_no_stack(self):

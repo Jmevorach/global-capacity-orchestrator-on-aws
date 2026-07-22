@@ -20,6 +20,54 @@
 #   - Apache YuniKorn: https://github.com/apache/yunikorn-release/releases
 
 charts:
+  # AWS Load Balancer Controller - mandatory Gateway API data plane
+  # Installed first so it remains alive until every Gateway-owned ALB and
+  # finalizer has been removed during reverse-order teardown.
+  # https://kubernetes-sigs.github.io/aws-load-balancer-controller/
+  aws-load-balancer-controller:
+    enabled: true
+    repo_name: eks
+    repo_url: https://aws.github.io/eks-charts
+    chart: aws-load-balancer-controller
+    version: "3.4.2"
+    namespace: kube-system
+    create_namespace: false
+    wait: true
+    wait_timeout: "8m"
+    values:
+      # Required by the upstream chart during static validation. The regional
+      # stack always overrides this placeholder with the real EKS cluster name.
+      clusterName: gco-runtime-injected
+      # The real cluster name, region, VPC, and IRSA annotation are injected by
+      # the regional stack because they contain deployment-specific tokens.
+      serviceAccount:
+        create: true
+        name: aws-load-balancer-controller
+      createIngressClassResource: false
+      ingressClassParams:
+        create: false
+      ingressClass: gco-unused-lbc-ingress
+      disableIngressClassAnnotation: true
+      webhookConfig:
+        disableIngressValidation: true
+      enableServiceMutatorWebhook: false
+      defaultTargetType: ip
+      defaultLoadBalancerScheme: internal
+      controllerConfig:
+        featureGates:
+          ALBGatewayAPI: true
+          NLBGatewayAPI: false
+          EnableServiceController: false
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 1000m
+          memory: 512Mi
+      podAnnotations:
+        karpenter.sh/do-not-disrupt: "true"
+
   # KEDA - Kubernetes Event-Driven Autoscaling
   # Enables autoscaling based on external metrics (SQS, Kafka, Prometheus, etc.)
   # https://keda.sh/
@@ -386,10 +434,10 @@ charts:
           podSpec:
             nodeSelector:
               kubernetes.io/os: linux
-      # Login pods — disabled by default. GCO submits Slurm jobs via the
+      # Login pods are disabled by default. GCO submits Slurm jobs via the
       # Kubernetes API (gco jobs submit-direct), not via SSH. Enabling the
-      # login set creates a LoadBalancer (NLB) which adds cost and can
-      # interfere with Global Accelerator endpoint registration.
+      # login set creates a separate LoadBalancer (NLB), which adds cost and is
+      # not part of the GCO API path; GA registration explicitly ignores it.
       # For interactive access, use: kubectl exec -it <controller-pod> -- bash
       loginsets:
         slinky:
@@ -532,6 +580,20 @@ charts:
             searchNamespace: monitoring
         podAnnotations:
           karpenter.sh/do-not-disrupt: "true"
+      # EKS manages the control plane: etcd, the scheduler, and the controller
+      # manager are not reachable as pods, and EKS Auto Mode runs no kube-proxy
+      # DaemonSet. Their exporters would render kube-system Services whose
+      # selectors can never have ready endpoints, so release validation (and
+      # scraping) disables them; CoreDNS pods do run in kube-system and stay
+      # monitored.
+      kubeEtcd:
+        enabled: false
+      kubeScheduler:
+        enabled: false
+      kubeControllerManager:
+        enabled: false
+      kubeProxy:
+        enabled: false
       # Prometheus: discover ServiceMonitors/PodMonitors cluster-wide (not just
       # ones labeled with this release) so GCO component monitors are scraped.
       prometheus:

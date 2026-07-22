@@ -1,15 +1,13 @@
 """
 Tests for the inference monitor health watchdog.
 
-Covers _check_health_watchdog, which tracks per-endpoint unready
-timestamps and removes the Ingress once an endpoint has been fully
-unready (ready_replicas == 0) for longer than _ingress_removal_threshold.
-The threshold is lowered to 300 seconds in the fixture to keep the
-tests fast. Verifies the watchdog clears state when an endpoint
-recovers, starts the timer on the first unready observation, holds
-off within the grace period, and actually calls delete_namespaced_ingress
-once the threshold is breached — which prevents GA from killing the
-entire ALB because a single endpoint's target group flipped unhealthy.
+Covers `_check_health_watchdog`, which tracks per-endpoint unready timestamps
+and reports when zero ready replicas have persisted beyond the configured
+threshold. Traffic enters through the shared ``gco-system/gco-gateway``
+``/inference`` HTTPRoute to ``gco-system/inference-proxy`` and then an endpoint
+ClusterIP Service, so the watchdog does not create, delete, or recreate routing
+resources. The tests verify timer start, grace-period behavior, degraded-state
+reporting, recovery, cleanup, and independent tracking across endpoints.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -39,7 +37,7 @@ def monitor():
             reconcile_interval=15,
         )
         # Override the threshold for faster testing
-        m._ingress_removal_threshold = 300  # 5 minutes
+        m._unhealthy_threshold_seconds = 300  # 5 minutes
         return m
 
 
@@ -83,11 +81,11 @@ class TestHealthWatchdogUnhealthyEndpoint:
             "my-llm", "gco-inference", ready_replicas=0, desired_replicas=1, spec={}, endpoint={}
         )
 
-        assert result is False  # Don't remove yet — grace period
+        assert result is False  # Still inside the grace period
         assert "my-llm" in monitor._unready_since
 
-    def test_within_threshold_does_not_remove(self, monitor):
-        """Endpoints unready for less than the threshold should keep their Ingress."""
+    def test_within_threshold_is_not_degraded(self, monitor):
+        """Endpoints inside the grace period should not report degraded."""
         monitor._unready_since["my-llm"] = datetime.now(UTC) - timedelta(minutes=2)
 
         result = monitor._check_health_watchdog(
@@ -96,8 +94,8 @@ class TestHealthWatchdogUnhealthyEndpoint:
 
         assert result is False
 
-    def test_exceeds_threshold_removes_ingress(self, monitor):
-        """Endpoints unready beyond the threshold should have their Ingress removed."""
+    def test_exceeds_threshold_reports_degraded_without_ingress_mutation(self, monitor):
+        """A prolonged outage reports degraded but does not mutate ALB rules."""
         monitor._unready_since["my-llm"] = datetime.now(UTC) - timedelta(minutes=10)
         monitor.networking_v1.delete_namespaced_ingress = MagicMock()
 
@@ -106,25 +104,25 @@ class TestHealthWatchdogUnhealthyEndpoint:
         )
 
         assert result is True
-        monitor.networking_v1.delete_namespaced_ingress.assert_called_once_with(
-            "inference-my-llm", "gco-inference", _request_timeout=monitor._k8s_timeout
-        )
+        monitor.networking_v1.delete_namespaced_ingress.assert_not_called()
 
-    def test_ingress_already_deleted_is_handled(self, monitor):
-        """If the Ingress is already gone, the watchdog should handle 404 gracefully."""
+    def test_repeated_checks_after_threshold_remain_degraded(self, monitor):
+        """A prolonged outage remains degraded until a replica recovers."""
         monitor._unready_since["my-llm"] = datetime.now(UTC) - timedelta(minutes=10)
-        monitor.networking_v1.delete_namespaced_ingress = MagicMock(
-            side_effect=ApiException(status=404, reason="Not Found")
-        )
 
-        result = monitor._check_health_watchdog(
+        first = monitor._check_health_watchdog(
+            "my-llm", "gco-inference", ready_replicas=0, desired_replicas=1, spec={}, endpoint={}
+        )
+        second = monitor._check_health_watchdog(
             "my-llm", "gco-inference", ready_replicas=0, desired_replicas=1, spec={}, endpoint={}
         )
 
-        assert result is True  # Still returns True to skip _ensure_ingress
+        assert first is True
+        assert second is True
+        assert "my-llm" in monitor._unready_since
 
-    def test_delete_api_error_is_handled(self, monitor):
-        """API errors during Ingress deletion should be logged but not crash."""
+    def test_ingress_api_errors_are_irrelevant_to_watchdog(self, monitor):
+        """The watchdog never invokes the legacy Ingress deletion API."""
         monitor._unready_since["my-llm"] = datetime.now(UTC) - timedelta(minutes=10)
         monitor.networking_v1.delete_namespaced_ingress = MagicMock(
             side_effect=ApiException(status=500, reason="Internal Server Error")
@@ -134,25 +132,23 @@ class TestHealthWatchdogUnhealthyEndpoint:
             "my-llm", "gco-inference", ready_replicas=0, desired_replicas=1, spec={}, endpoint={}
         )
 
-        assert result is True  # Still returns True — don't re-create the Ingress
+        assert result is True
+        monitor.networking_v1.delete_namespaced_ingress.assert_not_called()
 
 
 class TestHealthWatchdogRecovery:
     """Tests for the recovery flow (endpoint becomes healthy again)."""
 
-    def test_recovery_after_ingress_removal(self, monitor):
-        """After Ingress removal, recovery should clear the tracker."""
-        # Simulate: was unready, Ingress was removed
+    def test_recovery_after_degraded_state(self, monitor):
+        """Recovery clears the tracked outage."""
         monitor._unready_since["my-llm"] = datetime.now(UTC) - timedelta(minutes=10)
 
-        # Now it's healthy again
         result = monitor._check_health_watchdog(
             "my-llm", "gco-inference", ready_replicas=1, desired_replicas=1, spec={}, endpoint={}
         )
 
         assert result is False
         assert "my-llm" not in monitor._unready_since
-        # _ensure_ingress will be called by the caller since result is False
 
 
 class TestHealthWatchdogConfiguration:
@@ -160,7 +156,7 @@ class TestHealthWatchdogConfiguration:
 
     def test_custom_threshold(self, monitor):
         """Custom threshold should be respected."""
-        monitor._ingress_removal_threshold = 60  # 1 minute
+        monitor._unhealthy_threshold_seconds = 60  # 1 minute
         monitor._unready_since["my-llm"] = datetime.now(UTC) - timedelta(seconds=90)
         monitor.networking_v1.delete_namespaced_ingress = MagicMock()
 
@@ -172,7 +168,7 @@ class TestHealthWatchdogConfiguration:
 
     def test_short_threshold_does_not_trigger_early(self, monitor):
         """Threshold should not trigger before the configured time."""
-        monitor._ingress_removal_threshold = 600  # 10 minutes
+        monitor._unhealthy_threshold_seconds = 600  # 10 minutes
         monitor._unready_since["my-llm"] = datetime.now(UTC) - timedelta(minutes=5)
 
         result = monitor._check_health_watchdog(
@@ -225,11 +221,10 @@ class TestHealthWatchdogMultipleEndpoints:
         assert "endpoint-b" not in monitor._unready_since
 
     def test_one_unhealthy_does_not_affect_others(self, monitor):
-        """Removing Ingress for one endpoint should not affect others."""
+        """One endpoint's degraded state does not affect another endpoint."""
         monitor._unready_since["endpoint-a"] = datetime.now(UTC) - timedelta(minutes=10)
         monitor.networking_v1.delete_namespaced_ingress = MagicMock()
 
-        # Remove Ingress for A
         result_a = monitor._check_health_watchdog(
             "endpoint-a",
             "gco-inference",
@@ -250,7 +245,4 @@ class TestHealthWatchdogMultipleEndpoints:
 
         assert result_a is True
         assert result_b is False
-        # Only A's Ingress should be deleted
-        monitor.networking_v1.delete_namespaced_ingress.assert_called_once_with(
-            "inference-endpoint-a", "gco-inference", _request_timeout=monitor._k8s_timeout
-        )
+        monitor.networking_v1.delete_namespaced_ingress.assert_not_called()

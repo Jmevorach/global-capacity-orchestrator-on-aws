@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
         <title>Secrets Manager Rotation Lambda</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -16,7 +17,7 @@
                 var btn = document.getElementById("run"),
                     cd = document.getElementById("code"),
                     chart;
-                    
+
                 (btn.onclick = function () {
                     var code = cd.value;
 
@@ -115,14 +116,14 @@
                     // output download link for base64 PNG converted on download from base64
                     var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
                     document.getElementById("pngbase64").innerHTML=pngOutHtml;
-                    });    
+                    });
                     // output download link for base64 SVG converted on download from base64
                     var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
                         document.getElementById("svgbase64").innerHTML=svgOutHtml;
                     })();
 
                             };
-                 
+
 
 // derived from https://stackoverflow.com/a/64800570
 // we need to use web browser canvas to generate a image. In this case png
@@ -190,7 +191,7 @@ function base64ToSvgDocument(base64) {
     svg = svg.substring(svg.indexOf('<svg'));
     let parser = new DOMParser();
     return parser.parseFromString(svg, "image/svg+xml");
-} 
+}
         </script>
 
         <script>
@@ -205,36 +206,36 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op629=>operation: '\n    Handle Secrets Manager rotation request.\n\n    Args:\n        event: Rotation event with Step, SecretId, ClientRequestToken\n        context: Lambda context (unused)\n\n    Raises:\n        ValueError: If the rotation step is invalid\n    '
-op631=>operation: secret_id = event['SecretId']
-op633=>operation: token = event['ClientRequestToken']
-op635=>operation: step = event['Step']
-sub637=>subroutine: logger.info(f"Rotation step '{step}' for secret {secret_id}")
-op639=>operation: client = boto3.client('secretsmanager')
-cond642=>condition: if step == 'createSecret'
-sub646=>subroutine: create_secret(client, secret_id, token)
-cond651=>condition: if step == 'setSecret'
-sub655=>subroutine: set_secret(client, secret_id, token)
-cond660=>condition: if step == 'testSecret'
-sub664=>subroutine: test_secret(client, secret_id, token)
-cond669=>condition: if step == 'finishSecret'
-sub673=>subroutine: finish_secret(client, secret_id, token)
-sub677=>subroutine: raise ValueError(f'Invalid rotation step: {step}')
+        <div><textarea id="code" style="width: 100%;" rows="11">op707=>operation: '\n    Handle Secrets Manager rotation request.\n\n    Args:\n        event: Rotation event with Step, SecretId, ClientRequestToken\n        context: Lambda context (unused)\n\n    Raises:\n        ValueError: If the rotation step is invalid\n    '
+op709=>operation: secret_id = event['SecretId']
+op711=>operation: token = event['ClientRequestToken']
+op713=>operation: step = event['Step']
+sub715=>subroutine: logger.info(f"Rotation step '{step}' for secret {secret_id}")
+op717=>operation: client = boto3.client('secretsmanager')
+cond720=>condition: if step == 'createSecret'
+sub724=>subroutine: create_secret(client, secret_id, token)
+cond729=>condition: if step == 'setSecret'
+sub733=>subroutine: set_secret(client, secret_id, token)
+cond738=>condition: if step == 'testSecret'
+sub742=>subroutine: test_secret(client, secret_id, token)
+cond747=>condition: if step == 'finishSecret'
+sub751=>subroutine: finish_secret(client, secret_id, token)
+sub755=>subroutine: raise ValueError(f'Invalid rotation step: {step}')
 
-op629->op631
-op631->op633
-op633->op635
-op635->sub637
-sub637->op639
-op639->cond642
-cond642(yes)->sub646
-cond642(no)->cond651
-cond651(yes)->sub655
-cond651(no)->cond660
-cond660(yes)->sub664
-cond660(no)->cond669
-cond669(yes)->sub673
-cond669(no)->sub677
+op707->op709
+op709->op711
+op711->op713
+op713->sub715
+sub715->op717
+op717->cond720
+cond720(yes)->sub724
+cond720(no)->cond729
+cond729(yes)->sub733
+cond729(no)->cond738
+cond738(yes)->sub742
+cond738(no)->cond747
+cond747(yes)->sub751
+cond747(no)->sub755
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -244,6 +245,12 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <div id="canvas"></div>
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
     </body>
 </html>

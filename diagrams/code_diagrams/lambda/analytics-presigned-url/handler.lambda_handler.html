@@ -2,6 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-07-18T01:03:40Z">
         <title>Analytics Presigned-URL Lambda (SageMaker Studio login)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -16,7 +17,7 @@
                 var btn = document.getElementById("run"),
                     cd = document.getElementById("code"),
                     chart;
-                    
+
                 (btn.onclick = function () {
                     var code = cd.value;
 
@@ -115,14 +116,14 @@
                     // output download link for base64 PNG converted on download from base64
                     var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
                     document.getElementById("pngbase64").innerHTML=pngOutHtml;
-                    });    
+                    });
                     // output download link for base64 SVG converted on download from base64
                     var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
                         document.getElementById("svgbase64").innerHTML=svgOutHtml;
                     })();
 
                             };
-                 
+
 
 // derived from https://stackoverflow.com/a/64800570
 // we need to use web browser canvas to generate a image. In this case png
@@ -190,7 +191,7 @@ function base64ToSvgDocument(base64) {
     svg = svg.substring(svg.indexOf('<svg'));
     let parser = new DOMParser();
     return parser.parseFromString(svg, "image/svg+xml");
-} 
+}
         </script>
 
         <script>
@@ -205,8 +206,8 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op97=>operation: 'Exchange a Cognito-authorized event for a presigned Studio URL.\n\n    Returns:\n\n    * **HTTP 200** with ``{"url": "...", "expires_in": N}`` when the\n      user profile is ``InService`` and the presigned URL is ready.\n    * **HTTP 202** with ``{"status": "provisioning"}`` when the user\n      profile is still being created.  The CLI should retry after a\n      few seconds.\n    * **HTTP 4xx / 5xx** with ``{"error": "<token>"}`` on failure.\n\n    The Lambda never blocks waiting for profile provisioning.  The CLI\n    is responsible for polling until it receives HTTP 200.\n    '
-op100=>operation: claims = _parse_claims(event)
+        <div><textarea id="code" style="width: 100%;" rows="11">op103=>operation: 'Exchange a Cognito-authorized event for a presigned Studio URL.\n\n    Returns:\n\n    * **HTTP 200** with ``{"url": "...", "expires_in": N}`` when the\n      user profile is ``InService`` and the presigned URL is ready.\n    * **HTTP 202** with ``{"status": "provisioning"}`` when the user\n      profile is still being created.  The CLI should retry after a\n      few seconds.\n    * **HTTP 4xx / 5xx** with ``{"error": "<token>"}`` on failure.\n\n    The Lambda never blocks waiting for profile provisioning.  The CLI\n    is responsible for polling until it receives HTTP 200.\n    '
+op106=>operation: claims = _parse_claims(event)
 username = claims.get('cognito:username') or claims.get('username')
 if not isinstance(username, str) or not username:
     logger.warning('Request missing Cognito username claim')
@@ -222,18 +223,18 @@ _ensure_access_point(username, STUDIO_EFS_ID)
 response = sagemaker.create_presigned_domain_url(DomainId=domain_id, UserProfileName=username, SessionExpirationDurationInSeconds=SESSION_EXPIRES_SECONDS, ExpiresInSeconds=URL_EXPIRES_SECONDS)
 url = response.get('AuthorizedUrl', '')
 return _format_success(url, URL_EXPIRES_SECONDS)
-cond99=>condition: exception raised?
-cond102=>condition: except Exception as exc
-sub106=>subroutine: logger.error('Presigned URL generation failed: %s', exc, exc_info=True)
-io111=>inputoutput: output: _format_error(500, _ERR_GENERIC)
-e109=>end: end function return
+cond105=>condition: exception raised?
+cond108=>condition: except Exception as exc
+sub112=>subroutine: logger.error('Presigned URL generation failed: %s', exc, exc_info=True)
+io117=>inputoutput: output: _format_error(500, _ERR_GENERIC)
+e115=>end: end function return
 
-op97->op100
-op100->cond99
-cond99(yes)->cond102
-cond102(yes)->sub106
-sub106->io111
-io111->e109
+op103->op106
+op106->cond105
+cond105(yes)->cond108
+cond108(yes)->sub112
+sub112->io117
+io117->e115
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -243,6 +244,12 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <div id="canvas"></div>
+        <!-- Generated at (UTC): 2026-07-18T01:03:40Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-07-18T01:03:40Z">2026-07-18T01:03:40Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
     </body>
 </html>

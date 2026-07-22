@@ -15,7 +15,20 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies: [types-requests, types-PyYAML]
-        args: [--ignore-missing-imports, --no-error-summary]
+        # The mirror environment intentionally installs only typing helpers,
+        # not the full runtime graph. Keep substantive strict checks here but
+        # leave decorator/base typing to CI, which installs the real packages.
+        args:
+          [
+            --ignore-missing-imports,
+            --no-error-summary,
+            --allow-untyped-decorators,
+            --allow-subclassing-any,
+            gco/config,
+            gco/models,
+            gco/services,
+            cli,
+          ]
         # gco/stacks/ excluded here because CDK type stubs aren't installed in pre-commit.
         # Stacks are type-checked in CI via the lint:typecheck-stacks job.
         files: ^(gco/(config|models|services)/|cli/)
@@ -32,6 +45,6 @@ repos:
     hooks:
       # Configuration (rule set, globs, ignores) lives in
       # .github/config/.markdownlint-cli2.yaml. See CONTRIBUTING.md for
-      # how to run the same check locally via `npx markdownlint-cli2`.
+      # how to install the locked root graph and run `npm run lint:markdown`.
       - id: markdownlint-cli2
         args: ["--config", ".github/config/.markdownlint-cli2.yaml"]

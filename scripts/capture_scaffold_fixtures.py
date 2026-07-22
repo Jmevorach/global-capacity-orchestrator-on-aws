@@ -16,19 +16,23 @@ Usage:
     # Capture every default model against every canonical directive
     # (writes one JSON file per model under
     # tests/fixtures/scaffold_responses/).
-    python scripts/capture_scaffold_fixtures.py
+    python3 scripts/capture_scaffold_fixtures.py
 
     # Capture a single model.
-    python scripts/capture_scaffold_fixtures.py --model us.amazon.nova-pro-v1:0
+    python3 scripts/capture_scaffold_fixtures.py --model MODEL_ID
 
     # Use a different region.
-    python scripts/capture_scaffold_fixtures.py --region us-west-2
+    python3 scripts/capture_scaffold_fixtures.py --region us-west-2
 
 The script needs AWS credentials with ``bedrock:InvokeModel`` access
-to the listed models. Failures (missing model access, transient
-ClientError) are reported per-model and never abort the run — every
-model that does succeed lands in the fixture directory and protects
-the validator path on every CI run thereafter.
+to the listed models. The configured default also consumes
+``cdk.json`` ``context.bedrock.thinking``. With the stock Nova 2 Lite
+``high`` effort setting, each capture can use substantially more billed
+output tokens and take longer; AWS requires maxTokens, temperature, and
+topP to remain unset in that mode. Failures (missing model access,
+transient ClientError) are reported per-model and never abort the run —
+every model that does succeed lands in the fixture directory and
+protects the validator path on every CI run thereafter.
 """
 
 from __future__ import annotations
@@ -46,7 +50,9 @@ from typing import Any, cast
 # Mirror the path-injection pattern used throughout the Mission tree
 # so ``mission.*`` resolves regardless of how the script is launched.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT / "gco_mcp"))
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "gco_mcp")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import mission.criteria_scaffold as criteria_scaffold  # noqa: E402
 from mission.sampling import (  # noqa: E402
@@ -54,6 +60,8 @@ from mission.sampling import (  # noqa: E402
     SamplingPrompt,
     SamplingTransportError,
 )
+
+from gco.bedrock import get_default_bedrock_model_id  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -108,7 +116,7 @@ _DIRECTIVES: tuple[_Directive, ...] = (
 # so the replay test stays representative of the long tail of
 # Pythonic emission shapes. When a new family or size lands in
 # Bedrock, add it here and re-run the capture script.
-_DEFAULT_MODELS: tuple[str, ...] = (
+_CURATED_MODELS: tuple[str, ...] = (
     # Anthropic family — kept for cross-family diversity. NOTE: Anthropic
     # models require a one-time First-Time-Use (FTU) form per account/org
     # before first invoke, so they are NOT the GCO default.
@@ -117,9 +125,9 @@ _DEFAULT_MODELS: tuple[str, ...] = (
     "us.anthropic.claude-opus-4-5-20251101-v1:0",
     "us.anthropic.claude-3-5-haiku-20241022-v1:0",
     "us.anthropic.claude-3-haiku-20240307-v1:0",
-    # Amazon Nova family — first-party, no FTU form; nova-pro is the GCO
-    # default (DEFAULT_BEDROCK_MODEL_ID). Every visible CRIS profile.
-    "us.amazon.nova-premier-v1:0",
+    # Amazon Nova family — first-party, no FTU form. The configured GCO
+    # default is prepended lazily by ``_default_models`` and deduplicated from
+    # this curated set before any paid calls are made.
     "us.amazon.nova-pro-v1:0",
     "us.amazon.nova-lite-v1:0",
     "us.amazon.nova-micro-v1:0",
@@ -135,6 +143,11 @@ _DEFAULT_MODELS: tuple[str, ...] = (
     # DeepSeek family.
     "us.deepseek.r1-v1:0",
 )
+
+
+def _default_models() -> tuple[str, ...]:
+    """Return the configured default plus the curated set, in stable order."""
+    return tuple(dict.fromkeys((get_default_bedrock_model_id(), *_CURATED_MODELS)))
 
 
 _FIXTURE_DIR = _REPO_ROOT / "tests" / "fixtures" / "scaffold_responses"
@@ -183,6 +196,13 @@ class _PromptAdapter:
         return self._text
 
 
+def _backend_for_capture(model_id: str, region: str) -> BedrockSamplingBackend:
+    """Preserve canonical-policy provenance while keeping overrides explicit."""
+    if model_id == get_default_bedrock_model_id():
+        return BedrockSamplingBackend.from_canonical_default(region=region)
+    return BedrockSamplingBackend(model_id=model_id, region=region)
+
+
 async def _capture_one(
     backend: BedrockSamplingBackend,
     directive: _Directive,
@@ -224,7 +244,7 @@ async def _capture_model(
     or not at all — an incomplete fixture would silently weaken the
     replay test.
     """
-    backend = BedrockSamplingBackend(model_id=model_id, region=region)
+    backend = _backend_for_capture(model_id, region)
     captures: dict[str, dict[str, Any]] = {}
     for directive in _DIRECTIVES:
         try:
@@ -289,7 +309,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _main_async(args: argparse.Namespace) -> int:
-    models = tuple(args.models) if args.models else _DEFAULT_MODELS
+    requested_models = tuple(args.models) if args.models else _default_models()
+    # Repeated --model values and overlap between the configured default and
+    # curated set must never duplicate paid Bedrock calls or fixture writes.
+    models = tuple(dict.fromkeys(requested_models))
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     successes = 0
