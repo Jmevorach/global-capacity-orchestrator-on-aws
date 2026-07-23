@@ -282,8 +282,8 @@ GCO uses multiple security layers:
 ┌─────────────────────────▼───────────────────────────────┐
 │ Layer 3: Authenticated Backend TLS                      │
 │ - Private-root TLS with explicit SNI/hostname checks    │
-│ - Global Accelerator passes TCP/443 in `aws`; regional │
-│   VPC proxies connect directly in other partitions     │
+│ - Global Accelerator passes TCP/443 in `aws`; regional  │
+│   VPC proxies connect directly in other partitions      │
 └─────────────────────────────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────┐
