@@ -1344,6 +1344,12 @@ class TestHelmChartConsistency:
         conflicts = {
             ns: names for ns, names in conflicts.items() if not all("slinky" in n for n in names)
         }
+        # OpenCost deliberately co-locates with kube-prometheus-stack in the
+        # monitoring namespace (it reads that Prometheus, and the shared
+        # namespace keeps the ServiceMonitor + tunnel wiring simple). Pin the
+        # exact pair so any third chart landing in `monitoring` still fails.
+        if sorted(conflicts.get("monitoring", [])) == ["kube-prometheus-stack", "opencost"]:
+            del conflicts["monitoring"]
         assert not conflicts, f"Charts sharing unexpected namespaces: {conflicts}"
 
     def test_image_tags_in_values_are_semver(self):
@@ -1386,10 +1392,12 @@ class TestHelmChartConsistency:
 
         source_urls = re.findall(r"#\s+-\s+\w.*?:\s+(https?://\S+)", content)
 
-        # Every enabled chart should have a corresponding version check source URL
-        enabled_charts = [name for name, cfg in charts.items() if cfg.get("enabled")]
+        # Every chart should have a corresponding version check source URL.
+        # Disabled-by-default charts (e.g. opencost, slurm) are included: the
+        # monthly dependency scan enumerates charts.yaml without consulting
+        # the enabled flag, so the human-facing header must keep pace.
         missing_sources = []
-        for chart_name in enabled_charts:
+        for chart_name in charts:
             # Check if any source URL is plausibly related to this chart
             chart_words = chart_name.lower().replace("-", " ").replace("_", " ").split()
             found = any(any(word in url.lower() for word in chart_words) for url in source_urls)

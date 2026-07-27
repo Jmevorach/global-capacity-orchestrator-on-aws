@@ -25,14 +25,21 @@ Usage:
     python3 scripts/capture_scaffold_fixtures.py --region us-west-2
 
 The script needs AWS credentials with ``bedrock:InvokeModel`` access
-to the listed models. The configured default also consumes
-``cdk.json`` ``context.bedrock.thinking``. With the stock Nova 2 Lite
-``high`` effort setting, each capture can use substantially more billed
-output tokens and take longer; AWS requires maxTokens, temperature, and
-topP to remain unset in that mode. Failures (missing model access,
-transient ClientError) are reported per-model and never abort the run —
-every model that does succeed lands in the fixture directory and
-protects the validator path on every CI run thereafter.
+to the listed models. Anthropic models — including the stock default —
+additionally require the one-time Anthropic first-time-use case form on
+the account; without it Bedrock answers ``FTUFormNotFilled`` and the
+capture for that model fails with that code (see
+``docs/CUSTOMIZATION.md``, Bedrock Model Selection).
+
+The configured default also consumes ``cdk.json``
+``context.bedrock.thinking``. At the stock ``high`` effort each capture
+can use substantially more billed output tokens and take longer;
+Claude models from Opus 4.7 onward additionally reject ``temperature``,
+``topP``, and ``topK``, which GCO omits for the canonical default.
+Failures (missing model access, transient ClientError) are reported
+per-model and never abort the run — every model that does succeed lands
+in the fixture directory and protects the validator path on every CI run
+thereafter.
 """
 
 from __future__ import annotations
@@ -61,7 +68,10 @@ from mission.sampling import (  # noqa: E402
     SamplingTransportError,
 )
 
-from gco.bedrock import get_default_bedrock_model_id  # noqa: E402
+from gco.bedrock import (  # noqa: E402
+    BedrockFTUFormNotAcceptedError,
+    get_default_bedrock_model_id,
+)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -117,9 +127,10 @@ _DIRECTIVES: tuple[_Directive, ...] = (
 # Pythonic emission shapes. When a new family or size lands in
 # Bedrock, add it here and re-run the capture script.
 _CURATED_MODELS: tuple[str, ...] = (
-    # Anthropic family — kept for cross-family diversity. NOTE: Anthropic
-    # models require a one-time First-Time-Use (FTU) form per account/org
-    # before first invoke, so they are NOT the GCO default.
+    # Anthropic family — also the family the configured default belongs to.
+    # NOTE: Anthropic models require a one-time First-Time-Use (FTU) form per
+    # account/org before the first invoke; capture fails with
+    # ``FTUFormNotFilled`` until it is submitted.
     "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     "us.anthropic.claude-opus-4-5-20251101-v1:0",
@@ -127,7 +138,8 @@ _CURATED_MODELS: tuple[str, ...] = (
     "us.anthropic.claude-3-haiku-20240307-v1:0",
     # Amazon Nova family — first-party, no FTU form. The configured GCO
     # default is prepended lazily by ``_default_models`` and deduplicated from
-    # this curated set before any paid calls are made.
+    # this curated set before any paid calls are made, whichever family it
+    # belongs to.
     "us.amazon.nova-pro-v1:0",
     "us.amazon.nova-lite-v1:0",
     "us.amazon.nova-micro-v1:0",
@@ -249,6 +261,11 @@ async def _capture_model(
     for directive in _DIRECTIVES:
         try:
             captures[directive.slug] = await _capture_one(backend, directive)
+        except BedrockFTUFormNotAcceptedError:
+            # Account-wide gate, not a per-model failure: every Anthropic model
+            # in the run would fail identically, so abort with the remediation
+            # instead of repeating it once per model.
+            raise
         except SamplingTransportError as exc:
             print(
                 f"[{model_id}] capture failed for {directive.slug!r}: {exc.code}: {exc}",
@@ -318,7 +335,14 @@ async def _main_async(args: argparse.Namespace) -> int:
     successes = 0
     failures = 0
     for model_id in models:
-        ok = await _capture_model(model_id, args.region, args.output_dir)
+        try:
+            ok = await _capture_model(model_id, args.region, args.output_dir)
+        except BedrockFTUFormNotAcceptedError as exc:
+            # Account-wide prerequisite: stop rather than walking the rest of
+            # the Anthropic models to collect identical failures.
+            print(f"\n{exc}", file=sys.stderr)
+            print(f"Captured {successes} model(s) before aborting.", file=sys.stderr)
+            return 1
         if ok:
             successes += 1
         else:

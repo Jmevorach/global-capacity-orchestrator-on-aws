@@ -2,11 +2,11 @@
 
 In-cluster observability installs a self-hosted
 [`kube-prometheus-stack`](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack)
-(Prometheus + Alertmanager + Grafana + `kube-state-metrics` + `node-exporter` +
+([Prometheus](https://prometheus.io/docs/introduction/overview/) + Alertmanager + [Grafana](https://grafana.com/docs/grafana/latest/) + `kube-state-metrics` + `node-exporter` +
 the Prometheus Operator) on **every regional EKS cluster**, through the existing
 Helm-installer pipeline. It answers "what is happening **inside** this cluster
 right now" at Prometheus resolution — per-GPU DCGM series, scheduler queue depth,
-KEDA scaler lag, and per-pod GCO service metrics.
+[KEDA](https://keda.sh/) scaler lag, and per-pod GCO service metrics.
 
 Unlike most optional features, cluster observability is **on by default**. A
 stock deployment installs it in each region; operators opt out with
@@ -74,14 +74,19 @@ Per regional cluster, when enabled:
 - The `kube-prometheus-stack` chart in the `monitoring` namespace (Prometheus,
   Alertmanager, Grafana, `kube-state-metrics`, `node-exporter`, operator).
 - A gated `gco-observability-gp3` StorageClass backing the persistent volumes.
-- `ServiceMonitor`s for the schedulers/operators (KEDA, Volcano, Kueue, KubeRay,
-  YuniKorn) and the DCGM GPU exporter, plus `PodMonitor`s for the GCO services
+- `ServiceMonitor`s for the schedulers/operators (KEDA, [Volcano](https://volcano.sh/), [Kueue](https://kueue.sigs.k8s.io/), [KubeRay](https://docs.ray.io/en/latest/cluster/kubernetes/index.html),
+  [YuniKorn](https://yunikorn.apache.org/)) and the DCGM GPU exporter, plus `PodMonitor`s for the GCO services
   (health-monitor, manifest-processor, inference-monitor), which expose
   Prometheus `/metrics`.
 - A standalone DCGM exporter DaemonSet on GPU nodes for per-GPU metrics.
 - Curated Grafana dashboards (see [below](#curated-dashboards)).
 - A credential-rotation CronJob (see
   [Admin credential rotation](#admin-credential-rotation)).
+- When cost monitoring is enabled (the default), an
+  [OpenCost](https://opencost.io/) release in the same `monitoring` namespace
+  that reads this Prometheus and powers the *GCO Cost (OpenCost)* dashboard
+  plus the cost report pipeline — see
+  [COST_MONITORING.md](COST_MONITORING.md).
 
 Grafana uses **Grafana-native authentication** (its own user database) with self
 sign-up and anonymous access disabled. All three UIs (Grafana, Prometheus,
@@ -206,12 +211,19 @@ kube-prometheus-stack cluster/node/pod dashboards:
 - **GCO Services** — request rate and p95 latency per GCO service, plus inference
   monitor reconcile/error counts.
 
+With cost monitoring enabled (the default) a fifth dashboard, **GCO Cost
+(OpenCost)**, is imported the same way; open it directly with
+`gco costs dashboard` (see [COST_MONITORING.md](COST_MONITORING.md#accessing-the-cost-dashboards)).
+
 ## Dashboard screenshots
 
 The four curated dashboards, captured from a live regional cluster. The cluster
 was largely idle with no GPU nodes, so these are intentionally light on data —
 GPU panels honestly show "No data" and the others show modest control-plane
-activity. They demonstrate the panels and layout you get out of the box.
+activity. They demonstrate the panels and layout you get out of the box. The
+cost surfaces — the *GCO Cost (OpenCost)* Grafana dashboard and the native
+OpenCost UI — are shown in
+[COST_MONITORING.md](COST_MONITORING.md#accessing-the-cost-dashboards).
 
 ### GCO GPU (DCGM)
 
@@ -241,7 +253,7 @@ reconcile/error counts.
 
 These images are regenerated on demand after a dashboard change. Grafana is
 private, so first port-forward it — `gco monitoring open` can auto-provision a
-self-terminating ephemeral bastion (`--via-ssm auto`) — then run the Playwright
+self-terminating ephemeral bastion (`--via-ssm auto`) — then run the [Playwright](https://playwright.dev/python/docs/intro)
 capture script:
 
 ```bash
@@ -251,5 +263,10 @@ python scripts/capture_monitoring_screenshots.py \
     --username admin --password "$GCO_GRAFANA_ADMIN_PASSWORD"
 ```
 
-The four PNGs above are written to the repo's [`images/`](../images/) directory
-(one per curated dashboard) by the capture script.
+The capture script writes one PNG per curated dashboard (including
+`grafana-cost.png`, embedded in
+[COST_MONITORING.md](COST_MONITORING.md#accessing-the-cost-dashboards)) to the
+repo's [`images/`](../images/) directory; pass
+`--opencost-url http://localhost:9091` (with an
+`gco monitoring open --service opencost` tunnel up) to also capture the native
+OpenCost UI as `opencost-ui.png`.

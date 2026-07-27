@@ -38,7 +38,7 @@ review decisions.
 | Monthly | Review the dependency-scan issue, including accelerator catalog and NodePool findings | Automated `deps-scan` issue |
 | When EC2 accelerator drift appears | Review family policy, refresh the catalog, and update eligible NodePools/watch lists together | `deps-scan` **Accelerator Catalog and NodePools** row or AWS launch announcement |
 | When the scan flags EKS standard-support ending (or ~yearly) | Upgrade the EKS Kubernetes minor | `deps-scan` **EKS Kubernetes Version** row |
-| When the scan flags an epoch older than 45 days (or Trivy finds an OS CVE) | Bump the base-image security epoch | `deps-scan` **Base-image Security Epochs** row |
+| When the scan flags an epoch older than 45 days (or [Trivy](https://trivy.dev/) finds an OS CVE) | Bump the base-image security epoch | `deps-scan` **Base-image Security Epochs** row |
 | ~30 days before a suppression `exp:` date | Renew or drop the CVE suppression | `deps-scan` **Suppression Expiries** row |
 | When the scan flags a newer same-family model | Bump the Bedrock default model pin | `deps-scan` **Bedrock default model** row |
 | Weekly | Check the `cve-scan` result and act on new findings | Monday `cve-scan` run |
@@ -54,7 +54,7 @@ GCO separates three concerns that must not be conflated:
    advertises in any enabled commercial Region.
 2. **Observation** — which types the capacity-history poller watches, including
    types retained for historical visibility.
-3. **Scheduling policy** — which reviewed families each Karpenter NodePool may
+3. **Scheduling policy** — which reviewed families each [Karpenter](https://karpenter.sh/) NodePool may
    select for new workloads.
 
 The checked-in catalog makes the first two concerns complete and deterministic;
@@ -136,7 +136,7 @@ drift, and `2` means the online check itself failed.
    `reason`, and `replacements` when the default active/allowed policy is not
    correct.
 3. Decide which NodePools, if any, should schedule the family. Check CPU
-   architecture, accelerator class, EFA/RDMA requirements, memory and FP8
+   architecture, accelerator class, [EFA](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html)/RDMA requirements, memory and FP8
    capability, workload fit, and regional support. Deprecated and end-of-life
    families must not enter new scheduling.
 4. Refresh to a review file first. The command refuses unknown families and EC2
@@ -309,7 +309,7 @@ To act on it:
 5. Run the affected checks and open a PR; CI independently audits both npm
    graphs and rejects lock, runtime, or dependency-management drift.
 
-Python dependencies are intentionally not tracked by Dependabot — they are
+Python dependencies are intentionally not tracked by [Dependabot](https://docs.github.com/en/code-security/dependabot) — they are
 pinned through `requirements-lock.txt` with `pip-compile` and reviewed
 deliberately. GitHub Actions, Docker base images, and both repository-owned npm
 graphs *are* tracked by Dependabot; see
@@ -319,31 +319,49 @@ graphs *are* tracked by Dependabot; see
 
 GCO's two optional, advisory Bedrock features — Mission sampling (`gco mission
 ...`) and the capacity advisor (`gco capacity ai-recommend` / `predict` and the
-`ai_recommend` MCP tool) — default to **Amazon Nova 2 Lite** through its global
-cross-Region inference profile (`global.amazon.nova-2-lite-v1:0`). The model id
-and reasoning preference have one checked-in source: `cdk.json`
-`context.bedrock`, whose stock `thinking.effort` is `high` (Nova 2 Lite's maximum
-supported effort). Mission sampling and the capacity advisor resolve both
+`ai_recommend` MCP tool) — default to **Anthropic Claude Opus 5** through its
+global cross-Region inference profile (`global.anthropic.claude-opus-5`). The
+model id and reasoning preference have one checked-in source: `cdk.json`
+`context.bedrock`, whose stock `thinking.effort` is `high` (Claude's default
+adaptive-thinking level). Mission sampling and the capacity advisor resolve both
 values through the lightweight `gco.bedrock` module; the same file is shipped
 as package data for installed CLI/MCP use. The consistency test guards the
 compatibility aliases, reasoning translation, packaging, inference-profile
 shape, and captured default-model fixture.
 
-High reasoning maps to Converse
-`additionalModelRequestFields.reasoningConfig.maxReasoningEffort=high`. AWS
-requires `maxTokens`, `temperature`, and `topP` to be unset at this effort, so
-GCO omits those controls for the canonical default. Reasoning tokens are billed
-as output tokens and high effort can materially increase cost and latency.
-Explicit model overrides keep their existing inference controls and do not
-inherit Nova-specific reasoning fields.
+Because it is an Anthropic model, the default additionally requires the one-time
+[Anthropic first-time-use form](CUSTOMIZATION.md#accepting-the-anthropic-first-time-use-form)
+on the account. Bedrock answers `FTUFormNotFilled` until it is submitted. GCO
+raises `BedrockFTUFormNotAcceptedError` for that code rather than degrading to a
+deterministic fallback, so a missing form surfaces as an actionable error on
+every path that reaches Bedrock.
+
+`gco.bedrock` translates the canonical effort into whichever reasoning dialect
+the default model speaks:
+
+| Default model family | Converse fields | Inference controls dropped |
+|----------------------|-----------------|-----------------------------|
+| Claude adaptive thinking (Opus 4.6+, Sonnet 4.6, Mythos/Fable) | `thinking.type=adaptive` + `output_config.effort` | `temperature`, `topP`, `topK` (removed from Opus 4.7 onward) |
+| Nova 2 | `reasoningConfig.maxReasoningEffort` | `maxTokens`, `temperature`, `topP` — at `high` effort only |
+
+The adaptive-thinking model list is enumerated in `gco/bedrock.py` rather than
+pattern-matched, because pre-4.6 Claude models reject `adaptive` and need the
+legacy `enabled` + `budget_tokens` form; an unlisted default therefore receives
+no reasoning fields rather than a guessed request shape. Reasoning tokens are
+billed as output tokens and high effort can materially increase cost and
+latency. Explicit model overrides keep their existing inference controls and do
+not inherit the default's reasoning fields.
 
 Because it is a deployment configuration value — not a `pyproject.toml` entry,
 a Dockerfile `FROM`, or a manifest image — Dependabot never sees it. The monthly
 [`deps-scan`](../.github/CI.md#dependency-scan-script) closes that gap: its
 **Bedrock default model** check reads the `cdk.json` context value, lists the
 system-defined inference profiles in `us-east-1`, and flags a newer release **in
-the same model family** — a future global Nova Lite generation, never a jump to
-a different scope, tier, or provider (that is a choice, not drift). The check needs AWS
+the same model family** — a future global Claude Opus release, never a jump to
+a different scope, tier, or provider (that is a choice, not drift). Family
+derivation tolerates all three revision shapes Bedrock ships
+(`-vMAJOR:MINOR`, a bare `-vMAJOR`, and no suffix at all), so one model line
+stays one family. The check needs AWS
 credentials via OIDC; without them the scan skips it with a noted reason, so a
 credential-less run is not a false "up to date".
 
@@ -355,8 +373,11 @@ deliberately):
    value is a system-defined **global inference profile**; global profiles can
    route worldwide and are unsuitable when a geography boundary is required.
    Use an appropriate geography-scoped profile (`us.` / `eu.` / `jp.` / etc.)
-   where data residency requires it. Update the intentionally independent
-   `_EXPECTED_DEFAULT_MODEL_ID`, `_EXPECTED_FIXTURE_NAME`, and thinking review
+   where data residency requires it. If the new model speaks a reasoning
+   dialect GCO does not yet translate, add it to the dialect dispatch in
+   `gco/bedrock.py` — otherwise the configured effort is silently inert. Update
+   the intentionally independent `_EXPECTED_DEFAULT_MODEL_ID`,
+   `_EXPECTED_FIXTURE_NAME`, and thinking review
    pins in `tests/test_default_bedrock_model_consistency.py`; those assertions
    are not runtime defaults, but they make model, fixture, and reasoning changes
    explicit in review.
@@ -369,7 +390,8 @@ deliberately):
    same `cdk.json` value.
 
 Picking a *different* model — for regulatory, data-residency, model-governance,
-or cost reasons — rather than tracking Nova Lite releases is an operator choice,
+or cost reasons, or to avoid the Anthropic FTU form — rather than tracking
+Claude Opus releases is an operator choice,
 not routine maintenance; the override paths (per-call flag,
 `GCO_MISSION_BEDROCK_MODEL_ID`, or changing the default) live in
 [Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). Both
@@ -480,7 +502,7 @@ for acting on a monthly drift report.
 
 | Layer | What runs | Cadence |
 |-------|-----------|---------|
-| `security.yml` | bandit, pip-audit, npm audit (every owned graph), Trivy (filesystem + per-image), semgrep, checkov, KICS, trufflehog, gitleaks, CodeQL (Python + JavaScript) | Every push + PR |
+| `security.yml` | bandit, pip-audit, npm audit (every owned graph), Trivy (filesystem + per-image), semgrep, checkov, KICS, trufflehog, gitleaks, [CodeQL](https://codeql.github.com/docs/) (Python + JavaScript) | Every push + PR |
 | `cve-scan.yml` | Trivy re-run against fresh CVE databases | Weekly (Mon 09:00 UTC) |
 | `deps-scan.yml` | Version drift across every pinned surface | Monthly |
 
@@ -516,7 +538,7 @@ rather than lowering the 90% floor.
   `mooncake_image`, `helm_online`, `asyncio`), and `addopts` includes
   `--strict-markers` so a typo'd marker fails instead of silently skipping.
 - Heavy tests are opt-in via env vars so the default run stays fast:
-  `GCO_MOONCAKE_IMAGE_TEST=1` (pulls the ~9 GB vLLM image) and
+  `GCO_MOONCAKE_IMAGE_TEST=1` (pulls the ~9 GB [vLLM](https://docs.vllm.ai/en/latest/) image) and
   `GCO_HELM_CHART_VALIDATION=1` (needs `helm` + network).
 - `tests/BATS/` — Bash tests for the shell scripts (`dependency-scan.sh`, the
   demo recorders, cluster-access setup), run by the `unit:bats:*` jobs.
@@ -641,7 +663,7 @@ monitoring region resolved in `app.py`) creates the observability surface:
 
 - **Dashboard** — one CloudWatch dashboard with per-region widgets for Global
   Accelerator, API Gateway, Lambda, SQS, DynamoDB, EKS, ALBs, the optional
-  FSx/Valkey/Aurora services, and custom application metrics.
+  FSx/[Valkey](https://valkey.io/)/Aurora services, and custom application metrics.
 - **Alarms** — metric and composite alarms for EKS CPU/memory, ALB unhealthy
   hosts, response time, manifest-processing failures, Lambda errors/throttles,
   SQS message age (stuck jobs), DynamoDB throttling, API Gateway 5XX, and
@@ -660,7 +682,7 @@ Shape is guarded by `tests/test_monitoring_stack.py` and
   `ClusterName`, `Region`) from `health_monitor.py` and `manifest_processor.py`.
 - **Health endpoints:** `gco/services/health_api.py` exposes `/healthz`
   (liveness), `/readyz` (readiness), `/api/v1/health` (detailed, 200/503), and
-  `/metrics` (Prometheus). These four are the only paths the auth middleware
+  `/metrics` ([Prometheus](https://prometheus.io/docs/introduction/overview/)). These four are the only paths the auth middleware
   leaves unauthenticated (`gco/services/auth_middleware.py`), so ALB and Global
   Accelerator health checks reach them without a token.
 

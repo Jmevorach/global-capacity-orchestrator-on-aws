@@ -18,6 +18,7 @@ from gco.bedrock import (
     build_bedrock_converse_options,
     extract_bedrock_converse_text,
     get_default_bedrock_model_id,
+    raise_if_bedrock_ftu_form_error,
 )
 
 from .checker import CapacityChecker
@@ -585,6 +586,9 @@ Respond ONLY with the JSON object, no additional text."""
 
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "")
+            # Raised as a distinct type (still a RuntimeError) so callers can
+            # tell a fixable account-setup gap from a transient Bedrock fault.
+            raise_if_bedrock_ftu_form_error(e)
             if error_code == "AccessDeniedException":
                 raise RuntimeError(
                     "Access denied to Bedrock. Ensure your IAM role has "

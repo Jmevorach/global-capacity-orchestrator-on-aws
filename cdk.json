@@ -38,9 +38,9 @@
       "Owner": "platform-team"
     },
 
-    "_comment_bedrock": "Shared defaults for optional advisory Bedrock features. Mission sampling and the capacity advisor both consume this system-defined global cross-Region inference-profile ID and its Nova 2 reasoning preference; explicit command/environment model overrides still take precedence and do not inherit Nova-specific thinking fields.",
+    "_comment_bedrock": "Shared defaults for optional advisory Bedrock features. Mission sampling and the capacity advisor both consume this system-defined global cross-Region inference-profile ID and its reasoning-effort preference; explicit command/environment model overrides still take precedence and do not inherit model-specific thinking fields. The stock Anthropic default requires the one-time Anthropic first-time-use case form per account (https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html); see docs/CUSTOMIZATION.md (Bedrock Model Selection).",
     "bedrock": {
-      "default_model_id": "global.amazon.nova-2-lite-v1:0",
+      "default_model_id": "global.anthropic.claude-opus-5",
       "thinking": {
         "effort": "high"
       }
@@ -305,6 +305,19 @@
       "alertmanager": {
         "enabled": true,
         "persistence_size": "5Gi"
+      }
+    },
+
+    "_comment_cost_monitoring": "Cost monitoring and cost analytics pipeline. enabled: master toggle, ON BY DEFAULT (requires cluster_observability.enabled — OpenCost reads usage data from the in-cluster Prometheus). When enabled: OpenCost is installed per region via the Helm installer with a Grafana cost dashboard; the monitoring stack provisions the cost report S3 bucket (Hive-partitioned Parquet under reports/region=<region>/date=<date>/), a Glue database/table, and an Athena workgroup for cross-region queries; and the cost-monitor service on each regional cluster writes scheduled allocation reports and serves ad-hoc reports through the GCO API (/api/v1/cost/*). reports.interval_minutes: scheduled report cadence. reports.retention_days: S3 expiration for report objects. reports.transition_to_infrequent_access_days: S3 STANDARD_IA transition (must be < retention_days). athena.query_results_retention_days: S3 expiration for Athena query results. See docs/COST_MONITORING.md.",
+    "cost_monitoring": {
+      "enabled": true,
+      "reports": {
+        "interval_minutes": 60,
+        "retention_days": 365,
+        "transition_to_infrequent_access_days": 90
+      },
+      "athena": {
+        "query_results_retention_days": 30
       }
     },
 

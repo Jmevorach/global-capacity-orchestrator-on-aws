@@ -79,7 +79,7 @@ aggregator uses it to reach that region's private VPC. In the commercial `aws`
 partition, the bridge's resource policy admits only the aggregator role by
 default, and `api_gateway.regional_api_enabled=true` additionally permits
 IAM-authorized principals from the deployment account. In other partitions,
-same-account direct access is enabled automatically because Global Accelerator
+same-account direct access is enabled automatically because [Global Accelerator](https://docs.aws.amazon.com/global-accelerator/latest/dg/what-is-global-accelerator.html)
 and its global proxy routes are omitted.
 
 When a command supplies an exact target region, the CLI automatically resolves
@@ -92,7 +92,7 @@ direct regional access. Outside `aws`, the deployment enables that same-account
 policy automatically. The global endpoint rejects `X-GCO-Target-Region` rather
 than silently pretending a region pin succeeded.
 
-Both API Gateway hops use AWS-managed TLS and SigV4. The regional VPC Lambda
+Both API Gateway hops use AWS-managed TLS and [SigV4](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv.html). The regional VPC Lambda
 then uses HMAC plus deployment-local private-root TLS to the internal ALB.
 
 ```bash
@@ -564,6 +564,10 @@ gco queue submit MANIFEST_PATH [OPTIONS]
 | `--namespace` | `-n` | Kubernetes namespace |
 | `--priority` | `-p` | Job priority (0-100, higher = more important) |
 | `--label` | `-l` | Add labels (key=value), can be repeated |
+| `--max-spot-price` | | Spot price cap in USD/hour; the job stays queued until the current spot price of `--spot-instance-type` in the target region drops to or below this value. Requires `--spot-instance-type` |
+| `--spot-instance-type` | | EC2 instance type whose spot price gates dispatch (e.g. `g5.xlarge`). Requires `--max-spot-price` |
+
+With the spot price gate set, the regional queue worker re-evaluates the instance type's lowest current spot price across the region's Availability Zones on every polling pass and only dispatches once it clears the cap. `gco queue get` shows the gate and the last observed price; the job waits indefinitely until the price clears or you cancel it with `gco queue cancel`. Price-gated jobs never block other queued work. See [docs/COST_MONITORING.md](COST_MONITORING.md#spot-price-aware-scheduling).
 
 **Example:**
 
@@ -571,6 +575,9 @@ gco queue submit MANIFEST_PATH [OPTIONS]
 gco queue submit job.yaml --region us-east-1
 gco queue submit job.yaml -r us-west-2 --priority 50
 gco queue submit job.yaml -r us-east-1 -l team=ml -l project=training
+
+# Cost-gated: dispatch only when g5.xlarge spot drops to <= $0.50/hour
+gco queue submit job.yaml -r us-east-1 --max-spot-price 0.50 --spot-instance-type g5.xlarge
 ```
 
 #### `gco queue list`
@@ -916,9 +923,9 @@ Manage CDK infrastructure stacks.
 | [`gco stacks destroy-all`](#gco-stacks-destroy-all) | Destroy all stacks in correct order. |
 | [`gco stacks bootstrap`](#gco-stacks-bootstrap) | Bootstrap CDK in a region. |
 | [`gco stacks access`](#gco-stacks-access) | Configure kubectl access to a GCO EKS cluster. |
-| [`gco stacks fsx`](#gco-stacks-fsx) | Manage FSx for Lustre storage. |
-| [`gco stacks valkey`](#gco-stacks-valkey) | Manage Valkey Serverless cache. |
-| [`gco stacks aurora`](#gco-stacks-aurora) | Manage Aurora PostgreSQL (pgvector) database. |
+| [`gco stacks fsx`](#gco-stacks-fsx) | Manage [FSx for Lustre](https://docs.aws.amazon.com/fsx/latest/LustreGuide/what-is.html) storage. |
+| [`gco stacks valkey`](#gco-stacks-valkey) | Manage [Valkey](https://valkey.io/) Serverless cache. |
+| [`gco stacks aurora`](#gco-stacks-aurora) | Manage Aurora PostgreSQL ([pgvector](https://github.com/pgvector/pgvector)) database. |
 | [`gco stacks synth`](#gco-stacks-synth) | Synthesize CloudFormation templates without deploying. |
 | [`gco stacks diff`](#gco-stacks-diff) | Show differences between deployed and local stacks. |
 | [`gco stacks outputs`](#gco-stacks-outputs) | Get CloudFormation outputs from a deployed stack (e.g. API URLs, ARNs, secret references that the stack exposes). |
@@ -1337,7 +1344,7 @@ gco costs summary --all
 You can also activate the `Environment` and `Owner` tags for more granular filtering in the AWS Cost Explorer console.
 
 <details>
-<summary>All <code>gco costs</code> commands (5) — click to expand</summary>
+<summary>All <code>gco costs</code> commands (15) — click to expand</summary>
 
 | Command | Description |
 | --- | --- |
@@ -1346,6 +1353,16 @@ You can also activate the `Environment` and `Owner` tags for more granular filte
 | [`gco costs trend`](#gco-costs-trend) | Show daily cost trend with a visual bar chart. |
 | [`gco costs workloads`](#gco-costs-workloads) | Estimate costs for currently running workloads (jobs and inference endpoints) based on instance pricing and runtime. |
 | [`gco costs forecast`](#gco-costs-forecast) | Forecast GCO costs for the next N days based on historical spending patterns. |
+| [`gco costs k8s`](#gco-costs-k8s) | Query Kubernetes allocation costs across regions via Athena ([OpenCost](https://opencost.io/) data). |
+| [`gco costs k8s namespaces`](#gco-costs-k8s-namespaces) | Show Kubernetes cost by namespace across all regions. |
+| [`gco costs k8s regions`](#gco-costs-k8s-regions) | Show Kubernetes allocation cost by deployment region. |
+| [`gco costs k8s trend`](#gco-costs-k8s-trend) | Show Kubernetes cost over time (daily or hourly buckets). |
+| [`gco costs k8s top`](#gco-costs-k8s-top) | Show the top-N spenders by namespace, region, or cluster. |
+| [`gco costs report`](#gco-costs-report) | Generate and list OpenCost allocation reports via the GCO API. |
+| [`gco costs report generate`](#gco-costs-report-generate) | Generate an ad-hoc cost report now. |
+| [`gco costs report list`](#gco-costs-report-list) | List recent cost report objects in the cost report bucket. |
+| [`gco costs report status`](#gco-costs-report-status) | Show cost monitoring health, including OpenCost status. |
+| [`gco costs dashboard`](#gco-costs-dashboard) | Open a regional cost dashboard ([Grafana](https://grafana.com/docs/grafana/latest/) or the OpenCost UI) over the private EKS endpoint. |
 
 </details>
 
@@ -1470,6 +1487,212 @@ gco costs forecast --days 60
 ```
 
 > **Note:** Cost Explorer needs at least 14 days of historical data to generate forecasts.
+
+#### `gco costs k8s`
+
+Query Kubernetes allocation costs across regions. These commands run [Amazon Athena](https://docs.aws.amazon.com/athena/latest/ug/what-is.html) aggregations over the [Parquet](https://parquet.apache.org/docs/) allocation reports the per-region cost-monitor services write to the central cost report bucket. Requires `cost_monitoring.enabled` in `cdk.json` (the default) and a deployed monitoring stack — see [docs/COST_MONITORING.md](COST_MONITORING.md).
+
+```bash
+gco costs k8s COMMAND [OPTIONS]
+```
+
+#### `gco costs k8s namespaces`
+
+Show Kubernetes cost by namespace across all regions, broken down into CPU, RAM, GPU, and persistent volume cost.
+
+```bash
+gco costs k8s namespaces [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--days` | `-d` | Days to look back (default: 7) |
+| `--region` | `-r` | Restrict to one deployment region |
+
+**Examples:**
+
+```bash
+gco costs k8s namespaces
+gco costs k8s namespaces --days 30
+gco costs k8s namespaces -r us-east-1
+```
+
+#### `gco costs k8s regions`
+
+Show Kubernetes allocation cost by deployment region.
+
+```bash
+gco costs k8s regions [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--days` | `-d` | Days to look back (default: 7) |
+
+**Examples:**
+
+```bash
+gco costs k8s regions
+gco costs k8s regions --days 30
+```
+
+#### `gco costs k8s trend`
+
+Show Kubernetes cost over time.
+
+```bash
+gco costs k8s trend [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--days` | `-d` | Days to look back (default: 14) |
+| `--granularity` | | Trend bucket size: `daily` (default) or `hourly` |
+| `--namespace` | `-n` | Restrict to one namespace |
+
+**Examples:**
+
+```bash
+gco costs k8s trend
+gco costs k8s trend --days 30 --granularity daily
+gco costs k8s trend -n gco-jobs --granularity hourly --days 2
+```
+
+#### `gco costs k8s top`
+
+Show the top-N spenders by namespace, region, or cluster.
+
+```bash
+gco costs k8s top [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--limit` | `-n` | Number of results (default: 10) |
+| `--by` | | Grouping dimension: `namespace` (default), `region`, or `cluster` |
+| `--days` | `-d` | Days to look back (default: 7) |
+
+**Examples:**
+
+```bash
+gco costs k8s top
+gco costs k8s top -n 5 --by region
+gco costs k8s top --by cluster --days 30
+```
+
+#### `gco costs report`
+
+Generate and list OpenCost allocation reports through the authenticated GCO API (`/api/v1/cost/*`).
+
+```bash
+gco costs report COMMAND [OPTIONS]
+```
+
+Passing `--region` pins the request to that region's API bridge (each region's cost monitor owns its own OpenCost data); in the commercial partition direct bridge access requires `api_gateway.regional_api_enabled=true`. Without `--region` the request rides the global API and is served by the nearest healthy region — the response names the region that answered.
+
+#### `gco costs report generate`
+
+Generate an ad-hoc cost report now. The report is written under the `adhoc/` prefix in the cost report bucket (kept out of the scheduled Athena table so overlapping windows never double-count) and its summary is returned.
+
+```bash
+gco costs report generate [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--region` | `-r` | Region whose cost monitor generates the report |
+| `--window-hours` | | Trailing window the report covers, 1-168 (default: 24) |
+| `--show-rows` | | Print the allocation rows in the response |
+
+**Examples:**
+
+```bash
+gco costs report generate
+gco costs report generate -r us-east-1 --window-hours 48
+gco costs report generate --show-rows
+```
+
+#### `gco costs report list`
+
+List recent cost report objects in the cost report bucket.
+
+```bash
+gco costs report list [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--region` | `-r` | Region whose reports to list |
+| `--adhoc` | | List ad-hoc instead of scheduled reports |
+| `--limit` | `-l` | Maximum results, 1-1000 (default: 20) |
+
+**Examples:**
+
+```bash
+gco costs report list
+gco costs report list -r us-east-1 --limit 50
+gco costs report list --adhoc
+```
+
+#### `gco costs report status`
+
+Show cost monitoring health for a region: OpenCost liveness, whether it is returning allocation data, the report bucket, cadence, and the last scheduled report.
+
+```bash
+gco costs report status [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--region` | `-r` | Region whose cost monitor to check |
+
+**Examples:**
+
+```bash
+gco costs report status
+gco costs report status -r us-east-1
+```
+
+#### `gco costs dashboard`
+
+Open a regional cost dashboard over the private EKS endpoint. `--service grafana` (the default) port-forwards to the in-cluster Grafana and prints the direct URL of the GCO Cost dashboard; `--service opencost` forwards the native OpenCost UI. Runs in the foreground; press Ctrl-C to stop. Accepts the same `--via-ssm` tunnel options as [`gco monitoring open`](#gco-monitoring-open).
+
+```bash
+gco costs dashboard [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--service` | | `grafana` (default) or `opencost` |
+| `--region` | | Cluster region (defaults to the first cdk.json regional entry) |
+| `--local-port` | | Local port to bind (defaults per-service) |
+| `--via-ssm` | | Tunnel through an SSM-managed instance: an instance id, or `auto` |
+| `--bastion-ttl-minutes` | | Self-terminate backstop for an `auto` bastion (default: 120) |
+| `--yes` | `-y` | Skip the confirmation prompt when provisioning an `auto` bastion |
+
+**Examples:**
+
+```bash
+gco costs dashboard
+gco costs dashboard --service opencost --region us-east-1
+gco costs dashboard --via-ssm auto -y
+```
 
 ---
 
@@ -1601,11 +1824,12 @@ This command gathers comprehensive capacity data including:
 - Running and pending job counts
 
 The data is analyzed by the Bedrock model selected by `cdk.json`
-`context.bedrock.default_model_id` (Amazon Nova 2 Lite's global inference
+`context.bedrock.default_model_id` (Anthropic Claude Opus 5's global inference
 profile in the stock configuration). The stock
-`context.bedrock.thinking.effort=high` enables Nova 2 Lite's maximum reasoning
-effort; reasoning tokens are billed as output and can materially increase
-latency. Explicit model overrides do not inherit Nova-specific thinking fields.
+`context.bedrock.thinking.effort=high` runs Claude adaptive thinking at its
+default effort; reasoning tokens are billed as output and can materially
+increase latency. Explicit model overrides do not inherit the default's
+thinking fields.
 
 **Requirements:**
 
@@ -2051,15 +2275,15 @@ gco inference deploy ENDPOINT_NAME [OPTIONS]
 | `--label` | `-l` | Label (key=value), repeatable |
 | `--min-replicas` | | Autoscaling: minimum replicas |
 | `--max-replicas` | | Autoscaling: maximum replicas |
-| `--autoscale-metric` | | Autoscaling metric (e.g. `cpu:70`, `memory:80`, `gpu:60`), repeatable. CPU/memory use the native HPA; gpu/gpu_memory scale via KEDA + CloudWatch. |
+| `--autoscale-metric` | | Autoscaling metric (e.g. `cpu:70`, `memory:80`, `gpu:60`), repeatable. CPU/memory use the native HPA; gpu/gpu_memory scale via [KEDA](https://keda.sh/) + CloudWatch. |
 | `--capacity-type` | | Node capacity type: `on-demand` (default) or `spot` |
-| `--accelerator` | `nvidia` | Accelerator type: `nvidia` for GPU instances, `neuron` for Trainium/Inferentia |
+| `--accelerator` | `nvidia` | Accelerator type: `nvidia` for GPU instances, `neuron` for [Trainium](https://aws.amazon.com/ai/machine-learning/trainium/)/Inferentia |
 | `--node-selector` | | Node selector (key=value), repeatable. E.g. `eks.amazonaws.com/instance-family=inf2` |
 | `--extra-args` | | Extra arguments passed to the container (e.g. `--kv-transfer-config {...}`). Repeatable |
 | `--mooncake-mode` | | Mooncake serving mode: `disaggregated` (prefill/decode split), `store` (shared KV-cache), or `both` |
 | `--prefill-replicas` | | Number of prefill replicas (default: 1). Used with `--mooncake-mode disaggregated\|both` |
 | `--decode-replicas` | | Number of decode replicas (default: 1). Used with `--mooncake-mode disaggregated\|both` |
-| `--mooncake-protocol` | | Transfer intent: `rdma` (default, rendered to vLLM's EFA connector protocol and scheduled on EFA) or `tcp` (non-EFA fallback). Requires `--mooncake-mode` |
+| `--mooncake-protocol` | | Transfer intent: `rdma` (default, rendered to [vLLM](https://docs.vllm.ai/en/latest/)'s [EFA](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html) connector protocol and scheduled on EFA) or `tcp` (non-EFA fallback). Requires `--mooncake-mode` |
 | `--mooncake-device-name` | | Optional provider-visible network device forwarded to Mooncake. Omit for auto-detection. Requires `--mooncake-mode` |
 | `--mooncake-autoscale` | | Per-role autoscaling as `ROLE:MIN:MAX[:METRIC:TARGET...]`. Repeatable. E.g. `prefill:1:8:gpu:70` |
 | `--mooncake-cold-tier` | | Enable the async per-region S3 cold tier for the shared KV-cache store. Requires `--mooncake-mode store\|both`. Pre-warm with `gco inference populate-kv` |
@@ -2858,7 +3082,7 @@ gco images uri my-app -t v1.2.3
 #### `gco images build`
 
 Build a container image and push it to the project's ECR repo. Uses
-the local container runtime (Docker / Finch / Podman), authenticates
+the local container runtime (Docker / [Finch](https://runfinch.com/) / [Podman](https://podman.io/docs)), authenticates
 to ECR via `aws ecr get-login-password`, then pushes the resulting
 image.
 
@@ -3049,7 +3273,7 @@ gco images lifecycle set my-app --file lifecycle.json
 
 #### `gco images mirror`
 
-Mirror third-party images (e.g. the Volcano `docker.io` images) into the project ECR. This is the same multi-arch copy `gco stacks deploy` runs automatically when `volcano_image_mirror.enabled` is set; run it directly to pre-seed a region before enabling the toggle, or to re-mirror after bumping a mirrored image version. Wraps the shared `cli._image_mirror` core (also used by the `images_mirror` MCP tool).
+Mirror third-party images (e.g. the [Volcano](https://volcano.sh/) `docker.io` images) into the project ECR. This is the same multi-arch copy `gco stacks deploy` runs automatically when `volcano_image_mirror.enabled` is set; run it directly to pre-seed a region before enabling the toggle, or to re-mirror after bumping a mirrored image version. Wraps the shared `cli._image_mirror` core (also used by the `images_mirror` MCP tool).
 
 ```bash
 gco images mirror [OPTIONS]
@@ -3229,7 +3453,7 @@ gco files access-points fs-0123456789abcdef0 -r us-east-1
 
 ### Nodepools Commands
 
-Manage Karpenter NodePools.
+Manage [Karpenter](https://karpenter.sh/) NodePools.
 
 <details>
 <summary>All <code>gco nodepools</code> commands (5) — click to expand</summary>
@@ -3360,7 +3584,7 @@ gco nodepools delete gpu-reserved -r us-east-1 -y
 
 ### Monitoring Commands
 
-Manage in-cluster observability (`kube-prometheus-stack`: Prometheus + Grafana +
+Manage in-cluster observability (`kube-prometheus-stack`: [Prometheus](https://prometheus.io/docs/introduction/overview/) + Grafana +
 Alertmanager). Unlike most features this one is **on by default** on every
 regional cluster. See the [Monitoring Guide](MONITORING.md) for the cost model,
 private-endpoint access, and credential rotation.
@@ -3378,7 +3602,7 @@ port-forward.
 | [`gco monitoring status`](#gco-monitoring-status) | Show the current `cluster_observability.*` toggle state from `cdk.json`. |
 | [`gco monitoring enable`](#gco-monitoring-enable) | Flip `cluster_observability.enabled` to `true` in `cdk.json`. |
 | [`gco monitoring disable`](#gco-monitoring-disable) | Flip `cluster_observability.enabled` to `false` in `cdk.json`. |
-| [`gco monitoring open`](#gco-monitoring-open) | Port-forward Grafana / Prometheus / Alertmanager over the private endpoint (optionally via an SSM tunnel). |
+| [`gco monitoring open`](#gco-monitoring-open) | Port-forward Grafana / Prometheus / Alertmanager / OpenCost over the private endpoint (optionally via an SSM tunnel). |
 | [`gco monitoring users add`](#gco-monitoring-users) | Create a Grafana user via the admin API. |
 | [`gco monitoring users list`](#gco-monitoring-users) | List Grafana organisation users. |
 | [`gco monitoring users remove`](#gco-monitoring-users) | Delete a Grafana user. |
@@ -3427,7 +3651,7 @@ gco monitoring open [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--service` | `grafana` (default, `localhost:3000`), `prometheus` (`:9090`), or `alertmanager` (`:9093`). |
+| `--service` | `grafana` (default, `localhost:3000`), `prometheus` (`:9090`), `alertmanager` (`:9093`), `opencost` (the OpenCost UI, `:9091`), or `opencost-api` (the OpenCost allocation API, `:9003`). The OpenCost targets exist when `cost_monitoring.enabled` is on — see [docs/COST_MONITORING.md](COST_MONITORING.md). |
 | `--region` | Cluster region (defaults to the first `deployment_regions.regional` entry). |
 | `--local-port` | Override the local bind port. |
 | `--via-ssm INSTANCE_ID` | Tunnel to the private API endpoint through an SSM-managed instance (requires the Session Manager plugin). |
@@ -4295,7 +4519,7 @@ Set any threshold to `-1` to disable that health check. This is useful when runn
 | `GCO_ENABLE_MISSION` | Gate the `gco mission` subcommand group (`true`/`false`). With the flag unset, every subcommand exits 2 with a hint. |
 | `GCO_ENABLE_ALL_TOOLS` | Umbrella flag that satisfies every per-tool gate including `GCO_ENABLE_MISSION`. |
 | `GCO_MISSION_STATE_BACKEND` | Persistence backend for sessions (`filesystem` or `dynamodb`). Unrecognised values fall back to filesystem with a one-line warning. |
-| `GCO_MISSION_BEDROCK_MODEL_ID` | Override the shared `cdk.json` `context.bedrock.default_model_id` used by the CLI sampling backend (stock value: Amazon Nova 2 Lite, `global.amazon.nova-2-lite-v1:0`). Explicit overrides do not inherit the stock Nova-specific `thinking.effort=high` field. See [Customization → Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). |
+| `GCO_MISSION_BEDROCK_MODEL_ID` | Override the shared `cdk.json` `context.bedrock.default_model_id` used by the CLI sampling backend (stock value: Anthropic Claude Opus 5, `global.anthropic.claude-opus-5`). Explicit overrides do not inherit the stock `thinking.effort=high` field. See [Customization → Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). |
 | `GCO_MISSION_BEDROCK_REGION` | Override the default Bedrock region (`us-east-1`). |
 
 ## Examples
