@@ -1140,13 +1140,10 @@ jobs:
           # container runtime does not need a systemd session.
           sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true
           mkdir -p "$HOME/.config/containers"
-          {
-            echo '[engine]'
-            echo 'cgroup_manager = "cgroupfs"'
-            echo 'events_logger = "file"'
-            echo '[containers]'
-            echo 'cgroups = "disabled"'
-          } > "$HOME/.config/containers/containers.conf"
+          # The default configuration, written by .github/scripts/podman_ci_config.sh
+          # so the live step can rewrite it for the fallback attempt using the
+          # same code path. See that script for why two configurations exist.
+          .github/scripts/podman_ci_config.sh crun
       - name: Live-prove the generated gco function against Podman
         run: |
           set -euo pipefail
@@ -1166,7 +1163,29 @@ jobs:
           done
           # Fallback so the bind-mount source always exists.
           [ -e "$XDG_RUNTIME_DIR/podman/podman.sock" ] || : >"$XDG_RUNTIME_DIR/podman/podman.sock"
-          .github/scripts/dev_alias_live.sh podman
+
+          # Two OCI runtime configurations are viable here and each fails in a
+          # way the other survives, so try both rather than depending on which
+          # podman/crun pairing the runner image shipped. See
+          # .github/scripts/podman_ci_config.sh for both failure modes.
+          #
+          # This is a genuine alternative configuration, not a blind retry: the
+          # crun failure is deterministic inside a given runner, so re-running
+          # the same setup could never clear it.
+          for runtime in crun runc; do
+            echo "::group::podman dev-alias attempt with ${runtime}"
+            .github/scripts/podman_ci_config.sh "${runtime}"
+            if .github/scripts/dev_alias_live.sh podman; then
+              echo "::endgroup::"
+              echo "dev-alias succeeded with the ${runtime} configuration"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "dev-alias failed with the ${runtime} configuration" >&2
+          done
+
+          echo "dev-alias failed with every OCI runtime configuration" >&2
+          exit 1
 
   integration-dev-alias-finch:
     name: "integration:dev-alias:finch"
