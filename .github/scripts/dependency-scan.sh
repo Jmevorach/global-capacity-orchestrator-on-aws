@@ -183,7 +183,22 @@ print((datetime.date.today() - d).days)
 # ---------------------------------------------------------------------------
 echo "=== Checking for outdated Python dependencies ==="
 
-pip install -e . --quiet --root-user-action=ignore
+# Install the project with EVERY optional-dependency group, not just the
+# base dependencies: ``pip list --outdated`` can only report packages that
+# are installed, so a base-only install silently dropped pins that live
+# exclusively in an extras group (``aws-cdk-lib`` in ``cdk``, ``playwright``
+# in ``diagrams``, ``mypy`` in ``typecheck``, ...) even though
+# ``extract_direct_python_deps`` already includes them in the direct-pin
+# filter below. Groups are enumerated from pyproject.toml so a new extras
+# group joins the surface automatically; if enumeration fails, fall back to
+# the old base-only install rather than dropping the report section.
+PYTHON_EXTRAS="$(extract_python_extras pyproject.toml | paste -sd, -)"
+if [ -n "$PYTHON_EXTRAS" ]; then
+  echo "Installing with extras: [${PYTHON_EXTRAS}]"
+  pip install -e ".[${PYTHON_EXTRAS}]" --quiet --root-user-action=ignore
+else
+  pip install -e . --quiet --root-user-action=ignore
+fi
 OUTDATED_RAW="$(pip list --outdated --format=json)"
 
 # Build a newline-separated list of PEP-503-normalised direct-dep names.
@@ -245,6 +260,46 @@ else
   echo "Found $PYTHON_COUNT outdated Python package(s) (direct dependencies only — transitive bumps are upstream's job)"
   echo "$OUTDATED" | jq -r '.[] | "  - \(.name): \(.version) -> \(.latest_version)"'
   PYTHON_OUTDATED="$OUTDATED"
+fi
+
+# ---------------------------------------------------------------------------
+# npm packages (every repository-owned graph)
+# ---------------------------------------------------------------------------
+# Direct npm dependencies never had a drift surface of their own: aws-cdk and
+# markdownlint-cli2 only leaked into the report indirectly (via the
+# Dockerfile.dev ARG and the pre-commit hook rev), and the
+# inference-streaming-proxy's @aws-sdk clients were reported nowhere at all.
+# This walks the same repository-owned graphs the npm package-management
+# check validates and compares each exact direct pin against the registry's
+# ``latest`` dist-tag — the npm analogue of the Python Packages surface.
+echo ""
+echo "=== Checking for outdated npm packages ==="
+
+NPM_RESULTS="$(mktemp)"
+NPM_COUNT=0
+
+list_npm_package_dirs . | while IFS= read -r package_dir; do
+  manifest="${package_dir}/package.json"
+  extract_npm_direct_pins "$manifest" | while IFS='|' read -r pkg_name pkg_version; do
+    [ -n "$pkg_name" ] || continue
+    # Scoped names carry a '/', which must be encoded in the registry URL.
+    encoded_name="$(printf '%s' "$pkg_name" | sed 's|/|%2F|g')"
+    pkg_latest="$(curl -fsSL --max-time 15 \
+      "https://registry.npmjs.org/${encoded_name}/latest" 2>/dev/null \
+      | jq -r '.version // empty' 2>/dev/null)" || true
+    [ -n "$pkg_latest" ] || continue
+    if [ "$(compare_semver "$pkg_version" "$pkg_latest")" = "newer" ]; then
+      echo "  - ${package_dir}: ${pkg_name} ${pkg_version} -> ${pkg_latest}"
+      echo "${package_dir}|${pkg_name}|${pkg_version}|${pkg_latest}" >> "$NPM_RESULTS"
+    fi
+  done
+done
+
+NPM_COUNT="$(wc -l < "$NPM_RESULTS" | tr -d ' ')"
+if [ "$NPM_COUNT" -eq 0 ]; then
+  echo "All npm direct dependencies are up to date."
+else
+  echo "Found $NPM_COUNT outdated npm package pin(s) across the owned graphs"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1536,7 +1591,7 @@ echo "Base-image epochs:        $EPOCH_COUNT"
 echo "Suppression expiries:     $SUPPRESSION_COUNT"
 echo "Lockfile freshness:       $LOCKFILE_COUNT"
 
-if [ "$PYTHON_COUNT" -eq 0 ] && [ "$DOCKER_COUNT" -eq 0 ] \
+if [ "$PYTHON_COUNT" -eq 0 ] && [ "$NPM_COUNT" -eq 0 ] && [ "$DOCKER_COUNT" -eq 0 ] \
    && [ "$HELM_COUNT" -eq 0 ] && [ "$ADDON_COUNT" -eq 0 ] \
    && [ "$EKS_K8S_COUNT" -eq 0 ] \
    && [ "$AURORA_COUNT" -eq 0 ] && [ "$EMR_COUNT" -eq 0 ] \
@@ -1589,7 +1644,7 @@ if [ "$PYTHON_COUNT" -eq 0 ] && [ "$DOCKER_COUNT" -eq 0 ] \
   else
     echo "All dependencies are up to date."
   fi
-  rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS" "$ACCELERATOR_OFFLINE_REPORT" "$ACCELERATOR_ONLINE_REPORT" "$ACCELERATOR_ONLINE_SUMMARY" "$ACCELERATOR_OFFLINE_ERROR" "$ACCELERATOR_ONLINE_ERROR"
+  rm -f "$NPM_RESULTS" "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS" "$ACCELERATOR_OFFLINE_REPORT" "$ACCELERATOR_ONLINE_REPORT" "$ACCELERATOR_ONLINE_SUMMARY" "$ACCELERATOR_OFFLINE_ERROR" "$ACCELERATOR_ONLINE_ERROR"
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
       echo "# Dependency Update Report"
@@ -1639,6 +1694,7 @@ summary_row() {
   echo "| Surface | Status | Urgency |"
   echo "|---------|--------|---------|"
   summary_row "Python Packages"          "$PYTHON_COUNT"         ""                          "routine"
+  summary_row "npm Packages"             "$NPM_COUNT"            ""                          "routine"
   summary_row "Docker Images"            "$DOCKER_COUNT"         ""                          "routine"
   summary_row "Helm Charts"              "$HELM_COUNT"           ""                          "routine"
   summary_row "EKS Add-ons"              "$ADDON_COUNT"          "$ADDON_SKIP_REASON"        "routine"
@@ -1672,6 +1728,24 @@ summary_row() {
     echo "| Package | Current | Latest | Ref |"
     echo "|---------|---------|--------|-----|"
     echo "$PYTHON_OUTDATED" | jq -r '.[] | "| \(.name) | \(.version) | \(.latest_version) | [PyPI](https://pypi.org/project/\(.name)/) |"'
+    echo ""
+  fi
+
+  if [ "$NPM_COUNT" -gt 0 ]; then
+    echo "## npm Packages"
+    echo ""
+    echo "Exact direct pins in every repository-owned \`package.json\` (the root"
+    echo "tooling graph and \`lambda/inference-streaming-proxy\`), compared against"
+    echo "each package's \`latest\` dist-tag. Transitives are excluded — those are"
+    echo "controlled by the lockfiles. Bump the pin, then regenerate the graph's"
+    echo "\`package-lock.json\` with the pinned npm."
+    echo ""
+    npm_disp="$(mktemp)"
+    while IFS='|' read -r graph pkg cur lat; do
+      echo "\`${graph}\`|${pkg}|${cur}|${lat}|[npm](https://www.npmjs.com/package/${pkg})"
+    done < "$NPM_RESULTS" > "$npm_disp"
+    emit_md_table "Graph|Package|Current|Latest|Ref" "$npm_disp"
+    rm -f "$npm_disp"
     echo ""
   fi
 
@@ -1926,7 +2000,7 @@ summary_row() {
   echo "_Automatically created by the \`deps-scan\` workflow._"
 } > "$REPORT_FILE"
 
-rm -f "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS" "$ACCELERATOR_OFFLINE_REPORT" "$ACCELERATOR_ONLINE_REPORT" "$ACCELERATOR_ONLINE_SUMMARY" "$ACCELERATOR_OFFLINE_ERROR" "$ACCELERATOR_ONLINE_ERROR"
+rm -f "$NPM_RESULTS" "$DOCKER_RESULTS" "$HELM_RESULTS" "$ADDON_RESULTS" "$EKS_K8S_RESULTS" "$AURORA_RESULTS" "$EMR_RESULTS" "$DOCKERFILE_RESULTS" "$PRECOMMIT_RESULTS" "$CDK_ENUM_RESULTS" "$PYTHON_RELEASE_RESULTS" "$BEDROCK_MODEL_RESULTS" "$CI_TOOLING_RESULTS" "$CONSISTENCY_RESULTS" "$EPOCH_RESULTS" "$SUPPRESSION_RESULTS" "$LOCKFILE_RESULTS" "$ACCELERATOR_OFFLINE_REPORT" "$ACCELERATOR_ONLINE_REPORT" "$ACCELERATOR_ONLINE_SUMMARY" "$ACCELERATOR_OFFLINE_ERROR" "$ACCELERATOR_ONLINE_ERROR"
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "has_drift=true"            >> "$GITHUB_OUTPUT"

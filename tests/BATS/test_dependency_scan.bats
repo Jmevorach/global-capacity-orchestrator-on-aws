@@ -768,6 +768,62 @@ EOF
     [ -z "$output" ]
 }
 
+# ── extract_python_extras ───────────────────────────────────────────────────
+
+@test "extract_python_extras: lists every optional-dependency group in the real pyproject" {
+    # The python-drift path installs the project with every extras group so
+    # extras-only pins (aws-cdk-lib lives ONLY in ``cdk``) are visible to
+    # ``pip list --outdated``. Spot-check groups that exist today.
+    run extract_python_extras "pyproject.toml"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ (^|$'\n')cdk($|$'\n') ]]
+    [[ "$output" =~ (^|$'\n')diagrams($|$'\n') ]]
+    [[ "$output" =~ (^|$'\n')test($|$'\n') ]]
+    [[ "$output" =~ (^|$'\n')dev($|$'\n') ]]
+    [[ "$output" =~ (^|$'\n')image-health-monitor($|$'\n') ]]
+}
+
+@test "extract_python_extras: emits bare group names only (no pins, no brackets)" {
+    # Output feeds straight into ``pip install -e ".[a,b,c]"`` after a
+    # paste-join, so every line must be a bare extras name.
+    run extract_python_extras "pyproject.toml"
+    [ "$status" -eq 0 ]
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        [[ "$line" =~ ^[A-Za-z0-9._-]+$ ]]
+    done <<< "$output"
+}
+
+@test "extract_python_extras: agrees with tomllib's own view of the group count" {
+    # Guard against the helper silently dropping groups: its line count
+    # must equal the number of keys under [project.optional-dependencies].
+    expected="$(python3 -c "
+import tomllib
+with open('pyproject.toml', 'rb') as f:
+    data = tomllib.load(f)
+print(len(data['project']['optional-dependencies']))
+")"
+    run extract_python_extras "pyproject.toml"
+    [ "$status" -eq 0 ]
+    actual="$(printf '%s\n' "$output" | sed '/^$/d' | wc -l | tr -d ' ')"
+    [ "$actual" = "$expected" ]
+}
+
+@test "extract_python_extras: empty for a missing file" {
+    run extract_python_extras "/nonexistent/pyproject.toml"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "extract_python_extras: empty for malformed TOML" {
+    tmpfile="$(mktemp)"
+    echo '[project not toml' > "$tmpfile"
+    run extract_python_extras "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -f "$tmpfile"
+}
+
 # ── extract_build_system_pins ───────────────────────────────────────────────
 
 @test "extract_build_system_pins: the real pyproject pins one exact setuptools" {
@@ -1737,6 +1793,97 @@ EOF
     run check_lockfile_freshness /nonexistent/pyproject.toml /nonexistent/lock.txt
     [ "$status" -eq 0 ]
     [ -z "$output" ]
+}
+
+# ── extract_npm_direct_pins ──────────────────────────────────────────────────
+
+@test "extract_npm_direct_pins: reads exact pins from dependencies and devDependencies" {
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<'EOF'
+{
+  "dependencies": { "@aws-sdk/client-ssm": "3.1098.0" },
+  "devDependencies": { "aws-cdk": "2.1134.0", "cdk-dia": "0.12.3" }
+}
+EOF
+    run extract_npm_direct_pins "$tmpfile"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"@aws-sdk/client-ssm|3.1098.0"* ]]
+    [[ "$output" == *"aws-cdk|2.1134.0"* ]]
+    [[ "$output" == *"cdk-dia|0.12.3"* ]]
+    rm -f "$tmpfile"
+}
+
+@test "extract_npm_direct_pins: emits pipe-delimited NAME|VERSION pairs only" {
+    run extract_npm_direct_pins "package.json"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[@A-Za-z0-9/_.-]+\|[0-9]+\.[0-9]+\.[0-9]+ ]]
+    done <<< "$output"
+}
+
+@test "extract_npm_direct_pins: skips range specifiers, keeping only exact pins" {
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<'EOF'
+{
+  "dependencies": {
+    "caret": "^1.0.0",
+    "tilde": "~2.0.0",
+    "star": "*",
+    "gte": ">=3.0.0",
+    "tag": "latest",
+    "exact": "1.2.3"
+  }
+}
+EOF
+    run extract_npm_direct_pins "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ "$output" = "exact|1.2.3" ]
+    rm -f "$tmpfile"
+}
+
+@test "extract_npm_direct_pins: ignores packageManager, engines, and overrides" {
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<'EOF'
+{
+  "engines": { "node": "24.x" },
+  "packageManager": "npm@12.0.2",
+  "overrides": { "some-pkg": { "js-yaml": "5.2.2" } },
+  "devDependencies": { "only-this": "4.5.6" }
+}
+EOF
+    run extract_npm_direct_pins "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ "$output" = "only-this|4.5.6" ]
+    rm -f "$tmpfile"
+}
+
+@test "extract_npm_direct_pins: empty for a missing file" {
+    run extract_npm_direct_pins "/nonexistent/package.json"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "extract_npm_direct_pins: empty for malformed JSON" {
+    tmpfile="$(mktemp)"
+    echo '{ not json' > "$tmpfile"
+    run extract_npm_direct_pins "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -f "$tmpfile"
+}
+
+@test "extract_npm_direct_pins: finds every owned graph via list_npm_package_dirs" {
+    run list_npm_package_dirs .
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"."* ]]
+    [[ "$output" == *"lambda/inference-streaming-proxy"* ]]
+    # And each listed graph yields at least one exact pin.
+    while IFS= read -r dir; do
+        run extract_npm_direct_pins "$dir/package.json"
+        [ "$status" -eq 0 ]
+        [ -n "$output" ]
+    done <<< "$(list_npm_package_dirs .)"
 }
 
 # ── extract_security_epochs ─────────────────────────────────────────────────

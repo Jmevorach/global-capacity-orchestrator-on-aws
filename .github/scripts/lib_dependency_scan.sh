@@ -65,6 +65,41 @@ for spec in deps:
 " "$pyproject" 2>/dev/null
 }
 
+# =============================================================================
+# extract_python_extras [pyproject_path]
+#
+# Prints every ``[project.optional-dependencies]`` group name from
+# ``pyproject.toml``, one per line, in declaration order. The python-drift
+# path in ``dependency-scan.sh`` joins these into a single
+# ``pip install -e ".[group1,group2,...]"`` so that packages pinned *only*
+# inside an optional group (``aws-cdk-lib`` in ``cdk``, ``playwright`` in
+# ``diagrams``, ``mypy`` in ``typecheck``, ...) are actually present in the
+# scan venv. ``pip list --outdated`` can only report drift for installed
+# packages, so the previous base-only install silently dropped every
+# extras-only pin from the report even though
+# ``extract_direct_python_deps`` already includes those names in the
+# direct-pin filter.
+#
+# Falls back silently to an empty list (prints nothing) if the file is
+# missing or unparsable — the caller then falls back to a plain ``-e .``
+# install, which is exactly the old behaviour, rather than dropping the
+# report section.
+extract_python_extras() {
+  local pyproject="${1:-pyproject.toml}"
+  [ -f "$pyproject" ] || return 0
+  python3 -c "
+import sys, tomllib
+try:
+    with open(sys.argv[1], 'rb') as f:
+        data = tomllib.load(f)
+except Exception:
+    sys.exit(0)
+groups = (data.get('project', {}) or {}).get('optional-dependencies', {}) or {}
+for group in groups:
+    print(group)
+" "$pyproject" 2>/dev/null
+}
+
 # extract_build_system_pins [pyproject_path]
 #
 # Reads ``[build-system].requires`` and emits one ``name|version|raw``
@@ -382,6 +417,38 @@ with open(sys.argv[1]) as f:
         name, value = m.group(1), m.group(2)
         if name in allowlist:
             print(f'{name}|{value}')
+" "$file" 2>/dev/null
+}
+
+# extract_npm_direct_pins [package_json_path]
+#
+# Prints ``name|version`` for every exactly-pinned direct dependency in one
+# ``package.json`` — ``dependencies`` and ``devDependencies`` both count, since
+# every repository-owned graph pins tooling through devDependencies. Range
+# specifiers (``^``, ``~``, ``>=``, ``*``, tags) are skipped: the npm package
+# management check already fails graphs that carry them, and a range cannot
+# drift in the "pinned copy is behind latest" sense this scan reports.
+# Missing or malformed files print nothing, matching extract_dockerfile_pins.
+extract_npm_direct_pins() {
+  local file="${1:-package.json}"
+  [ -f "$file" ] || return 0
+  python3 -c "
+import json, re, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        manifest = json.load(f)
+except (OSError, json.JSONDecodeError):
+    sys.exit(0)
+
+exact = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$')
+for section in ('dependencies', 'devDependencies'):
+    entries = manifest.get(section)
+    if not isinstance(entries, dict):
+        continue
+    for name, version in sorted(entries.items()):
+        if isinstance(version, str) and exact.match(version):
+            print(f'{name}|{version}')
 " "$file" 2>/dev/null
 }
 
