@@ -42,7 +42,14 @@ python -m pytest -k "health" -v
 
 ## Mission End-to-End Tests
 
-The `mission_e2e` marker (registered in `pytest.ini`) tags the nine end-to-end tests across six files that drive a complete Mission session through `MissionEngine`. The covered files are `test_mission_e2e_train_to_loss.py`, `test_mission_e2e_search.py`, `test_mission_e2e_converge.py`, `test_mission_e2e_budget.py`, `test_mission_e2e_stagnation.py`, and `test_mission_no_aws.py`. Per-file descriptions live in the [Mission Tests](#mission-tests) section below.
+The `mission_e2e` marker (registered under `[tool.pytest.ini_options]` in
+`pyproject.toml`) tags 14 end-to-end tests across eight files that drive a
+complete Mission session through `MissionEngine`. The covered files are
+`test_metric_readers_observe.py`, `test_mission_e2e_train_to_loss.py`,
+`test_mission_e2e_search.py`, `test_mission_e2e_converge.py`,
+`test_mission_e2e_budget.py`, `test_mission_e2e_stagnation.py`,
+`test_mission_no_aws.py`, and `test_semantic_progress_observe.py`. Per-file
+descriptions live in the [Mission Tests](#mission-tests) section below.
 
 ```bash
 # Run only the Mission e2e suite (about 11 seconds wall-clock on a laptop)
@@ -103,7 +110,6 @@ Tests are organized by the component they test:
 | File | Description |
 |------|-------------|
 | `test_split_tests.py` | Tests for `scripts/split_tests.py`, which shards the core pytest suite across parallel CI jobs. The headline case asserts that a partition never loses or duplicates a test file, for shard counts from 1 to 6 — a splitter that silently dropped files would leave every shard green while part of the suite stopped running. Also pins determinism (a rerun of a commit reproduces the same split), rough balance, that the excluded modules are exactly the ones owned by dedicated jobs, and the workflow contract that makes changing the shard count a one-line edit: `matrix.shard` must be a contiguous 1-based range, `--of` must come from `strategy.job-total` rather than a second literal, shards must pass `--cov-fail-under=0` (pytest-cov otherwise enforces pyproject's floor against a single shard's slice), and the combining job must depend on every shard and own the real floor. |
-| `test_presentation_claims.py` | Keeps the headline numbers on the "Built on a serious engineering foundation" slide of `demo/GCO_PRESENTATION.pdf` true, by reading the committed PDF with `pypdf` and comparing each figure to the repository: the quoted unit-test total against the live pytest + BATS count (compared at 500-test granularity, so the "N+" claim stays honest as tests are added and only needs an edit when the rounded value changes), the CDK synth matrix figure against `len(tests._cdk_config_matrix.CONFIGS)`, and the coverage claim against `fail_under` in `[tool.coverage.report]`. The slide is located by label rather than page number so reordering slides does not break it; each failure names the exact value to use and says to update the `.pptx` and re-export the PDF. |
 | `test_migrate_fork.py` | Tests for `scripts/migrate_fork.py`, the fork-migration assistant. The headline case walks every git-tracked file and asserts each occurrence of the upstream organization or repository name is claimed by exactly one classification rule, so a reference in an unanticipated shape (a `raw.githubusercontent.com` URL, a new package name) fails CI until a rule handles it deliberately. Also pins the preservation rules that keep links to other AWS Labs projects and the runtime-resolved `awslabs.*` MCP package names intact, the rewrite cases including the percent-encoded Pages URL in the coverage badge and the OIDC trust-policy subject, idempotency, `--repo-url` parsing and rejection of malformed or upstream targets, and that a dry run leaves the working tree untouched. |
 | `test_manifest_api.py` | `gco/services/manifest_api.py` core route set — `/`, `/healthz`, `/readyz`, `/api/v1/health`, `/api/v1/status`, `/api/v1/manifests`, `/api/v1/manifests/validate`, plus `ManifestSubmissionAPIRequest` / `ResourceIdentifier` request shapes. An autouse fixture seeds the auth middleware token cache so the real `AuthenticationMiddleware` runs end-to-end against `TestClient` traffic — same code path as production. |
 | `test_manifest_api_extended.py` | Async lifespan startup (wires a `ManifestProcessor` into the module global, propagates failures), the `submit_manifests` endpoint with a full `ResourceStatus` response, and other endpoint wiring driven by direct route-function calls after mutating module-level state so the handler logic is asserted in isolation. |
@@ -211,10 +217,10 @@ and inverse-derivation logic.
 
 The cdk.json configuration matrix — the set of overlays users can pick from (multi-region, FSx on/off, all feature toggles, resource threshold values, helm chart enable/disable, etc.) — lives in `tests/_cdk_config_matrix.CONFIGS` and is the single source of truth shared between two test surfaces:
 
-1. **`tests/test_cdk_synthesis_matrix.py`** builds the full CDK app in-process against every entry in `CONFIGS` and runs `app.synth()`, parallelized with `pytest-xdist`. Catches synth-time breakage, hardcoded regions, missing conditional guards, and broken feature-flag interactions. Run locally or in CI:
+1. **`tests/test_cdk_synthesis_matrix.py`** builds the full CDK app in-process against every entry in `CONFIGS` and runs `app.synth()` serially. Serial execution avoids shared CDK asset-staging races while catching synth-time breakage, hardcoded regions, missing conditional guards, and broken feature-flag interactions. Run locally or in CI:
 
     ```bash
-    pytest tests/test_cdk_synthesis_matrix.py -n auto
+    pytest tests/test_cdk_synthesis_matrix.py
     ```
 
 2. **`tests/test_nag_compliance.py`** runs the full CDK app in-process against the IAM-relevant subset (`NAG_CONFIGS`) and asserts zero unsuppressed cdk-nag findings across five rule packs (AwsSolutions, HIPAA Security, NIST 800-53 R5, PCI DSS 3.2.1, Serverless). This is the gate that prevents a user from hitting a cdk-nag error at `cdk deploy` time on a config CI hasn't already validated. See [cdk-nag Compliance Testing](#cdk-nag-compliance-testing) below for details.
@@ -231,7 +237,7 @@ The cdk-nag rule packs that block production deploys (AwsSolutions-IAM5 wildcard
 
 - cdk-nag v3 runs as a CDK **policy-validation plugin** (`IPolicyValidationPlugin`) rather than an `IAspect`. `app.synth()` writes every unacknowledged finding to `validation-report.json` in the cloud assembly directory (and does **not** raise on findings), so the test reads that report to assert on findings programmatically.
 - `tests/test_nag_compliance.py` parameterizes over the IAM-relevant `NAG_CONFIGS` subset, builds the complete CDK app (Global, API Gateway, Regional, Monitoring) the same way `app.py` does, registers all five rule packs via `cdk.Validations.of(app).add_plugins(...)`, calls `app.synth()`, and asserts the report's finding list is empty.
-- CI runs this as its own job — `unit:cdk:nag-compliance` — with `pytest-xdist`'s `-n auto` (via the `psutil` extra).
+- CI fans the IAM-relevant configs out through `unit:cdk:nag-compliance`, one GitHub Actions runner per `NAG_CONFIGS` entry; each pytest invocation runs serially.
 
 **Scope discipline for new suppressions:**
 
@@ -342,7 +348,7 @@ actually deploy anything, hit AWS, or spawn long-running subprocesses.
 |------|-------------------|----------------|
 | `test_bump_version.py` | `scripts/bump_version.py` | SemVer reads the source of truth from `VERSION` and keeps `gco/_version.py` and `cli/__init__.py` in sync — current-version reading, patch / minor / major bumps with correct field resets, dry-run mode, invalid-input error paths, and `main()` argparse dispatch. Uses a `tmp_path` fixture that patches the module's path constants so real repo files are never touched. |
 | `test_webhook_delivery_script.py` | `scripts/test_webhook_delivery.py` | The script's own helpers and argparse `main()` without spinning up a real dispatcher or hitting the network — `WebhookHandler.do_POST` capture and 200 response, silenced `log_message`, `start_local_server` port binding + daemon thread + clean shutdown, `create_mock_job` fixture shape, and the local-server vs. external-URL `main()` branches. |
-| `test_cdk_synthesis_matrix.py` | `tests/_cdk_config_matrix.CONFIGS` | Full-app `app.synth()` validation parameterised over every entry in the shared matrix, parallelised via pytest-xdist. Pairs with `test_nag_compliance.py` which runs the IAM-relevant subset through cdk-nag. |
+| `test_cdk_synthesis_matrix.py` | `tests/_cdk_config_matrix.CONFIGS` | Full-app `app.synth()` validation parameterised over every entry in the shared matrix, run serially to avoid shared CDK asset-staging races. Pairs with `test_nag_compliance.py` which fans the IAM-relevant subset across CI runners for cdk-nag. |
 | `test_dump_nag_findings_script.py` | `scripts/dump_nag_findings.py` | `run_config` threads context overrides through to `_build_app_with_logger`, invokes `app.synth()` while the Docker-asset mock is live, returns `logger.findings` verbatim. `main()` aggregates by `(rule_id, resource_path, finding_id)`, deduplicates across configs, emits per-config and summary counts, exits 0 on clean and 1 otherwise. |
 | `test_image_mirror.py` | `cli/_image_mirror.py` + `gco images mirror` (`cli/commands/images_cmd.py`) | The general image-mirror core and its CLI command without Docker or AWS — `_volcano_source_refs`/`collect_source_refs` read the default components + pinned tag from a charts.yaml-shaped config (tag-override precedence, error paths), `parse_source_ref`/`plan_from_sources` produce source/dest refs that line up with the consumer's `image_registry` override, `resolve_copy_strategy` prefers buildx then Finch `--all-platforms` then skopeo, `_copy_commands` shells out to a manifest-list-preserving copy (asserts it is *not* the arch-dropping pull/tag/push), `ensure_repository`/`tag_exists` cover idempotent create + skip-if-mirrored, `plan_mirror`/`mirror_status` resolve the destination registry/repos and per-image ECR presence read-only (no copy), and `gco images mirror --dry-run` makes no STS/ECR/docker calls. |
 | `test_live_release_validation.py` | `scripts/live_release_validation/` | Offline contracts for the local-only release-validation harness: exact identity and resume checks, private checkpoint/report writes, action ordering and partial-report semantics, destructive-resource ownership gates, smoke-manifest security, contributor documentation, and the requirement to share reports through manual PR upload only. All AWS, Kubernetes, subprocess, and time-dependent boundaries are stubbed. Replaces harness helpers through `tests/_live_validation_patching.patch_live_validation_helper`, which binds one shared mock into every module that references the name so a stale patch target fails loudly instead of silently running production code. |
@@ -381,7 +387,7 @@ The MCP server has a layered test surface — unit tests for individual modules,
 The Mission goal-directed iteration loop has its own test surface that
 exercises the engine, the validators, the predicate / script sandbox,
 sampling, the filesystem state backend, the audit pipeline, the MCP
-tool gating, and the CLI subcommand group. Six end-to-end files carry
+tool gating, and the CLI subcommand group. Eight end-to-end files carry
 the `mission_e2e` marker (see [Mission End-to-End Tests](#mission-end-to-end-tests)
 for the dedicated invocation knobs); the rest run in the default suite.
 
