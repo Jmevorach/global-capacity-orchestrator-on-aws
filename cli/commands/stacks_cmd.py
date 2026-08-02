@@ -715,6 +715,258 @@ def setup_access(config: Any, cluster: Any, region: Any) -> None:
         sys.exit(1)
 
 
+# =============================================================================
+# Deployment-region commands (managed-config engine veneers)
+# =============================================================================
+
+
+@stacks.group("regions")
+@pass_config
+def regions_cmd(config: Any) -> None:
+    """Manage workload deployment Regions in cdk.json.
+
+    These commands edit context.deployment_regions.regional through the
+    managed-config engine: validated against the same rules CDK synth
+    enforces, atomic, idempotent, and audited. They never deploy — run
+    'gco stacks deploy' afterwards to apply the change.
+    """
+    pass
+
+
+@regions_cmd.command("list")
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@pass_config
+def regions_list(config: Any, config_path: Any) -> None:
+    """Show the configured deployment-region topology.
+
+    Reports the global/api_gateway/monitoring Regions, the workload Region
+    list, the resolved AWS partition, and the cdk.json path backing the
+    answer. On a broken configuration, partition_error explains what CDK
+    synth would reject.
+    """
+    from ..managed_config import ManagedConfigError, get_deployment_regions_status
+
+    formatter = get_output_formatter(config)
+
+    try:
+        status = get_deployment_regions_status(config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+    if config.output_format == "table":
+        # The table cell renderer collapses lists to "[N items]"; join for
+        # humans. JSON/YAML (the MCP path) keep the real list.
+        status["regional"] = ", ".join(status["regional"])
+    formatter.print(status)
+
+
+@regions_cmd.command("add")
+@click.argument("region")
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@pass_config
+def regions_add(config: Any, region: Any, config_path: Any, yes: Any) -> None:
+    """Add a workload Region to deployment_regions.regional.
+
+    The Region must expose CloudFormation in the AWS SDK's endpoint data and
+    belong to the same AWS partition as the already-configured Regions.
+    Re-adding a present Region is a reported no-op.
+
+    Examples:
+        gco stacks regions add us-west-2
+        gco stacks regions add eu-west-1 -y
+    """
+    from ..managed_config import ManagedConfigError, add_deployment_region
+
+    formatter = get_output_formatter(config)
+
+    if not yes:
+        click.confirm(f"Add {region} to deployment_regions.regional in cdk.json?", abort=True)
+
+    try:
+        report = add_deployment_region(region, config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+
+    if report.changed:
+        formatter.print_success(report.summary())
+        formatter.print_info(
+            "Config only — no stacks were deployed. "
+            f"Run 'gco stacks deploy {config.project_name}-{region}' (or 'gco stacks deploy-all') to apply"
+        )
+    else:
+        formatter.print_info(report.summary())
+
+
+@regions_cmd.command("remove")
+@click.argument("region")
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@pass_config
+def regions_remove(config: Any, region: Any, config_path: Any, yes: Any) -> None:
+    """Remove a workload Region from deployment_regions.regional.
+
+    The resulting list must stay valid (at least one Region). Removing an
+    absent Region is a reported no-op. Removing an unknown/typo'd entry from
+    a hand-edited config is allowed — validation applies to the result, so
+    this is also the repair path.
+
+    Examples:
+        gco stacks regions remove us-west-2
+        gco stacks regions remove xx-typo-1 -y
+    """
+    from ..managed_config import ManagedConfigError, remove_deployment_region
+
+    formatter = get_output_formatter(config)
+
+    if not yes:
+        formatter.print_warning(
+            f"This only edits cdk.json — a deployed {config.project_name}-{region} "
+            "stack is NOT destroyed by this change."
+        )
+        click.confirm(f"Remove {region} from deployment_regions.regional in cdk.json?", abort=True)
+
+    try:
+        report = remove_deployment_region(region, config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+
+    if report.changed:
+        formatter.print_success(report.summary())
+        formatter.print_info(
+            f"Config only — if {config.project_name}-{region} is deployed, destroy it "
+            f"explicitly with 'gco stacks destroy {config.project_name}-{region}'"
+        )
+    else:
+        formatter.print_info(report.summary())
+
+
+@regions_cmd.command("set")
+@click.argument("role", type=click.Choice(["global", "api_gateway", "monitoring"]))
+@click.argument("region")
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@pass_config
+def regions_set(config: Any, role: Any, region: Any, config_path: Any, yes: Any) -> None:
+    """Set a control-plane Region scalar (global/api_gateway/monitoring).
+
+    The Region must be SDK-known and keep the whole topology (all three
+    scalars plus the workload list) in one AWS partition. Setting the
+    current value is a reported no-op.
+
+    Examples:
+        gco stacks regions set monitoring us-west-2
+        gco stacks regions set global us-east-2 -y
+    """
+    from ..managed_config import ManagedConfigError, set_deployment_region_role
+
+    formatter = get_output_formatter(config)
+
+    if not yes:
+        formatter.print_warning(
+            "This only edits cdk.json — already-deployed stacks are not moved "
+            "or destroyed; the next deploy creates the stack in the new Region."
+        )
+        click.confirm(f"Set deployment_regions.{role} to {region} in cdk.json?", abort=True)
+
+    try:
+        report = set_deployment_region_role(role, region, config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+
+    if report.changed:
+        formatter.print_success(report.summary())
+        formatter.print_info(
+            "Config only — no stacks were deployed. Run 'gco stacks deploy-all' to apply, "
+            "and clean up the stack in the previous Region yourself if it was deployed"
+        )
+    else:
+        formatter.print_info(report.summary())
+
+
+# =============================================================================
+# Bedrock model default (managed-config engine veneer)
+# =============================================================================
+
+
+@stacks.group("bedrock")
+@pass_config
+def bedrock_cmd(config: Any) -> None:
+    """Manage the Bedrock model default in cdk.json.
+
+    Edits context.bedrock.default_model_id — the model/inference-profile ID
+    GCO's advisory Bedrock features (capacity advisor, Mission sampling,
+    autopilot) use unless explicitly overridden. Edits go through the
+    managed-config engine: validated, atomic, idempotent, and audited.
+    """
+    pass
+
+
+@bedrock_cmd.command("show")
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@pass_config
+def bedrock_show(config: Any, config_path: Any) -> None:
+    """Show the configured Bedrock default model ID and its backing path."""
+    from ..managed_config import ManagedConfigError, get_bedrock_model_status
+
+    formatter = get_output_formatter(config)
+
+    try:
+        status = get_bedrock_model_status(config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+    formatter.print(status)
+
+
+@bedrock_cmd.command("set-model")
+@click.argument("model_id")
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@pass_config
+def bedrock_set_model(config: Any, model_id: Any, config_path: Any, yes: Any) -> None:
+    """Set context.bedrock.default_model_id.
+
+    Model and inference-profile IDs are free-form (custom profiles,
+    marketplace models), so validation mirrors the runtime reader: a
+    non-empty string without surrounding whitespace. Sibling settings
+    (bedrock.thinking) are preserved.
+
+    Examples:
+        gco stacks bedrock set-model us.amazon.nova-pro-v1:0
+        gco stacks bedrock set-model us.amazon.nova-2-lite-v1:0 -y
+    """
+    from ..managed_config import ManagedConfigError, set_default_bedrock_model
+
+    formatter = get_output_formatter(config)
+
+    if not yes:
+        click.confirm(f"Set bedrock.default_model_id to {model_id} in cdk.json?", abort=True)
+
+    try:
+        report = set_default_bedrock_model(model_id, config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+
+    if report.changed:
+        formatter.print_success(report.summary())
+        formatter.print_info(
+            "Advisory features pick this up on their next run; explicit "
+            "--model/env overrides still take precedence"
+        )
+    else:
+        formatter.print_info(report.summary())
+
+
+# =============================================================================
+# FSx commands
+# =============================================================================
+
+
 @stacks.group("fsx")
 @pass_config
 def fsx_cmd(config: Any) -> None:

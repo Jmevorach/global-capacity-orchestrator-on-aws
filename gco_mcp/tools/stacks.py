@@ -8,6 +8,7 @@ from typing import Any
 import cli_runner
 from audit import audit_logged
 from feature_flags import (
+    FLAG_CONFIG_MANAGEMENT,
     FLAG_INFRASTRUCTURE_DEPLOY,
     FLAG_INFRASTRUCTURE_DESTROY,
     is_enabled,
@@ -547,3 +548,104 @@ if is_enabled(FLAG_INFRASTRUCTURE_DESTROY):
                 is_stack_op=True,
                 total_units=_expected_stack_count_for_all(),
             )
+
+
+# =============================================================================
+# Managed deployment configuration — disabled by default.
+# Set GCO_ENABLE_CONFIG_MANAGEMENT=true to enable.
+# =============================================================================
+# These tools edit cdk.json on the MCP host through the managed-config
+# engine (cli/managed_config.py): validated against the same rules CDK
+# synth enforces, atomic, idempotent, and audited. They never deploy —
+# an explicit deploy_stack / deploy_all_stacks call (separately gated by
+# GCO_ENABLE_INFRASTRUCTURE_DEPLOY) is still required for a topology
+# change to reach AWS. Installed (uvx/pip) servers resolve a read-only
+# packaged cdk.json; the engine refuses those with guidance rather than
+# half-working, so these tools are useful from a GCO checkout.
+
+if is_enabled(FLAG_CONFIG_MANAGEMENT):
+
+    @mcp.tool(tags={"safe", "stacks"})
+    @audit_logged
+    def list_deployment_regions() -> str:
+        """[gated by GCO_ENABLE_CONFIG_MANAGEMENT]
+
+        Show the deployment-region topology configured in cdk.json.
+
+        Reports the global/api_gateway/monitoring Regions, the workload
+        (regional) Region list, the resolved AWS partition, and the cdk.json
+        path backing the answer. Works on a broken configuration too — the
+        partition_error field explains what CDK synth would reject.
+        """
+        return cli_runner._run_cli("stacks", "regions", "list")
+
+    @mcp.tool(tags={"low-risk", "stacks"})
+    @audit_logged
+    def add_deployment_region(region: str) -> str:
+        """[gated by GCO_ENABLE_CONFIG_MANAGEMENT]
+
+        Add a workload Region to cdk.json deployment_regions.regional.
+
+        Config-only and idempotent: the Region must be SDK-known and share
+        the AWS partition of the already-configured Regions; re-adding a
+        present Region is a reported no-op. No stack is deployed — follow
+        up with deploy_stack / deploy_all_stacks to apply the topology.
+
+        Args:
+            region: AWS Region name to add (e.g. us-west-2).
+        """
+        return cli_runner._run_cli("stacks", "regions", "add", region, "-y")
+
+    @mcp.tool(tags={"low-risk", "stacks"})
+    @audit_logged
+    def remove_deployment_region(region: str) -> str:
+        """[gated by GCO_ENABLE_CONFIG_MANAGEMENT]
+
+        Remove a workload Region from cdk.json deployment_regions.regional.
+
+        Config-only and idempotent: the resulting list must stay valid (at
+        least one Region); removing an absent Region is a reported no-op.
+        A deployed stack for the removed Region is NOT destroyed — that
+        requires an explicit destroy_stack call (separately gated).
+
+        Args:
+            region: AWS Region name to remove (e.g. us-west-2).
+        """
+        return cli_runner._run_cli("stacks", "regions", "remove", region, "-y")
+
+    @mcp.tool(tags={"low-risk", "stacks"})
+    @audit_logged
+    def set_deployment_region(role: str, region: str) -> str:
+        """[gated by GCO_ENABLE_CONFIG_MANAGEMENT]
+
+        Set a control-plane Region scalar in cdk.json deployment_regions.
+
+        Config-only and idempotent: the Region must be SDK-known and keep
+        the whole topology (all three scalars plus the workload list) in one
+        AWS partition. Already-deployed stacks are not moved or destroyed —
+        the next deploy creates the stack in the new Region.
+
+        Args:
+            role: Which scalar to set: "global", "api_gateway", or "monitoring".
+            region: AWS Region name (e.g. us-east-2).
+        """
+        return cli_runner._run_cli("stacks", "regions", "set", role, region, "-y")
+
+    @mcp.tool(tags={"low-risk", "stacks"})
+    @audit_logged
+    def set_default_bedrock_model(model_id: str) -> str:
+        """[gated by GCO_ENABLE_CONFIG_MANAGEMENT]
+
+        Set cdk.json bedrock.default_model_id (advisory-feature model default).
+
+        Config-only and idempotent. Model and inference-profile IDs are
+        free-form (custom profiles, marketplace models); validation mirrors
+        the runtime reader (non-empty, no surrounding whitespace). Sibling
+        settings (bedrock.thinking) are preserved; explicit --model / env
+        overrides still take precedence at run time.
+
+        Args:
+            model_id: Bedrock model or inference-profile ID
+                (e.g. us.amazon.nova-2-lite-v1:0).
+        """
+        return cli_runner._run_cli("stacks", "bedrock", "set-model", model_id, "-y")

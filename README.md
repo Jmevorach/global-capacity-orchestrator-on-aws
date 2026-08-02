@@ -141,7 +141,7 @@ cd global-capacity-orchestrator-on-aws && pipx install -e .
 
 See the [Quick Start](#quick-start) for the full install + first-job walkthrough, or [`docs/CLI.md`](docs/CLI.md) for every CLI command.
 
-> **💡 New to the codebase?** GCO ships with the **GCO MCP server** — an [MCP server](gco_mcp/) exposing 134 tools by default (up to 174 with feature flags) that index the whole project: docs, examples, source code, K8s manifests, and scripts. Connect it to an AI-powered IDE with [MCP](https://modelcontextprotocol.io/) support (like [Kiro](https://kiro.dev)) and explore GCO conversationally — ask questions about the codebase instead of reading repository files directly: *"How does region recommendation work?"*, *"Walk me through the inference deployment flow"*. See [gco_mcp/README.md](gco_mcp/README.md).
+> **💡 New to the codebase?** GCO ships with the **GCO MCP server** — an [MCP server](gco_mcp/) exposing 134 tools by default (up to 179 with feature flags) that index the whole project: docs, examples, source code, K8s manifests, and scripts. Connect it to an AI-powered IDE with [MCP](https://modelcontextprotocol.io/) support (like [Kiro](https://kiro.dev)) and explore GCO conversationally — ask questions about the codebase instead of reading repository files directly: *"How does region recommendation work?"*, *"Walk me through the inference deployment flow"*. See [gco_mcp/README.md](gco_mcp/README.md).
 
 <details>
 <summary><b>Table of Contents</b></summary>
@@ -398,7 +398,7 @@ The following estimates are for a single-region deployment with default settings
 
 - Platform costs (~$210/month) are fixed regardless of workload volume.
 - GPU costs dominate and scale with the number of instances and hours run. Use `gco costs summary` to track actual spend.
-- GPU estimates assume an on-demand g5.xlarge in us-east-1 at ~$1.006/hr (~$734/month over 730 hours); rates vary by region and instance type.
+- GPU estimates assume an on-demand g5.xlarge in us-east-1 at \~$1.006/hr (\~$734/month over 730 hours); rates vary by region and instance type.
 - Optional services (FSx, Valkey, Aurora) add additional cost depending on configuration.
 - The cost table above uses US East (N. Virginia) pricing as of June 2025.
 
@@ -588,7 +588,7 @@ This is host-socket pass-through, not true Docker-in-Docker. Anyone with access 
 │   ├── regional-api-proxy/              # Regional API Gateway → internal ALB proxy
 │   └── secret-rotation/                 # Daily secret rotation
 │
-├── gco_mcp/                             # MCP server for LLM interaction (134 tools default, up to 174 with feature flags)
+├── gco_mcp/                             # MCP server for LLM interaction (134 tools default, up to 179 with feature flags)
 ├── scripts/                             # Utility scripts (version bump, cluster access setup)
 └── tests/                               # PyTest + BATS test suites (counts tracked via badges)
 ```
