@@ -196,7 +196,11 @@ proc type_words {text} {
 # The GCO MCP server's tools are pre-approved for the session with
 # claude's own --allowedTools flag (through autopilot's passthrough), so
 # the recording is deterministic — no version-specific permission-dialog
-# text to script against. The displayed command shows exactly this.
+# text to script against. The driver deliberately displays plain
+# `gco autopilot`: the flag is recording plumbing, not part of the user
+# journey — an interactive user running the plain command gets the
+# identical session, with claude's ordinary one-click permission prompt
+# standing in for the pre-approval.
 # log_user is toggled off around spawn so expect's own echo of the spawn
 # line doesn't appear in the recording (the driver already printed the
 # pretty prompt line).
@@ -217,7 +221,7 @@ expect {
 }
 sleep 4
 
-type_words "Which gco command submits a job via SQS, and why is that the recommended path? Answer briefly, using only the GCO MCP doc tools (no shell commands)."
+type_words "Which gco command submits a job via SQS, and why is that the recommended path? Check the GCO MCP docs (no shell commands) and keep it brief."
 sleep 1
 send -- "\r"
 
@@ -240,18 +244,23 @@ EXPECT_DRIVER
 set -euo pipefail
 cd "\$REPO_ROOT"
 export PATH="\${SHIM_DIR}:\${PATH}"
+# tput cols runs inside command substitutions in lib_demo.sh, where stdout
+# is a pipe rather than the recording PTY, so it falls back to 80 unless
+# COLUMNS is exported. Without this the banner renders 80 wide on a
+# ${COLS}-column recording and sits awkwardly off-center.
+export COLUMNS="\${COLS}" LINES="\${ROWS}"
 
 # shellcheck source=demo/lib_demo.sh
 source "\${REPO_ROOT}/demo/lib_demo.sh"
 setup_colors
 
 banner "GCO Autopilot"
-narrate "One command turns your terminal into a fully configured agent session:"
+narrate "One command turns your terminal into a working Claude Code setup:"
 narrate "Claude Code on Amazon Bedrock + the GCO MCP server + companion MCPs."
 sleep 3
 
 echo ""
-echo "  \${MAGENTA}\\\$ \${WHITE}\${BOLD}gco autopilot -- --allowedTools mcp__gco\${RESET}"
+echo "  \${MAGENTA}\\\$ \${WHITE}\${BOLD}gco autopilot\${RESET}"
 sleep 1
 
 expect -f "$EXPECT_SCRIPT"
@@ -272,13 +281,16 @@ else
 set -euo pipefail
 cd "$REPO_ROOT"
 export PATH="${SHIM_DIR}:${PATH}"
+# See the live driver: COLUMNS keeps tput-in-substitution honest so the
+# banner spans the full recording width.
+export COLUMNS="${COLS}" LINES="${ROWS}"
 
 # shellcheck source=demo/lib_demo.sh
 source "${REPO_ROOT}/demo/lib_demo.sh"
 setup_colors
 
 banner "GCO Autopilot"
-narrate "One command from a plain terminal to a fully configured agent session:"
+narrate "One command from a plain terminal to a working Claude Code setup:"
 narrate "Claude Code + the GCO MCP server + the recommended companion MCPs,"
 narrate "on Amazon Bedrock with GCO's canonical default model."
 sleep 3
@@ -304,7 +316,7 @@ rm -f "$CAST_FILE"
 
 # --idle-time-limit caps recorded pauses (model thinking time in live mode)
 # so the GIF stays short without editing the cast by hand.
-export REPO_ROOT SHIM_DIR
+export REPO_ROOT SHIM_DIR COLS ROWS
 asciinema rec \
     --cols "$COLS" \
     --rows "$ROWS" \
@@ -363,12 +375,23 @@ echo "✓ Cast sanitized and verified (AWS account IDs → 000000000000)"
 strip_emoji_from_cast "$CAST_FILE"
 echo "✓ Tofu-triggering codepoints stripped"
 
-# ── Strip terminal query/response artifacts ─────────────────────────────────
-# The Claude Code TUI probes the terminal (focus tracking, OSC 11 background
-# color, device attributes, XTVERSION), and pieces of those query/response
-# exchanges land in the recorded output stream. agg's renderer doesn't
-# understand them and paints fragments like ``^[[O`` or ``^[]11;rgb:...``
-# literally. They carry no visual content, so they are removed outright.
+# ── Strip terminal query/response artifacts and TUI tofu glyphs ─────────────
+# Two Claude-Code-specific cleanups on top of lib_demo.sh's shared passes:
+#
+# 1. The TUI probes the terminal (focus tracking, OSC 11 background color,
+#    device attributes, XTVERSION), and pieces of those query/response
+#    exchanges land in the recorded output stream. agg's renderer doesn't
+#    understand them and paints fragments like ``^[[O`` or ``^[]11;rgb:...``
+#    literally. They carry no visual content, so they are removed outright.
+#
+# 2. The TUI emits three codepoints Menlo has no glyph for, and agg's
+#    first-family-wins renderer paints them as tofu boxes (same root cause
+#    strip_emoji_from_cast documents). Verified against Menlo.ttc's cmap:
+#      ⏺ U+23FA BLACK CIRCLE FOR RECORD  → ● U+25CF (in Menlo, same intent)
+#      ⏸ U+23F8 DOUBLE VERTICAL BAR      → ║ U+2551 (in Menlo, same width)
+#      ⎿ U+23BF DENTISTRY SYMBOL ...     → └ U+2514 (in Menlo, same elbow)
+#    Everything else the TUI uses (box drawing, quadrant blocks, the
+#    spinner asterisks ✻✶✳✢✽, ❯, arrows) is covered by Menlo.
 python3 - "$CAST_FILE" <<'PYEOF'
 import json
 import re
@@ -383,6 +406,14 @@ ARTIFACTS = re.compile(
     r"|\x1bP>\|[^\x1b]*\x1b\\"                   # XTVERSION response
 )
 
+# Single-codepoint substitutions (str.translate); multi-char targets are
+# fine as translate values.
+TUI_TOFU = {
+    0x23FA: "\u25cf",  # ⏺ → ●
+    0x23F8: "\u2551",  # ⏸ → ║
+    0x23BF: "\u2514",  # ⎿ → └
+}
+
 path = Path(sys.argv[1])
 documents = []
 for line in path.read_text(encoding="utf-8").splitlines():
@@ -392,7 +423,7 @@ for line in path.read_text(encoding="utf-8").splitlines():
 
 for document in documents:
     if isinstance(document, list) and len(document) >= 3 and document[1] == "o":
-        document[2] = ARTIFACTS.sub("", document[2])
+        document[2] = ARTIFACTS.sub("", document[2]).translate(TUI_TOFU)
 
 path.write_text(
     "\n".join(json.dumps(d, ensure_ascii=False, separators=(",", ":")) for d in documents)
@@ -400,7 +431,7 @@ path.write_text(
     encoding="utf-8",
 )
 PYEOF
-echo "✓ Terminal query/response artifacts stripped"
+echo "✓ Terminal query/response artifacts stripped, TUI tofu glyphs substituted"
 
 # ── Convert to GIF ──────────────────────────────────────────────────────────
 
