@@ -78,6 +78,61 @@ class TestBuiltInNodePoolContracts:
         assert "arch" not in labels
 
 
+class TestStaticPodTokenBoundaries:
+    @staticmethod
+    def _documents(filename: str) -> list[dict]:
+        text = (MANIFESTS_DIR / filename).read_text(encoding="utf-8")
+        rendered = validator.render_placeholders(text)
+        return [document for document in yaml.safe_load_all(rendered) if document]
+
+    def test_shared_inference_service_account_disables_api_token(self) -> None:
+        accounts = {
+            document["metadata"]["namespace"]: document
+            for document in self._documents("01-serviceaccounts.yaml")
+            if document["kind"] == "ServiceAccount"
+        }
+        assert accounts["gco-jobs"]["automountServiceAccountToken"] is False
+        assert accounts["gco-inference"]["automountServiceAccountToken"] is False
+        assert accounts["gco-inference"]["metadata"]["annotations"]["eks.amazonaws.com/role-arn"]
+
+    def test_cost_monitor_disables_api_token_but_keeps_sts_projection(self) -> None:
+        documents = self._documents("34-cost-monitor.yaml")
+        account = next(document for document in documents if document["kind"] == "ServiceAccount")
+        deployment = next(document for document in documents if document["kind"] == "Deployment")
+        pod = deployment["spec"]["template"]["spec"]
+
+        assert account["automountServiceAccountToken"] is False
+        assert pod["automountServiceAccountToken"] is False
+        assert pod["serviceAccountName"] == "gco-cost-monitor-sa"
+
+        container = pod["containers"][0]
+        environment = {entry["name"]: entry["value"] for entry in container["env"]}
+        role_arn = account["metadata"]["annotations"]["eks.amazonaws.com/role-arn"]
+        token_directory = "/var/run/secrets/eks.amazonaws.com/serviceaccount"
+        assert environment["AWS_ROLE_ARN"] == role_arn
+        assert environment["AWS_WEB_IDENTITY_TOKEN_FILE"] == f"{token_directory}/token"
+
+        token_mount = next(
+            mount for mount in container["volumeMounts"] if mount["name"] == "aws-iam-token"
+        )
+        assert token_mount["mountPath"] == token_directory
+        assert token_mount["readOnly"] is True
+        token_source = next(
+            volume["projected"]["sources"][0]["serviceAccountToken"]
+            for volume in pod["volumes"]
+            if volume["name"] == "aws-iam-token"
+        )
+        assert token_source == {
+            "audience": "sts.amazonaws.com",
+            "expirationSeconds": 86400,
+            "path": "token",
+        }
+
+    def test_nvidia_plugin_disables_api_token(self) -> None:
+        (daemonset,) = self._documents("50-nvidia-device-plugin.yaml")
+        assert daemonset["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+
+
 # ── render_placeholders ───────────────────────────────────────────────────────
 
 
@@ -119,6 +174,7 @@ class TestRenderPlaceholders:
         [
             "03-network-policies.yaml",  # the structural VPC CIDR placeholder
             "30-health-monitor.yaml",  # bare image: placeholder + quoted values
+            "31-manifest-processor.yaml",  # REST policy env wiring
             "post-helm-sqs-consumer.yaml",  # the bare integer placeholders
             "04-resource-quotas.yaml",  # quoted-string placeholders only
         ],
@@ -132,6 +188,35 @@ class TestRenderPlaceholders:
         assert "{{" not in rendered
         docs = list(yaml.safe_load_all(rendered))
         assert any(doc for doc in docs), "rendered manifest produced no YAML documents"
+
+    def test_manifest_processor_security_policy_env_is_fully_wired(self) -> None:
+        raw = (MANIFESTS_DIR / "31-manifest-processor.yaml").read_text(encoding="utf-8")
+        # Only the image token occupies an unquoted YAML scalar. Preserve the
+        # quoted env tokens so this test can assert their exact wiring.
+        docs = list(
+            yaml.safe_load_all(
+                raw.replace("{{MANIFEST_PROCESSOR_IMAGE}}", "example.invalid/manifest:test")
+            )
+        )
+        deployment = next(doc for doc in docs if doc and doc.get("kind") == "Deployment")
+        env = {
+            item["name"]: item.get("value")
+            for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+        }
+
+        expected = {
+            "VALIDATION_ENABLED": "{{MP_VALIDATION_ENABLED}}",
+            "YAML_MAX_DEPTH": "{{MP_YAML_MAX_DEPTH}}",
+            "BLOCK_PRIVILEGED": "{{MP_BLOCK_PRIVILEGED}}",
+            "BLOCK_PRIVILEGE_ESCALATION": "{{MP_BLOCK_PRIVILEGE_ESCALATION}}",
+            "BLOCK_HOST_NETWORK": "{{MP_BLOCK_HOST_NETWORK}}",
+            "BLOCK_HOST_PID": "{{MP_BLOCK_HOST_PID}}",
+            "BLOCK_HOST_IPC": "{{MP_BLOCK_HOST_IPC}}",
+            "BLOCK_HOST_PATH": "{{MP_BLOCK_HOST_PATH}}",
+            "BLOCK_ADDED_CAPABILITIES": "{{MP_BLOCK_ADDED_CAPABILITIES}}",
+            "BLOCK_RUN_AS_ROOT": "{{MP_BLOCK_RUN_AS_ROOT}}",
+        }
+        assert {name: env.get(name) for name in expected} == expected
 
 
 # ── iter_target_files (live, offline) ─────────────────────────────────────────
@@ -308,6 +393,219 @@ class TestFormatFailures:
         assert validator.format_failures({"resources": []}) == []
 
 
+class TestKubeconformOutputIntegrity:
+    @pytest.mark.parametrize(
+        "result",
+        [
+            pytest.param({}, id="blank-or-malformed-json"),
+            pytest.param([], id="non-object-json"),
+            pytest.param(
+                {
+                    "resources": [],
+                    "summary": {"valid": 0, "invalid": 0, "errors": 0, "skipped": 0},
+                },
+                id="empty-results",
+            ),
+            pytest.param(
+                {
+                    "resources": [
+                        {
+                            "filename": "one.yaml",
+                            "kind": "Namespace",
+                            "name": "one",
+                            "status": "statusValid",
+                            "msg": "",
+                        }
+                    ],
+                    "summary": {"valid": 1, "invalid": 0, "errors": 0, "skipped": 0},
+                },
+                id="partial-results",
+            ),
+        ],
+    )
+    def test_zero_exit_with_unusable_json_fails_closed(
+        self,
+        result: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        for name in ("one", "two"):
+            (tmp_path / f"{name}.yaml").write_text(
+                f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {name}\n",
+                encoding="utf-8",
+            )
+        monkeypatch.setattr(validator.shutil, "which", lambda _binary: "/usr/bin/kubeconform")
+        monkeypatch.setattr(validator, "run_kubeconform", lambda *_args, **_kwargs: (0, result))
+
+        rc = validator.main(["--path", str(tmp_path), "--kubeconform-binary", "fake"])
+
+        assert rc == 2
+        assert "unusable JSON output" in capsys.readouterr().err
+
+    def test_v080_separator_pseudo_record_is_ignored(self) -> None:
+        result = {
+            "resources": [
+                {
+                    "filename": "one.yaml",
+                    "kind": "",
+                    "name": "",
+                    "version": "",
+                    "status": "",
+                    "msg": "",
+                },
+                {
+                    "filename": "one.yaml",
+                    "kind": "Namespace",
+                    "name": "one",
+                    "version": "v1",
+                    "status": "statusValid",
+                    "msg": "",
+                },
+            ],
+            "summary": {"valid": 1, "invalid": 0, "errors": 0, "skipped": 0},
+        }
+
+        assert (
+            validator.validate_kubeconform_output(
+                result,
+                expected_filenames={"one.yaml"},
+            )
+            == []
+        )
+
+    def test_multidocument_file_cannot_mask_a_missing_input(self) -> None:
+        result = {
+            "resources": [
+                {
+                    "filename": "one.yaml",
+                    "kind": "Namespace",
+                    "name": name,
+                    "status": "statusValid",
+                    "msg": "",
+                }
+                for name in ("one-a", "one-b")
+            ],
+            "summary": {"valid": 2, "invalid": 0, "errors": 0, "skipped": 0},
+        }
+
+        errors = validator.validate_kubeconform_output(
+            result,
+            expected_filenames={"one.yaml", "two.yaml"},
+        )
+
+        assert any("two.yaml" in error and "no resource result" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            pytest.param(
+                {
+                    "filename": "one.yaml",
+                    "kind": "Namespace",
+                    "name": "",
+                    "version": "",
+                    "status": "",
+                    "msg": "",
+                },
+                id="partially-populated",
+            ),
+            pytest.param(
+                {
+                    "filename": "one.yaml",
+                    "kind": "",
+                    "name": "",
+                    "version": "",
+                    "status": "",
+                    "msg": "",
+                    "futureField": "",
+                },
+                id="unknown-field",
+            ),
+            pytest.param(
+                {
+                    "filename": "one.yaml",
+                    "kind": "",
+                    "name": "",
+                    "status": "",
+                    "msg": "",
+                },
+                id="missing-field",
+            ),
+            pytest.param(
+                {
+                    "filename": "",
+                    "kind": "",
+                    "name": "",
+                    "version": "",
+                    "status": "",
+                    "msg": "",
+                },
+                id="empty-filename",
+            ),
+            pytest.param(
+                {
+                    "filename": 7,
+                    "kind": "",
+                    "name": "",
+                    "version": "",
+                    "status": "",
+                    "msg": "",
+                },
+                id="non-string-filename",
+            ),
+        ],
+    )
+    def test_non_separator_blank_records_still_fail_closed(self, record: dict) -> None:
+        result = {
+            "resources": [record],
+            "summary": {"valid": 0, "invalid": 0, "errors": 0, "skipped": 0},
+        }
+
+        errors = validator.validate_kubeconform_output(
+            result,
+            expected_filenames={"one.yaml"},
+        )
+        assert "resources[0] has unknown status ''" in errors
+
+    def test_complete_accounted_output_succeeds(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        manifest = tmp_path / "one.yaml"
+        manifest.write_text(
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: one\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(validator.shutil, "which", lambda _binary: "/usr/bin/kubeconform")
+
+        def fake_run(directory: Path, **_kwargs):
+            rendered = next(directory.rglob("*.yaml"))
+            return 0, {
+                "resources": [
+                    {
+                        "filename": str(rendered),
+                        "kind": "Namespace",
+                        "name": "one",
+                        "status": "statusValid",
+                        "msg": "",
+                    }
+                ],
+                "summary": {"valid": 1, "invalid": 0, "errors": 0, "skipped": 0},
+            }
+
+        monkeypatch.setattr(validator, "run_kubeconform", fake_run)
+
+        rc = validator.main(["--path", str(manifest), "--kubeconform-binary", "fake"])
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "OK: 1 manifest(s)" in captured.out
+        assert captured.err == ""
+
+
 class TestMainExplicitInputs:
     def test_missing_input_does_not_mask_existing_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -320,8 +618,20 @@ class TestMainExplicitInputs:
         monkeypatch.setattr(validator.shutil, "which", lambda _binary: "/usr/bin/kubeconform")
 
         def fake_run(directory: Path, **_kwargs):
-            calls.extend(directory.rglob("*.yaml"))
-            return 0, {"resources": [], "summary": {"valid": 1, "skipped": 0}}
+            rendered = list(directory.rglob("*.yaml"))
+            calls.extend(rendered)
+            return 0, {
+                "resources": [
+                    {
+                        "filename": str(rendered[0]),
+                        "kind": "Namespace",
+                        "name": "valid",
+                        "status": "statusValid",
+                        "msg": "",
+                    }
+                ],
+                "summary": {"valid": 1, "invalid": 0, "errors": 0, "skipped": 0},
+            }
 
         monkeypatch.setattr(validator, "run_kubeconform", fake_run)
         rc = validator.main(
@@ -340,25 +650,23 @@ class TestMainExplicitInputs:
         manifest.write_text("apiVersion: v1\nkind: Pod\nmetadata:\n  name: bad\n")
         missing = tmp_path / "missing.yaml"
         monkeypatch.setattr(validator.shutil, "which", lambda _binary: "/usr/bin/kubeconform")
-        monkeypatch.setattr(
-            validator,
-            "run_kubeconform",
-            lambda _directory, **_kwargs: (
-                1,
-                {
-                    "resources": [
-                        {
-                            "filename": "bad.yaml",
-                            "kind": "Pod",
-                            "name": "bad",
-                            "status": "statusInvalid",
-                            "msg": "schema error",
-                        }
-                    ],
-                    "summary": {"valid": 0, "skipped": 0},
-                },
-            ),
-        )
+
+        def fake_run(directory: Path, **_kwargs):
+            rendered = next(directory.rglob("*.yaml"))
+            return 1, {
+                "resources": [
+                    {
+                        "filename": str(rendered),
+                        "kind": "Pod",
+                        "name": "bad",
+                        "status": "statusInvalid",
+                        "msg": "schema error",
+                    }
+                ],
+                "summary": {"valid": 0, "invalid": 1, "errors": 0, "skipped": 0},
+            }
+
+        monkeypatch.setattr(validator, "run_kubeconform", fake_run)
 
         rc = validator.main(
             ["--path", str(manifest), "--path", str(missing), "--kubeconform-binary", "fake"]

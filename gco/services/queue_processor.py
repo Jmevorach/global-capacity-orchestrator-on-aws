@@ -36,13 +36,13 @@ Configuration via environment variables:
                              a bare byte count (default: 32Gi)
     TRUSTED_REGISTRIES:      Comma-separated list of registry domains
                              (e.g. "nvcr.io,public.ecr.aws"). Empty/unset
-                             disables the image registry check (fail-open).
+                             uses the REST processor's secure defaults.
                              Keep in sync with
                              cdk.json::job_validation_policy.trusted_registries.
     TRUSTED_DOCKERHUB_ORGS:  Comma-separated list of Docker Hub org names
-                             (e.g. "nvidia,pytorch"). Empty/unset disables
-                             the check. Keep in sync with
-                             cdk.json::job_validation_policy.trusted_dockerhub_orgs.
+                             (e.g. "nvidia,pytorch"). Empty/unset uses the
+                             REST processor's secure defaults. Keep in sync
+                             with cdk.json::job_validation_policy.trusted_dockerhub_orgs.
 
 Security policy toggles (all default to true except ``BLOCK_RUN_AS_ROOT``
 which defaults to false, matching job_validation_policy.manifest_security_policy
@@ -85,8 +85,14 @@ from kubernetes import client, config, dynamic
 from kubernetes.client.rest import ApiException
 from kubernetes.dynamic.exceptions import NotFoundError, ResourceNotFoundError
 
+from gco.manifest_security_policy import parse_boolean_environment
 from gco.models import ResourceStatus
-from gco.services.manifest_processor import DEFAULT_ALLOWED_KINDS, validate_resource_kind
+from gco.services.manifest_processor import (
+    DEFAULT_ALLOWED_KINDS,
+    DEFAULT_TRUSTED_DOCKERHUB_ORGS,
+    DEFAULT_TRUSTED_REGISTRIES,
+    validate_resource_kind,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,26 +172,14 @@ MAX_GPU = int(os.environ.get("MAX_GPU_PER_MANIFEST", "4"))
 ACCELERATOR_TAINTS = ("nvidia.com/gpu", "aws.amazon.com/neuron", "vpc.amazonaws.com/efa")
 
 # Trusted image sources (populated from cdk.json::manifest_processor at deploy time).
-# Comma-separated env vars; empty/unset disables the check (fail-open logged).
-# Keep in sync with gco/services/manifest_processor.py::_validate_image_sources.
+# Empty/unset values use the same secure defaults as ManifestProcessor so the
+# SQS path cannot bypass REST image-source validation after a wiring error.
 TRUSTED_REGISTRIES = [
     r.strip() for r in os.environ.get("TRUSTED_REGISTRIES", "").split(",") if r.strip()
-]
+] or list(DEFAULT_TRUSTED_REGISTRIES)
 TRUSTED_DOCKERHUB_ORGS = [
     o.strip() for o in os.environ.get("TRUSTED_DOCKERHUB_ORGS", "").split(",") if o.strip()
-]
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """Parse a boolean environment variable.
-
-    Empty/unset returns ``default``. Recognized truthy values: "true", "1",
-    "yes", "on" (case-insensitive). Everything else is falsy.
-    """
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in ("true", "1", "yes", "on")
+] or list(DEFAULT_TRUSTED_DOCKERHUB_ORGS)
 
 
 # Security-policy toggles. Every one of these mirrors an attribute the REST
@@ -194,19 +188,19 @@ def _env_bool(name: str, default: bool) -> bool:
 # sqs:SendMessage on the job queue must not be able to bypass checks the REST
 # path applies. Structural parity is pinned by
 # tests/test_queue_processor.py::TestSecurityPolicyParityWithManifestProcessor.
-BLOCK_PRIVILEGED = _env_bool("BLOCK_PRIVILEGED", True)
-BLOCK_PRIVILEGE_ESCALATION = _env_bool("BLOCK_PRIVILEGE_ESCALATION", True)
-BLOCK_HOST_NETWORK = _env_bool("BLOCK_HOST_NETWORK", True)
-BLOCK_HOST_PID = _env_bool("BLOCK_HOST_PID", True)
-BLOCK_HOST_IPC = _env_bool("BLOCK_HOST_IPC", True)
-BLOCK_HOST_PATH = _env_bool("BLOCK_HOST_PATH", True)
-BLOCK_ADDED_CAPABILITIES = _env_bool("BLOCK_ADDED_CAPABILITIES", True)
-BLOCK_RUN_AS_ROOT = _env_bool("BLOCK_RUN_AS_ROOT", False)
+BLOCK_PRIVILEGED = parse_boolean_environment("BLOCK_PRIVILEGED", True)
+BLOCK_PRIVILEGE_ESCALATION = parse_boolean_environment("BLOCK_PRIVILEGE_ESCALATION", True)
+BLOCK_HOST_NETWORK = parse_boolean_environment("BLOCK_HOST_NETWORK", True)
+BLOCK_HOST_PID = parse_boolean_environment("BLOCK_HOST_PID", True)
+BLOCK_HOST_IPC = parse_boolean_environment("BLOCK_HOST_IPC", True)
+BLOCK_HOST_PATH = parse_boolean_environment("BLOCK_HOST_PATH", True)
+BLOCK_ADDED_CAPABILITIES = parse_boolean_environment("BLOCK_ADDED_CAPABILITIES", True)
+BLOCK_RUN_AS_ROOT = parse_boolean_environment("BLOCK_RUN_AS_ROOT", False)
 
 # Hard-reject accelerator jobs that lack a matching node toleration. Mirrors
 # manifest_processor.require_accelerator_toleration so the SQS path is not a
 # bypass.
-REQUIRE_ACCELERATOR_TOLERATION = _env_bool("REQUIRE_ACCELERATOR_TOLERATION", True)
+REQUIRE_ACCELERATOR_TOLERATION = parse_boolean_environment("REQUIRE_ACCELERATOR_TOLERATION", True)
 
 
 def _is_registry_domain(entry: str) -> bool:
@@ -282,10 +276,9 @@ def _is_image_trusted(image: str) -> bool:
       3. Docker Hub images with an org (first segment has no '.' or ':') must
          match an entry in TRUSTED_DOCKERHUB_ORGS
 
-    If both allowlists are empty the check is disabled (fail-open, logged).
+    Empty or missing environment allowlists use the REST processor's secure
+    defaults; they never disable image-source validation.
     """
-    if not TRUSTED_REGISTRIES and not TRUSTED_DOCKERHUB_ORGS:
-        return True
     if not image:
         return True
     if "/" not in image:
@@ -338,9 +331,9 @@ def validate_manifest(m: dict[str, Any]) -> tuple[bool, str]:
     4. **Image registry allowlist** — every container's image must come
        from ``TRUSTED_REGISTRIES`` (registry domains like ``nvcr.io``)
        or ``TRUSTED_DOCKERHUB_ORGS`` (Docker Hub orgs like ``nvidia``).
-       Official Docker Hub images with no slash are always allowed. When
-       both allowlists are empty the check is disabled. Keep the lists in
-       sync with ``cdk.json::job_validation_policy.trusted_registries`` and
+       Official Docker Hub images with no slash are always allowed. Empty or
+       missing allowlists use the shared secure defaults. Keep explicit lists
+       in sync with ``cdk.json::job_validation_policy.trusted_registries`` and
        ``trusted_dockerhub_orgs`` — CDK wires the same config into both
        services.
 
@@ -577,6 +570,18 @@ def _inject_security_defaults(manifest: dict[str, Any]) -> dict[str, Any]:
     return manifest
 
 
+def _is_job_finished(job_resource: dict[str, Any]) -> bool:
+    """Return whether a Kubernetes Job has a true terminal condition."""
+    status = job_resource.get("status", {})
+    conditions = status.get("conditions") or [] if isinstance(status, dict) else []
+    return any(
+        isinstance(condition, dict)
+        and condition.get("type") in ("Complete", "Failed")
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+
+
 def apply_manifest(m: dict[str, Any]) -> ResourceStatus:
     """Apply one prevalidated manifest and return an explicit operation status.
 
@@ -616,9 +621,7 @@ def apply_manifest(m: dict[str, Any]) -> ResourceStatus:
     if kind == "Job":
         try:
             existing = resource.get(name=name, namespace=namespace)
-            conditions = existing.get("status", {}).get("conditions", [])
-            finished = any(c.get("type") in ("Complete", "Failed") for c in conditions)
-            if finished:
+            if _is_job_finished(existing):
                 log.info("Deleting finished Job %s/%s before re-creation", namespace, name)
                 resource.delete(
                     name=name,

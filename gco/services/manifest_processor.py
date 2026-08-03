@@ -47,6 +47,11 @@ from kubernetes.client.models import V1Job
 from kubernetes.client.rest import ApiException
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 
+from gco.manifest_security_policy import (
+    MANIFEST_SECURITY_POLICY_DEFAULTS,
+    parse_boolean_environment,
+    validate_manifest_security_policy,
+)
 from gco.models import (
     ManifestSubmissionRequest,
     ManifestSubmissionResponse,
@@ -93,6 +98,44 @@ DEFAULT_ALLOWED_KINDS = (
     "ConfigMap",
     "Pod",
 )
+
+# Authoritative image-source defaults shared by the REST and SQS submission
+# paths. Keep these centralized so missing deployment wiring cannot make either
+# path weaker or let their allowlists drift independently.
+DEFAULT_TRUSTED_REGISTRIES = (
+    "docker.io",
+    "gcr.io",
+    "quay.io",
+    "registry.k8s.io",
+    "k8s.gcr.io",
+    "public.ecr.aws",
+    "nvcr.io",
+)
+DEFAULT_TRUSTED_DOCKERHUB_ORGS = (
+    "nvidia",
+    "pytorch",
+    "rayproject",
+    "tensorflow",
+    "huggingface",
+    "amazon",
+    "bitnami",
+    "gco",
+)
+
+# CRUD endpoints accept only these exact built-in, namespaced GVKs. A kind-only
+# allowlist is insufficient because a custom API group can define the same kind
+# name, and cluster-scoped resources must never be reachable through a
+# namespace-shaped user endpoint.
+RESOURCE_API_VERSIONS: dict[str, frozenset[str]] = {
+    "Job": frozenset({"batch/v1"}),
+    "CronJob": frozenset({"batch/v1"}),
+    "Deployment": frozenset({"apps/v1"}),
+    "StatefulSet": frozenset({"apps/v1"}),
+    "DaemonSet": frozenset({"apps/v1"}),
+    "Service": frozenset({"v1"}),
+    "ConfigMap": frozenset({"v1"}),
+    "Pod": frozenset({"v1"}),
+}
 
 
 class RetryableQueuedJobApplyError(RuntimeError):
@@ -282,37 +325,22 @@ class ManifestProcessor:
         self.max_gpu_per_manifest = int(config_dict.get("max_gpu_per_manifest", 4))
         # Hard-reject accelerator jobs that lack a matching node toleration.
         # Kept in sync with queue_processor.REQUIRE_ACCELERATOR_TOLERATION.
-        self.require_accelerator_toleration = config_dict.get(
-            "require_accelerator_toleration", True
-        )
+        require_accelerator_toleration = config_dict.get("require_accelerator_toleration", True)
+        if type(require_accelerator_toleration) is not bool:
+            raise ValueError("require_accelerator_toleration must be a boolean")
+        self.require_accelerator_toleration = require_accelerator_toleration
         self.allowed_namespaces = set(config_dict.get("allowed_namespaces", ["gco-jobs"]))
-        self.validation_enabled = config_dict.get("validation_enabled", True)
+        validation_enabled = config_dict.get("validation_enabled", True)
+        if type(validation_enabled) is not bool:
+            raise ValueError("validation_enabled must be a boolean")
+        self.validation_enabled = validation_enabled
 
         # Trusted registries for image validation (configurable via cdk.json)
         self.trusted_registries = config_dict.get(
-            "trusted_registries",
-            [
-                "docker.io",
-                "gcr.io",
-                "quay.io",
-                "registry.k8s.io",
-                "k8s.gcr.io",
-                "public.ecr.aws",
-                "nvcr.io",
-            ],
+            "trusted_registries", list(DEFAULT_TRUSTED_REGISTRIES)
         )
         self.trusted_dockerhub_orgs = config_dict.get(
-            "trusted_dockerhub_orgs",
-            [
-                "nvidia",
-                "pytorch",
-                "rayproject",
-                "tensorflow",
-                "huggingface",
-                "amazon",
-                "bitnami",
-                "gco",
-            ],
+            "trusted_dockerhub_orgs", list(DEFAULT_TRUSTED_DOCKERHUB_ORGS)
         )
 
         # Warn about trusted_registries entries that look like Docker Hub orgs (no dot or colon)
@@ -330,7 +358,9 @@ class ManifestProcessor:
         self.allowed_kinds = set(config_dict.get("allowed_kinds", DEFAULT_ALLOWED_KINDS))
 
         # Security policy — toggleable checks (configurable via cdk.json)
-        security_policy = config_dict.get("manifest_security_policy", {})
+        security_policy = validate_manifest_security_policy(
+            config_dict.get("manifest_security_policy", {})
+        )
         self.block_privileged = security_policy.get("block_privileged", True)
         self.block_privilege_escalation = security_policy.get("block_privilege_escalation", True)
         self.block_host_network = security_policy.get("block_host_network", True)
@@ -339,6 +369,20 @@ class ManifestProcessor:
         self.block_host_path = security_policy.get("block_host_path", True)
         self.block_added_capabilities = security_policy.get("block_added_capabilities", True)
         self.block_run_as_root = security_policy.get("block_run_as_root", False)
+
+    def _resource_access_error(self, api_version: str, kind: str, namespace: str) -> str | None:
+        """Return an authorization error for a CRUD resource identifier."""
+        if namespace not in self.allowed_namespaces:
+            return f"Namespace '{namespace}' is not allowed"
+        if kind not in self.allowed_kinds:
+            return f"Resource kind '{kind}' is not allowed"
+        allowed_versions = RESOURCE_API_VERSIONS.get(kind)
+        if not allowed_versions or api_version not in allowed_versions:
+            return (
+                f"API version '{api_version}' is not allowed for kind '{kind}'. "
+                f"Allowed versions: {sorted(allowed_versions or ())}"
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Security defaults injection
@@ -1241,12 +1285,21 @@ class ManifestProcessor:
         return False
 
     async def _get_existing_resource(
-        self, api_version: str, kind: str, name: str, namespace: str
+        self,
+        api_version: str,
+        kind: str,
+        name: str,
+        namespace: str,
+        *,
+        api_resource: Any | None = None,
     ) -> dict[str, Any] | None:
-        """Check if a resource already exists using dynamic client"""
+        """Check if a resource already exists using dynamic client."""
         try:
-            # Get the API resource
-            api_resource = self._get_api_resource(api_version, kind)
+            # Reuse an already-authorized discovery result when supplied so a
+            # status request cannot observe a different resource definition
+            # between the scope check and the actual read.
+            if api_resource is None:
+                api_resource = self._get_api_resource(api_version, kind)
 
             # Try to get the resource
             if namespace and api_resource.namespaced:
@@ -1331,15 +1384,32 @@ class ManifestProcessor:
         """
         Delete a resource from the cluster using dynamic client
         """
+        access_error = self._resource_access_error(api_version, kind, namespace)
+        if access_error:
+            return ResourceStatus(
+                api_version=api_version,
+                kind=kind,
+                name=name,
+                namespace=namespace,
+                status="forbidden",
+                message=access_error,
+            )
+
         try:
             # Get the API resource
             api_resource = self._get_api_resource(api_version, kind)
+            if not api_resource.namespaced:
+                return ResourceStatus(
+                    api_version=api_version,
+                    kind=kind,
+                    name=name,
+                    namespace=namespace,
+                    status="forbidden",
+                    message="Cluster-scoped resource operations are not allowed",
+                )
 
-            # Delete the resource
-            if namespace and api_resource.namespaced:
-                api_resource.delete(name=name, namespace=namespace)
-            else:
-                api_resource.delete(name=name)
+            # Every authorized GVK is namespaced; never drop the namespace.
+            api_resource.delete(name=name, namespace=namespace)
 
             return ResourceStatus(
                 api_version=api_version,
@@ -1500,8 +1570,37 @@ class ManifestProcessor:
         """
         Get the status of a specific resource
         """
+        access_error = self._resource_access_error(api_version, kind, namespace)
+        if access_error:
+            return {
+                "api_version": api_version,
+                "kind": kind,
+                "name": name,
+                "namespace": namespace,
+                "exists": False,
+                "forbidden": True,
+                "error": access_error,
+            }
+
         try:
-            resource = await self._get_existing_resource(api_version, kind, name, namespace)
+            api_resource = self._get_api_resource(api_version, kind)
+            if not api_resource.namespaced:
+                return {
+                    "api_version": api_version,
+                    "kind": kind,
+                    "name": name,
+                    "namespace": namespace,
+                    "exists": False,
+                    "forbidden": True,
+                    "error": "Cluster-scoped resource operations are not allowed",
+                }
+            resource = await self._get_existing_resource(
+                api_version,
+                kind,
+                name,
+                namespace,
+                api_resource=api_resource,
+            )
             if resource:
                 return {
                     "api_version": api_version,
@@ -1525,6 +1624,13 @@ class ManifestProcessor:
             return None
 
 
+def _manifest_security_policy_from_env() -> dict[str, bool]:
+    return {
+        key: parse_boolean_environment(key.upper(), default)
+        for key, default in MANIFEST_SECURITY_POLICY_DEFAULTS.items()
+    }
+
+
 def create_manifest_processor_from_env() -> ManifestProcessor:
     """
     Create ManifestProcessor instance from environment variables
@@ -1544,10 +1650,9 @@ def create_manifest_processor_from_env() -> ManifestProcessor:
         "max_cpu_per_manifest": os.getenv("MAX_CPU_PER_MANIFEST", "10"),
         "max_memory_per_manifest": os.getenv("MAX_MEMORY_PER_MANIFEST", "32Gi"),
         "max_gpu_per_manifest": int(os.getenv("MAX_GPU_PER_MANIFEST", "4")),
-        "require_accelerator_toleration": os.getenv(
-            "REQUIRE_ACCELERATOR_TOLERATION", "true"
-        ).lower()
-        == "true",
+        "require_accelerator_toleration": parse_boolean_environment(
+            "REQUIRE_ACCELERATOR_TOLERATION", True
+        ),
         "allowed_namespaces": (
             ["gco-jobs"]
             if os.getenv("ALLOWED_NAMESPACES") is None
@@ -1557,7 +1662,9 @@ def create_manifest_processor_from_env() -> ManifestProcessor:
                 if namespace.strip()
             ]
         ),
-        "validation_enabled": os.getenv("VALIDATION_ENABLED", "true").lower() == "true",
+        "validation_enabled": parse_boolean_environment("VALIDATION_ENABLED", True),
+        "yaml_max_depth": int(os.getenv("YAML_MAX_DEPTH", "50")),
+        "manifest_security_policy": _manifest_security_policy_from_env(),
     }
 
     allowed_kinds_env = os.getenv("ALLOWED_KINDS")

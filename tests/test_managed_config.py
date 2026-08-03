@@ -24,6 +24,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -82,6 +83,26 @@ def cdk_json(tmp_path: Path) -> Path:
     path = tmp_path / "cdk.json"
     path.write_text(json.dumps(BASE_CONFIG, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def _hold_config_lock_worker(path: str, ready: Any, release: Any) -> None:
+    """Process target that holds the shared directory lock until released."""
+    from cli.stacks import _config_mutation_lock
+
+    with _config_mutation_lock(Path(path)):
+        ready.set()
+        release.wait(10)
+
+
+def _add_region_worker(path: str, started: Any, result_queue: Any) -> None:
+    """Process target that reports whether a managed update completed."""
+    started.set()
+    try:
+        add_deployment_region("us-west-2", config_path=path)
+    except BaseException as exc:  # pragma: no cover - returned to parent
+        result_queue.put((False, f"{type(exc).__name__}: {exc}"))
+    else:
+        result_queue.put((True, ""))
 
 
 # =============================================================================
@@ -242,6 +263,268 @@ class TestEngineWriteMechanics:
         assert "deployment_regions.regional" in summary
         assert "us-west-2" in summary
         assert str(cdk_json) in summary
+
+    def test_concurrent_updates_do_not_lose_each_other(
+        self, cdk_json: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The lock covers load through replace, not just the final write."""
+        import threading
+        import time
+
+        import cli.managed_config as managed_config
+
+        original_load = managed_config._load_document
+
+        def slow_load(path: Path):
+            loaded = original_load(path)
+            # Release the GIL after reading. Without transaction locking, both
+            # workers deterministically read the same pre-update document and
+            # the last replace loses the other worker's Region.
+            time.sleep(0.05)
+            return loaded
+
+        monkeypatch.setattr(managed_config, "_load_document", slow_load)
+        start = threading.Barrier(3)
+        errors: list[BaseException] = []
+
+        def add(region: str) -> None:
+            start.wait()
+            try:
+                add_deployment_region(region, config_path=cdk_json)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=add, args=(region,)) for region in ("us-west-1", "us-west-2")
+        ]
+        for worker in workers:
+            worker.start()
+        start.wait()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        assert all(not worker.is_alive() for worker in workers)
+        assert errors == []
+        regional = json.loads(cdk_json.read_text(encoding="utf-8"))["context"][
+            "deployment_regions"
+        ]["regional"]
+        assert regional[0] == "us-east-1"
+        assert set(regional[1:]) == {"us-west-1", "us-west-2"}
+
+    def test_process_update_waits_for_shared_lock(self, cdk_json: Path):
+        """The advisory lock coordinates separate CLI/MCP processes."""
+        import multiprocessing
+        import time
+
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        started = context.Event()
+        result_queue = context.Queue()
+        holder = context.Process(
+            target=_hold_config_lock_worker,
+            args=(str(cdk_json), ready, release),
+        )
+        writer = context.Process(
+            target=_add_region_worker,
+            args=(str(cdk_json), started, result_queue),
+        )
+
+        holder.start()
+        try:
+            assert ready.wait(5), "lock-holder process did not start"
+            writer.start()
+            assert started.wait(5), "writer process did not start"
+            time.sleep(0.1)
+            assert writer.is_alive(), "writer bypassed the held cross-process lock"
+        finally:
+            release.set()
+            holder.join(timeout=5)
+            writer.join(timeout=5)
+
+        assert holder.exitcode == 0
+        assert writer.exitcode == 0
+        assert result_queue.get(timeout=2) == (True, "")
+        assert get_deployment_regions_status(config_path=cdk_json)["regional"] == [
+            "us-east-1",
+            "us-west-2",
+        ]
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory flock semantics")
+    def test_posix_process_update_obeys_config_lock_timeout(
+        self, cdk_json: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A live holder cannot block another POSIX config writer indefinitely."""
+        import multiprocessing
+
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        started = context.Event()
+        result_queue = context.Queue()
+        holder = context.Process(
+            target=_hold_config_lock_worker,
+            args=(str(cdk_json), ready, release),
+        )
+        writer = context.Process(
+            target=_add_region_worker,
+            args=(str(cdk_json), started, result_queue),
+        )
+        monkeypatch.setenv("GCO_CONFIG_LOCK_TIMEOUT_SECONDS", "0.2")
+
+        holder.start()
+        try:
+            assert ready.wait(5), "lock-holder process did not start"
+            writer.start()
+            assert started.wait(5), "writer process did not start"
+            writer.join(timeout=5)
+            assert not writer.is_alive(), "writer ignored the configured lock timeout"
+            assert writer.exitcode == 0
+            succeeded, error = result_queue.get(timeout=2)
+            assert succeeded is False
+            assert "ManagedConfigError" in error
+            assert "Timed out" in error
+            assert "GCO_CONFIG_LOCK_TIMEOUT_SECONDS" in error
+            assert holder.is_alive(), "holder released the lock before the timeout was observed"
+        finally:
+            release.set()
+            holder.join(timeout=5)
+            writer.join(timeout=5)
+
+        assert holder.exitcode == 0
+        assert get_deployment_regions_status(config_path=cdk_json)["regional"] == ["us-east-1"]
+
+    def test_windows_config_lock_uses_stable_sidecar_and_is_reentrant(self, cdk_json: Path):
+        """Windows serializes on one persistent file without relocking nested calls."""
+        from cli import stacks
+
+        lock_path = cdk_json.parent / stacks._CONFIG_LOCK_FILENAME
+        events: list[tuple[str, str, bool]] = []
+
+        def acquire(lock_file: Any, *, exclusive: bool, purpose: str) -> None:
+            assert purpose == "configuration"
+            events.append(("acquire", str(lock_file.name), exclusive))
+
+        def release(lock_file: Any) -> None:
+            events.append(("release", str(lock_file.name), True))
+
+        with (
+            patch.object(stacks.os, "name", "nt"),
+            patch.object(stacks, "_acquire_file_lock", side_effect=acquire),
+            patch.object(stacks, "_release_file_lock", side_effect=release),
+            stacks._config_mutation_lock(cdk_json),
+            stacks._config_mutation_lock(cdk_json),
+        ):
+            assert events == [("acquire", str(lock_path), True)]
+
+        assert events == [
+            ("acquire", str(lock_path), True),
+            ("release", str(lock_path), True),
+        ]
+        assert lock_path.is_file()
+
+    def test_windows_config_lock_acquisition_failure_closes_handle_and_resets_state(
+        self, cdk_json: Path
+    ):
+        """A failed OS lock cannot leak a handle or leave false reentrant state."""
+        from cli import stacks
+
+        failed_handles: list[Any] = []
+        successful_acquisitions: list[str] = []
+
+        def fail_acquisition(lock_file: Any, *, exclusive: bool, purpose: str) -> None:
+            assert exclusive is True
+            assert purpose == "configuration"
+            failed_handles.append(lock_file)
+            raise TimeoutError("configuration lock contention")
+
+        def acquire(lock_file: Any, *, exclusive: bool, purpose: str) -> None:
+            assert exclusive is True
+            assert purpose == "configuration"
+            successful_acquisitions.append(str(lock_file.name))
+
+        with (
+            patch.object(stacks.os, "name", "nt"),
+            patch.object(stacks, "_acquire_file_lock", side_effect=fail_acquisition),
+            pytest.raises(stacks.ConfigMutationLockError, match="configuration lock contention"),
+            stacks._config_mutation_lock(cdk_json),
+        ):
+            pass
+
+        assert len(failed_handles) == 1
+        assert failed_handles[0].closed
+
+        with (
+            patch.object(stacks.os, "name", "nt"),
+            patch.object(stacks, "_acquire_file_lock", side_effect=acquire),
+            patch.object(stacks, "_release_file_lock"),
+            stacks._config_mutation_lock(cdk_json),
+        ):
+            pass
+
+        assert successful_acquisitions == [str(cdk_json.parent / stacks._CONFIG_LOCK_FILENAME)]
+
+    def test_feature_writer_participates_in_same_transaction(
+        self, cdk_json: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A legacy feature toggle cannot overwrite a managed config edit."""
+        import threading
+        import time
+
+        import cli.managed_config as managed_config
+        from cli import stacks
+
+        original_load = managed_config._load_document
+        managed_loaded = threading.Event()
+        release_managed = threading.Event()
+        errors: list[BaseException] = []
+
+        def paused_load(path: Path):
+            loaded = original_load(path)
+            managed_loaded.set()
+            if not release_managed.wait(5):
+                raise TimeoutError("test did not release managed writer")
+            return loaded
+
+        monkeypatch.setattr(managed_config, "_load_document", paused_load)
+        monkeypatch.setattr(stacks, "_find_cdk_json", lambda: cdk_json)
+
+        def managed_writer() -> None:
+            try:
+                add_deployment_region("us-west-2", config_path=cdk_json)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        def feature_writer() -> None:
+            try:
+                stacks._update_feature_config(
+                    "my_feature",
+                    {"enabled": True},
+                    {"enabled": False},
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        managed_thread = threading.Thread(target=managed_writer)
+        feature_thread = threading.Thread(target=feature_writer)
+        managed_thread.start()
+        assert managed_loaded.wait(5)
+        feature_thread.start()
+        time.sleep(0.1)
+        assert feature_thread.is_alive(), "feature writer bypassed the shared lock"
+        release_managed.set()
+        managed_thread.join(timeout=5)
+        feature_thread.join(timeout=5)
+
+        assert not managed_thread.is_alive()
+        assert not feature_thread.is_alive()
+        assert errors == []
+        document = json.loads(cdk_json.read_text(encoding="utf-8"))
+        assert document["context"]["deployment_regions"]["regional"] == [
+            "us-east-1",
+            "us-west-2",
+        ]
+        assert document["context"]["my_feature"]["enabled"] is True
 
 
 # =============================================================================

@@ -35,6 +35,16 @@ class TestResourceQuotaTemplateVars:
             "{{MP_MAX_GPU_PER_MANIFEST}}": "8",
             "{{MP_REQUIRE_ACCELERATOR_TOLERATION}}": "true",
             "{{MP_MAX_REQUEST_BODY_BYTES}}": "1048576",
+            "{{MP_VALIDATION_ENABLED}}": "true",
+            "{{MP_YAML_MAX_DEPTH}}": "50",
+            "{{MP_BLOCK_PRIVILEGED}}": "true",
+            "{{MP_BLOCK_PRIVILEGE_ESCALATION}}": "true",
+            "{{MP_BLOCK_HOST_NETWORK}}": "true",
+            "{{MP_BLOCK_HOST_PID}}": "true",
+            "{{MP_BLOCK_HOST_IPC}}": "true",
+            "{{MP_BLOCK_HOST_PATH}}": "true",
+            "{{MP_BLOCK_ADDED_CAPABILITIES}}": "true",
+            "{{MP_BLOCK_RUN_AS_ROOT}}": "false",
             "{{MP_ALLOWED_NAMESPACES}}": "gco-jobs",
             "{{MP_ALLOWED_KINDS}}": (
                 "Job,CronJob,Deployment,StatefulSet,DaemonSet,Service,ConfigMap,Pod"
@@ -113,6 +123,9 @@ class TestManifestProcessorEnvVars:
     def test_has_shared_namespace_and_kind_policy_env(self, manifest_content):
         assert 'value: "{{MP_ALLOWED_NAMESPACES}}"' in manifest_content
         assert 'value: "{{MP_ALLOWED_KINDS}}"' in manifest_content
+
+    def test_has_validation_enabled_env(self, manifest_content):
+        assert 'value: "{{MP_VALIDATION_ENABLED}}"' in manifest_content
 
 
 class TestQueueProcessorEnvVars:

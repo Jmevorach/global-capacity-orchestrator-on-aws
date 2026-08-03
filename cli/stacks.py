@@ -52,13 +52,13 @@ import time
 import uuid
 from collections.abc import Callable, Collection, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from threading import Event, Lock, Thread, local
-from typing import TYPE_CHECKING, Any, BinaryIO, TypedDict
+from threading import Event, Lock, RLock, Thread, local
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypedDict
 
 from botocore.exceptions import ClientError
 
@@ -86,6 +86,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Every writer that replaces cdk.json must participate in the same transaction
+# lock. The process-local RLock handles threads and nested feature updates; the
+# advisory process lock uses a stable directory descriptor on POSIX and a
+# persistent sidecar file on Windows, so it survives ``os.replace`` of the
+# configuration inode.
+_CONFIG_LOCK_FILENAME = ".gco-config.lock"
+_CONFIG_THREAD_LOCKS: dict[Path, Any] = {}
+_CONFIG_THREAD_LOCKS_GUARD = Lock()
+_CONFIG_LOCK_STATE = local()
+
 # Python packages ``app.py`` imports at CDK synth time. They ship in the
 # optional ``[cdk]`` extra (see pyproject.toml), NOT the base install, so a
 # lightweight ``uvx`` / ``pip install`` of ``gco-cli`` that skips the extra
@@ -106,11 +116,13 @@ _LAMBDA_SOURCE_COPY_IGNORE_PATTERNS = (
     "*.pyc",
     "*.pyo",
 )
-_ASSET_LOCK_RETRY_SECONDS = 0.05
+_FILE_LOCK_RETRY_SECONDS = 0.05
 # 15 minutes: comfortably above the longest legitimate hold (a cold publisher
 # rebuild, minutes) while bounding the pathological one (an abandoned pytest
 # session's session-long shared locks, indefinite).
 _ASSET_LOCK_TIMEOUT_SECONDS_DEFAULT = 900.0
+_CONFIG_LOCK_TIMEOUT_SECONDS_DEFAULT = 900.0
+_FileLockPurpose = Literal["asset", "configuration"]
 _CDK_ASSET_CONSUMER_MAX_ATTEMPTS = 3
 _CLOUDFORMATION_DELETE_TIMEOUT_SECONDS = 7200.0
 _CLOUDFORMATION_DELETE_POLL_SECONDS = 15.0
@@ -323,27 +335,42 @@ def _windows_lock_is_contended(exc: OSError) -> bool:
     ) in {32, 33, 36}
 
 
-def _asset_lock_timeout_seconds() -> float:
-    """Bounded wait for a contended asset lock, env-tunable.
+def _file_lock_timeout_seconds(purpose: _FileLockPurpose) -> float:
+    """Return the bounded wait for one class of interprocess lock."""
+    if purpose == "asset":
+        env_name = "GCO_ASSET_LOCK_TIMEOUT_SECONDS"
+        default = _ASSET_LOCK_TIMEOUT_SECONDS_DEFAULT
+    else:
+        env_name = "GCO_CONFIG_LOCK_TIMEOUT_SECONDS"
+        default = _CONFIG_LOCK_TIMEOUT_SECONDS_DEFAULT
 
-    Contended acquisitions used to block forever with no diagnostics; a
-    destroy was once observed frozen for 40 minutes inside ``flock`` because
-    two abandoned pytest sessions still held their session-long shared locks.
-    The bound turns that silence into a warning at contention time and an
-    actionable error at the deadline.
-    """
-    raw = os.environ.get("GCO_ASSET_LOCK_TIMEOUT_SECONDS", "")
+    raw = os.environ.get(env_name, "")
     try:
         value = float(raw)
     except ValueError:
-        return _ASSET_LOCK_TIMEOUT_SECONDS_DEFAULT
+        return default
     if not math.isfinite(value) or value <= 0:
-        return _ASSET_LOCK_TIMEOUT_SECONDS_DEFAULT
+        return default
     return value
 
 
-def _warn_asset_lock_contended(lock_file: BinaryIO, *, exclusive: bool, timeout: float) -> None:
-    lock_name = getattr(lock_file, "name", "<unknown>")
+def _warn_file_lock_contended(
+    lock_name: object,
+    *,
+    exclusive: bool,
+    timeout: float,
+    purpose: _FileLockPurpose,
+) -> None:
+    if purpose == "configuration":
+        logger.warning(
+            "Waiting up to %.0fs for the configuration lock on %s — another CLI "
+            "or MCP process is updating cdk.json. Wait for it to finish; tune via "
+            "GCO_CONFIG_LOCK_TIMEOUT_SECONDS.",
+            timeout,
+            lock_name,
+        )
+        return
+
     mode = "exclusive" if exclusive else "shared"
     logger.warning(
         "Waiting up to %.0fs for the %s asset lock on %s — another process holds "
@@ -357,8 +384,20 @@ def _warn_asset_lock_contended(lock_file: BinaryIO, *, exclusive: bool, timeout:
     )
 
 
-def _raise_asset_lock_timeout(lock_file: BinaryIO, *, timeout: float) -> None:
-    lock_name = getattr(lock_file, "name", "<unknown>")
+def _raise_file_lock_timeout(
+    lock_name: object,
+    *,
+    timeout: float,
+    purpose: _FileLockPurpose,
+) -> None:
+    if purpose == "configuration":
+        raise TimeoutError(
+            f"Timed out after {timeout:.0f}s waiting for the configuration lock on "
+            f"{lock_name}. Another CLI or MCP process is updating cdk.json. Wait "
+            "for it to finish and retry; raise GCO_CONFIG_LOCK_TIMEOUT_SECONDS "
+            "to wait longer."
+        )
+
     raise TimeoutError(
         f"Timed out after {timeout:.0f}s waiting for the asset lock on {lock_name}. "
         "Another process still holds it — often an abandoned pytest session, which "
@@ -367,25 +406,74 @@ def _raise_asset_lock_timeout(lock_file: BinaryIO, *, timeout: float) -> None:
     )
 
 
-def _acquire_asset_file_lock(
+def _posix_lock_is_contended(exc: OSError) -> bool:
+    return isinstance(exc, BlockingIOError) or exc.errno in {errno.EACCES, errno.EAGAIN}
+
+
+def _acquire_posix_flock(
+    lock_fd: int,
+    *,
+    lock_name: object,
+    exclusive: bool,
+    purpose: _FileLockPurpose,
+) -> None:
+    """Acquire one POSIX flock with the shared warning and timeout contract."""
+    import fcntl
+
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    try:
+        fcntl.flock(lock_fd, operation | fcntl.LOCK_NB)
+        return
+    except OSError as exc:
+        if not _posix_lock_is_contended(exc):
+            raise
+
+    timeout = _file_lock_timeout_seconds(purpose)
+    deadline = time.monotonic() + timeout
+    _warn_file_lock_contended(
+        lock_name,
+        exclusive=exclusive,
+        timeout=timeout,
+        purpose=purpose,
+    )
+    while True:
+        try:
+            fcntl.flock(lock_fd, operation | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if not _posix_lock_is_contended(exc):
+                raise
+            if time.monotonic() >= deadline:
+                _raise_file_lock_timeout(
+                    lock_name,
+                    timeout=timeout,
+                    purpose=purpose,
+                )
+            time.sleep(_FILE_LOCK_RETRY_SECONDS)
+
+
+def _acquire_file_lock(
     lock_file: BinaryIO,
     *,
     exclusive: bool,
+    purpose: _FileLockPurpose,
 ) -> None:
     """Acquire a platform-native interprocess lock, loudly and boundedly.
 
-    The first attempt is non-blocking. On contention a warning names the lock
-    file and the likely holder class, then acquisition polls until the
-    env-tunable deadline so a stuck holder produces an actionable error
-    instead of an indefinite silent hang.
+    The first attempt is non-blocking. On contention a purpose-specific warning
+    names the lock file, then acquisition polls until the env-tunable deadline
+    so a stuck holder produces an actionable error instead of an indefinite
+    silent hang.
     """
     if os.name == "nt":
         import msvcrt
 
         msvcrt_api: Any = msvcrt
         _ensure_windows_lock_byte(lock_file)
+        lock_name = getattr(lock_file, "name", "<unknown>")
         warned = False
         deadline: float | None = None
+        timeout: float | None = None
         while True:
             lock_file.seek(0)
             try:
@@ -398,37 +486,33 @@ def _acquire_asset_file_lock(
                 if not _windows_lock_is_contended(exc):
                     raise
                 if not warned:
-                    timeout = _asset_lock_timeout_seconds()
+                    timeout = _file_lock_timeout_seconds(purpose)
                     deadline = time.monotonic() + timeout
-                    _warn_asset_lock_contended(lock_file, exclusive=exclusive, timeout=timeout)
+                    _warn_file_lock_contended(
+                        lock_name,
+                        exclusive=exclusive,
+                        timeout=timeout,
+                        purpose=purpose,
+                    )
                     warned = True
-                assert deadline is not None
+                assert deadline is not None and timeout is not None
                 if time.monotonic() >= deadline:
-                    _raise_asset_lock_timeout(lock_file, timeout=_asset_lock_timeout_seconds())
-                time.sleep(_ASSET_LOCK_RETRY_SECONDS)
+                    _raise_file_lock_timeout(
+                        lock_name,
+                        timeout=timeout,
+                        purpose=purpose,
+                    )
+                time.sleep(_FILE_LOCK_RETRY_SECONDS)
 
-    import fcntl
-
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-    try:
-        fcntl.flock(lock_file.fileno(), operation | fcntl.LOCK_NB)
-        return
-    except BlockingIOError:
-        pass
-    timeout = _asset_lock_timeout_seconds()
-    deadline = time.monotonic() + timeout
-    _warn_asset_lock_contended(lock_file, exclusive=exclusive, timeout=timeout)
-    while True:
-        try:
-            fcntl.flock(lock_file.fileno(), operation | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                _raise_asset_lock_timeout(lock_file, timeout=timeout)
-            time.sleep(_ASSET_LOCK_RETRY_SECONDS)
+    _acquire_posix_flock(
+        lock_file.fileno(),
+        lock_name=getattr(lock_file, "name", "<unknown>"),
+        exclusive=exclusive,
+        purpose=purpose,
+    )
 
 
-def _release_asset_file_lock(lock_file: BinaryIO) -> None:
+def _release_file_lock(lock_file: BinaryIO) -> None:
     """Release the matching platform-native interprocess lock."""
     if os.name == "nt":
         import msvcrt
@@ -463,13 +547,13 @@ def _lambda_asset_lock(build_dir: Path, *, exclusive: bool) -> Iterator[None]:
         return
 
     with lock_path.open("a+b") as lock_file:
-        _acquire_asset_file_lock(lock_file, exclusive=exclusive)
+        _acquire_file_lock(lock_file, exclusive=exclusive, purpose="asset")
         held[lock_key] = (exclusive, 1)
         try:
             yield
         finally:
             held.pop(lock_key, None)
-            _release_asset_file_lock(lock_file)
+            _release_file_lock(lock_file)
 
 
 def _asset_build_is_fresh(
@@ -598,6 +682,102 @@ def _atomic_write_bytes(target: Path, content: bytes, *, mode: int | None = None
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+class ConfigMutationLockError(RuntimeError):
+    """The shared cdk.json transaction lock could not be acquired."""
+
+
+@contextmanager
+def _config_process_lock(lock_key: Path) -> Iterator[None]:
+    """Hold the platform-native process lock for one config directory."""
+    if os.name == "nt":
+        # Windows cannot open a directory for ``msvcrt.locking``. A persistent
+        # sidecar in that directory gives every CLI/MCP process the same stable
+        # inode even while cdk.json itself is atomically replaced.
+        lock_path = lock_key / _CONFIG_LOCK_FILENAME
+        lock_file: BinaryIO | None = None
+        try:
+            lock_file = lock_path.open("a+b")
+            _acquire_file_lock(lock_file, exclusive=True, purpose="configuration")
+        except OSError as exc:
+            if lock_file is not None:
+                lock_file.close()
+            raise ConfigMutationLockError(
+                f"could not lock configuration directory {lock_key}: {exc}"
+            ) from exc
+
+        try:
+            yield
+        finally:
+            assert lock_file is not None
+            try:
+                _release_file_lock(lock_file)
+            finally:
+                lock_file.close()
+        return
+
+    # Keep the POSIX directory lock: unlike a lock on cdk.json, the descriptor
+    # continues to identify the same object when an atomic writer replaces the
+    # configuration file.
+    import fcntl
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open(lock_key, flags)
+        _acquire_posix_flock(
+            lock_fd,
+            lock_name=str(lock_key),
+            exclusive=True,
+            purpose="configuration",
+        )
+    except OSError as exc:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        raise ConfigMutationLockError(
+            f"could not lock configuration directory {lock_key}: {exc}"
+        ) from exc
+
+    try:
+        yield
+    finally:
+        assert lock_fd is not None
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+@contextmanager
+def _config_mutation_lock(path: Path) -> Iterator[None]:
+    """Serialize a complete read/modify/replace transaction for ``path``.
+
+    POSIX locks the stable directory descriptor; Windows locks a persistent
+    sidecar in that directory. A thread-local held-set makes this context
+    reentrant, which is required by analytics teardown: it holds the
+    transaction across its temporary mutation and nested feature-toggle writes.
+    """
+    lock_key = path.parent.resolve()
+    with _CONFIG_THREAD_LOCKS_GUARD:
+        thread_lock = _CONFIG_THREAD_LOCKS.setdefault(lock_key, RLock())
+
+    with thread_lock:
+        held_directories = getattr(_CONFIG_LOCK_STATE, "held_directories", None)
+        if held_directories is None:
+            held_directories = set()
+            _CONFIG_LOCK_STATE.held_directories = held_directories
+        if lock_key in held_directories:
+            yield
+            return
+
+        with _config_process_lock(lock_key):
+            held_directories.add(lock_key)
+            try:
+                yield
+            finally:
+                held_directories.discard(lock_key)
 
 
 @lru_cache(maxsize=1)
@@ -1866,33 +2046,43 @@ class StackManager:
     ) -> bool:
         """Destroy stacks while restoring any temporary config mutation exactly."""
         config_path: Path | None = None
-        original_bytes: bytes | None = None
-        original_mode: int | None = None
         if stack_name and not all_stacks and "analytics" in stack_name:
             config_path = _find_cdk_json()
             if config_path is None:
                 raise RuntimeError("cdk.json not found before analytics destroy")
-            original_bytes = config_path.read_bytes()
-            original_mode = stat.S_IMODE(config_path.stat().st_mode)
-        try:
-            return self._destroy(
-                stack_name=stack_name,
-                all_stacks=all_stacks,
-                force=force,
-                output_dir=output_dir,
-                expected_stack_id=expected_stack_id,
-                expected_stack_ids=expected_stack_ids,
-                prepared_change_sets=prepared_change_sets,
-                authorize_stack=authorize_stack,
-                allow_bootstrap=allow_bootstrap,
-                bootstrap_stacks=bootstrap_stacks,
-                strict_deployment_token=strict_deployment_token,
-                on_change_set_prepared=on_change_set_prepared,
-                on_ecr_repository_created=on_ecr_repository_created,
-            )
-        finally:
-            if config_path is not None and original_bytes is not None:
-                _atomic_write_bytes(config_path, original_bytes, mode=original_mode)
+
+        # Analytics teardown may temporarily enable a disabled stack in the CDK
+        # app. Hold the shared configuration transaction through restore so a
+        # concurrent CLI/MCP edit cannot be silently overwritten by the exact-
+        # bytes rollback in ``finally``.
+        lock_context = (
+            _config_mutation_lock(config_path) if config_path is not None else nullcontext()
+        )
+        with lock_context:
+            original_bytes: bytes | None = None
+            original_mode: int | None = None
+            if config_path is not None:
+                original_bytes = config_path.read_bytes()
+                original_mode = stat.S_IMODE(config_path.stat().st_mode)
+            try:
+                return self._destroy(
+                    stack_name=stack_name,
+                    all_stacks=all_stacks,
+                    force=force,
+                    output_dir=output_dir,
+                    expected_stack_id=expected_stack_id,
+                    expected_stack_ids=expected_stack_ids,
+                    prepared_change_sets=prepared_change_sets,
+                    authorize_stack=authorize_stack,
+                    allow_bootstrap=allow_bootstrap,
+                    bootstrap_stacks=bootstrap_stacks,
+                    strict_deployment_token=strict_deployment_token,
+                    on_change_set_prepared=on_change_set_prepared,
+                    on_ecr_repository_created=on_ecr_repository_created,
+                )
+            finally:
+                if config_path is not None and original_bytes is not None:
+                    _atomic_write_bytes(config_path, original_bytes, mode=original_mode)
 
     def _destroy(
         self,
@@ -5740,34 +5930,35 @@ def _update_feature_config(
 
     import json
 
-    with open(cdk_json_path, encoding="utf-8") as f:
-        cdk_config = json.load(f)
+    with _config_mutation_lock(cdk_json_path):
+        with open(cdk_json_path, encoding="utf-8") as f:
+            cdk_config = json.load(f)
 
-    if "context" not in cdk_config:
-        cdk_config["context"] = {}
+        if "context" not in cdk_config:
+            cdk_config["context"] = {}
 
-    if region:
-        region_key = f"{feature_key}_regions"
-        if region_key not in cdk_config["context"]:
-            cdk_config["context"][region_key] = {}
-        if region not in cdk_config["context"][region_key]:
-            cdk_config["context"][region_key][region] = {}
-        for key, value in settings.items():
-            if value is not None or key == "enabled":
-                cdk_config["context"][region_key][region][key] = value
-    else:
-        if feature_key not in cdk_config["context"]:
-            cdk_config["context"][feature_key] = {**default_config}
-        for key, value in settings.items():
-            if value is not None or key == "enabled":
-                cdk_config["context"][feature_key][key] = value
+        if region:
+            region_key = f"{feature_key}_regions"
+            if region_key not in cdk_config["context"]:
+                cdk_config["context"][region_key] = {}
+            if region not in cdk_config["context"][region_key]:
+                cdk_config["context"][region_key][region] = {}
+            for key, value in settings.items():
+                if value is not None or key == "enabled":
+                    cdk_config["context"][region_key][region][key] = value
+        else:
+            if feature_key not in cdk_config["context"]:
+                cdk_config["context"][feature_key] = {**default_config}
+            for key, value in settings.items():
+                if value is not None or key == "enabled":
+                    cdk_config["context"][feature_key][key] = value
 
-    serialized = json.dumps(cdk_config, indent=2).encode("utf-8")
-    _atomic_write_bytes(
-        cdk_json_path,
-        serialized,
-        mode=stat.S_IMODE(cdk_json_path.stat().st_mode),
-    )
+        serialized = json.dumps(cdk_config, indent=2).encode("utf-8")
+        _atomic_write_bytes(
+            cdk_json_path,
+            serialized,
+            mode=stat.S_IMODE(cdk_json_path.stat().st_mode),
+        )
 
 
 # =============================================================================

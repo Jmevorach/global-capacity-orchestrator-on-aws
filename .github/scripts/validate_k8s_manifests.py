@@ -65,6 +65,7 @@ import subprocess  # nosec B404 - used only to invoke the pinned `kubeconform` b
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -278,7 +279,7 @@ def run_kubeconform(
     strict: bool = True,
     extra_schema_locations: tuple[str, ...] = (CRD_CATALOG_SCHEMA_LOCATION,),
     skip_gvks: tuple[str, ...] = SCHEMA_UNAVAILABLE_SKIPS,
-) -> tuple[int, dict]:
+) -> tuple[int, object]:
     """Run kubeconform against every manifest in ``directory``, JSON output.
 
     Returns ``(returncode, parsed_json)``. ``parsed_json`` is ``{}`` if
@@ -316,7 +317,112 @@ def run_kubeconform(
     return proc.returncode, parsed
 
 
-def format_failures(result: dict) -> list[str]:
+_KUBECONFORM_STATUS_TO_SUMMARY = {
+    "statusValid": "valid",
+    "statusInvalid": "invalid",
+    "statusError": "errors",
+    "statusSkipped": "skipped",
+}
+_KUBECONFORM_RESOURCE_FIELDS = frozenset({"filename", "kind", "name", "version", "status", "msg"})
+_KUBECONFORM_BLANK_RESOURCE_FIELDS = ("kind", "name", "version", "status", "msg")
+
+
+def _is_kubeconform_separator_record(resource: object) -> bool:
+    """Recognize kubeconform v0.8.0's record for a leading YAML separator.
+
+    The pinned binary emits one record with a filename but empty semantic
+    fields when a file starts with ``---``. Match that exact shape so a
+    partially populated record or a future unknown field still fails closed.
+    """
+    return (
+        isinstance(resource, dict)
+        and set(resource) == _KUBECONFORM_RESOURCE_FIELDS
+        and isinstance(resource["filename"], str)
+        and bool(resource["filename"])
+        and all(resource[field] == "" for field in _KUBECONFORM_BLANK_RESOURCE_FIELDS)
+    )
+
+
+def validate_kubeconform_output(
+    result: object,
+    *,
+    expected_filenames: set[str],
+) -> list[str]:
+    """Validate kubeconform's JSON envelope and per-file resource accounting.
+
+    A zero process exit code is not sufficient: blank, malformed, truncated,
+    or structurally incomplete JSON must fail closed rather than reporting
+    ``OK: 0 manifest(s)``. Multi-document inputs may produce many resource
+    records, so completeness is based on exact rendered filenames instead of
+    comparing aggregate record and file counts.
+    """
+    if not isinstance(result, dict):
+        return ["top-level JSON value is not an object"]
+
+    errors: list[str] = []
+    raw_resources = result.get("resources")
+    if not isinstance(raw_resources, list):
+        return ["'resources' is missing or is not an array"]
+    resources = [
+        resource for resource in raw_resources if not _is_kubeconform_separator_record(resource)
+    ]
+    if not resources:
+        errors.append("'resources' is empty")
+
+    expected = {str(Path(filename).resolve(strict=False)) for filename in expected_filenames}
+    observed: set[str] = set()
+    actual_counts = dict.fromkeys(_KUBECONFORM_STATUS_TO_SUMMARY.values(), 0)
+    for index, resource in enumerate(resources):
+        if not isinstance(resource, dict):
+            errors.append(f"resources[{index}] is not an object")
+            continue
+
+        filename = resource.get("filename")
+        if not isinstance(filename, str) or not filename:
+            errors.append(f"resources[{index}].filename is missing or is not a non-empty string")
+        else:
+            observed.add(str(Path(filename).resolve(strict=False)))
+
+        status = resource.get("status")
+        summary_field = (
+            _KUBECONFORM_STATUS_TO_SUMMARY.get(status) if isinstance(status, str) else None
+        )
+        if summary_field is None:
+            errors.append(f"resources[{index}] has unknown status {status!r}")
+            continue
+        actual_counts[summary_field] += 1
+
+    missing = sorted(expected - observed)
+    if missing:
+        errors.append("no resource result was returned for input file(s): " + ", ".join(missing))
+    unexpected = sorted(observed - expected)
+    if unexpected:
+        errors.append(
+            "resource results were returned for unexpected file(s): " + ", ".join(unexpected)
+        )
+
+    summary = result.get("summary")
+    if not isinstance(summary, dict):
+        errors.append("'summary' is missing or is not an object")
+        return errors
+
+    for field, actual_count in actual_counts.items():
+        reported_count = summary.get(field)
+        if (
+            isinstance(reported_count, bool)
+            or not isinstance(reported_count, int)
+            or reported_count < 0
+        ):
+            errors.append(f"summary.{field} is missing or is not a non-negative integer")
+        elif reported_count != actual_count:
+            errors.append(
+                f"summary.{field} reports {reported_count}, but resources contain {actual_count}"
+            )
+
+    return errors
+
+
+def format_failures(result: dict[str, Any]) -> list[str]:
     """Turn kubeconform's per-resource JSON records into readable error lines.
 
     Only ``statusInvalid`` and ``statusError`` are failures — ``statusValid``
@@ -398,7 +504,8 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="gco-k8s-validate-") as tmp:
         rendered_dir = Path(tmp)
-        render_tree(files, rendered_dir)
+        rendered_paths = render_tree(files, rendered_dir)
+        expected_filenames = {str(path) for path in rendered_paths}
 
         rc, result = run_kubeconform(
             rendered_dir,
@@ -406,15 +513,21 @@ def main(argv: list[str] | None = None) -> int:
             strict=not args.no_strict,
         )
 
-    if args.verbose:
-        for resource in result.get("resources", []):
+    output_errors = validate_kubeconform_output(
+        result,
+        expected_filenames=expected_filenames,
+    )
+    result_dict = result if isinstance(result, dict) else {}
+
+    if args.verbose and not output_errors:
+        for resource in result_dict.get("resources", []):
             if resource.get("status") == "statusValid":
                 kind = resource.get("kind") or ""
                 name = resource.get("name") or ""
                 print(f"ok    {resource.get('filename')}: {kind} {name}".rstrip())
 
-    failures = format_failures(result)
-    summary = result.get("summary", {})
+    failures = format_failures(result_dict) if not output_errors else []
+    summary = result_dict.get("summary", {})
 
     if failures:
         print()
@@ -430,8 +543,12 @@ def main(argv: list[str] | None = None) -> int:
 
     _print_input_errors(input_errors)
 
-    runtime_failure = rc != 0 and not failures
-    if runtime_failure:
+    runtime_failure = bool(output_errors) or (rc != 0 and not failures)
+    if output_errors:
+        print("ERROR: kubeconform returned unusable JSON output:", file=sys.stderr)
+        for error in output_errors:
+            print(f"  - {error}", file=sys.stderr)
+    elif rc != 0 and not failures:
         # A non-zero process result without resource validation failures is an
         # invocation/runtime error, even if a partial JSON document was emitted.
         print("ERROR: kubeconform exited non-zero without validation failures.", file=sys.stderr)

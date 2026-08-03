@@ -10,6 +10,7 @@ import pytest
 from kubernetes.client.rest import ApiException
 
 from gco.services.inference_monitor import (
+    AWS_CLI_IMAGE,
     MOONCAKE_BOOTSTRAP_BASE_PORT,
     VLLM_MOONCAKE_BOOTSTRAP_PORT_ENV,
     AdminApiKeySecretError,
@@ -641,6 +642,33 @@ def test_deployment_builder_suppresses_root_path_for_explicit_command() -> None:
     assert container.command == ["python3", "custom_server.py"]
     assert container.args is None
     assert container.readiness_probe.http_get.path == "/ready"
+
+
+def test_deployment_builder_uses_literal_model_sync_argv_without_api_token() -> None:
+    monitor = _make_monitor()
+    model_source = "s3://model-bucket/prefix; echo not-shell-syntax"
+    deployment = _build_deployment(
+        monitor,
+        {
+            "image": "example/runtime:pinned",
+            "gpu_count": 0,
+            "model_source": model_source,
+        },
+    )
+    pod = deployment.spec.template.spec
+    (model_sync,) = pod.init_containers
+
+    assert pod.service_account_name == "gco-service-account"
+    assert pod.automount_service_account_token is False
+    assert model_sync.image == AWS_CLI_IMAGE
+    assert model_sync.command == ["aws"]
+    assert model_sync.args == [
+        "s3",
+        "sync",
+        model_source,
+        "/models/chat",
+        "--quiet",
+    ]
 
 
 def test_deployment_builder_appends_extra_args_and_merges_role_labels() -> None:

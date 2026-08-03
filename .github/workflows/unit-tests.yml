@@ -231,9 +231,22 @@ jobs:
   unit-pytest-core:
     name: "unit:pytest:core"
     needs: unit-pytest-core-shard
+    # A skipped required check can be treated as non-blocking. Always schedule
+    # this stable aggregate check, then fail it explicitly unless every matrix
+    # shard succeeded.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Require every core test shard to pass
+        env:
+          SHARD_RESULT: ${{ needs.unit-pytest-core-shard.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SHARD_RESULT" != "success" ]; then
+            echo "::error::Core pytest shard result was ${SHARD_RESULT}; refusing a successful aggregate check."
+            exit 1
+          fi
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7.0.0
         with:
@@ -377,8 +390,8 @@ jobs:
           python-version: "3.14"
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
-      - name: Install CLI with CDK dependencies
-        run: pip install -e ".[cdk]"
+      - name: Install CLI with CDK and test dependencies
+        run: pip install -e ".[cdk,test]"
       - name: Exercise native Windows imports and asset locks
         shell: pwsh
         run: |
@@ -398,6 +411,14 @@ jobs:
           print("Windows CDK imports and asset locks OK")
           '@ | python -
           gco stacks --help
+      - name: Verify native Windows configuration-lock exclusion
+        # This item only exercises cli.managed_config/cli.stacks against a
+        # temporary cdk.json. Exclude the repository-wide autouse conftest,
+        # which prepares every CDK Lambda asset and would make this focused
+        # Windows lock test depend on the unrelated Node/npm packaging stack.
+        run: >-
+          python -m pytest --noconftest -q
+          tests/test_managed_config.py::TestEngineWriteMechanics::test_process_update_waits_for_shared_lock
 
   # End-to-end smoke for `gco autopilot`: the launch plan resolves without
   # Claude Code present, the generated MCP config is valid and matches the

@@ -37,11 +37,12 @@ _QP_ENV_VARS = (
     "BLOCK_RUN_AS_ROOT",
     "ALLOWED_NAMESPACES",
     "ALLOWED_KINDS",
-    "MAX_CPU",
-    "MAX_MEMORY",
-    "MAX_GPU",
+    "MAX_CPU_PER_MANIFEST",
+    "MAX_MEMORY_PER_MANIFEST",
+    "MAX_GPU_PER_MANIFEST",
     "TRUSTED_REGISTRIES",
     "TRUSTED_DOCKERHUB_ORGS",
+    "REQUIRE_ACCELERATOR_TOLERATION",
 )
 
 
@@ -344,9 +345,18 @@ class TestApplyManifest:
     def test_finished_job_deleted(self):
         qp, res = self._setup_mocks()
         qp.time = MagicMock()
-        res.get.return_value = {"status": {"conditions": [{"type": "Complete"}]}}
+        res.get.return_value = {"status": {"conditions": [{"type": "Complete", "status": "True"}]}}
         assert qp.apply_manifest(_job()).status == "created"
         res.delete.assert_called_once()
+
+    def test_false_terminal_condition_is_not_deleted(self):
+        qp, res = self._setup_mocks()
+        qp.time = MagicMock()
+        res.get.return_value = {"status": {"conditions": [{"type": "Failed", "status": "False"}]}}
+
+        assert qp.apply_manifest(_job()).status == "created"
+
+        res.delete.assert_not_called()
 
     def test_non_namespaced(self):
         qp, res = self._setup_mocks()
@@ -801,14 +811,16 @@ class TestImageRegistryAllowlist:
         ok, err = qp.validate_manifest(_job_with_image("public.ecr.aws/lambda/python:3.14"))
         assert ok, err
 
-    def test_empty_allowlists_disable_check(self, monkeypatch):
-        """Unset/empty allowlists must fail-open (no check), to preserve
-        backward compatibility with operators who haven't opted in."""
+    def test_empty_allowlists_use_secure_defaults(self, monkeypatch):
+        """Missing deployment wiring must retain the REST processor defaults."""
         monkeypatch.setenv("TRUSTED_REGISTRIES", "")
         monkeypatch.setenv("TRUSTED_DOCKERHUB_ORGS", "")
         qp = _reload()
         ok, err = qp.validate_manifest(_job_with_image("evil.example.com/malicious:latest"))
-        assert ok, err
+        assert not ok
+        assert "untrusted" in err.lower()
+        assert "nvcr.io" in qp.TRUSTED_REGISTRIES
+        assert "nvidia" in qp.TRUSTED_DOCKERHUB_ORGS
 
     def test_init_container_image_rejected(self, monkeypatch):
         """initContainers carry real risk (they run with pod privileges
@@ -1400,33 +1412,51 @@ class TestCronJobSecurityPolicyChecks:
 
 
 class TestEnvBoolParser:
-    """Sanity checks for the env-var boolean parser."""
+    """Sanity checks for the shared fail-closed env-var boolean parser."""
 
-    def test_env_bool_true_variants(self):
+    def test_env_bool_true_variants(self, monkeypatch):
         qp = _reload()
-        for v in ("true", "True", "TRUE", "1", "yes", "on"):
-            assert qp._env_bool("X", False) is False  # unset default
-            import os as _os
+        for value in ("true", "True", "TRUE", "1", "yes", "on"):
+            monkeypatch.setenv("X", value)
+            assert qp.parse_boolean_environment("X", False) is True
+        monkeypatch.delenv("X")
+        assert qp.parse_boolean_environment("X", False) is False
 
-            _os.environ["X"] = v
-            try:
-                assert qp._env_bool("X", False) is True, f"{v!r} should be true"
-            finally:
-                _os.environ.pop("X")
-
-    def test_env_bool_false_variants(self):
+    def test_env_bool_false_variants(self, monkeypatch):
         qp = _reload()
-        import os as _os
+        for value in ("false", "False", "0", "no", "off"):
+            monkeypatch.setenv("X", value)
+            assert qp.parse_boolean_environment("X", True) is False
+        for value in ("", "   "):
+            monkeypatch.setenv("X", value)
+            assert qp.parse_boolean_environment("X", True) is True
 
-        for v in ("false", "False", "0", "no", "off", ""):
-            _os.environ["X"] = v
-            try:
-                # Empty string falls back to the default, which we pass as True
-                # so we can distinguish "" from "false".
-                expected = v == ""
-                assert qp._env_bool("X", True) is expected, f"{v!r} should be {expected}"
-            finally:
-                _os.environ.pop("X")
+    @pytest.mark.parametrize("value", ("treu", "2", "${UNRESOLVED_BOOLEAN}"))
+    def test_env_bool_rejects_malformed_values(self, monkeypatch, value):
+        qp = _reload()
+        monkeypatch.setenv("X", value)
+        with pytest.raises(ValueError, match="X must be an explicit boolean value"):
+            qp.parse_boolean_environment("X", True)
+
+    @pytest.mark.parametrize(
+        "name",
+        (
+            "BLOCK_PRIVILEGED",
+            "BLOCK_PRIVILEGE_ESCALATION",
+            "BLOCK_HOST_NETWORK",
+            "BLOCK_HOST_PID",
+            "BLOCK_HOST_IPC",
+            "BLOCK_HOST_PATH",
+            "BLOCK_ADDED_CAPABILITIES",
+            "BLOCK_RUN_AS_ROOT",
+            "REQUIRE_ACCELERATOR_TOLERATION",
+        ),
+    )
+    def test_malformed_boolean_rejects_queue_worker_startup(self, monkeypatch, name):
+        """Every queue-worker admission toggle fails closed during import."""
+        monkeypatch.setenv(name, "${UNRESOLVED_BOOLEAN}")
+        with pytest.raises(ValueError, match=rf"{name} must be an explicit boolean value"):
+            _reload()
 
 
 class TestSecurityPolicyParityWithManifestProcessor:
