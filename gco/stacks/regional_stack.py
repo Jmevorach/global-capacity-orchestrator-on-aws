@@ -5130,7 +5130,13 @@ class GCORegionalStack(Stack):
             self,
             "AuroraPgvectorCluster",
             engine=rds.DatabaseClusterEngine.aurora_postgres(
-                version=getattr(rds.AuroraPostgresEngineVersion, AURORA_POSTGRES_VERSION),
+                # ``of()`` rather than a ``VER_X_Y`` enum member: the pin in
+                # constants.py is a plain version string so an Aurora minor
+                # bump never has to wait for an aws-cdk-lib enum release.
+                version=rds.AuroraPostgresEngineVersion.of(
+                    AURORA_POSTGRES_VERSION,
+                    AURORA_POSTGRES_VERSION.split(".", 1)[0],
+                ),
             ),
             serverless_v2_min_capacity=aurora_config.get("min_acu", 0),
             serverless_v2_max_capacity=aurora_config.get("max_acu", 16),
@@ -5183,6 +5189,26 @@ class GCORegionalStack(Stack):
                     "Aurora cluster members inherit the cluster's "
                     "storage_encrypted=True; StorageEncrypted is not applicable "
                     "on Aurora member DBInstances."
+                ),
+            )
+        )
+
+        # E9006 checks EngineVersion against the enum embedded in the CDK's
+        # bundled CloudFormation resource spec, which lags new Aurora minor
+        # releases (at 17.10's release the spec listed 17.9 and even 18.3,
+        # but not 17.10). The pin in constants.py is validated against the
+        # authoritative source instead: the monthly dependency scan compares
+        # it with live ``rds describe-db-engine-versions`` output, and the
+        # live release validation deploys it for real. Same app-wide
+        # collection caveat as W9008 above; the compensating controls are
+        # those live checks, which a stale spec enum cannot see.
+        Validations.of(self.aurora_cluster).acknowledge(
+            Acknowledgment(
+                id="CloudFormation-Validate::E9006",
+                reason=(
+                    "EngineVersion is validated against live RDS (monthly "
+                    "dependency scan + live release validation); the CDK's "
+                    "embedded CloudFormation spec enum lags new Aurora minors."
                 ),
             )
         )
