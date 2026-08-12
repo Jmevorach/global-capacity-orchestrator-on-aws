@@ -518,11 +518,10 @@ spec:
     eks.amazonaws.com/instance-family: g5
 ```
 
-### GPU Time-Slicing (Fractional GPUs)
+### Fractional / Shared GPUs
 
-You can share a single GPU across multiple pods using NVIDIA time-slicing. The NVIDIA device plugin is already installed (as a standalone DaemonSet, with [EKS Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/automode.html) providing the GPU drivers), but time-slicing is not enabled by default. To enable it, apply a ConfigMap that sets the number of replicas per physical GPU (e.g., `replicas: 4` makes one GPU appear as four schedulable units). The kube-scheduler can then place several lightweight workloads onto one GPU node. Note that [Karpenter](https://karpenter.sh/) does not currently account for time-slicing replicas when provisioning nodes ([kubernetes-sigs/karpenter#729](https://github.com/kubernetes-sigs/karpenter/issues/729)), so it may over-provision initially.
-
-See `examples/gpu-timeslicing-job.yaml` for a complete example with setup instructions.
+GCO runs on [EKS Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/automode.html), which ships the NVIDIA driver **and** device plugin built into the node (the plugin is not visible as a DaemonSet). GPU sharing via the device plugin's time-slicing ConfigMap is therefore not available: there is no cluster-managed device plugin to configure, and installing the community plugin alongside the built-in one does not work (it cannot initialize NVML on Auto Mode nodes and crash-loops).
+For workloads that don't need a full dedicated GPU, use the fractional-GPU instance sizes already present in the default `gpu-x86-pool` (`g6f` / `gr6f` expose a slice of an L4 as a whole `nvidia.com/gpu` unit), or right-size onto the smallest suitable family (e.g. `g4dn.xlarge`). Constrain placement with `eks.amazonaws.com/instance-family` node selectors as shown above.
 
 ## Customizing Services
 
@@ -2139,12 +2138,49 @@ For namespace allowlisting, resource caps, and security toggles (shared between 
 "job_validation_policy": {
   "allowed_namespaces": ["gco-jobs"],
   "resource_quotas": {
-    "max_cpu_per_manifest": "10",
-    "max_memory_per_manifest": "32Gi",
-    "max_gpu_per_manifest": 4
+    "max_cpu_per_manifest": "384",
+    "max_memory_per_manifest": "4096Gi",
+    "max_gpu_per_manifest": 16
   }
 }
 ```
+
+The caps limit what a single submitted manifest may request in total (summed
+across all containers). They sit between two other enforcement layers, and
+synth validates the ordering so the three always tell one story:
+
+- `resource_quota.container_max_*` (the gco-jobs `LimitRange`) caps each
+  container; a manifest cap below it would reject manifests whose single
+  container the cluster admits.
+- `resource_quota.max_*` (the gco-jobs `ResourceQuota`) caps the namespace
+  aggregate; a manifest cap above it would accept manifests whose pods can
+  never all run.
+
+The defaults size a per-manifest budget of two full accelerator nodes
+(2 × p5.48xlarge: 384 vCPUs, 16 GPUs) so the shipped distributed-training
+examples pass the front door unchanged.
+
+The per-container and namespace layers live under the top-level
+`resource_quota` context (substituted into the gco-jobs `ResourceQuota` and
+`LimitRange` manifests at deploy time), with defaults sized for one full
+accelerator node per container and two nodes plus headroom per namespace:
+
+```json
+"resource_quota": {
+  "max_cpu": "400",
+  "max_memory": "4096Gi",
+  "max_gpu": "32",
+  "max_pods": "50",
+  "container_max_cpu": "192",
+  "container_max_memory": "2048Gi",
+  "container_max_gpu": "8"
+}
+```
+
+Overrides are validated at synth: unknown keys, unparseable quantities, a
+container ceiling above its namespace ceiling, or a manifest cap outside the
+`container_max_* <= *_per_manifest <= max_*` ordering all fail the deploy
+with a message naming the offending pair.
 
 ### Disabling the Built-In Consumer
 

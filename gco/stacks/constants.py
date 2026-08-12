@@ -24,6 +24,21 @@ from collections.abc import Collection, Mapping
 from functools import lru_cache
 from types import MappingProxyType
 
+# Resource-governance defaults live in gco.resource_governance (a
+# runtime-shippable module) because the manifest/queue processors need the
+# same values inside their container images, whose build context deliberately
+# excludes gco/stacks/** (see _SERVICE_IMAGE_COMMON_EXCLUDES in the regional
+# stack). Re-exported here so synth-side code keeps one import home.
+from gco.resource_governance import (
+    DEFAULT_MANIFEST_RESOURCE_CAPS as DEFAULT_MANIFEST_RESOURCE_CAPS,
+)
+from gco.resource_governance import (
+    DEFAULT_RESOURCE_QUOTA as DEFAULT_RESOURCE_QUOTA,
+)
+from gco.resource_governance import (
+    parse_k8s_quantity as parse_k8s_quantity,
+)
+
 # ---------------------------------------------------------------------------
 # Lambda Runtimes
 # ---------------------------------------------------------------------------

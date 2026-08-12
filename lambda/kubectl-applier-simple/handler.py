@@ -108,6 +108,18 @@ _GATEWAY_CUSTOM_OBJECTS: dict[str, tuple[str, str, str, bool]] = {
     ),
 }
 
+# Kueue queue-topology resources applied by post-helm-kueue-default-queues.yaml.
+# Kept separate from _GATEWAY_CUSTOM_OBJECTS because gateway kinds get the
+# ALB-finalizer teardown treatment while these are ordinary CRs; the same
+# group/version/plural/scope discipline applies so apply and pruning cannot
+# drift onto different objects. tests/test_kubectl_applier.py pins this map
+# against the manifests directory exactly like the gateway map.
+_QUEUEING_CUSTOM_OBJECTS: dict[str, tuple[str, str, str, bool]] = {
+    "ResourceFlavor": ("kueue.x-k8s.io", "v1beta1", "resourceflavors", True),
+    "ClusterQueue": ("kueue.x-k8s.io", "v1beta1", "clusterqueues", True),
+    "LocalQueue": ("kueue.x-k8s.io", "v1beta1", "localqueues", False),
+}
+
 # Services annotated with this marker are validated for exact existence only;
 # a ready EndpointSlice endpoint is not required. Reserved for Services whose
 # backends schedule exclusively onto accelerator nodes that a fresh cluster
@@ -143,8 +155,11 @@ _SUPPORTED_MANIFEST_KINDS = frozenset(
         "PersistentVolume",
         "PersistentVolumeClaim",
         "Pod",
+        "ClusterQueue",
+        "LocalQueue",
         "PodDisruptionBudget",
         "PodMonitor",
+        "ResourceFlavor",
         "ResourceQuota",
         "Role",
         "RoleBinding",
@@ -162,6 +177,7 @@ _SUPPORTED_MANIFEST_KINDS = frozenset(
 _CLUSTER_SCOPED_KINDS = frozenset(
     {
         "APIService",
+        "ClusterQueue",
         "ClusterRole",
         "ClusterRoleBinding",
         "CustomResourceDefinition",
@@ -171,6 +187,7 @@ _CLUSTER_SCOPED_KINDS = frozenset(
         "Namespace",
         "NodePool",
         "PersistentVolume",
+        "ResourceFlavor",
         "StorageClass",
     }
 )
@@ -427,6 +444,18 @@ _FEATURE_RESOURCE_INVENTORY: dict[
     ("{{QUEUE_PROCESSOR_IMAGE}}", True): (
         ("keda.sh/v1alpha1", "ScaledJob", "gco-system", "sqs-queue-processor"),
     ),
+    ("{{KUEUE_ENABLED}}", True): (
+        # Deletion order matters: the LocalQueue references the ClusterQueue,
+        # which references the ResourceFlavor.
+        ("kueue.x-k8s.io/v1beta1", "LocalQueue", "gco-jobs", "gco-default"),
+        ("kueue.x-k8s.io/v1beta1", "ClusterQueue", None, "gco-cluster-queue"),
+        ("kueue.x-k8s.io/v1beta1", "ResourceFlavor", None, "gco-default-flavor"),
+    ),
+    ("{{SLURM_ENABLED}}", True): (
+        ("networking.k8s.io/v1", "NetworkPolicy", "gco-jobs", "allow-slurm-cluster-internal"),
+        ("networking.k8s.io/v1", "NetworkPolicy", "gco-jobs", "allow-slurm-client-to-restapi"),
+        ("networking.k8s.io/v1", "NetworkPolicy", "gco-jobs", "allow-slurm-client-egress"),
+    ),
     ("{{COST_MONITORING_ENABLED}}", False): (
         ("apps/v1", "Deployment", "gco-system", "cost-monitor"),
         ("v1", "Service", "gco-system", "cost-monitor"),
@@ -456,14 +485,34 @@ _FEATURE_RESOURCE_INVENTORY: dict[
 }
 
 
-def _prune_disabled_feature(placeholder: str, post_helm: bool) -> dict[str, list[str]]:
-    """Delete only the exact resources managed by a disabled optional feature.
+# Resources GCO shipped in earlier releases that no longer appear in the
+# manifest set. The base apply pass deletes them exactly (missing = no-op) so
+# upgraded clusters do not keep orphaned objects running forever.
+#
+# nvidia-device-plugin-daemonset: GCO runs exclusively on EKS Auto Mode, which
+# ships its own NVIDIA device plugin built into the node ("runs automatically
+# and isn't visible as a daemon set" — the EKS auto-accelerated guide). The
+# community plugin GCO used to ship can never start on Auto Mode GPU nodes:
+# the runtime only injects the NVIDIA driver libraries for containers that
+# request them, so the plugin crash-loops with NVML ERROR_LIBRARY_NOT_FOUND
+# and permanently fails DaemonSet convergence (observed live the moment the
+# Slurm NodeSet provisioned the first GPU nodes). The built-in plugin
+# advertises nvidia.com/gpu on its own.
+_LEGACY_REMOVED_RESOURCES: tuple[tuple[str, str, str | None, str], ...] = (
+    ("apps/v1", "DaemonSet", "kube-system", "nvidia-device-plugin-daemonset"),
+)
+
+
+def _delete_exact_resources(
+    targets: tuple[tuple[str, str, str | None, str], ...],
+    context: str,
+) -> dict[str, list[str]]:
+    """Delete an exact list of (apiVersion, kind, namespace, name) resources.
 
     Missing resources and missing CRDs/API resource types are successful no-ops.
     Every other error is returned so convergence fails instead of silently
-    leaving stale resources running after the feature was disabled.
+    leaving stale resources running.
     """
-    targets = _FEATURE_RESOURCE_INVENTORY.get((placeholder, post_helm), ())
     result: dict[str, list[str]] = {"pruned": [], "failed": []}
     if not targets:
         return result
@@ -479,25 +528,38 @@ def _prune_disabled_feature(placeholder: str, post_helm: bool) -> dict[str, list
                 kwargs["namespace"] = namespace
             resource.delete(**kwargs)
             result["pruned"].append(identifier)
-            logger.info("Pruned disabled-feature resource %s", identifier)
+            logger.info("Pruned %s resource %s", context, identifier)
         except ResourceNotFoundError, NotFoundError:
-            logger.info("Disabled-feature resource already absent: %s", identifier)
+            logger.info("%s resource already absent: %s", context, identifier)
         except ApiException as exc:
             if exc.status == 404:
-                logger.info("Disabled-feature resource already absent: %s", identifier)
+                logger.info("%s resource already absent: %s", context, identifier)
             else:
                 failure = f"{identifier}:{exc.status}:{exc.reason}"
                 result["failed"].append(failure)
-                logger.error("Failed pruning disabled-feature resource %s", failure)
+                logger.error("Failed pruning %s resource %s", context, failure)
         except Exception as exc:
             if getattr(exc, "status", None) == 404:
-                logger.info("Disabled-feature resource already absent: %s", identifier)
+                logger.info("%s resource already absent: %s", context, identifier)
             else:
                 failure = f"{identifier}:{exc}"
                 result["failed"].append(failure)
-                logger.error("Failed pruning disabled-feature resource %s", failure)
+                logger.error("Failed pruning %s resource %s", context, failure)
 
     return result
+
+
+def _prune_disabled_feature(placeholder: str, post_helm: bool) -> dict[str, list[str]]:
+    """Delete only the exact resources managed by a disabled optional feature."""
+    return _delete_exact_resources(
+        _FEATURE_RESOURCE_INVENTORY.get((placeholder, post_helm), ()),
+        "disabled-feature",
+    )
+
+
+def _prune_legacy_removed_resources() -> dict[str, list[str]]:
+    """Delete resources shipped by earlier GCO releases and since removed."""
+    return _delete_exact_resources(_LEGACY_REMOVED_RESOURCES, "legacy-removed")
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +944,15 @@ def apply_manifests(
         prune_failures.extend(prune_result["failed"])
         failed.extend(f"prune:{failure}" for failure in prune_result["failed"])
 
+    # Objects GCO used to ship that no longer exist in any manifest — delete
+    # them exactly on upgraded clusters (fresh clusters: no-op). Base pass
+    # only, so the sweep runs once per convergence.
+    if not post_helm:
+        legacy_result = _prune_legacy_removed_resources()
+        pruned.extend(legacy_result["pruned"])
+        prune_failures.extend(legacy_result["failed"])
+        failed.extend(f"prune:{failure}" for failure in legacy_result["failed"])
+
     for planned_resource in planned_resources:
         filename = planned_resource["sourceFile"]
         try:
@@ -1072,8 +1143,10 @@ def apply_manifests(
                             else:
                                 raise
 
-                    elif kind in _GATEWAY_CUSTOM_OBJECTS:
-                        group, version, plural, cluster_scoped = _GATEWAY_CUSTOM_OBJECTS[kind]
+                    elif kind in _GATEWAY_CUSTOM_OBJECTS or kind in _QUEUEING_CUSTOM_OBJECTS:
+                        group, version, plural, cluster_scoped = (
+                            _GATEWAY_CUSTOM_OBJECTS.get(kind) or _QUEUEING_CUSTOM_OBJECTS[kind]
+                        )
                         try:
                             if cluster_scoped:
                                 custom_api.create_cluster_custom_object(

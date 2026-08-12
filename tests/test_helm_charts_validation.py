@@ -704,3 +704,183 @@ class TestGatewayLockstepValidation:
         # strict semver is refused before any network use.
         with pytest.raises(RuntimeError, match="non-semver controller version"):
             validator.fetch_lbc_go_mod("3.5.0/../../evil")
+
+
+class TestSlinkySlurmValuesShape:
+    """Pin the slinky-slurm values in the LIVE charts.yaml to the chart's schema.
+
+    Helm merges unknown value keys silently, so a misspelled key deploys a
+    half-configured cluster with no error anywhere. Both shapes below were
+    caught live by the release-validation ``schedulers`` action (run
+    sched241-6b8520b2-r2): a camelCase ``nodeSets`` list was ignored — the
+    cluster came up with **zero slurmd workers** — and with no enabled
+    ``partitions`` entry slurmctld had no default partition, so every
+    partition-less submission (``sbatch --wrap``, the REST probe,
+    ``examples/slurm-cluster-job.yaml``) failed with rc 2001.
+
+    Chart schema reference: ``helm show values oci://ghcr.io/slinkyproject/charts/slurm``
+    — ``nodesets`` is a lowercase MAP keyed by NodeSet name; ``partitions`` is
+    a map whose entries carry ``enabled`` + ``configMap``.
+    """
+
+    @pytest.fixture(scope="class")
+    def slinky_values(self) -> dict:
+        import yaml
+
+        charts = yaml.safe_load(LIVE_CHARTS.read_text(encoding="utf-8"))["charts"]
+        return charts["slinky-slurm"]["values"]
+
+    def test_no_camelcase_nodesets_key(self, slinky_values: dict) -> None:
+        assert "nodeSets" not in slinky_values, (
+            "slinky-slurm values use camelCase 'nodeSets' — the chart's key is "
+            "lowercase 'nodesets'; Helm ignores the unknown key and deploys a "
+            "Slurm cluster with zero workers"
+        )
+
+    def test_nodesets_is_nonempty_map_of_maps(self, slinky_values: dict) -> None:
+        nodesets = slinky_values.get("nodesets")
+        assert isinstance(nodesets, dict) and nodesets, (
+            "slinky-slurm values must define 'nodesets' as a non-empty map "
+            "keyed by NodeSet name (list shapes are silently ignored)"
+        )
+        for name, spec in nodesets.items():
+            assert isinstance(spec, dict), f"nodesets.{name} must be a mapping"
+            assert "name" not in spec, (
+                f"nodesets.{name} carries a 'name' key — that's the list shape; "
+                "the map key IS the NodeSet name"
+            )
+
+    def test_default_partition_exists_and_spans_nodesets(self, slinky_values: dict) -> None:
+        partitions = slinky_values.get("partitions")
+        assert isinstance(partitions, dict) and partitions, (
+            "slinky-slurm values must define 'partitions' — without one, "
+            "slurmctld has no default partition and every partition-less "
+            "submission fails with rc 2001"
+        )
+        enabled = {
+            name: spec
+            for name, spec in partitions.items()
+            if isinstance(spec, dict) and spec.get("enabled")
+        }
+        assert enabled, "at least one partitions entry must set enabled: true"
+        defaults = [
+            name
+            for name, spec in enabled.items()
+            if str((spec.get("configMap") or {}).get("Default", "")).upper() == "YES"
+        ]
+        assert defaults, (
+            "exactly one enabled partition must carry configMap.Default: 'YES' so "
+            "sbatch/REST submissions without an explicit partition are accepted"
+        )
+        assert len(defaults) == 1, f"multiple default partitions defined: {defaults}"
+
+
+# ── bounded re-pass over failed charts (offline) ──────────────────────────────
+#
+# The inner per-command retry rides out blips shorter than one command's
+# attempt window; these pin the outer layer: charts that still fail the first
+# sweep are re-validated once more behind a fresh repo index, so a registry
+# outage lasting minutes no longer forces a manual rerun of the job while a
+# genuinely bad pin still fails every pass. All offline: _run and time.sleep
+# are monkeypatched.
+
+
+class TestValidateOnlineRepass:
+    @pytest.fixture(autouse=True)
+    def _no_real_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(validator.time, "sleep", lambda *_a, **_k: None)
+
+    @staticmethod
+    def _ref(name: str = "keda") -> validator.ChartRef:
+        return validator.ChartRef(
+            name=name,
+            chart=name,
+            version="1.2.3",
+            repo_name="repo",
+            repo_url="https://example.invalid/charts",
+            use_oci=False,
+            namespace="default",
+            enabled=True,
+            values={},
+        )
+
+    def _fake_run(self, monkeypatch: pytest.MonkeyPatch, outcomes: dict) -> list[list[str]]:
+        """Route validator._run by helm subcommand.
+
+        ``outcomes["show"]`` is a list of (rc, out, err) consumed one per
+        ``helm show chart`` call (last repeated when exhausted); repo
+        add/update and template always succeed. Returns the recorded argv
+        list for assertions.
+        """
+        calls: list[list[str]] = []
+        show_seq = list(outcomes.get("show", [(0, "version: 1.2.3\n", "")]))
+        shows = {"n": 0}
+
+        def fake_run(cmd, env, *, timeout=120):  # noqa: ANN001
+            calls.append(list(cmd))
+            if cmd[1] == "show":
+                result = show_seq[min(shows["n"], len(show_seq) - 1)]
+                shows["n"] += 1
+                return result
+            return (0, "", "")
+
+        monkeypatch.setattr(validator, "_run", fake_run)
+        return calls
+
+    def test_transient_failure_clears_on_the_second_pass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # First sweep: every inner attempt fails (4 attempts). Second sweep:
+        # first attempt succeeds. The job must end green.
+        failures = [(1, "", "registry blip")] * 4
+        self._fake_run(monkeypatch, {"show": [*failures, (0, "version: 1.2.3\n", "")]})
+        errors = validator.validate_online([self._ref()], skip_template=True, repass_delay=0.0)
+        assert errors == []
+
+    def test_persistent_failure_survives_every_pass_and_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._fake_run(monkeypatch, {"show": [(1, "", "no such version")]})
+        errors = validator.validate_online([self._ref()], skip_template=True, repass_delay=0.0)
+        assert len(errors) == 1
+        assert "cannot resolve" in errors[0]
+        # Two sweeps x four inner attempts.
+        assert sum(1 for c in calls if c[1] == "show") == 8
+
+    def test_repass_refreshes_the_repo_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        failures = [(1, "", "blip")] * 4
+        calls = self._fake_run(monkeypatch, {"show": [*failures, (0, "version: 1.2.3\n", "")]})
+        validator.validate_online([self._ref()], skip_template=True, repass_delay=0.0)
+        repo_adds = [c for c in calls if c[1] == "repo" and c[2] == "add"]
+        repo_updates = [c for c in calls if c[1] == "repo" and c[2] == "update"]
+        assert len(repo_adds) == 2, "re-pass must re-add repos behind a fresh index"
+        assert len(repo_updates) == 2
+
+    def test_only_failed_charts_are_revalidated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        good = self._ref("good-chart")
+        bad = self._ref("bad-chart")
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, env, *, timeout=120):  # noqa: ANN001
+            calls.append(list(cmd))
+            if cmd[1] == "show":
+                if "bad-chart" in cmd[3]:
+                    return (1, "", "still broken")
+                return (0, "version: 1.2.3\n", "")
+            return (0, "", "")
+
+        monkeypatch.setattr(validator, "_run", fake_run)
+        errors = validator.validate_online([good, bad], skip_template=True, repass_delay=0.0)
+        assert len(errors) == 1 and "bad-chart" in errors[0]
+        good_shows = [c for c in calls if c[1] == "show" and "good-chart" in c[3]]
+        assert len(good_shows) == 1, "a chart that passed must not be re-fetched"
+
+    def test_single_pass_configuration_disables_the_repass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._fake_run(monkeypatch, {"show": [(1, "", "boom")]})
+        errors = validator.validate_online(
+            [self._ref()], skip_template=True, passes=1, repass_delay=0.0
+        )
+        assert errors
+        assert sum(1 for c in calls if c[1] == "show") == 4

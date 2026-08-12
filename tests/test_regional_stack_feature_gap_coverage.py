@@ -24,7 +24,13 @@ from tests.test_regional_stack import MockConfigLoader
 _ACCOUNT = "123456789012"
 _REGION = "us-east-1"
 _IMAGE_URI = f"{_ACCOUNT}.dkr.ecr.{_REGION}.amazonaws.com/gco-test/fixture:latest"
-_AZS = [f"{_REGION}{suffix}" for suffix in "abc"]
+# Six AZs, matching real us-east-1: the span-every-AZ VPC then yields six
+# private subnets, which is what exposes any construct that forwards the
+# whole subnet list to a service with a tighter bound (ElastiCache
+# Serverless takes 2-3 — caught live by example-job validation run
+# ex241-2913b044). With only "abc" here that whole failure class is
+# invisible to synth tests.
+_AZS = [f"{_REGION}{suffix}" for suffix in "abcdef"]
 _REAL_HELM_BUILDER = rs.GCORegionalStack._create_helm_installer_lambda
 
 
@@ -436,7 +442,11 @@ def test_optional_data_services_are_private_and_discoverable(feature_stack):
         "DataStorage": {"Maximum": 37, "Minimum": 1, "Unit": "GB"},
         "ECPUPerSecond": {"Maximum": 9000, "Minimum": 1000},
     }
-    assert len(cache_props["SubnetIds"]) >= 2
+    # ElastiCache Serverless rejects anything outside 2-3 subnets; the
+    # span-every-AZ VPC yields more private subnets than that in real
+    # regions (six in us-east-1 — caught live by example-job validation
+    # run ex241-2913b044), so the construct must cap its selection.
+    assert 2 <= len(cache_props["SubnetIds"]) <= 3
     assert all("PrivateSubnet" in json.dumps(subnet) for subnet in cache_props["SubnetIds"])
     assert "ValkeySG" in json.dumps(cache_props["SecurityGroupIds"])
     assert {tag["Key"]: tag["Value"] for tag in cache_props["Tags"]} == {
@@ -492,6 +502,25 @@ def test_optional_data_services_are_private_and_discoverable(feature_stack):
     )
     assert all(
         "PrivateSubnet" in json.dumps(subnet) for subnet in subnet_group["Properties"]["SubnetIds"]
+    )
+
+    # RDS creates the exported postgresql log group outside CloudFormation
+    # and never deletes it (post-teardown residue caught live by example-job
+    # validation run ex241-edf33111-r2). The stack must pre-create the group
+    # under the exact name RDS uses so teardown owns it.
+    log_group_id, log_group = _single_resource(
+        template,
+        "AWS::Logs::LogGroup",
+        "AuroraPgvectorPostgresqlLogs",
+    )
+    assert log_group["Properties"]["LogGroupName"] == (
+        f"/aws/rds/cluster/gco-test-pgvector-{_REGION}/postgresql"
+    )
+    assert log_group["DeletionPolicy"] == "Delete"
+    _, cluster = _single_resource(template, "AWS::RDS::DBCluster", "AuroraPgvectorCluster")
+    assert cluster["Properties"]["DBClusterIdentifier"] == f"gco-test-pgvector-{_REGION}"
+    assert log_group_id in cluster.get("DependsOn", []), (
+        "the cluster must depend on the pre-created group so exports never race it"
     )
 
 

@@ -21,9 +21,10 @@ Security Validations:
 Environment Variables:
     CLUSTER_NAME: Name of the EKS cluster
     REGION: AWS region of the cluster
-    MAX_CPU_PER_MANIFEST: Maximum CPU (millicores) per manifest (default: 10000)
-    MAX_MEMORY_PER_MANIFEST: Maximum memory per manifest (default: 32Gi)
-    MAX_GPU_PER_MANIFEST: Maximum GPUs per manifest (default: 4)
+    MAX_CPU_PER_MANIFEST: Maximum CPU per manifest (default: 384 cores — see
+        gco.resource_governance.DEFAULT_MANIFEST_RESOURCE_CAPS)
+    MAX_MEMORY_PER_MANIFEST: Maximum memory per manifest (default: 4096Gi)
+    MAX_GPU_PER_MANIFEST: Maximum GPUs per manifest (default: 16)
     ALLOWED_NAMESPACES: Comma-separated list of allowed namespaces
     VALIDATION_ENABLED: Enable/disable validation (default: true)
 
@@ -57,6 +58,7 @@ from gco.models import (
     ManifestSubmissionResponse,
     ResourceStatus,
 )
+from gco.resource_governance import DEFAULT_MANIFEST_RESOURCE_CAPS
 from gco.services.structured_logging import configure_structured_logging, sanitize_log_value
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
@@ -110,6 +112,10 @@ DEFAULT_TRUSTED_REGISTRIES = (
     "k8s.gcr.io",
     "public.ecr.aws",
     "nvcr.io",
+    # Org-scoped GHCR prefix (matched via the startswith branch) for the
+    # HuggingFace TGI image shipped in examples/inference-tgi.yaml. Scoped to
+    # the org rather than all of ghcr.io on purpose.
+    "ghcr.io/huggingface",
 )
 DEFAULT_TRUSTED_DOCKERHUB_ORGS = (
     "nvidia",
@@ -119,6 +125,12 @@ DEFAULT_TRUSTED_DOCKERHUB_ORGS = (
     "huggingface",
     "amazon",
     "bitnami",
+    # Official orgs of the vLLM and SGLang projects — the images shipped in
+    # examples/inference-vllm.yaml and examples/inference-sglang.yaml. Kept in
+    # lockstep with cdk.json job_validation_policy.trusted_dockerhub_orgs (see
+    # tests/test_manifest_processor_extended.py).
+    "vllm",
+    "lmsysorg",
     "gco",
 )
 
@@ -136,6 +148,86 @@ RESOURCE_API_VERSIONS: dict[str, frozenset[str]] = {
     "ConfigMap": frozenset({"v1"}),
     "Pod": frozenset({"v1"}),
 }
+
+
+def _extract_validation_pod_spec(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Locate the pod spec for image-source validation across resource shapes."""
+    spec = manifest.get("spec", {})
+    pod_spec: Any = {}
+    if "template" in spec:
+        pod_spec = spec.get("template", {}).get("spec", {})
+    elif "jobTemplate" in spec:
+        pod_spec = spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec", {})
+    elif "containers" in spec:
+        pod_spec = spec
+    return pod_spec if isinstance(pod_spec, dict) else {}
+
+
+def _iter_all_containers(pod_spec: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """All (container_type, container) pairs incl. init and ephemeral containers."""
+    result: list[tuple[str, dict[str, Any]]] = []
+    for container in pod_spec.get("containers", []):
+        result.append(("container", container))
+    for container in pod_spec.get("initContainers", []):
+        result.append(("initContainer", container))
+    for container in pod_spec.get("ephemeralContainers", []):
+        result.append(("ephemeralContainer", container))
+    return result
+
+
+def _is_trusted_registry_domain(entry: str) -> bool:
+    """True when a registry entry is a domain (dot/colon) rather than a Hub org."""
+    return "." in entry or ":" in entry
+
+
+def validate_image_sources(
+    manifest: dict[str, Any],
+    trusted_registries: list[str] | tuple[str, ...] = DEFAULT_TRUSTED_REGISTRIES,
+    trusted_dockerhub_orgs: list[str] | tuple[str, ...] = DEFAULT_TRUSTED_DOCKERHUB_ORGS,
+) -> tuple[bool, str | None]:
+    """Validate container image sources against the trust allowlists.
+
+    Pure function (no Kubernetes client, no configuration loading) so offline
+    validators — the example-manifest static checks, tests — apply the exact
+    logic the deployed services enforce. ``ManifestProcessor`` delegates here.
+
+    Matching logic:
+    1. No ``/`` in the image → official Docker Hub image (always allowed)
+    2. First segment contains a dot/colon → registry domain → exact match or
+       org-scoped prefix match against ``trusted_registries``
+    3. Otherwise → Docker Hub org → match against ``trusted_dockerhub_orgs``
+    """
+    try:
+        pod_spec = _extract_validation_pod_spec(manifest)
+        for container_type, container in _iter_all_containers(pod_spec):
+            image = container.get("image", "")
+            if not image:
+                continue
+            is_trusted = False
+            if "/" not in image:
+                is_trusted = True
+            else:
+                first_segment = image.split("/")[0]
+                if _is_trusted_registry_domain(first_segment):
+                    for registry in trusted_registries:
+                        if first_segment == registry or image.startswith(registry + "/"):
+                            is_trusted = True
+                            break
+                elif first_segment in trusted_dockerhub_orgs:
+                    is_trusted = True
+            if not is_trusted:
+                container_name = container.get("name", "unknown")
+                # image comes from the user-submitted manifest; sanitize it
+                # before logging to prevent log injection / forging (CWE-117).
+                logger.warning("Untrusted image source: %s", sanitize_log_value(image))
+                return (
+                    False,
+                    f"{container_type} '{container_name}': Untrusted image source '{image}'",
+                )
+        return True, None
+    except Exception as e:
+        logger.error(f"Error validating image sources: {e}")
+        return False, f"Image source validation error: {e}"
 
 
 class RetryableQueuedJobApplyError(RuntimeError):
@@ -315,14 +407,28 @@ class ManifestProcessor:
         # Timeout for Kubernetes API calls (seconds)
         self._k8s_timeout = int(os.environ.get("K8S_API_TIMEOUT", "30"))
 
-        # Resource quotas and limits
+        # Resource quotas and limits. Defaults come from the shared source of
+        # truth (gco.resource_governance.DEFAULT_MANIFEST_RESOURCE_CAPS): two
+        # full accelerator-node slices, validated at synth against the
+        # LimitRange / namespace-quota layering invariant.
         self.max_cpu_per_manifest = self._parse_cpu_string(
-            config_dict.get("max_cpu_per_manifest", "10")
+            config_dict.get(
+                "max_cpu_per_manifest",
+                DEFAULT_MANIFEST_RESOURCE_CAPS["max_cpu_per_manifest"],
+            )
         )
         self.max_memory_per_manifest = self._parse_memory_string(
-            config_dict.get("max_memory_per_manifest", "32Gi")
+            config_dict.get(
+                "max_memory_per_manifest",
+                DEFAULT_MANIFEST_RESOURCE_CAPS["max_memory_per_manifest"],
+            )
         )
-        self.max_gpu_per_manifest = int(config_dict.get("max_gpu_per_manifest", 4))
+        self.max_gpu_per_manifest = int(
+            config_dict.get(
+                "max_gpu_per_manifest",
+                DEFAULT_MANIFEST_RESOURCE_CAPS["max_gpu_per_manifest"],
+            )
+        )
         # Hard-reject accelerator jobs that lack a matching node toleration.
         # Kept in sync with queue_processor.REQUIRE_ACCELERATOR_TOLERATION.
         require_accelerator_toleration = config_dict.get("require_accelerator_toleration", True)
@@ -838,87 +944,16 @@ class ManifestProcessor:
         return "." in entry or ":" in entry
 
     def _validate_image_sources(self, manifest: dict[str, Any]) -> tuple[bool, str | None]:
-        """Validate container image sources.
+        """Validate container image sources against this deployment's allowlists.
 
-        Uses proper domain matching instead of prefix matching to prevent
-        dependency confusion attacks (e.g., 'gco-malicious/evil' should NOT
-        match a trusted registry entry 'gco').
-
-        Matching logic:
-        1. If image has no '/' → official Docker Hub image (always allowed)
-        2. If image has '/' and part before first '/' contains a dot or colon
-           → it's a registry domain → match against trusted_registries
-        3. If image has '/' but first segment has no dot/colon
-           → it's a Docker Hub org → match against trusted_dockerhub_orgs
-        4. Digest references (@sha256:) are accepted from any trusted source
-
-        Returns:
-            Tuple of (is_valid, error_message). error_message is None if valid.
+        Delegates to the module-level :func:`validate_image_sources` so the
+        REST/SQS services and offline validators share one implementation.
         """
-        try:
-            trusted_registries = self.trusted_registries
-            trusted_dockerhub_orgs = self.trusted_dockerhub_orgs
-
-            spec = manifest.get("spec", {})
-
-            # Get pod spec (handle different resource types)
-            pod_spec = {}
-            if "template" in spec:
-                pod_spec = spec.get("template", {}).get("spec", {})
-            elif "jobTemplate" in spec:
-                pod_spec = (
-                    spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec", {})
-                )
-            elif "containers" in spec:
-                pod_spec = spec
-
-            for container_type, container in self._get_all_containers(pod_spec):
-                image = container.get("image", "")
-                if not image:
-                    continue
-
-                is_trusted = False
-
-                # Case 1: Official Docker Hub image (no slash) — e.g., "python:3.14", "busybox"
-                if "/" not in image:
-                    is_trusted = True
-                else:
-                    # Image has a slash — determine if first segment is a domain or org
-                    first_segment = image.split("/")[0]
-
-                    if self._is_registry_domain(first_segment):
-                        # Case 2: First segment looks like a domain (has dot or colon)
-                        # Match against trusted_registries as exact domain match
-                        for registry in trusted_registries:
-                            if first_segment == registry:
-                                is_trusted = True
-                                break
-                            # Also support multi-level registry paths like "public.ecr.aws"
-                            # where the image might be "public.ecr.aws/lambda/python:3.14"
-                            if image.startswith(registry + "/"):
-                                is_trusted = True
-                                break
-                    else:
-                        # Case 3: First segment has no dot/colon — it's a Docker Hub org
-                        # Match against trusted_dockerhub_orgs
-                        if first_segment in trusted_dockerhub_orgs:
-                            is_trusted = True
-
-                if not is_trusted:
-                    container_name = container.get("name", "unknown")
-                    # image comes from the user-submitted manifest; sanitize it
-                    # before logging to prevent log injection / forging (CWE-117).
-                    logger.warning("Untrusted image source: %s", sanitize_log_value(image))
-                    return (
-                        False,
-                        f"{container_type} '{container_name}': Untrusted image source '{image}'",
-                    )
-
-            return True, None
-
-        except Exception as e:
-            logger.error(f"Error validating image sources: {e}")
-            return False, f"Image source validation error: {e}"
+        return validate_image_sources(
+            manifest,
+            trusted_registries=self.trusted_registries,
+            trusted_dockerhub_orgs=self.trusted_dockerhub_orgs,
+        )
 
     async def process_manifest_submission(
         self, request: ManifestSubmissionRequest
@@ -1647,9 +1682,20 @@ def create_manifest_processor_from_env() -> ManifestProcessor:
 
     # Load configuration from environment
     config_dict = {
-        "max_cpu_per_manifest": os.getenv("MAX_CPU_PER_MANIFEST", "10"),
-        "max_memory_per_manifest": os.getenv("MAX_MEMORY_PER_MANIFEST", "32Gi"),
-        "max_gpu_per_manifest": int(os.getenv("MAX_GPU_PER_MANIFEST", "4")),
+        "max_cpu_per_manifest": os.getenv(
+            "MAX_CPU_PER_MANIFEST",
+            str(DEFAULT_MANIFEST_RESOURCE_CAPS["max_cpu_per_manifest"]),
+        ),
+        "max_memory_per_manifest": os.getenv(
+            "MAX_MEMORY_PER_MANIFEST",
+            str(DEFAULT_MANIFEST_RESOURCE_CAPS["max_memory_per_manifest"]),
+        ),
+        "max_gpu_per_manifest": int(
+            os.getenv(
+                "MAX_GPU_PER_MANIFEST",
+                str(DEFAULT_MANIFEST_RESOURCE_CAPS["max_gpu_per_manifest"]),
+            )
+        ),
         "require_accelerator_toleration": parse_boolean_environment(
             "REQUIRE_ACCELERATOR_TOLERATION", True
         ),

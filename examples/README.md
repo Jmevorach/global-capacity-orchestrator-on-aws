@@ -17,12 +17,10 @@ This directory contains example Kubernetes manifests you can use with GCO (Globa
   - [EFS Output Job](#efs-output-job)
   - [FSx for Lustre Job](#fsx-for-lustre-job)
   - [GPU Job](#gpu-job)
-  - [GPU Time-Slicing Job](#gpu-time-slicing-job)
   - [Inference Frameworks](#inference-frameworks)
   - [Inferentia Job](#inferentia-job)
   - [KEDA Autoscaled Job](#keda-autoscaled-job)
   - [Kueue Job Queueing](#kueue-job-queueing)
-  - [MegaTrain SFT Job](#megatrain-sft-job)
   - [Mission Semantic-Progress Judge](#mission-semantic-progress-judge)
   - [Mission Training-Loss Observation](#mission-training-loss-observation)
   - [Model Download Job](#model-download-job)
@@ -56,7 +54,6 @@ This directory contains example Kubernetes manifests you can use with GCO (Globa
 | [EFS Output](#efs-output-job) | `efs-output-job.yaml` | Storage | — | — |
 | [FSx Lustre](#fsx-for-lustre-job) | `fsx-lustre-job.yaml` | Storage | — | [FSx](https://docs.aws.amazon.com/fsx/latest/LustreGuide/what-is.html) |
 | [GPU Job](#gpu-job) | `gpu-job.yaml` | Jobs | ✅ | — |
-| [GPU Time-Slicing](#gpu-time-slicing-job) | `gpu-timeslicing-job.yaml` | Jobs | ✅ | ConfigMap |
 | [Inferentia](#inferentia-job) | `inferentia-job.yaml` | Accelerator | [Inferentia](https://aws.amazon.com/ai/machine-learning/inferentia/) | — |
 | [SGLang](#inference-frameworks) | `inference-sglang.yaml` | Inference | ✅ | — |
 | [TGI](#inference-frameworks) | `inference-tgi.yaml` | Inference | ✅ | — |
@@ -65,7 +62,6 @@ This directory contains example Kubernetes manifests you can use with GCO (Globa
 | [vLLM](#inference-frameworks) | `inference-vllm.yaml` | Inference | ✅ | — |
 | [KEDA Scaled](#keda-autoscaled-job) | `keda-scaled-job.yaml` | Scheduler | — | — |
 | [Kueue](#kueue-job-queueing) | `kueue-job.yaml` | Scheduler | Optional | — |
-| [MegaTrain SFT](#megatrain-sft-job) | `megatrain-sft-job.yaml` | Jobs | ✅ | — |
 | [Mission Semantic-Progress](#mission-semantic-progress-judge) | `mission-semantic-progress-criteria.json` | Mission | — | Mission, Semantic-Progress |
 | [Mission Training-Loss](#mission-training-loss-observation) | `mission-training-loss-criteria.json`, `megatrain-trainer-state.json` | Mission | — | Mission |
 | [Model Download](#model-download-job) | `model-download-job.yaml` | Jobs | — | — |
@@ -283,25 +279,6 @@ kubectl logs job/gpu-test-job
 
 ---
 
-### GPU Time-Slicing Job
-
-**File:** `gpu-timeslicing-job.yaml`
-
-Uses a fractional GPU via NVIDIA time-slicing. Multiple pods share a single physical GPU by taking turns, letting you run lightweight GPU workloads without dedicating a full GPU to each pod.
-
-**Usage:**
-
-```bash
-kubectl apply -f examples/gpu-timeslicing-job.yaml
-kubectl logs job/gpu-timeslice-job -n gco-jobs
-```
-
-**Requirements:** GPU nodepools (default), NVIDIA device plugin with time-slicing ConfigMap applied (not enabled by default — see manifest comments for setup).
-
-**When to use:** Inference workloads that don't need a full GPU, dev/test GPU workloads, reducing GPU costs by sharing hardware.
-
----
-
 ### Inference Frameworks
 
 GCO includes example manifests for multiple inference frameworks. Each creates a Deployment and Service in the `gco-inference` namespace.
@@ -391,25 +368,6 @@ kubectl get workloads -n gco-jobs
 
 ---
 
-### MegaTrain SFT Job
-
-**File:** `megatrain-sft-job.yaml`
-
-Runs SFT fine-tuning of Qwen2.5-1.5B on a single GPU using [MegaTrain](https://github.com/DLYuanGod/MegaTrain). An init container downloads model weights to shared EFS (skipped if already cached), then the main container trains on the built-in alpaca demo dataset. Change the `MODEL_NAME` env var to target a different HuggingFace model.
-
-**Usage:**
-
-```bash
-gco jobs submit-direct examples/megatrain-sft-job.yaml -r us-east-1
-gco jobs logs megatrain-sft -r us-east-1
-```
-
-**Requirements:** GPU node with large CPU RAM, shared EFS storage.
-
-**When to use:** SFT fine-tuning of large HuggingFace models, full-precision training on a single GPU.
-
----
-
 ### Mission Semantic-Progress Judge
 
 **File:** `mission-semantic-progress-criteria.json`
@@ -458,34 +416,31 @@ The Mission loop calls `metrics_semantic_progress` each iteration with these arg
 
 **Files:** `mission-training-loss-criteria.json`, `megatrain-trainer-state.json`
 
-Ties the [MegaTrain SFT Job](#megatrain-sft-job) to a [Mission](../docs/MISSION.md) `metric_threshold` criterion so the goal-directed loop can watch training loss fall without any scripting. The MegaTrain trainer writes a Hugging Face `trainer_state.json` to shared EFS under its `OUTPUT_DIR` (`/mnt/gco/megatrain-sft/checkpoints`); its `log_history` is a list of per-step records carrying `loss`, `eval_loss`, `step`, and `epoch`. The read-only `metrics_from_shared_storage_file` tool reads that file with `format=hf_trainer_state`, collects the `loss` field across every `log_history` entry, and reduces the sequence to a single number via an aggregation mode — `min` for "best loss so far", or `last` for "current loss". The result lands in the canonical `{"metrics": {"loss": <number>}}` shape that Mission's Observe phase merges, so the `metrics.loss` dot-path in the criterion resolves directly.
+Ties a training job to a [Mission](../docs/MISSION.md) `metric_threshold` criterion so the goal-directed loop can watch training loss fall without any scripting. Hugging Face `Trainer`-based jobs (including anything built on `transformers.Trainer`) write a `trainer_state.json` under their checkpoint output directory on shared EFS; its `log_history` is a list of per-step records carrying `loss`, `eval_loss`, `step`, and `epoch`. The read-only `metrics_from_shared_storage_file` tool reads that file with `format=hf_trainer_state`, collects the `loss` field across every `log_history` entry, and reduces the sequence to a single number via an aggregation mode — `min` for "best loss so far", or `last` for "current loss". The result lands in the canonical `{"metrics": {"loss": <number>}}` shape that Mission's Observe phase merges, so the `metrics.loss` dot-path in the criterion resolves directly.
 
-- `megatrain-trainer-state.json` is a small representative sample of the artifact MegaTrain produces (five training steps plus one eval record) so you can try the reader against a concrete file.
+- `megatrain-trainer-state.json` is a small representative sample of the standard Hugging Face `trainer_state.json` artifact (five training steps plus one eval record) so you can try the reader against a concrete file.
 - `mission-training-loss-criteria.json` is a one-criterion [Criteria File](../docs/MISSION.md#criteria-file-schema) asserting `metrics.loss <= 1.5`.
 
-**Prerequisites:** `GCO_ENABLE_MISSION=true` (or the umbrella `GCO_ENABLE_ALL_TOOLS=true`). The MegaTrain job must have run and written its `trainer_state.json` to shared storage.
+**Prerequisites:** `GCO_ENABLE_MISSION=true` (or the umbrella `GCO_ENABLE_ALL_TOOLS=true`). A training job built on the Hugging Face `Trainer` must have run and written its `trainer_state.json` to shared storage (any of the training examples above adapted to save checkpoints under `/mnt/gco/<your-job>/checkpoints` works).
 
 **Usage:**
 
 ```bash
 export GCO_ENABLE_MISSION=true
 
-# Run the training job that produces trainer_state.json on shared EFS.
-gco jobs submit-direct examples/megatrain-sft-job.yaml -r us-east-1
-
 # Drive a Mission that observes the best training loss so far.
 gco mission start --run \
-  --directive "Drive MegaTrain SFT training loss to 1.5 or below." \
+  --directive "Drive SFT training loss to 1.5 or below." \
   --criteria-file examples/mission-training-loss-criteria.json \
   --max-iterations 10 --max-wall-clock 3600 \
   --tool-allowlist metrics_from_shared_storage_file
 ```
 
-The Mission loop calls `metrics_from_shared_storage_file` each iteration with these arguments:
+The Mission loop calls `metrics_from_shared_storage_file` each iteration with these arguments (adjust `path` to your job's checkpoint directory):
 
 ```json
 {
-  "path": "/mnt/gco/megatrain-sft/checkpoints/trainer_state.json",
+  "path": "/mnt/gco/your-training-job/checkpoints/trainer_state.json",
   "region": "us-east-1",
   "field": "loss",
   "format": "hf_trainer_state",
@@ -870,6 +825,26 @@ Then redeploy: `gco stacks deploy-all -y`
 `job_validation_policy` is authoritative for both submission paths: the REST manifest processor and SQS queue processor enforce the same limits, namespace/kind allowlists, image policy, and security controls.
 
 ## Testing Your Manifests
+
+### Changing an example in this directory?
+
+Every example here is covered by [example-job validation](../docs/EXAMPLE_VALIDATION.md):
+
+```bash
+# Minimum bar for ANY change (seconds, offline; CI runs the same checks):
+gco examples validate --static-only
+
+# Required when you changed an example's BEHAVIOR — live-run just that example:
+gco examples validate --examples <name> \
+  --expected-account <ACCOUNT_ID> \
+  --i-understand-this-deploys-and-destroys-infrastructure \
+  --confirm-kms-key-deletion
+```
+
+Adding or removing an example also requires a spec entry in
+`scripts/example_job_validation/specs.py` and a catalog entry in
+`gco_mcp/resources/docs.py` — CI enforces three-way symmetry between this
+directory, the spec registry, and the catalog.
 
 ### Dry Run
 
