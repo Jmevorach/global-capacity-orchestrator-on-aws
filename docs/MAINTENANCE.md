@@ -67,6 +67,7 @@ NodePool family lists keep the third concern deliberate.
 | EC2 accelerator inventory | `gco/config/accelerator_catalog.json` → `instance_types` | Sorted union of instance types with an NVIDIA GPU or AWS Neuron device across enabled commercial Regions |
 | Reviewed family policy | `gco/config/accelerator_catalog.json` → `families` | Accelerator, architecture, track, generation, lifecycle, scheduling eligibility, reason, and replacements |
 | Capacity-history observation | `cdk.json` → `historical.watch_instance_types`; fallback in `gco/config/config_loader.py` | Both copies must exactly equal the catalog's `instance_types` list |
+| Spot Placement Score pools | `scripts/accelerator_catalog.py` → `INSTANCE_POOLS` and `UNPOOLED_INSTANCE_TYPES` | Every pool has three-plus interchangeable watched members; every watched type is either pooled or explicitly declared unpooled with a rationale |
 | Karpenter scheduling | `lambda/kubectl-applier-simple/manifests/40-*.yaml` through `46-*.yaml` | Explicit `eks.amazonaws.com/instance-family` policy per workload class |
 | Rich CLI hardware/pricing metadata | `cli/capacity/models.py` and the curated defaults in `cli/capacity/advisor.py` | Add only when the CLI needs local vCPU, memory, accelerator, or advisor metadata |
 | Pinned examples and prose | `examples/*.yaml`, `gco/stacks/regional_stack.py`, `README.md`, `docs/CUSTOMIZATION.md` | Keep selectors and human guidance aligned with reviewed scheduling support |
@@ -87,7 +88,7 @@ Run this before and after every accelerator or NodePool change:
 
 ```bash
 python scripts/accelerator_catalog.py validate
-python -m pytest tests/test_accelerator_catalog.py -q
+python -m pytest tests/test_accelerator_catalog.py tests/test_accelerator_pools.py -q
 ```
 
 The validator needs no AWS credentials and fails with actionable guidance when:
@@ -96,7 +97,11 @@ The validator needs no AWS credentials and fails with actionable guidance when:
   manifest and reviewed replacements;
 - a newer active generation in the same scheduling track is absent from every
   eligible NodePool, naming the pools to review;
-- `cdk.json` or the `ConfigLoader` fallback omits or adds a watched type; or
+- `cdk.json` or the `ConfigLoader` fallback omits or adds a watched type;
+- a Spot Placement Score pool has fewer than three distinct members, includes a
+  type outside the watch list, or a watched type has no pooled-or-unpooled
+  decision (new catalog entries must be placed in a pool or added to
+  `UNPOOLED_INSTANCE_TYPES` with a rationale); or
 - the catalog, family metadata, architecture, lifecycle, or manifest policy is
   malformed or contradictory.
 
@@ -357,10 +362,15 @@ not inherit the default's reasoning fields.
 Because it is a deployment configuration value — not a `pyproject.toml` entry,
 a Dockerfile `FROM`, or a manifest image — Dependabot never sees it. The monthly
 [`deps-scan`](../.github/CI.md#dependency-scan-script) closes that gap: its
-**Bedrock default model** check reads the `cdk.json` context value, lists the
-system-defined inference profiles in `us-east-1`, and flags a newer release **in
-the same model family** — a future global Claude Opus release, never a jump to
-a different scope, tier, or provider (that is a choice, not drift). Family
+**Bedrock default model** check reads each managed `cdk.json` context value and
+flags a newer release **in the same model family** — a future global Claude
+Opus release, never a jump to a different scope, tier, or provider (that is a
+choice, not drift). The generation keys (`default_model_id`,
+`claude_code_default_model_id`) compare against the system-defined inference
+profiles in `us-east-1`; `embedding_model_id` — Mission memory's text-embedding
+model, resolved through `gco.bedrock.get_default_embedding_model_id()` — is a
+plain foundation model, so it compares against
+`bedrock list-foundation-models --by-output-modality EMBEDDING` instead. Family
 derivation tolerates all three revision shapes Bedrock ships
 (`-vMAJOR:MINOR`, a bare `-vMAJOR`, and no suffix at all), so one model line
 stays one family. The check needs AWS
@@ -395,6 +405,15 @@ deliberately):
 3. Run the Mission and capacity suites, then open a PR. The consistency guard
    proves both runtime aliases and the dependency scanner still resolve the
    same `cdk.json` value.
+
+When the flagged key is `context.bedrock.embedding_model_id`, treat the row as
+a planning signal rather than a routine bump: vectors are only comparable to
+vectors produced by the same model, and every Mission-memory item records its
+`embedding_model_id` for exactly this reason. Adopting a newer embedding model
+means re-embedding existing items (or segregating old and new vectors) before
+changing the pin, and updating `_EXPECTED_EMBEDDING_MODEL_ID` in
+`tests/test_default_bedrock_model_consistency.py` alongside the `cdk.json`
+value.
 
 Picking a *different* model — for regulatory, data-residency, model-governance,
 or cost reasons, or to avoid the Anthropic FTU form — rather than tracking
@@ -461,8 +480,9 @@ resolved lockfile, so a clean checkout installs the same graph CI ran.
   Dockerfile `ARG`s, `lambda/helm-installer/charts.yaml`,
   `gco/stacks/constants.py`, the Python-constant Mooncake default image in
   `cli/images.py`, and the Bedrock models at `cdk.json`
-  `context.bedrock.default_model_id` and
-  `context.bedrock.claude_code_default_model_id` (see
+  `context.bedrock.default_model_id`,
+  `context.bedrock.claude_code_default_model_id`, and
+  `context.bedrock.embedding_model_id` (see
   [Refreshing the Bedrock default model](#refreshing-the-bedrock-default-model)).
   These are tracked by the monthly scan rather than Dependabot.
 
