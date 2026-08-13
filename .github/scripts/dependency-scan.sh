@@ -15,12 +15,15 @@
 #   - EKS Kubernetes minor from cdk.json (AWS creds)
 #   - Aurora PostgreSQL engine versions (AWS creds)
 #   - EMR Serverless release labels (AWS creds)
-#   - Bedrock default model ids from cdk.json context.bedrock.default_model_id
-#     (advisory), context.bedrock.claude_code_default_model_id (autopilot),
-#     and context.bedrock.embedding_model_id (Mission memory), each compared
-#     against the newest same-family release — inference profiles for the
-#     generation keys, EMBEDDING foundation models for the embedding key
-#     (AWS creds)
+#   - Bedrock default model ids from cdk.json
+#     context.bedrock.mission_default_model_id (Mission sampling),
+#     context.bedrock.capacity_advisor_default_model_id (capacity advisor),
+#     context.bedrock.claude_code_default_model_id (autopilot),
+#     context.bedrock.embedding_model_id (Mission memory), and
+#     context.vector_store.embedding_model_id (workload RAG corpus), each
+#     compared against the newest same-family release — inference profiles
+#     for the generation keys, EMBEDDING foundation models for the embedding
+#     keys (AWS creds)
 #   - Accelerator catalog and Karpenter NodePool policy (offline), plus live
 #     NVIDIA GPU / AWS Neuron EC2 catalog drift across enabled Regions (AWS creds)
 #   - Dockerfile.dev ARG pins (Node LTS major, npm, CDK CLI, kubectl,
@@ -903,11 +906,12 @@ EMR_COUNT="$(wc -l < "$EMR_RESULTS" 2>/dev/null | tr -d ' ')"
 # Bedrock default model (best-effort — requires AWS credentials)
 #
 # Compares each configured Bedrock model default in cdk.json —
-# context.bedrock.default_model_id (advisory: Mission sampling + capacity
+# context.bedrock.mission_default_model_id (Mission sampling),
+# context.bedrock.capacity_advisor_default_model_id (the capacity
 # advisor), context.bedrock.claude_code_default_model_id (the session
 # model gco autopilot hands to Claude Code), and
 # context.bedrock.embedding_model_id (Mission memory's text-embedding
-# model) — against the newest release in the SAME model family. The two
+# model) — against the newest release in the SAME model family. The three
 # generation keys compare against system-defined inference profiles
 # (aws bedrock list-inference-profiles); the embedding key is a plain
 # foundation model, so it compares against
@@ -920,7 +924,7 @@ EMR_COUNT="$(wc -l < "$EMR_RESULTS" 2>/dev/null | tr -d ' ')"
 # release of the same model line (e.g. a newer global Amazon Nova Lite) — never a
 # different tier or provider, since switching those is a human decision,
 # not drift. When a newer release is reported, update the flagged key in
-# cdk.json; for the advisory key also re-capture the scaffold
+# cdk.json; for the Mission key also re-capture the scaffold
 # fixture with scripts/capture_scaffold_fixtures.py. For the embedding
 # key, remember stored vectors are only comparable to vectors from the
 # same model: adopting a newer embedding model means re-embedding or
@@ -942,7 +946,7 @@ if ! aws sts get-caller-identity >/dev/null 2>&1; then
   BEDROCK_MODEL_SKIP_REASON="No AWS credentials available (scan needs bedrock:ListInferenceProfiles). Configure OIDC to enable."
   echo "  $BEDROCK_MODEL_SKIP_REASON"
 else
-  for BEDROCK_MODEL_LEAF in default_model_id claude_code_default_model_id embedding_model_id; do
+  for BEDROCK_MODEL_LEAF in mission_default_model_id capacity_advisor_default_model_id claude_code_default_model_id embedding_model_id; do
     CURRENT_BEDROCK_MODEL="$(extract_default_bedrock_model cdk.json "$BEDROCK_MODEL_LEAF")"
     if [ -z "$CURRENT_BEDROCK_MODEL" ]; then
       BEDROCK_MODEL_SKIP_REASON="Could not read context.bedrock.${BEDROCK_MODEL_LEAF} from cdk.json."
@@ -964,6 +968,24 @@ else
       echo "context.bedrock.${BEDROCK_MODEL_LEAF}|${CURRENT_BEDROCK_MODEL}|${LATEST_BEDROCK_MODEL}" >> "$BEDROCK_MODEL_RESULTS"
     fi
   done
+  # The vector store keeps its own embedding model at
+  # context.vector_store.embedding_model_id (independent of mission memory's
+  # bedrock.embedding_model_id by design). Same foundation-model drift check,
+  # same re-embed caveat: adopting a newer model means re-ingesting the corpus.
+  # The key is optional (the block ships with defaults), so absence is not a
+  # skip condition for the whole check.
+  VECTOR_STORE_MODEL="$(extract_default_bedrock_model cdk.json embedding_model_id vector_store)"
+  if [ -n "$VECTOR_STORE_MODEL" ]; then
+    LATEST_VECTOR_STORE_MODEL="$(get_latest_bedrock_embedding_model "$VECTOR_STORE_MODEL" us-east-1)" || LATEST_VECTOR_STORE_MODEL=""
+    if [ -z "$LATEST_VECTOR_STORE_MODEL" ]; then
+      BEDROCK_MODEL_SKIP_REASON="Bedrock model lookup failed or returned no active release in the model family of context.vector_store.embedding_model_id."
+      echo "  $BEDROCK_MODEL_SKIP_REASON"
+    elif [ "$VECTOR_STORE_MODEL" != "$LATEST_VECTOR_STORE_MODEL" ] \
+         && [ "$(compare_bedrock_model "$VECTOR_STORE_MODEL" "$LATEST_VECTOR_STORE_MODEL")" = "newer" ]; then
+      echo "  - vector_store embedding_model_id: ${VECTOR_STORE_MODEL} -> ${LATEST_VECTOR_STORE_MODEL}"
+      echo "context.vector_store.embedding_model_id|${VECTOR_STORE_MODEL}|${LATEST_VECTOR_STORE_MODEL}" >> "$BEDROCK_MODEL_RESULTS"
+    fi
+  fi
 fi
 
 BEDROCK_MODEL_COUNT="$(wc -l < "$BEDROCK_MODEL_RESULTS" 2>/dev/null | tr -d ' ')"
@@ -2273,14 +2295,17 @@ summary_row() {
   if [ "$BEDROCK_MODEL_COUNT" -gt 0 ]; then
     echo "## Bedrock Default Model"
     echo ""
-    echo "A Bedrock model default configured under \`cdk.json\`"
-    echo "\`context.bedrock\` is behind a newer release in the same model family."
-    echo "For \`default_model_id\`, update the value and re-capture the scaffold"
-    echo "fixture (\`scripts/capture_scaffold_fixtures.py\`). For"
-    echo "\`claude_code_default_model_id\`, updating the value is enough. For"
-    echo "\`embedding_model_id\` (Mission memory), stored vectors are only"
-    echo "comparable to vectors from the same model — plan to re-embed or"
-    echo "segregate existing data before adopting the newer model."
+    echo "A Bedrock model default configured in \`cdk.json\` is behind a newer"
+    echo "release in the same model family. For \`bedrock.mission_default_model_id\`,"
+    echo "update the value and re-capture the scaffold fixture"
+    echo "(\`scripts/capture_scaffold_fixtures.py\`). For"
+    echo "\`bedrock.capacity_advisor_default_model_id\` and"
+    echo "\`bedrock.claude_code_default_model_id\`, updating the value is enough."
+    echo "For the embedding keys — \`bedrock.embedding_model_id\` (Mission memory)"
+    echo "and \`vector_store.embedding_model_id\` (workload RAG corpus) — stored"
+    echo "vectors are only comparable to vectors from the same model: plan to"
+    echo "re-embed (for the vector store, re-ingest the corpus) or segregate"
+    echo "existing data before adopting the newer model."
     echo ""
     emit_md_table "Configuration key|Current|Latest" "$BEDROCK_MODEL_RESULTS"
     echo ""

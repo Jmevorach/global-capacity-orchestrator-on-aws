@@ -1478,7 +1478,7 @@ EOF
     expected="$(python3 -c '
 import json
 with open("cdk.json") as handle:
-    print(json.load(handle)["context"]["bedrock"]["default_model_id"])
+    print(json.load(handle)["context"]["bedrock"]["mission_default_model_id"])
 ')"
     [ -n "$expected" ]
     run extract_default_bedrock_model "cdk.json"
@@ -1486,15 +1486,35 @@ with open("cdk.json") as handle:
     [ "$output" = "$expected" ]
 }
 
-@test "extract_default_bedrock_model: parses context.bedrock.default_model_id" {
+@test "extract_default_bedrock_model: default leaf is mission_default_model_id" {
     tmpfile="$(mktemp)"
     cat > "$tmpfile" <<'EOF'
-{"context":{"bedrock":{"default_model_id":"us.amazon.nova-pro-v1:0"}}}
+{"context":{"bedrock":{"mission_default_model_id":"us.amazon.nova-pro-v1:0"}}}
 EOF
     run extract_default_bedrock_model "$tmpfile"
     [ "$status" -eq 0 ]
     [ "$output" = "us.amazon.nova-pro-v1:0" ]
     rm -f "$tmpfile"
+}
+
+@test "extract_default_bedrock_model: reads the capacity advisor leaf from cdk.json" {
+    expected="$(python3 -c '
+import json
+with open("cdk.json") as handle:
+    print(json.load(handle)["context"]["bedrock"]["capacity_advisor_default_model_id"])
+')"
+    [ -n "$expected" ]
+    run extract_default_bedrock_model "cdk.json" "capacity_advisor_default_model_id"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$expected" ]
+}
+
+@test "extract_default_bedrock_model: retired default_model_id leaf reads nothing" {
+    # The pre-v6 single advisory key is no longer shipped in cdk.json; the
+    # runtime fails closed on it and the scan must not resurrect it.
+    run extract_default_bedrock_model "cdk.json" "default_model_id"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
 }
 
 @test "extract_default_bedrock_model: empty when the context key is absent" {
@@ -1536,7 +1556,7 @@ with open("cdk.json") as handle:
 @test "extract_default_bedrock_model: explicit leaf selects the requested key" {
     tmpfile="$(mktemp)"
     cat > "$tmpfile" <<'EOF'
-{"context":{"bedrock":{"default_model_id":"us.amazon.nova-pro-v1:0","claude_code_default_model_id":"us.anthropic.claude-sonnet-4-6"}}}
+{"context":{"bedrock":{"mission_default_model_id":"us.amazon.nova-pro-v1:0","claude_code_default_model_id":"us.anthropic.claude-sonnet-4-6"}}}
 EOF
     run extract_default_bedrock_model "$tmpfile" "claude_code_default_model_id"
     [ "$status" -eq 0 ]
@@ -1546,7 +1566,7 @@ EOF
 
 @test "extract_default_bedrock_model: empty when the requested leaf is absent" {
     tmpfile="$(mktemp)"
-    echo '{"context":{"bedrock":{"default_model_id":"us.amazon.nova-pro-v1:0"}}}' > "$tmpfile"
+    echo '{"context":{"bedrock":{"mission_default_model_id":"us.amazon.nova-pro-v1:0"}}}' > "$tmpfile"
     run extract_default_bedrock_model "$tmpfile" "claude_code_default_model_id"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
@@ -1790,6 +1810,41 @@ SHIM
 # instead of the inference-profile listing. Same shim pattern as the
 # get_latest_bedrock_model tests: family scoping, lifecycle filtering, and
 # version ranking run offline against canned JSON.
+
+@test "extract_default_bedrock_model: block argument reads vector_store from cdk.json" {
+    expected="$(python3 -c '
+import json
+with open("cdk.json") as handle:
+    print(json.load(handle)["context"]["vector_store"]["embedding_model_id"])
+')"
+    [ -n "$expected" ]
+    run extract_default_bedrock_model "cdk.json" "embedding_model_id" "vector_store"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$expected" ]
+}
+
+@test "extract_default_bedrock_model: block argument defaults to bedrock" {
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<'JSON'
+{"context":{"bedrock":{"embedding_model_id":"from-bedrock"},"vector_store":{"embedding_model_id":"from-vector-store"}}}
+JSON
+    run extract_default_bedrock_model "$tmpfile" "embedding_model_id"
+    [ "$status" -eq 0 ]
+    [ "$output" = "from-bedrock" ]
+    run extract_default_bedrock_model "$tmpfile" "embedding_model_id" "vector_store"
+    [ "$status" -eq 0 ]
+    [ "$output" = "from-vector-store" ]
+    rm -f "$tmpfile"
+}
+
+@test "extract_default_bedrock_model: empty when the requested block is absent" {
+    tmpfile="$(mktemp)"
+    echo '{"context":{"bedrock":{"embedding_model_id":"x"}}}' > "$tmpfile"
+    run extract_default_bedrock_model "$tmpfile" "embedding_model_id" "vector_store"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -f "$tmpfile"
+}
 
 @test "extract_default_bedrock_model: reads the embedding leaf from cdk.json" {
     expected="$(python3 -c '
