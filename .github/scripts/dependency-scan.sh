@@ -454,33 +454,16 @@ grep -rhoE "image: [a-zA-Z0-9_./-]+:[a-zA-Z0-9._-]+" scripts/live_release_valida
   | sed 's/image: //' >> "$ALL_IMAGES" || true
 
 echo "Checking Helm chart value images..."
-CHART_VALUE_IMAGES=""
-if ! CHART_VALUE_IMAGES="$(python3 - <<'PY'
-import yaml
-with open('lambda/helm-installer/charts.yaml') as f:
-    data = yaml.safe_load(f)
-
-
-def find_images(d):
-    if isinstance(d, dict):
-        repo = d.get('repository', '')
-        tag = d.get('tag', '')
-        if repo and tag and '/' in repo:
-            print(f'{repo}:{tag}')
-        for v in d.values():
-            find_images(v)
-    elif isinstance(d, list):
-        for item in d:
-            find_images(item)
-
-
-for name, cfg in (data or {}).get('charts', {}).items():
-    find_images(cfg.get('values', {}))
-PY
-)"; then
-  mark_scan_incomplete "Could not parse Helm chart value images."
-elif [ -n "$CHART_VALUE_IMAGES" ]; then
+# Registry-aware walk over every charts.yaml values block (see
+# extract_chart_value_images in lib_dependency_scan.sh — moved there so BATS
+# exercises the real logic). charts.yaml always pins values images, so an
+# empty result means the parse broke — surface that as an incomplete scan
+# rather than silently dropping the sweep.
+CHART_VALUE_IMAGES="$(extract_chart_value_images lambda/helm-installer/charts.yaml)"
+if [ -n "$CHART_VALUE_IMAGES" ]; then
   printf '%s\n' "$CHART_VALUE_IMAGES" >> "$ALL_IMAGES"
+else
+  mark_scan_incomplete "Could not parse Helm chart value images."
 fi
 
 # Mooncake default image — pinned as a Python constant in cli/images.py
@@ -1521,7 +1504,20 @@ check_github_tool "Calico (CALICO_VERSION)" "$CALICO_PIN" "projectcalico/calico"
   "https://github.com/projectcalico/calico/releases"
 
 # kind (kubernetes-sigs/kind) — the kind binary on the kind-action step.
-KIND_PIN="$(extract_kind_pins .github/workflows/integration-tests.yml | awk -F'|' '$1=="kind"{print $2}')"
+# Both kind-action steps (cluster-e2e and examples-smoke) must pin the same
+# kind binary + node image; extract_kind_pins de-duplicates identical pins,
+# so >1 value per key means the two jobs drifted apart.
+for kind_key in kind kind-node; do
+  kind_vals="$(extract_kind_pins .github/workflows/integration-tests.yml \
+    | awk -F'|' -v k="$kind_key" '$1==k{print $2}')"
+  kind_distinct="$(printf '%s\n' "$kind_vals" | sed '/^$/d' | grep -c .)"
+  if [ "$kind_distinct" -gt 1 ]; then
+    kind_list="$(printf '%s\n' "$kind_vals" | sed '/^$/d' | paste -sd',' -)"
+    echo "  - ${kind_key} pins disagree across kind-action steps: ${kind_list}"
+    echo "${kind_key} (across kind-action steps)|${kind_list}" >> "$CONSISTENCY_RESULTS"
+  fi
+done
+KIND_PIN="$(extract_kind_pins .github/workflows/integration-tests.yml | awk -F'|' '$1=="kind"{print $2}' | head -1)"
 check_github_tool "kind" "$KIND_PIN" "kubernetes-sigs/kind" \
   "https://github.com/kubernetes-sigs/kind/releases"
 
@@ -1546,7 +1542,7 @@ fi
 # kind node image (kindest/node) — report a newer PATCH within the pinned K8s
 # minor only. Jumping minors is governed by the kind release, not free drift,
 # so scoping to the same minor avoids false "upgrade" noise.
-KIND_NODE_PIN="$(extract_kind_pins .github/workflows/integration-tests.yml | awk -F'|' '$1=="kind-node"{print $2}')"
+KIND_NODE_PIN="$(extract_kind_pins .github/workflows/integration-tests.yml | awk -F'|' '$1=="kind-node"{print $2}' | head -1)"
 if [ -n "$KIND_NODE_PIN" ]; then
   node_tag="${KIND_NODE_PIN##*:}"
   node_minor="$(echo "${node_tag#v}" | cut -d. -f1-2)"
@@ -1692,7 +1688,15 @@ if [ -n "$NPM_MANAGEMENT_PROBLEMS" ]; then
   done <<< "$NPM_MANAGEMENT_PROBLEMS"
 fi
 
-for consistency_var in TRIVY_VERSION HELM_VERSION KUBECTL_VERSION; do
+# Every tool pinned in more than one workflow (or more than one job) must
+# agree. CALICO_* and METRICS_SERVER_* are here because the kind jobs install
+# them per job — two jobs on different Calico builds would enforce
+# NetworkPolicy with two different engines, and a version/checksum pair that
+# disagrees fails the download as what looks like a flake. The PR-time half of
+# this contract lives in
+# tests/test_supply_chain_integrity.py::test_repeated_workflow_pins_agree_across_jobs.
+for consistency_var in TRIVY_VERSION HELM_VERSION KUBECTL_VERSION \
+    CALICO_VERSION CALICO_SHA256 METRICS_SERVER_VERSION METRICS_SERVER_SHA256; do
   cvals="$(extract_workflow_env_pin "$consistency_var")"
   cnum="$(echo "$cvals" | grep -c .)"
   if [ "$cnum" -gt 1 ]; then

@@ -67,6 +67,7 @@ Modification Guide:
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from collections.abc import Mapping
@@ -137,7 +138,7 @@ from gco.stacks.constants import (
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-07-18T01:03:40Z
+# Generated at (UTC): 2026-08-14T03:46:22Z
 # Flowchart(s) generated from this file:
 #   * ``GCORegionalStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack___init__.png``)
@@ -195,6 +196,66 @@ def _compute_kubectl_cluster_shared_replacements(
 _OBSERVABILITY_STORAGE_CLASS = "gco-observability-gp3"
 
 
+#: In-cluster names clients use to reach the MLflow tracking server. MLflow
+#: 3.x's host-validation middleware matches the raw Host header (port
+#: included — that is why both spellings are listed), and setting
+#: ``allowed-hosts`` REPLACES its built-in localhost/private-IP allowance
+#: rather than extending it, so the value override must carry the complete
+#: list (see ``_mlflow_allowed_hosts``).
+_MLFLOW_SERVICE_HOSTS = ("mlflow.monitoring", "mlflow.monitoring:5000")
+
+#: Loopback spellings a browser sends through the access tunnel.
+#:
+#: ``gco monitoring open --service mlflow`` is the ONLY human path to this
+#: server (ClusterIP, no Ingress), and it port-forwards to localhost — so the
+#: browser sends ``Host: localhost:5000`` or ``Host: 127.0.0.1:5000``. Because
+#: the flag replaces MLflow's built-in loopback allowance instead of extending
+#: it, omitting these makes the documented UI path answer 403 "possible DNS
+#: rebinding attack detected" while the server is perfectly healthy — the
+#: in-cluster DNS spellings return 200 through the very same tunnel (caught
+#: live 2026-08-15, taking the release screenshot).
+#:
+#: This restores upstream's own loopback posture rather than widening it: the
+#: rebinding attack these checks exist for is an external DNS name resolving
+#: to an internal address, which loopback literals cannot express. Reaching
+#: the port at all still requires the authenticated SSM tunnel, and arbitrary
+#: DNS names stay rejected.
+_MLFLOW_TUNNEL_HOSTS = ("localhost", "localhost:5000", "127.0.0.1", "127.0.0.1:5000")
+
+
+def _mlflow_allowed_hosts(vpc_endpoint_cidrs: list[str]) -> str:
+    """Compose the MLflow ``allowed-hosts`` list from the deployment's CIDRs.
+
+    The service-DNS and loopback spellings are static; the IP tail derives
+    from ``vpc_endpoint_cidrs`` (single source of truth — the same context key
+    the NetworkPolicy egress rules render) so widening the VPC range never
+    needs a matching charts.yaml edit. Every group is load-bearing:
+    Prometheus scrapes the pod IP directly, so dropping the pod-IP allowance
+    403s every ServiceMonitor scrape (caught live 2026-08-14); the tunnel
+    forwards to loopback, so dropping those 403s the only human UI path
+    (caught live 2026-08-15).
+
+    MLflow's allow-list is glob-based, so only octet-aligned prefixes convert
+    exactly; other masks WIDEN to the containing octet boundary (capped at
+    /24 granularity so the trailing ``.*`` still matches ``host:port``
+    Host headers). Widening is the safe direction — this is Host-header
+    hygiene layered over NetworkPolicies and a private ALB, and
+    under-matching is what breaks scrapes.
+    """
+    patterns: list[str] = []
+    for cidr in vpc_endpoint_cidrs:
+        network = ipaddress.ip_network(cidr, strict=False)
+        if network.version != 4:
+            raise ValueError(
+                f"vpc_endpoint_cidrs entry {cidr!r} is not IPv4; the MLflow "
+                "allowed-hosts derivation only understands IPv4 globs"
+            )
+        octets = str(network.network_address).split(".")
+        kept = min(max(network.prefixlen // 8, 1), 3)
+        patterns.append(".".join(octets[:kept]) + ".*")
+    return ",".join(dict.fromkeys([*_MLFLOW_SERVICE_HOSTS, *_MLFLOW_TUNNEL_HOSTS, *patterns]))
+
+
 _SERVICE_IMAGE_BUILD_INPUTS = (
     "dockerfiles/health-monitor-dockerfile",
     "dockerfiles/manifest-processor-dockerfile",
@@ -241,6 +302,7 @@ _HELM_CHART_CONFIG_KEYS = frozenset(
         "cert_manager",
         "slurm",
         "yunikorn",
+        "kubeflow_trainer",
         "kueue",
     }
 )
@@ -421,14 +483,17 @@ def _helm_chart_enabled(
 
 
 def _compute_kubectl_scheduler_replacements(
-    *, kueue_enabled: bool, slurm_enabled: bool
+    *, kueue_enabled: bool, slurm_enabled: bool, kubeflow_trainer_enabled: bool = False
 ) -> dict[str, str]:
     """Build the kubectl-applier replacements that gate scheduler manifests.
 
     When Kueue is enabled the ``{{KUEUE_ENABLED}}`` gate resolves so the
     default queue topology (post-helm-kueue-default-queues.yaml) applies;
     when Slurm is enabled the ``{{SLURM_ENABLED}}`` gate resolves so the
-    Slinky NetworkPolicies (post-helm-slurm-network.yaml) apply. A disabled
+    Slinky NetworkPolicies (post-helm-slurm-network.yaml) apply; when the
+    Kubeflow Trainer is enabled the ``{{KUBEFLOW_TRAINER_ENABLED}}`` gate
+    resolves so the built-in ClusterTrainingRuntime blueprints
+    (post-helm-kubeflow-trainer-runtimes.yaml) apply. A disabled
     scheduler leaves its placeholder unreplaced, the applier skips the file,
     and _FEATURE_RESOURCE_INVENTORY prunes previously applied objects — the
     same optional-feature gating observability, FSx, and Valkey use.
@@ -438,6 +503,8 @@ def _compute_kubectl_scheduler_replacements(
         replacements["{{KUEUE_ENABLED}}"] = "true"
     if slurm_enabled:
         replacements["{{SLURM_ENABLED}}"] = "true"
+    if kubeflow_trainer_enabled:
+        replacements["{{KUBEFLOW_TRAINER_ENABLED}}"] = "true"
     return replacements
 
 
@@ -722,6 +789,15 @@ class GCORegionalStack(Stack):
         # replacements in the KubectlApplyManifests CustomResource).
         self.cluster_shared_identity = self._resolve_cluster_shared_bucket_from_ssm()
         self._grant_cluster_shared_bucket_to_job_role(self.cluster_shared_identity)
+
+        # MLflow artifact storage: a dedicated OIDC-only IRSA role for the
+        # tracking server's service account, scoped to the mlflow-artifacts/
+        # prefix of the same shared bucket. Created here (not with the other
+        # IRSA roles) because it needs the resolved bucket identity above;
+        # must precede _apply_kubernetes_manifests, whose value overrides
+        # inject the role ARN into the chart's service-account annotation.
+        if self._mlflow_active():
+            self._create_mlflow_artifact_role(self.cluster_shared_identity)
 
         # Create the always-on general-purpose regional bucket (KMS key +
         # access-logs bucket + primary bucket). Provisioned unconditionally —
@@ -2542,6 +2618,101 @@ class GCORegionalStack(Stack):
             ],
         )
 
+    def _create_mlflow_artifact_role(self, shared: SharedBucketIdentity) -> None:
+        """Create the OIDC-only IRSA role MLflow uses for S3 artifact storage.
+
+        The official mlflow chart creates a ``mlflow`` ServiceAccount in the
+        ``monitoring`` namespace (``fullnameOverride`` keeps the bare name);
+        the value overrides annotate it with this role's ARN so the tracking
+        server exchanges its webhook-injected projected token for
+        credentials, which is what feeds the server-side S3 artifact proxy
+        (``mlflow.artifactsDestination``). The chart's default
+        ``automountServiceAccountToken: false`` does not affect IRSA — the
+        EKS pod identity webhook mounts its own token volume. Controller-
+        style posture: OIDC-only (``include_pod_identity=False``), trust
+        bound to exactly one namespace/service-account pair.
+
+        Grants are deliberately narrower than the job-pod role's bucket-wide
+        grant: object access only under the ``mlflow-artifacts/`` prefix of
+        the cluster-shared bucket, ``ListBucket`` condition-scoped to the
+        same prefix, and KMS confined by ``kms:ViaService`` exactly like
+        ``_grant_cluster_shared_bucket_to_job_role``.
+        """
+        from gco.stacks.nag_suppressions import acknowledge_nag_findings
+
+        self.mlflow_role = GCORegionalStack._create_irsa_role(
+            self,
+            "MlflowArtifactRole",
+            oidc_provider_arn=self.oidc_provider.open_id_connect_provider_arn,
+            oidc_issuer_url=self.cluster.cluster_open_id_connect_issuer_url,
+            service_account_names=["mlflow"],
+            namespaces=["monitoring"],
+            include_pod_identity=False,
+        )
+
+        self.mlflow_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                resources=[f"{shared.arn}/mlflow-artifacts/*"],
+            )
+        )
+        self.mlflow_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["s3:ListBucket"],
+                resources=[shared.arn],
+                conditions={
+                    "StringLike": {
+                        "s3:prefix": "mlflow-artifacts/*",
+                    }
+                },
+            )
+        )
+        # GetBucketLocation cannot share the ListBucket statement: requests
+        # for it never carry the s3:prefix key, so the condition above would
+        # implicitly deny it.
+        self.mlflow_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["s3:GetBucketLocation"],
+                resources=[shared.arn],
+            )
+        )
+        self.mlflow_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["kms:Decrypt", "kms:GenerateDataKey"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "kms:ViaService": f"s3.{shared.region}.{self.url_suffix}",
+                    }
+                },
+            )
+        )
+
+        acknowledge_nag_findings(
+            self.mlflow_role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "The MLflow artifact grants require two wildcard shapes: a "
+                        "mlflow-artifacts/* object-key suffix within the single shared "
+                        "bucket resolved from SSM, and KMS Resource::* because the "
+                        "global key ARN is not exported to this stack. KMS use is "
+                        "constrained by kms:ViaService to S3 in the bucket's region, "
+                        "and S3 access is separately limited to the artifact prefix."
+                    ),
+                    "appliesTo": [
+                        "Resource::*",
+                        "Resource::<ReadClusterSharedBucketArn4B0BD291.Parameter.Value>/mlflow-artifacts/*",
+                    ],
+                },
+            ],
+        )
+
     def _create_regional_shared_bucket(self) -> None:
         """Create the always-on general-purpose regional bucket for this region.
 
@@ -3129,6 +3300,9 @@ class GCORegionalStack(Stack):
         )
         allowed_kinds = job_policy.get(
             "allowed_kinds",
+            # Fallback mirrors manifest_processor.DEFAULT_ALLOWED_KINDS (kept
+            # inline so CDK synth never imports service modules; lockstep is
+            # pinned by tests/test_manifest_processor_extended.py::TestAllowedKindsLockstep).
             [
                 "Job",
                 "CronJob",
@@ -3138,6 +3312,7 @@ class GCORegionalStack(Stack):
                 "Service",
                 "ConfigMap",
                 "Pod",
+                "TrainJob",
             ],
         )
 
@@ -3316,6 +3491,9 @@ class GCORegionalStack(Stack):
             _compute_kubectl_scheduler_replacements(
                 kueue_enabled=_helm_chart_enabled(_helm_config, _helm_overrides, "kueue"),
                 slurm_enabled=_helm_chart_enabled(_helm_config, _helm_overrides, "slurm"),
+                kubeflow_trainer_enabled=_helm_chart_enabled(
+                    _helm_config, _helm_overrides, "kubeflow_trainer"
+                ),
             )
         )
 
@@ -3341,6 +3519,15 @@ class GCORegionalStack(Stack):
                     ),
                 }
             )
+
+        # MLflow (on by default, requires observability): gate the client
+        # egress NetworkPolicy (post-helm-mlflow-network.yaml) on the toggle
+        # via the same unreplaced-placeholder mechanism; a disabled
+        # deployment leaves the file unapplied and the applier prunes both
+        # the policy and the chart-managed metadata claim helm uninstall
+        # leaves behind (metadata is discarded, artifacts stay in S3).
+        if self._mlflow_active():
+            image_replacements.update({"{{MLFLOW_ENABLED}}": "true"})
 
         # Add queue processor replacements if enabled
         qp_config = self.node.try_get_context("queue_processor") or {}
@@ -4014,6 +4201,9 @@ class GCORegionalStack(Stack):
         if self._cost_monitoring_active():
             overrides["opencost"] = self._opencost_chart_values()
 
+        if self._mlflow_active():
+            overrides["mlflow"] = self._mlflow_chart_values()
+
         return overrides
 
     def _cost_monitoring_active(self) -> bool:
@@ -4026,6 +4216,67 @@ class GCORegionalStack(Stack):
         off together.
         """
         return self.config.get_cost_monitoring_enabled()
+
+    def _mlflow_active(self) -> bool:
+        """Return whether the MLflow tracking server deploys on this cluster.
+
+        Delegates to ``ConfigLoader.get_mlflow_enabled`` — the conjunction of
+        ``cluster_observability.mlflow.enabled`` and observability itself,
+        so the chart, its IRSA role, the gated backend PVC, and the value
+        overrides all switch together.
+        """
+        return self.config.get_mlflow_enabled()
+
+    def _mlflow_chart_values(self) -> dict[str, Any]:
+        """Build the MLflow value overrides that carry deployment tokens.
+
+        Only four things are dynamic — everything static (image pin, PVC
+        wiring, resources, posture toggles) lives in ``charts.yaml``:
+
+        - ``mlflow.artifactsDestination``: run artifacts go to the
+          cluster-shared bucket under ``mlflow-artifacts/<region>/`` —
+          region-suffixed because each regional tracking server numbers
+          experiments independently, so a shared root would interleave
+          unrelated runs' artifacts. The server proxies artifact traffic
+          (``--serve-artifacts`` is the server default), so client pods
+          never need S3 credentials of their own.
+        - ``serviceAccount.annotations``: the IRSA role ARN, which is how
+          the server-side artifact proxy gets its S3 credentials.
+        - ``storage.size``: the metadata claim size from
+          ``cluster_observability.mlflow.persistence_size``.
+        - ``server.value_options.allowed_hosts``: the complete
+          host-validation allow-list — service DNS plus wildcard patterns
+          derived from ``vpc_endpoint_cidrs`` (see
+          ``_mlflow_allowed_hosts``); the deep merge keeps the static
+          ``workers`` value while replacing the charts.yaml DNS-only
+          fallback with this full list.
+        """
+        s3_destination = (
+            f"s3://{self.cluster_shared_identity.name}/mlflow-artifacts/{self.deployment_region}"
+        )
+        vpc_endpoint_cidrs = self.node.try_get_context("vpc_endpoint_cidrs") or ["10.0.0.0/16"]
+        return {
+            "values": {
+                "mlflow": {
+                    "artifactsDestination": s3_destination,
+                },
+                "serviceAccount": {
+                    "annotations": {
+                        "eks.amazonaws.com/role-arn": self.mlflow_role.role_arn,
+                    },
+                },
+                "storage": {
+                    "size": str(
+                        self.config.get_cluster_observability_config()["mlflow"]["persistence_size"]
+                    ),
+                },
+                "server": {
+                    "value_options": {
+                        "allowed_hosts": _mlflow_allowed_hosts(vpc_endpoint_cidrs),
+                    },
+                },
+            }
+        }
 
     def _opencost_chart_values(self) -> dict[str, Any]:
         """Build the OpenCost value overrides that carry deployment tokens.
@@ -4131,6 +4382,7 @@ class GCORegionalStack(Stack):
             ("cert_manager", ["cert-manager"]),
             ("slurm", ["slinky-slurm-operator", "slinky-slurm"]),
             ("yunikorn", ["yunikorn"]),
+            ("kubeflow_trainer", ["kubeflow-trainer"]),
             ("kueue", ["kueue"]),  # Must be last
         ]
 
@@ -4171,6 +4423,12 @@ class GCORegionalStack(Stack):
         # Operator CRDs exist before its ServiceMonitor renders.
         if self._cost_monitoring_active():
             enabled_charts.append("opencost")
+
+        # MLflow is driven by the on-by-default cluster_observability.mlflow
+        # sub-toggle and requires observability itself (monitoring namespace,
+        # gp3 StorageClass, ServiceMonitor discovery, tunnel access path).
+        if self._mlflow_active():
+            enabled_charts.append("mlflow")
 
         return enabled_charts
 

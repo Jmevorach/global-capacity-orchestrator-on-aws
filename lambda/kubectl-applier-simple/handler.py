@@ -49,7 +49,7 @@ from kubernetes.client.rest import ApiException
 from kubernetes.dynamic.exceptions import NotFoundError, ResourceNotFoundError
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-07-18T01:03:40Z
+# Generated at (UTC): 2026-08-14T03:46:22Z
 # Flowchart(s) generated from this file:
 #   * ``lambda_handler`` -> ``diagrams/code_diagrams/lambda/kubectl-applier-simple/handler.lambda_handler.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/kubectl-applier-simple/handler.lambda_handler.png``)
@@ -134,6 +134,7 @@ _SUPPORTED_MANIFEST_KINDS = frozenset(
         "APIService",
         "ClusterRole",
         "ClusterRoleBinding",
+        "ClusterTrainingRuntime",
         "ConfigMap",
         "CronJob",
         "CustomResourceDefinition",
@@ -180,6 +181,7 @@ _CLUSTER_SCOPED_KINDS = frozenset(
         "ClusterQueue",
         "ClusterRole",
         "ClusterRoleBinding",
+        "ClusterTrainingRuntime",
         "CustomResourceDefinition",
         "DeviceClass",
         "EC2NodeClass",
@@ -459,6 +461,22 @@ _FEATURE_RESOURCE_INVENTORY: dict[
         ("networking.k8s.io/v1", "NetworkPolicy", "gco-jobs", "allow-slurm-cluster-internal"),
         ("networking.k8s.io/v1", "NetworkPolicy", "gco-jobs", "allow-slurm-client-to-restapi"),
         ("networking.k8s.io/v1", "NetworkPolicy", "gco-jobs", "allow-slurm-client-egress"),
+    ),
+    ("{{KUBEFLOW_TRAINER_ENABLED}}", True): (
+        ("trainer.kubeflow.org/v1alpha1", "ClusterTrainingRuntime", None, "torch-distributed"),
+    ),
+    ("{{MLFLOW_ENABLED}}", True): (
+        # The claim is created BY THE CHART (storage.enabled), not by a
+        # shipped manifest — it appears here because helm uninstall never
+        # deletes chart PVCs, so disabling the feature would otherwise leak
+        # the volume forever. Deliberately destructive on disable: the claim
+        # holds the tracking server's SQLite run METADATA. Run artifacts
+        # live in S3 (untouched).
+        ("v1", "PersistentVolumeClaim", "monitoring", "mlflow"),
+        ("networking.k8s.io/v1", "NetworkPolicy", "gco-jobs", "allow-mlflow-clients"),
+        # The server's own network posture; GCO owns it because the chart's
+        # policy drops kubelet probes (post-helm-mlflow-network.yaml).
+        ("networking.k8s.io/v1", "NetworkPolicy", "monitoring", "mlflow-server"),
     ),
     ("{{COST_MONITORING_ENABLED}}", False): (
         ("apps/v1", "Deployment", "gco-system", "cost-monitor"),
@@ -1335,6 +1353,25 @@ def apply_manifests(
                         group = "resource.k8s.io"
                         version = api_version.split("/")[-1] if "/" in api_version else "v1"
                         plural = "deviceclasses"
+                        try:
+                            custom_api.create_cluster_custom_object(
+                                group, version, plural, body=doc
+                            )
+                        except ApiException as e:
+                            if e.status == 409:
+                                custom_api.patch_cluster_custom_object(
+                                    group, version, plural, name, body=doc
+                                )
+                            else:
+                                raise
+                    elif kind == "ClusterTrainingRuntime":
+                        # Kubeflow Trainer v2 runtime blueprint (cluster-scoped;
+                        # the CRD is registered by the kubeflow-trainer chart, so
+                        # the shipped torch-distributed runtime lands in the
+                        # post-Helm pass).
+                        group = "trainer.kubeflow.org"
+                        version = api_version.split("/")[-1] if "/" in api_version else "v1alpha1"
+                        plural = "clustertrainingruntimes"
                         try:
                             custom_api.create_cluster_custom_object(
                                 group, version, plural, body=doc

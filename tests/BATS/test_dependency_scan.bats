@@ -644,6 +644,60 @@ EOF
     [ -z "$output" ]
 }
 
+# ── extract_chart_value_images ───────────────────────────────────────────────
+
+@test "extract_chart_value_images: qualifies the trainer controller image with its registry" {
+    # The regression this extractor fixes: a registry-split pin
+    # (registry: ghcr.io + multi-segment repository) must emit fully
+    # qualified, or the tag sweep resolves it against docker.io and the
+    # monthly scan goes permanently INCOMPLETE.
+    run extract_chart_value_images "lambda/helm-installer/charts.yaml"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ghcr.io/kubeflow/trainer/trainer-controller-manager:v"* ]]
+    [[ "$output" != *$'\n'"kubeflow/trainer/trainer-controller-manager:v"* ]]
+}
+
+@test "extract_chart_value_images: handles every pin shape in a fixture" {
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<'EOF'
+charts:
+  demo:
+    values:
+      image:
+        registry: ghcr.io
+        repository: org/sub/app
+        tag: "v1.2.3"
+      sidecar:
+        image:
+          repository: example/tool
+          tag: "4.5.6"
+      bare:
+        image:
+          repository: single-segment
+          tag: "7.8.9"
+      tagless:
+        image:
+          registry: ghcr.io
+          repository: kedacore/keda
+EOF
+    run extract_chart_value_images "$tmpfile"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ghcr.io/org/sub/app:v1.2.3"* ]]
+    [[ "$output" == *"example/tool:4.5.6"* ]]
+    # Ambiguous single-segment repositories and tag-less pins (their images
+    # follow the chart appVersion, which the chart version sweep reports)
+    # stay un-emitted.
+    [[ "$output" != *"single-segment"* ]]
+    [[ "$output" != *"kedacore/keda"* ]]
+    rm -f "$tmpfile"
+}
+
+@test "extract_chart_value_images: returns empty for a missing file" {
+    run extract_chart_value_images "/nonexistent/charts.yaml"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
 # ── extract_dockerfile_pins ──────────────────────────────────────────────────
 
 @test "extract_dockerfile_pins: finds all eight pins in Dockerfile.dev" {
@@ -2092,6 +2146,70 @@ EOF
     [[ "$output" == *"kind|v0.99.0"* ]]
     [[ "$output" == *"kind-node|kindest/node:v1.40.0"* ]]
     rm -f "$tmpfile"
+}
+
+@test "extract_kind_pins: identical pins across two kind-action steps print once" {
+    # cluster-e2e and examples-smoke both create kind clusters; agreement on
+    # the pins must collapse to one line per key so the single-value callers
+    # (check_github_tool, the node-image minor scope) keep working unchanged.
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<'EOF'
+jobs:
+  e2e:
+    steps:
+      - uses: helm/kind-action@v1.14.0
+        with:
+          version: "v0.99.0"
+          node_image: "kindest/node:v1.40.0"
+  smoke:
+    steps:
+      - uses: helm/kind-action@v1.14.0
+        with:
+          version: "v0.99.0"
+          node_image: "kindest/node:v1.40.0"
+EOF
+    run extract_kind_pins "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c '^kind|')" -eq 1 ]
+    [ "$(printf '%s\n' "$output" | grep -c '^kind-node|')" -eq 1 ]
+    rm -f "$tmpfile"
+}
+
+@test "extract_kind_pins: drifted pins across steps surface as extra lines" {
+    # A second line for the same key is the drift signal the consistency
+    # section of dependency-scan.sh turns into a report row.
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<'EOF'
+jobs:
+  e2e:
+    steps:
+      - uses: helm/kind-action@v1.14.0
+        with:
+          version: "v0.99.0"
+          node_image: "kindest/node:v1.40.0"
+  smoke:
+    steps:
+      - uses: helm/kind-action@v1.14.0
+        with:
+          version: "v0.98.0"
+          node_image: "kindest/node:v1.40.0"
+EOF
+    run extract_kind_pins "$tmpfile"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c '^kind|')" -eq 2 ]
+    [[ "$output" == *"kind|v0.99.0"* ]]
+    [[ "$output" == *"kind|v0.98.0"* ]]
+    [ "$(printf '%s\n' "$output" | grep -c '^kind-node|')" -eq 1 ]
+    rm -f "$tmpfile"
+}
+
+@test "extract_kind_pins: real workflow pins agree across all kind-action steps" {
+    # The live guard for the two real jobs: exactly one distinct value per
+    # key in integration-tests.yml, or the jobs' clusters have diverged.
+    run extract_kind_pins ".github/workflows/integration-tests.yml"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c '^kind|')" -eq 1 ]
+    [ "$(printf '%s\n' "$output" | grep -c '^kind-node|')" -eq 1 ]
 }
 
 # ── extract_ruff_pins ───────────────────────────────────────────────────────

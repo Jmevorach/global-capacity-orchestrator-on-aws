@@ -55,6 +55,12 @@ Usage::
     # Point at a non-default charts.yaml (used by the test suite):
     python3 .github/scripts/validate_helm_charts.py --charts /path/to/charts.yaml
 
+    # Emit one chart's pinned reference / shipped values (consumed by the
+    # integration:kind:examples-smoke job so its `helm install` uses the
+    # exact pins and values the installer Lambda would — no copies in CI):
+    python3 .github/scripts/validate_helm_charts.py --emit-ref mlflow
+    python3 .github/scripts/validate_helm_charts.py --emit-values mlflow
+
 Exit codes::
 
     0  all validated charts are well-formed (and, when online, resolvable
@@ -72,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import os
 import re
 import shutil
@@ -710,6 +717,412 @@ def validate_gateway_lockstep(
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Kubeflow Trainer runtime / example / docs lockstep
+#
+# The kubeflow-trainer chart delivers its built-in ClusterTrainingRuntime
+# blueprints through a post-install hook Job (an unpinned run-time network
+# fetch), so GCO disables that hook and ships the ``torch-distributed``
+# runtime itself — extracted verbatim from the pinned chart into
+# ``post-helm-kubeflow-trainer-runtimes.yaml`` with two documented
+# deviations (``automountServiceAccountToken: false`` and NoNewPrivs on the
+# ``node`` container). Three more surfaces
+# repeat the runtime's pinned trainer image so users see exactly what runs:
+#
+#   * the shipped runtime manifest (the source of truth in-repo),
+#   * ``examples/kubeflow-trainjob.yaml`` ``spec.trainer.image`` (listed
+#     explicitly so the image-trust gate validates it), and
+#   * the ``docs/DISTRIBUTED_TRAINING.md`` TrainJob snippet.
+#
+# A chart version bump that skips re-extraction would silently run a stale
+# runtime (or torchrun wiring) against a newer controller. These checks
+# encode the contract so the drift fails CI instead:
+#
+#   offline: the shipped runtime manifest, the example and every
+#     ``pytorch/pytorch`` image mentioned in the distributed-training doc
+#     agree on one image.
+#   online: rendering the *pinned* chart with its runtime delivery enabled
+#     must reproduce the shipped runtime — image called out explicitly,
+#     full spec compared after applying the documented deviations, and the
+#     upstream ``trainer.kubeflow.org/*`` labels preserved (the
+#     ``webhook-validation: disabled`` label is what keeps webhook warm-up
+#     from flaking the apply).
+# ---------------------------------------------------------------------------
+
+_TRAINER_CHART_KEY = "kubeflow-trainer"
+_TRAINER_RUNTIME_NAME = "torch-distributed"
+_TRAINER_RUNTIME_MANIFEST = (
+    _REPO_ROOT
+    / "lambda"
+    / "kubectl-applier-simple"
+    / "manifests"
+    / "post-helm-kubeflow-trainer-runtimes.yaml"
+)
+_TRAINJOB_EXAMPLE = _REPO_ROOT / "examples" / "kubeflow-trainjob.yaml"
+_DISTRIBUTED_TRAINING_DOC = _REPO_ROOT / "docs" / "DISTRIBUTED_TRAINING.md"
+# Only pytorch/pytorch mentions are lockstep-bound: the doc may legitimately
+# show other registries' images, but a pytorch/pytorch tag that differs from
+# the shipped runtime is exactly the stale-doc drift this check exists for.
+_DOC_PYTORCH_IMAGE_RE = re.compile(r"image:\s*(pytorch/pytorch:\S+)")
+# The runtime labels GCO must carry verbatim: framework selection and the
+# upstream pre-validation marker that exempts the built-in runtime from
+# webhook admission (losing it reintroduces webhook warm-up flakes).
+_TRAINER_RUNTIME_LOCKSTEP_LABELS = (
+    "trainer.kubeflow.org/framework",
+    "trainer.kubeflow.org/webhook-validation",
+)
+
+
+def parse_shipped_torch_runtime(manifest_text: str) -> dict[str, Any] | None:
+    """Return the one ``torch-distributed`` runtime in the shipped manifest.
+
+    ``None`` when the manifest does not contain exactly one
+    ``ClusterTrainingRuntime`` named ``torch-distributed`` — the caller turns
+    that into an "update this check" error rather than guessing.
+    """
+    try:
+        docs = [doc for doc in yaml.safe_load_all(manifest_text) if isinstance(doc, dict)]
+    except yaml.YAMLError:
+        return None
+    runtimes = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "ClusterTrainingRuntime"
+        and (doc.get("metadata") or {}).get("name") == _TRAINER_RUNTIME_NAME
+    ]
+    return runtimes[0] if len(runtimes) == 1 else None
+
+
+def upstream_torch_runtime_from_render(render_text: str) -> dict[str, Any] | None:
+    """Extract the ``torch-distributed`` runtime from a rendered chart.
+
+    The chart ships its runtimes as multi-doc YAML inside the
+    ``*runtimes-installer`` ConfigMap's ``runtimes.yaml`` key (the payload its
+    hook Job would kubectl-apply); this digs the runtime out of that payload.
+    """
+    try:
+        docs = [doc for doc in yaml.safe_load_all(render_text) if isinstance(doc, dict)]
+    except yaml.YAMLError:
+        return None
+    for doc in docs:
+        if doc.get("kind") != "ConfigMap":
+            continue
+        name = str((doc.get("metadata") or {}).get("name") or "")
+        if not name.endswith("runtimes-installer"):
+            continue
+        payload = (doc.get("data") or {}).get("runtimes.yaml")
+        if not isinstance(payload, str):
+            continue
+        try:
+            runtimes = [item for item in yaml.safe_load_all(payload) if isinstance(item, dict)]
+        except yaml.YAMLError:
+            return None
+        for runtime in runtimes:
+            if (
+                runtime.get("kind") == "ClusterTrainingRuntime"
+                and (runtime.get("metadata") or {}).get("name") == _TRAINER_RUNTIME_NAME
+            ):
+                return runtime
+    return None
+
+
+def trainer_node_image(runtime: dict[str, Any]) -> str | None:
+    """Return the trainer image of a runtime's ``node`` replicated Job."""
+    template_spec = ((runtime.get("spec") or {}).get("template") or {}).get("spec") or {}
+    jobs = template_spec.get("replicatedJobs")
+    if not isinstance(jobs, list):
+        return None
+    for job in jobs:
+        if not isinstance(job, dict) or job.get("name") != "node":
+            continue
+        pod_spec = (((job.get("template") or {}).get("spec") or {}).get("template") or {}).get(
+            "spec"
+        ) or {}
+        containers = pod_spec.get("containers")
+        if not isinstance(containers, list):
+            return None
+        for container in containers:
+            if isinstance(container, dict) and container.get("name") == "node":
+                image = container.get("image")
+                return image if isinstance(image, str) else None
+    return None
+
+
+def example_trainer_image(example_text: str) -> str | None:
+    """Return ``spec.trainer.image`` from the TrainJob example manifest."""
+    try:
+        docs = [doc for doc in yaml.safe_load_all(example_text) if isinstance(doc, dict)]
+    except yaml.YAMLError:
+        return None
+    for doc in docs:
+        if doc.get("kind") == "TrainJob":
+            image = ((doc.get("spec") or {}).get("trainer") or {}).get("image")
+            return image if isinstance(image, str) else None
+    return None
+
+
+def doc_pytorch_images(doc_text: str) -> list[str]:
+    """Return every ``pytorch/pytorch`` image the doc's snippets mention."""
+    return _DOC_PYTORCH_IMAGE_RE.findall(doc_text)
+
+
+def _apply_documented_runtime_deviations(upstream_spec: dict[str, Any]) -> dict[str, Any]:
+    """Return the upstream runtime spec with GCO's sanctioned deviations applied.
+
+    Exactly two deviations from verbatim extraction are documented in the
+    manifest header, both on the ``node`` pod template:
+
+    - ``automountServiceAccountToken: false`` (the same security default
+      both submission paths inject into user Jobs), and
+    - ``securityContext.allowPrivilegeEscalation: false`` on the ``node``
+      container (NoNewPrivs; the platform's manifest policy already rejects
+      an explicit ``true``).
+
+    Anything else that differs from upstream is drift and must fail — a new
+    deliberate deviation belongs here *and* in the manifest header, in the
+    same change.
+    """
+    adjusted = copy.deepcopy(upstream_spec)
+    jobs = ((adjusted.get("template") or {}).get("spec") or {}).get("replicatedJobs")
+    for job in jobs if isinstance(jobs, list) else []:
+        if not isinstance(job, dict) or job.get("name") != "node":
+            continue
+        pod_spec = (((job.get("template") or {}).get("spec") or {}).get("template") or {}).get(
+            "spec"
+        )
+        if not isinstance(pod_spec, dict):
+            continue
+        pod_spec["automountServiceAccountToken"] = False
+        for container in pod_spec.get("containers") or []:
+            if isinstance(container, dict) and container.get("name") == "node":
+                security = container.setdefault("securityContext", {})
+                if isinstance(security, dict):
+                    security["allowPrivilegeEscalation"] = False
+    return adjusted
+
+
+def fetch_upstream_torch_runtime(
+    entry: dict[str, Any], helm_binary: str = "helm"
+) -> dict[str, Any]:
+    """Render the pinned chart with runtime delivery enabled; return the runtime.
+
+    Runs against an isolated Helm home (same hermetic setup as the resolve /
+    render pass) and rides the shared retry ladder, so registry blips do not
+    fail the job. Raises ``RuntimeError`` with an actionable message when the
+    chart cannot be rendered or no longer ships the runtime where this check
+    expects it.
+    """
+    refs = build_refs({_TRAINER_CHART_KEY: entry})
+    if not refs:
+        raise RuntimeError(
+            f"cannot build a Helm reference from the {_TRAINER_CHART_KEY!r} charts.yaml entry"
+        )
+    ref = refs[0]
+    with tempfile.TemporaryDirectory(prefix="gco-trainer-lockstep-") as tmp:
+        env = _helm_env(Path(tmp))
+        if not ref.use_oci:
+            _sync_classic_repos({ref.repo_name: ref.repo_url}, helm_binary, env)
+        rc, out, err = _run_with_retry(
+            [
+                helm_binary,
+                "template",
+                ref.name,
+                ref.reference(),
+                "--version",
+                ref.version,
+                "--namespace",
+                ref.namespace,
+                "--set",
+                "runtimes.torchDistributed.enabled=true",
+            ],
+            env,
+            timeout=180,
+            description="helm template kubeflow-trainer (runtime delivery enabled)",
+        )
+    if rc != 0:
+        raise RuntimeError(
+            f"helm template {ref.reference()} at {ref.version!r} (with "
+            f"runtimes.torchDistributed.enabled=true) failed: {_tail(err)}"
+        )
+    runtime = upstream_torch_runtime_from_render(out)
+    if runtime is None:
+        raise RuntimeError(
+            f"chart {ref.version} no longer ships a 'runtimes-installer' ConfigMap "
+            f"containing ClusterTrainingRuntime {_TRAINER_RUNTIME_NAME!r} — upstream "
+            "runtime delivery changed; update this check alongside the re-extraction"
+        )
+    return runtime
+
+
+def validate_trainer_runtime_lockstep(
+    charts: dict[str, Any],
+    *,
+    manifest_text: str | None = None,
+    example_text: str | None = None,
+    doc_text: str | None = None,
+    online: bool = False,
+    runtime_fetcher: Any = None,
+    helm_binary: str = "helm",
+    require_entry: bool = True,
+) -> list[str]:
+    """Check the trainer runtime / example / docs lockstep; return error strings.
+
+    Offline: the shipped runtime manifest, the TrainJob example and the
+    distributed-training doc must agree on the trainer image. Online (adds
+    one chart render): the shipped runtime must reproduce what the pinned
+    chart ships — byte-identical spec after the documented deviations, with
+    the trainer image compared explicitly for an actionable message. With
+    ``require_entry`` (the default, used for the repository's real
+    charts.yaml) a missing chart entry is reported rather than skipped;
+    ``main()`` disables it for ``--charts`` fixture files.
+    """
+    errors: list[str] = []
+    entry = charts.get(_TRAINER_CHART_KEY)
+    if not isinstance(entry, dict) or not entry.get("version"):
+        if require_entry:
+            return [
+                f"trainer runtime lockstep: no {_TRAINER_CHART_KEY!r} entry with a "
+                "version in charts.yaml"
+            ]
+        return []
+
+    if manifest_text is None:
+        try:
+            manifest_text = _TRAINER_RUNTIME_MANIFEST.read_text(encoding="utf-8")
+        except OSError as exc:
+            return [f"trainer runtime lockstep: cannot read {_TRAINER_RUNTIME_MANIFEST}: {exc}"]
+    if example_text is None:
+        try:
+            example_text = _TRAINJOB_EXAMPLE.read_text(encoding="utf-8")
+        except OSError as exc:
+            return [f"trainer runtime lockstep: cannot read {_TRAINJOB_EXAMPLE}: {exc}"]
+    if doc_text is None:
+        try:
+            doc_text = _DISTRIBUTED_TRAINING_DOC.read_text(encoding="utf-8")
+        except OSError as exc:
+            return [f"trainer runtime lockstep: cannot read {_DISTRIBUTED_TRAINING_DOC}: {exc}"]
+
+    shipped = parse_shipped_torch_runtime(manifest_text)
+    if shipped is None:
+        return [
+            "trainer runtime lockstep: post-helm-kubeflow-trainer-runtimes.yaml no "
+            f"longer contains exactly one ClusterTrainingRuntime named "
+            f"{_TRAINER_RUNTIME_NAME!r}; update this check alongside any restructure"
+        ]
+    shipped_image = trainer_node_image(shipped)
+    if not shipped_image:
+        return [
+            "trainer runtime lockstep: the shipped torch-distributed runtime has no "
+            "containers[name=node] image; update this check alongside any restructure"
+        ]
+
+    example_image = example_trainer_image(example_text)
+    if example_image != shipped_image:
+        errors.append(
+            f"trainer runtime lockstep: examples/kubeflow-trainjob.yaml pins "
+            f"spec.trainer.image {example_image!r} but the shipped torch-distributed "
+            f"runtime pins {shipped_image!r} — the example deliberately lists the "
+            "runtime's image so the image-trust gate validates exactly what runs; "
+            "bump both together"
+        )
+    for doc_image in dict.fromkeys(doc_pytorch_images(doc_text)):
+        if doc_image != shipped_image:
+            errors.append(
+                f"trainer runtime lockstep: docs/DISTRIBUTED_TRAINING.md shows "
+                f"{doc_image!r} but the shipped torch-distributed runtime pins "
+                f"{shipped_image!r} — update the doc snippet in the same change"
+            )
+
+    if not online:
+        return errors
+
+    fetcher = runtime_fetcher or fetch_upstream_torch_runtime
+    try:
+        upstream = fetcher(entry, helm_binary)
+    except RuntimeError as exc:
+        errors.append(f"trainer runtime lockstep: {exc}")
+        return errors
+
+    upstream_image = trainer_node_image(upstream)
+    if upstream_image != shipped_image:
+        errors.append(
+            f"trainer runtime lockstep: chart {entry.get('version')} ships "
+            f"torch-distributed with image {upstream_image!r} but "
+            f"post-helm-kubeflow-trainer-runtimes.yaml pins {shipped_image!r} — "
+            "re-extract the runtime from the pinned chart (helm template --set "
+            "runtimes.torchDistributed.enabled=true) and bump the example + doc "
+            "images in the same change"
+        )
+    expected_spec = _apply_documented_runtime_deviations(upstream.get("spec") or {})
+    if expected_spec != (shipped.get("spec") or {}):
+        errors.append(
+            f"trainer runtime lockstep: the shipped torch-distributed runtime spec "
+            f"differs from what chart {entry.get('version')} ships (beyond the "
+            "documented deviations in _apply_documented_runtime_deviations) — the manifest "
+            "header's contract is 'same bytes'; re-extract it from the pinned chart "
+            "or record a new sanctioned deviation in both the manifest header and "
+            "_apply_documented_runtime_deviations"
+        )
+    shipped_labels = (shipped.get("metadata") or {}).get("labels") or {}
+    upstream_labels = (upstream.get("metadata") or {}).get("labels") or {}
+    for label in _TRAINER_RUNTIME_LOCKSTEP_LABELS:
+        if shipped_labels.get(label) != upstream_labels.get(label):
+            errors.append(
+                f"trainer runtime lockstep: label {label!r} is "
+                f"{shipped_labels.get(label)!r} in the shipped runtime but "
+                f"{upstream_labels.get(label)!r} upstream — these labels carry "
+                "upstream semantics (framework selection / webhook pre-validation) "
+                "and must be preserved verbatim"
+            )
+    return errors
+
+
+def emit_chart_ref(charts: dict[str, Any], chart_name: str) -> tuple[str, str]:
+    """Return ``(text, error)`` for --emit-ref.
+
+    The emitted line is "<helm-ref> <version> <namespace> <repo_url>",
+    space-separated so shell callers can consume it with a plain
+    ``read -r ref version namespace repo_url``. The reference is built by the
+    same ``ChartRef.reference()`` the online validator uses, which mirrors
+    ``handler.install_chart`` — the CI job installs exactly what the
+    installer Lambda would. ``repo_url`` rides along for classic (non-OCI)
+    charts, whose reference is ``<repo_name>/<chart>`` and only resolves
+    after ``helm repo add <repo_name> <repo_url>`` (or via
+    ``helm pull <chart> --repo <repo_url>``); for OCI charts it is the
+    ``oci://`` base already embedded in the reference.
+    """
+    refs = {ref.name: ref for ref in build_refs(charts)}
+    ref = refs.get(chart_name)
+    if ref is None:
+        known = ", ".join(sorted(refs)) or "(none)"
+        return "", f"chart {chart_name!r} not found in charts.yaml (known: {known})"
+    return f"{ref.reference()} {ref.version} {ref.namespace} {ref.repo_url}", ""
+
+
+def emit_chart_values(charts: dict[str, Any], chart_name: str) -> tuple[str, str]:
+    """Return ``(yaml_text, error)`` for --emit-values.
+
+    Fails when the values still carry a ``{{TOKEN}}`` deployment placeholder:
+    charts.yaml values are the deploy-time *fallback* and must be
+    standalone-installable (the regional stack only ever layers additional
+    overrides on top). A token here would mean the fallback contract broke —
+    better to fail the emit than install a chart with a literal ``{{...}}``.
+    """
+    refs = {ref.name: ref for ref in build_refs(charts)}
+    ref = refs.get(chart_name)
+    if ref is None:
+        known = ", ".join(sorted(refs)) or "(none)"
+        return "", f"chart {chart_name!r} not found in charts.yaml (known: {known})"
+    text = yaml.safe_dump(ref.values, default_flow_style=False, sort_keys=False)
+    if "{{" in text:
+        tokens = sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", text)))
+        return "", (
+            f"{chart_name}: values contain deployment tokens {tokens} — "
+            "charts.yaml values must be standalone-installable fallbacks"
+        )
+    return text, ""
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
@@ -749,6 +1162,23 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print a per-chart resolve/render line during the online pass.",
     )
+    emit = parser.add_mutually_exclusive_group()
+    emit.add_argument(
+        "--emit-ref",
+        metavar="CHART",
+        help=(
+            "Print '<helm-ref> <version> <namespace>' for one charts.yaml entry "
+            "and exit (query mode for CI jobs that helm-install the pinned chart)."
+        ),
+    )
+    emit.add_argument(
+        "--emit-values",
+        metavar="CHART",
+        help=(
+            "Print the shipped values block for one charts.yaml entry as YAML "
+            "and exit; fails if the values carry {{TOKEN}} placeholders."
+        ),
+    )
     return parser
 
 
@@ -763,6 +1193,15 @@ def main(argv: list[str] | None = None) -> int:
     except (yaml.YAMLError, ValueError) as exc:
         print(f"ERROR: could not parse {args.charts}: {exc}", file=sys.stderr)
         return 2
+
+    if args.emit_ref or args.emit_values:
+        emitter = emit_chart_ref if args.emit_ref else emit_chart_values
+        text, error = emitter(charts, args.emit_ref or args.emit_values)
+        if error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
+        print(text, end="" if text.endswith("\n") else "\n")
+        return 0
 
     errors = validate_structure(charts, enabled_only=args.enabled_only)
 
@@ -784,13 +1223,22 @@ def main(argv: list[str] | None = None) -> int:
                 "Pass --mode online in CI to require the resolve/render checks."
             )
 
+    # Fixture chart files passed via --charts may legitimately omit the
+    # controller / trainer entries; the repository's real charts.yaml may not.
+    is_default_charts = args.charts.resolve() == _DEFAULT_CHARTS.resolve()
     errors.extend(
         validate_gateway_lockstep(
             charts,
             online=run_online,
-            # Fixture chart files passed via --charts may legitimately omit
-            # the controller entry; the repository's real charts.yaml may not.
-            require_entry=args.charts.resolve() == _DEFAULT_CHARTS.resolve(),
+            require_entry=is_default_charts,
+        )
+    )
+    errors.extend(
+        validate_trainer_runtime_lockstep(
+            charts,
+            online=run_online,
+            helm_binary=args.helm_binary,
+            require_entry=is_default_charts,
         )
     )
 

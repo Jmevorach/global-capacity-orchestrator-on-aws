@@ -564,7 +564,35 @@ def test_convergence_payload_carries_enabled_features_and_security_policy(featur
     assert observability["alertmanager"]["enabled"] is True
     assert observability["prometheus-node-exporter"]["tolerations"]
 
+    # MLflow rides the observability conjunction: the chart is enabled, its
+    # overrides carry the SSM-resolved shared-bucket artifact destination
+    # (region-suffixed), the dedicated IRSA role annotation, and the
+    # chart-managed claim size, and the client-egress gate placeholder
+    # resolves.
+    assert "mlflow" in enabled
+    mlflow_values = chart_overrides["mlflow"]["values"]
+    destination = json.dumps(mlflow_values["mlflow"]["artifactsDestination"])
+    assert "s3://" in destination
+    assert "ReadClusterSharedBucket" in destination
+    assert f"/mlflow-artifacts/{_REGION}" in destination
+    assert "MlflowArtifactRole" in json.dumps(
+        mlflow_values["serviceAccount"]["annotations"]["eks.amazonaws.com/role-arn"]
+    )
+    # Claim size rides the values override (deep-merged into the static
+    # storage block); {{MLFLOW_BACKEND_SIZE}} is gone with the hand-rolled
+    # PVC manifest.
+    assert mlflow_values["storage"] == {"size": "10Gi"}
+    # The complete host-validation allow-list is deployment-derived:
+    # service DNS plus one wildcard per vpc_endpoint_cidrs entry (this
+    # fixture's 10.41.0.0/16 + 10.42.0.0/16), proving the VPC range is the
+    # single source — no charts.yaml edit involved.
+    assert mlflow_values["server"]["value_options"]["allowed_hosts"] == (
+        "mlflow.monitoring,mlflow.monitoring:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000,10.41.*,10.42.*"
+    )
+
     replacements = properties["ImageReplacements"]
+    assert replacements["{{MLFLOW_ENABLED}}"] == "true"
+    assert "{{MLFLOW_BACKEND_SIZE}}" not in replacements
     expected_manifest_processor_values = {
         "{{MP_VALIDATION_ENABLED}}": "false",
         "{{MP_YAML_MAX_DEPTH}}": "50",
