@@ -13,6 +13,7 @@
   <a href="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/security.yml"><img src="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/security.yml/badge.svg?branch=main" alt="Security"></a>
   <a href="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/lint.yml"><img src="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/lint.yml/badge.svg?branch=main" alt="Linting"></a>
   <a href="https://awslabs.github.io/global-capacity-orchestrator-on-aws/coverage/"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fawslabs.github.io%2Fglobal-capacity-orchestrator-on-aws%2Fcoverage-badge.json" alt="Coverage"></a>
+  <a href="https://awslabs.github.io/global-capacity-orchestrator-on-aws/"><img src="https://img.shields.io/badge/docs-wiki-blue" alt="Wiki"></a>
 </p>
 <!-- END BADGE TABLE -->
 
@@ -576,10 +577,13 @@ This is host-socket pass-through, not true Docker-in-Docker. Anyone with access 
 ├── app.py                               # CDK app entry point
 ├── TENETS.md                            # Prioritized project principles and north-star guidance
 ├── cdk.json                             # CDK configuration (regions, features, thresholds)
+├── mkdocs.yml                           # MkDocs configuration for the GitHub Pages wiki (sources in wiki/)
 ├── pyproject.toml                       # Project metadata, dependencies, and CLI installation
 │
 ├── cli/                                 # GCO CLI (jobs, stacks, capacity, inference, costs, DAGs)
+├── demo/                                # Recorded CLI demos (GIFs + asciinema sources) with walkthroughs and re-record scripts
 ├── diagrams/                            # Auto-generated architecture diagrams (infra_diagrams/) and code flowcharts (code_diagrams/)
+├── dockerfiles/                         # Distroless container images for the in-cluster GCO services
 ├── docs/                                # Documentation (architecture, CLI, API, inference, customization, analytics)
 ├── examples/                            # Example manifests (jobs, inference, Ray, Volcano, Kueue, Slurm, YuniKorn)
 ├── gco/
@@ -607,8 +611,10 @@ This is host-socket pass-through, not true Docker-in-Docker. Anyone with access 
 │   └── secret-rotation/                 # Daily secret rotation
 │
 ├── gco_mcp/                             # MCP server for LLM interaction (135 tools default, up to 183 with feature flags)
+├── images/                              # Screenshots and visual assets for docs and the wiki
 ├── scripts/                             # Utility scripts (version bump, cluster access setup)
-└── tests/                               # PyTest + BATS test suites (counts tracked via badges)
+├── tests/                               # PyTest + BATS test suites (counts tracked via badges)
+└── wiki/                                # GitHub Pages wiki sources (published at awslabs.github.io/global-capacity-orchestrator-on-aws)
 ```
 
 ## Contributing
