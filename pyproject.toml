@@ -186,6 +186,10 @@ typecheck = [
     "mypy==2.3.0",
     "types-requests==2.33.0.20260712",
     "types-PyYAML==6.0.12.20260724",
+    # scripts/mkdocs_hooks.py imports mkdocs (which ships py.typed), and the
+    # strict mypy job checks scripts/ — reuse the docs extra's pins so the
+    # hook is genuinely type-checked instead of ignore_missing_imports'd.
+    "gco-cli[docs]",
 ]
 test = [
     "pytest==9.1.1",
@@ -217,8 +221,16 @@ security = [
     "pillow==12.3.0",
     "pip-tools==7.6.0",
 ]
+docs = [
+    # Builds the orientation wiki (wiki/ -> GitHub Pages site root) with
+    # `mkdocs build --strict`; the lint:mkdocs:strict job and pages.yml both
+    # install this extra. Material's pymdown-extensions arrives transitively
+    # and is version-controlled through requirements-lock.txt.
+    "mkdocs==1.6.1",
+    "mkdocs-material==9.7.7",
+]
 dev = [
-    "gco-cli[cdk,diagrams,lint,typecheck,test,security]",
+    "gco-cli[cdk,diagrams,lint,typecheck,test,security,docs]",
     "pre-commit==4.6.1",
 ]
 
