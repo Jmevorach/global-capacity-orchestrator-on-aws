@@ -11,6 +11,7 @@
 #
 # Jobs (display names are colon-delimited, job IDs are hyphen-delimited):
 #   - lint:actionlint:workflows   — validates .github/workflows/*.yml
+#   - lint:actions:pinning        — every action SHA-pinned, comment matches upstream
 #   - lint:hadolint:dockerfile    — hadolint on every Dockerfile
 #   - lint:markdownlint:md        — markdownlint-cli2 across all Markdown files
 #   - lint:mkdocs:strict          — strict MkDocs build of the wiki (wiki/ + mkdocs.yml)
@@ -53,7 +54,7 @@ jobs:
       ACTIONLINT_VERSION: "1.7.12"
       ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install pinned actionlint
         run: |
           set -euo pipefail
@@ -72,13 +73,38 @@ jobs:
       - name: Run actionlint
         run: ./actionlint -color
 
+  lint-actions-pinning:
+    name: "lint:actions:pinning"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version-file: ".python-version"
+      # Stdlib only, so no dependency install: this job must keep working even
+      # when the lockfile is mid-bump, since a bad action pin is exactly the
+      # kind of thing a dependency PR introduces.
+      #
+      # --verify-upstream resolves each `# vX.Y.Z` comment against
+      # api.github.com and fails if the tag does not point at the pinned SHA.
+      # That catches both a wrong comment and a tag the publisher has since
+      # moved. github.token raises the API allowance to 1,000 requests/hour;
+      # only ~15 calls are made (one per action repository), and a lookup that
+      # cannot be completed is reported without failing the job so an API blip
+      # never blocks a pull request.
+      - name: Verify every action is SHA-pinned and its version comment is true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/verify_action_pins.py --verify-upstream
+
   lint-yamllint-yaml:
     name: "lint:yamllint:yaml"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
@@ -93,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: ruff format --check
         # astral-sh/ruff-action ships a prebuilt ruff binary, so this job
         # skips the ~30-40s setup-python + pip-install-e-[lint] overhead
@@ -101,7 +127,7 @@ jobs:
         # ruff entry in pyproject.toml's [project.optional-dependencies]
         # lint group so the pre-commit hook, developer installs, and CI
         # stay in lockstep. Bump all three together.
-        uses: astral-sh/ruff-action@v4.1.0
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89  # v4.1.0
         with:
           version: "0.16.2"
           args: "format --check --diff"
@@ -119,7 +145,7 @@ jobs:
         # simplify (SIM), and isort-style import sorting (I). Exclusions
         # target build-staged Lambda package directories that contain
         # third-party wheels we don't own.
-        uses: astral-sh/ruff-action@v4.1.0
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89  # v4.1.0
         with:
           version: "0.16.2"
           args: "check --exclude lambda/kubectl-applier-simple-build --exclude lambda/helm-installer-build"
@@ -137,8 +163,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version-file: ".nvmrc"
           cache: "npm"
@@ -163,8 +189,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
@@ -179,7 +205,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Pre-pull hadolint image
         uses: ./.github/actions/docker-pull-with-retry
         with:
@@ -218,7 +244,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Pre-pull shellcheck image
         uses: ./.github/actions/docker-pull-with-retry
         with:
@@ -257,8 +283,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
@@ -270,7 +296,7 @@ jobs:
           # NOT installed here — gco/stacks/ is checked in lint-mypy-stacks.
           pip install -e ".[typecheck,mcp]"
       - name: Cache mypy results
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: .mypy_cache
           key: mypy-strict-${{ hashFiles('pyproject.toml', 'requirements-lock.txt') }}
@@ -282,8 +308,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
@@ -292,7 +318,7 @@ jobs:
         run: |
           pip install -e ".[cdk,typecheck]"
       - name: Cache mypy results
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: .mypy_cache
           key: mypy-stacks-${{ hashFiles('pyproject.toml', 'requirements-lock.txt') }}
@@ -304,8 +330,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
@@ -314,7 +340,7 @@ jobs:
         run: |
           pip install -e ".[typecheck]"
       - name: Cache mypy results
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: .mypy_cache
           key: mypy-lambda-${{ hashFiles('pyproject.toml', 'requirements-lock.txt') }}
