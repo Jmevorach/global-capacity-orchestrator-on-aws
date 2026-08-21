@@ -276,6 +276,19 @@ with _contextlib.suppress(ImportError):
 with _contextlib.suppress(ImportError):
     from tools.stacks import destroy_all, destroy_stack  # noqa: F401
 
+# Config-management gated tools — present only when
+# GCO_ENABLE_CONFIG_MANAGEMENT (or GCO_ENABLE_ALL_TOOLS) is set.
+with _contextlib.suppress(ImportError):
+    from tools.stacks import (  # noqa: F401
+        add_deployment_region,
+        list_deployment_regions,
+        remove_deployment_region,
+        set_capacity_advisor_default_model,
+        set_claude_code_default_model,
+        set_deployment_region,
+        set_mission_default_model,
+    )
+
 # Destructive-operations gated tools — present only when
 # GCO_ENABLE_DESTRUCTIVE_OPERATIONS (or GCO_ENABLE_ALL_TOOLS) is set.
 with _contextlib.suppress(ImportError):
@@ -339,6 +352,7 @@ with _contextlib.suppress(ImportError):
         mission_history,
         mission_iterate,
         mission_list,
+        mission_memory_search,
         mission_resume,
         mission_start,
         mission_status,
@@ -531,6 +545,7 @@ if _IS_RELOAD and _feature_flags.is_enabled(_feature_flags.FLAG_MISSION):
         "mission_resume",
         "mission_history",
         "mission_list",
+        "mission_memory_search",
     ):
         if hasattr(_mission_tools_mod, _name):
             globals()[_name] = getattr(_mission_tools_mod, _name)
@@ -585,6 +600,7 @@ _PUBLIC_EXPORTS = [
     "_MCP_SERVER_VERSION",
     "_PROJECT_VERSION",
     "_sanitize_arguments",
+    "add_deployment_region",
     "addons_install",
     "addons_status",
     "ai_recommend",
@@ -693,6 +709,7 @@ _PUBLIC_EXPORTS = [
     "inference_status",
     "instance_info",
     "invoke_inference",
+    "list_deployment_regions",
     "list_endpoint_models",
     "list_file_systems",
     "list_inference_endpoints",
@@ -714,6 +731,7 @@ _PUBLIC_EXPORTS = [
     "mission_history",
     "mission_iterate",
     "mission_list",
+    "mission_memory_search",
     "mission_resume",
     "mission_start",
     "mission_status",
@@ -736,11 +754,16 @@ _PUBLIC_EXPORTS = [
     "queue_submit",
     "recommend_capacity",
     "recommend_region",
+    "remove_deployment_region",
     "reservation_check",
     "reserve_capacity",
     "retry_job",
     "rollback_canary",
     "scale_inference",
+    "set_capacity_advisor_default_model",
+    "set_claude_code_default_model",
+    "set_deployment_region",
+    "set_mission_default_model",
     "set_mooncake_topology",
     "setup_cluster_access",
     "spot_prices",

@@ -34,6 +34,7 @@ spec:
         gco.aws/deployment-timestamp: "{{DEPLOYMENT_TIMESTAMP}}"
     spec:
       serviceAccountName: gco-inference-proxy-sa
+      priorityClassName: gco-platform-critical
       automountServiceAccountToken: false
       # API Gateway response streams can run for 15 minutes. Allow Uvicorn to
       # drain an in-flight stream after this pod stops receiving new traffic.
@@ -43,6 +44,8 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone

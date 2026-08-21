@@ -129,6 +129,25 @@ _CLOUDFORMATION_DELETE_POLL_SECONDS = 15.0
 _CLOUDFORMATION_DELETE_HEARTBEAT_SECONDS = 60.0
 _BOOTSTRAP_HEALTHY_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE"})
 _LIVE_VALIDATION_PROVIDER_LOG_CONTEXT = "gco_live_validation_retain_provider_log_groups"
+
+# Canonical shared Lambda sources and the checked-in copies that must mirror
+# them, as POSIX paths relative to the project root. This is the single map
+# behind StackManager._sync_lambda_sources (deploy-time enforcement) and
+# tests/test_lambda_shared_sources.py (commit-time enforcement): the copies
+# exist so each Lambda's build directory is self-contained, and they must stay
+# byte-identical to their canonical source or a deploy rewrites tracked files
+# and dirties the worktree mid-run.
+LAMBDA_SHARED_SOURCE_TARGETS: dict[str, tuple[str, ...]] = {
+    "lambda/proxy-shared/proxy_utils.py": (
+        "lambda/api-gateway-proxy/proxy_utils.py",
+        "lambda/regional-api-proxy/proxy_utils.py",
+    ),
+    "lambda/tls-shared/backend_tls.py": (
+        "lambda/proxy-shared/backend_tls.py",
+        "lambda/api-gateway-proxy/backend_tls.py",
+        "lambda/regional-api-proxy/backend_tls.py",
+    ),
+}
 StackAuthorizationCallback = Callable[[str, str, str], None]
 CleanupOutcomeCallback = Callable[[str, dict[str, Any]], None]
 ChangeSetPreparedCallback = Callable[[str, str, str, str, str], None]
@@ -1235,27 +1254,20 @@ class StackManager:
 
         Checked-in copies keep raw CDK evaluation deterministic. Deploy updates
         those copies before generated assets are checked, and never mutates a
-        generated final build tree in place.
+        generated final build tree in place. The source->targets mapping lives
+        in the module-level ``LAMBDA_SHARED_SOURCE_TARGETS`` so
+        ``tests/test_lambda_shared_sources.py`` can hold the checked-in copies
+        byte-identical to their canonical sources without restating the map.
         """
         if getattr(self, "_lambda_sources_synced", False):
             return
 
-        lambda_dir = self.project_root / "lambda"
-        shared_source_targets = {
-            lambda_dir / "proxy-shared" / "proxy_utils.py": [
-                lambda_dir / "api-gateway-proxy" / "proxy_utils.py",
-                lambda_dir / "regional-api-proxy" / "proxy_utils.py",
-            ],
-            lambda_dir / "tls-shared" / "backend_tls.py": [
-                lambda_dir / "proxy-shared" / "backend_tls.py",
-                lambda_dir / "api-gateway-proxy" / "backend_tls.py",
-                lambda_dir / "regional-api-proxy" / "backend_tls.py",
-            ],
-        }
-        for shared_source, targets in shared_source_targets.items():
+        for source_rel, target_rels in LAMBDA_SHARED_SOURCE_TARGETS.items():
+            shared_source = self.project_root / source_rel
             if not shared_source.exists():
                 continue
-            for target in targets:
+            for target_rel in target_rels:
+                target = self.project_root / target_rel
                 if target.parent.exists():
                     _atomic_copy_file(shared_source, target)
         self._lambda_sources_synced = True
@@ -4565,16 +4577,29 @@ class StackManager:
             implicit_log_groups = self._collect_implicit_log_groups(stacks)
 
         def finish(overall: bool) -> tuple[bool, list[str], list[str]]:
-            """Funnel every exit through the implicit log-group sweep.
+            """Funnel every exit through the teardown sweeps.
 
             Called at each return point so a partially failed teardown
-            still cleans up the stacks that DID delete. New exit paths
-            must return through here as well.
+            still cleans up the stacks that DID delete (implicit log
+            groups), while the success-only sweeps (runtime traffic-dial
+            parameters) run exactly when everything is gone. New exit
+            paths must return through here as well.
             """
             if implicit_log_groups:
                 record_cleanup(
                     "implicit-log-groups",
                     self._cleanup_implicit_log_groups(implicit_log_groups, successful),
+                )
+            if overall:
+                # Only after a complete teardown: while any stack survives,
+                # the accelerator may still be live and a manual override on
+                # it is standing operator intent the purge must not erase.
+                # Strict teardowns run this too — the runtime dial parameters
+                # are untagged, so the harness's tagging-index audit cannot
+                # see them and no one else owns their removal.
+                record_cleanup(
+                    "traffic-dial-parameters",
+                    self._cleanup_traffic_dial_parameters(),
                 )
             return overall, successful, failed
 
@@ -5348,6 +5373,35 @@ class StackManager:
             )
         for failure in outcome["errors"]:
             logger.warning("Implicit log-group cleanup failed for %s", failure)
+        return outcome
+
+    def _cleanup_traffic_dial_parameters(self) -> dict[str, Any]:
+        """Best-effort purge of the runtime traffic-dial SSM parameter tree.
+
+        The traffic-dial controller Lambda writes ``/{project}/traffic-dial/
+        state`` and ``gco capacity traffic-dial set`` writes ``override-*``
+        siblings at runtime; CloudFormation never owns them, so stack
+        deletion leaves them behind. A surviving override is the real
+        hazard: the scheduled controller honors overrides indefinitely, so
+        the next deployment in this account would silently pin that region's
+        dial until someone noticed. Runs only after a *fully* successful
+        teardown — while any stack remains, the accelerator may still be
+        live and an override on it is standing operator intent.
+        """
+        from .capacity.traffic_dial import TrafficDialManager
+
+        outcome: dict[str, Any] = {"deleted": [], "errors": []}
+        try:
+            outcome["deleted"] = TrafficDialManager(self.config).purge_runtime_parameters()
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            outcome["errors"].append(f"{type(exc).__name__}: {exc}")
+        if outcome["deleted"]:
+            print(
+                f"  Deleted {len(outcome['deleted'])} runtime traffic-dial SSM "
+                "parameter(s) (controller state / manual overrides)."
+            )
+        for failure in outcome["errors"]:
+            logger.warning("Traffic-dial parameter cleanup failed: %s", failure)
         return outcome
 
     def _cleanup_bastion_iam(self) -> dict[str, Any]:

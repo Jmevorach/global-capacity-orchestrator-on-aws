@@ -56,11 +56,14 @@ spec:
       spec:
         # Uses the manifest-processor SA (dedicated IRSA role for SQS + K8s access)
         serviceAccountName: gco-manifest-processor-sa
+        priorityClassName: gco-platform-critical
         securityContext:
           runAsNonRoot: true
           runAsUser: 1000
           runAsGroup: 1000
           fsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
         containers:
         - name: queue-processor
           image: {{QUEUE_PROCESSOR_IMAGE}}

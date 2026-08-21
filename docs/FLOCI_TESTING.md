@@ -36,11 +36,18 @@ image as a service container and runs two jobs — `floci:integration` (the
 `gco release validate --emulator-endpoint`, preflight + baseline subset).
 No AWS credentials exist anywhere in the workflow.
 
+Neither job names its modules: each discovers them by glob, so a new Floci
+test runs without a workflow edit and cannot silently go uncollected. The
+split is a filename convention — name a module `tests/test_floci_*_e2e.py`
+to place it in `floci:e2e:release-validate` (which provides Node, npm, and
+the CDK CLI); any other `tests/test_floci_*.py` lands in `floci:integration`.
+The globs are complements, so their union is always the whole layer.
+
 **Locally (optional):**
 
 ```bash
 docker run --rm -p 4566:4566 -e FLOCI_STORAGE_MODE=memory \
-  floci/floci:1.6.0    # finch/podman work identically
+  floci/floci:1.7.0    # finch/podman work identically
 GCO_FLOCI_ENDPOINT=http://127.0.0.1:4566 pytest tests/test_floci_*.py -v
 ```
 
@@ -90,14 +97,16 @@ committed tests, not inferred from Floci's docs):
 | ELBv2 | `regional-api-proxy` ownership validation; `ga-registration` tag/hostname ALB discovery | Meaningful behavior: real internal ALBs, tags, fail-closed rejections |
 | ECR | `image-lookup` adopt-or-create custom resource | Meaningful behavior in CI (create/adopt/delete); local Finch hosts skip (gap 4) |
 | EKS / Lambda / Logs / IAM / KMS / API Gateway / Tagging API | Harness inventory scanners | Control-plane list/describe only |
-| CloudWatch | `metrics_publisher` | Accepts writes (no query assertions) |
+| CloudWatch | `metrics_publisher`; `traffic-dial-controller` decision metrics and its no-datapoints `GetMetricData` hold | Accepts writes (no query assertions); an empty query answer drives the controller's fail-safe hold for real |
 
 Still mocked (unit layer only): Kubernetes API interactions (kind E2E owns
 live-cluster behavior), Bedrock advisors, Cost Explorer analytics, Cognito
 analytics users, SageMaker/EFS/FSx cleanup paths (`analytics-cleanup`,
 `analytics-presigned-url`), CloudFormation drift detection
 (`drift-detection`; `DetectStackDrift` is absent from the emulator), the
-Global Accelerator and EKS halves of `ga-registration`, and every
+Global Accelerator and EKS halves of `ga-registration`, the Global
+Accelerator half of `traffic-dial-controller` (its SSM and CloudWatch halves
+run here; see `test_floci_traffic_dial.py`), and every
 kubeconfig-dependent Lambda path (`kubectl-applier-simple`,
 `helm-installer` worker, `tls-certificate-manager`): emulator EKS clusters
 never reach `ACTIVE`, so in-cluster behavior cannot be exercised honestly.

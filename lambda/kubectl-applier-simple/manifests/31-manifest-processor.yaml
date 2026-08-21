@@ -30,12 +30,15 @@ spec:
         gco.aws/deployment-timestamp: "{{DEPLOYMENT_TIMESTAMP}}"
     spec:
       serviceAccountName: gco-manifest-processor-sa
+      priorityClassName: gco-platform-critical
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone

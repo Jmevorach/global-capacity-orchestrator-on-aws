@@ -50,6 +50,7 @@ spec:
         karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: gco-cost-monitor-sa
+      priorityClassName: gco-platform-critical
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       securityContext:
@@ -57,6 +58,8 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: cost-monitor
           image: {{COST_MONITOR_IMAGE}}
