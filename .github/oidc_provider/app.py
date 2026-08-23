@@ -23,7 +23,8 @@ app = cdk.App()
 
 # Read configuration from cdk.json context — users edit cdk.json, not this file.
 github_repo = (
-    app.node.try_get_context("github_repo") or "aws-solutions-library-samples/global-capacity-orchestrator-on-aws"
+    app.node.try_get_context("github_repo")
+    or "aws-solutions-library-samples/global-capacity-orchestrator-on-aws"
 )
 github_branch = app.node.try_get_context("github_branch") or "main"
 

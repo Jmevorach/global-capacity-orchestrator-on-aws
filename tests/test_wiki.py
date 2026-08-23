@@ -24,7 +24,9 @@ WIKI_DIR = PROJECT_ROOT / "wiki"
 MKDOCS_YML = PROJECT_ROOT / "mkdocs.yml"
 
 #: Canonical Pages origin; the nav's external coverage entry must live there.
-PAGES_ORIGIN = "https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/"
+PAGES_ORIGIN = (
+    "https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/"
+)
 
 #: Canonical repository URL. Kept as a plain literal (and the deep-link regex
 #: built from it with ``re.escape``) so scripts/migrate_fork.py's existing
