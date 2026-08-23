@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Repoint this checkout's upstream references at your own fork.
 
-GCO hard-codes ``awslabs/global-capacity-orchestrator-on-aws`` in CI badges,
-clone instructions, issue links, package metadata, the GitHub Pages URL, and —
-critically — the OIDC trust-policy subject that lets GitHub Actions assume a
-deploy role. A fork that leaves those pointing upstream gets badges reporting
-someone else's CI, "report an issue" links filed against upstream, and an OIDC
-role that refuses its workflows.
+GCO hard-codes ``aws-solutions-library-samples/global-capacity-orchestrator-on-aws``
+in CI badges, clone instructions, issue links, package metadata, the GitHub
+Pages URL, and — critically — the OIDC trust-policy subject that lets GitHub
+Actions assume a deploy role. A fork that leaves those pointing upstream gets
+badges reporting someone else's CI, "report an issue" links filed against
+upstream, and an OIDC role that refuses its workflows.
 
-The obvious fix, ``sed -i s/awslabs/myorg/g``, breaks the repository. The org
-string also appears in links to seven unrelated AWS Labs projects and in the
-``awslabs.*`` MCP server package names that ``mcp.json`` resolves at runtime;
-rewriting those produces dead links and tooling that cannot start. This script
-therefore classifies every occurrence and rewrites only the ones that identify
-*this* repository.
+The obvious fix, a blanket ``sed`` over the org name, breaks the repository.
+The tree also carries references that must survive: links to sibling projects
+under the upstream org, other projects' GitHub Pages hosts, and — from the
+project's original ``awslabs`` home — the ``awslabs.*`` MCP server package
+names that ``mcp.json`` resolves at runtime. Rewriting those produces dead
+links and tooling that cannot start. This script therefore classifies every
+occurrence and rewrites only the ones that identify *this* repository.
 
 Usage::
 
@@ -50,8 +51,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: The upstream identity this checkout ships with.
-UPSTREAM_OWNER = "awslabs"
+#: The upstream identity this checkout ships with. The project moved from
+#: ``awslabs`` to ``aws-solutions-library-samples`` in August 2026; checkouts
+#: predating the move ship the matching older constant, so the script always
+#: describes the tree it travels with.
+UPSTREAM_OWNER = "aws-solutions-library-samples"
 UPSTREAM_REPO = "global-capacity-orchestrator-on-aws"
 
 #: GitHub's own constraint on owner and repository names. Validated before any
@@ -126,19 +130,22 @@ def _build_rules(owner: str, repo: str) -> tuple[Rule, ...]:
 
     return (
         Rule(
-            name="other-awslabs-project",
+            name="other-upstream-org-project",
             pattern=re.compile(rf"github\.com/{up_owner}/(?!{up_repo})[\w.-]+"),
             replacement=None,
-            why="link to a different AWS Labs project",
+            why="link to a different project in the upstream org",
         ),
         Rule(
-            name="awslabs-package-name",
-            # ``*`` is accepted so prose referring to the namespace as a glob
+            name="upstream-package-name",
+            # ``*`` is accepted so prose referring to a namespace as a glob
             # ("the awslabs.* MCP servers") classifies as a package reference
-            # rather than falling through unrecognized.
+            # rather than falling through unrecognized. This rule also claims
+            # other projects' Pages hosts (``<owner>.github.io/other-repo``);
+            # the guard keeps it from swallowing this repository's own Pages
+            # URL, which the pages-url rules rewrite.
             pattern=re.compile(rf"{up_owner}\.{pages_guard}[a-z0-9_*-]+[a-z0-9_.*-]*"),
             replacement=None,
-            why="published package name (for example an awslabs.* MCP server)",
+            why="published package name or another project's GitHub Pages host",
         ),
         Rule(
             name="clone-url-ssh",
@@ -180,7 +187,15 @@ def _build_rules(owner: str, repo: str) -> tuple[Rule, ...]:
             # "-", or "." still blocks a match, so a differently-prefixed
             # directory like "PROD-global-capacity-orchestrator-on-aws" is left
             # alone.
-            pattern=re.compile(rf"(?<![\w.-]){up_repo}(?![\w-])"),
+            #
+            # A percent-encoded slash ("%2F"/"%2f") is an allowed prefix for
+            # the same reason "/" is: a tree whose Pages host already carries
+            # a different owner (this repository after its own org move, or a
+            # fork migrating a second time) still embeds the repo name in the
+            # shields.io coverage badge's percent-encoded URL, and only this
+            # rule can claim it there — pages-url-encoded is anchored to the
+            # upstream owner's host.
+            pattern=re.compile(rf"(?:(?<=%2[Ff])|(?<![\w.-])){up_repo}(?![\w-])"),
             replacement=repo,
             why="bare repository name (clone directory, package metadata)",
         ),

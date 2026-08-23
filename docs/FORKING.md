@@ -5,7 +5,7 @@ your own repository — what to rewrite, what to leave alone, and the handful of
 things a script cannot decide for you.
 
 Everything here is about *repository identity*: the URLs, badges, and trust
-policies that name `awslabs/global-capacity-orchestrator-on-aws`. Renaming the
+policies that name `aws-solutions-library-samples/global-capacity-orchestrator-on-aws`. Renaming the
 *deployment* is a separate, orthogonal knob — see
 [Renaming the deployment](#renaming-the-deployment).
 
@@ -25,7 +25,7 @@ Create your repository first — either a GitHub fork, or an empty repository yo
 push a clone into:
 
 ```bash
-git clone https://github.com/awslabs/global-capacity-orchestrator-on-aws.git my-gco
+git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git my-gco
 cd my-gco
 git remote rename origin upstream
 git remote add origin https://github.com/myorg/my-gco.git
@@ -60,35 +60,39 @@ reverts it. Running it twice is a no-op.
 ## What the Tool Rewrites
 
 Only git-tracked text files are considered, so ignored build output is never
-touched. In a clean checkout the tool finds about 70 references across roughly
-20 files:
+touched. In a clean checkout the tool finds about 155 references across roughly
+30 files:
 
 | Reference | Example | Why it matters |
 |-----------|---------|----------------|
-| Repository URLs | `github.com/awslabs/global-capacity-orchestrator-on-aws` | CI badges, issue links, `tree`/`blob` links, `pyproject.toml` project URLs |
-| SSH clone URLs | `git@github.com:awslabs/...` | The clone commands in `README.md` and `QUICKSTART.md` |
-| GitHub Pages URL | `awslabs.github.io/global-capacity-orchestrator-on-aws` | The published site: orientation wiki at the root, coverage report at `/coverage/`, badge JSON at `/coverage-badge.json` (in `mkdocs.yml`, `wiki/*.md`, the README badge, and the wiki guard test) |
-| Percent-encoded Pages URL | `awslabs.github.io%2Fglobal-capacity...` | The shields.io coverage badge embeds the Pages URL as a query parameter. Missing this leaves the badge reporting upstream's coverage while every other badge reports yours |
-| Bare `owner/repo` slug | `"github_repo": "awslabs/global-capacity-orchestrator-on-aws"` | The **OIDC trust-policy subject**. Until this changes, your workflows cannot assume the deploy role |
+| Repository URLs | `github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws` | CI badges, issue links, `tree`/`blob` links, `pyproject.toml` project URLs |
+| SSH clone URLs | `git@github.com:aws-solutions-library-samples/...` | The clone commands in `README.md` and `QUICKSTART.md` |
+| GitHub Pages URL | `aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws` | The published site: orientation wiki at the root, coverage report at `/coverage/`, badge JSON at `/coverage-badge.json` (in `mkdocs.yml`, `wiki/*.md`, the README badge, and the wiki guard test) |
+| Percent-encoded Pages URL | `aws-solutions-library-samples.github.io%2Fglobal-capacity...` | The shields.io coverage badge embeds the Pages URL as a query parameter. Missing this leaves the badge reporting upstream's coverage while every other badge reports yours |
+| Bare `owner/repo` slug | `"github_repo": "aws-solutions-library-samples/global-capacity-orchestrator-on-aws"` | The **OIDC trust-policy subject**. Until this changes, your workflows cannot assume the deploy role |
 | Bare repository name | `cd global-capacity-orchestrator-on-aws`, `/path/to/global-capacity-orchestrator-on-aws` | Clone directory names and the MCP server setup paths |
 
 ## What the Tool Preserves, and Why
 
-The reason to use the tool rather than `sed -i 's/awslabs/myorg/g'` is that this
-repository contains roughly twice as many occurrences of `awslabs` that must
-survive as occurrences that should change. A blanket replacement silently breaks
-two categories:
+The reason to use the tool rather than a blanket
+`sed -i 's/aws-solutions-library-samples/myorg/g'` is that not every string
+resembling the upstream identity *is* the upstream identity — and the
+project's history adds a second hazard: GCO began life under the `awslabs`
+org (it moved in August 2026), and references from that era must keep working.
+A blanket replacement of either org name silently breaks two categories:
 
-**Links to other AWS Labs projects.** Seven of them are referenced in the docs,
-including [`aws-sigv4-proxy`](https://github.com/awslabs/aws-sigv4-proxy),
+**Links to other projects.** The docs reference sibling projects under the
+upstream org as well as AWS Labs projects from the original home, including
+[`aws-sigv4-proxy`](https://github.com/awslabs/aws-sigv4-proxy),
 [`amazon-eks-ami`](https://github.com/awslabs/amazon-eks-ami), and the
 [`ai-on-eks`](https://awslabs.github.io/ai-on-eks/) blueprints. Rewriting them
 produces dead links to repositories under your org that do not exist.
 
 **`awslabs.*` package names.** The MCP server names — `awslabs.eks-mcp-server`,
 `awslabs.aws-documentation-mcp-server`, `awslabs.aws-pricing-mcp-server` — are
-resolved from a package registry at runtime by `mcp.json`. Rewriting them means
-`uvx` cannot find the package and the servers fail to start.
+resolved from a package registry at runtime by `mcp.json`. They are published
+package identifiers, not repository references; rewriting them means `uvx`
+cannot find the package and the servers fail to start.
 
 Three files keep their upstream references on purpose, because they define or
 explain the upstream identity: `scripts/migrate_fork.py`,
@@ -215,7 +219,7 @@ documentation-and-URL migration should do as a side effect.
 Keeping an `upstream` remote lets you pull fixes after diverging:
 
 ```bash
-git remote add upstream https://github.com/awslabs/global-capacity-orchestrator-on-aws.git
+git remote add upstream https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 git fetch upstream
 git merge upstream/main
 ```
