@@ -3,9 +3,9 @@
 GCO is one CDK application that deploys a **global control plane** plus **one
 regional stack per target region**, all in a single AWS partition. This page
 is the high-level story; the authoritative deep dive is
-[docs/ARCHITECTURE.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/ARCHITECTURE.md),
+[docs/ARCHITECTURE.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/ARCHITECTURE.md),
 with the conceptual model in
-[docs/CONCEPTS.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md).
+[docs/CONCEPTS.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md).
 
 ## The multi-region platform
 
@@ -53,7 +53,7 @@ empty), and the manifest processor validates each manifest against the
 security policy before applying it. EKS Auto Mode then provisions a matching
 node, the job runs, and outputs can persist to EFS or FSx after the pod
 terminates. The step-by-step walk-through lives in
-[Core Concepts — How Components Work Together](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md#how-components-work-together).
+[Core Concepts — How Components Work Together](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md#how-components-work-together).
 
 Capacity decisions stay explicit: `gco capacity` exposes spot placement
 scores, spot price history, capacity reservations, and Capacity Blocks, and
@@ -72,14 +72,14 @@ deployment-local private root behind it), a request-bound rotating HMAC,
 private backend exposure (internal ALBs, private EKS endpoints),
 freshness/integrity validation in backend middleware, and IRSA / EKS Pod
 Identity for pod-level AWS access without static credentials. The README's
-[Security Model](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/README.md#security-model)
+[Security Model](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/README.md#security-model)
 section shows the exact request flow per partition.
 
 ## Keep reading
 
-- [docs/ARCHITECTURE.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/ARCHITECTURE.md)
+- [docs/ARCHITECTURE.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/ARCHITECTURE.md)
   — layers, data flows, and scale characteristics
-- [docs/CONCEPTS.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md)
+- [docs/CONCEPTS.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md)
   — the mental model behind the components
-- [README — Architecture Overview](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/README.md#architecture-overview)
+- [README — Architecture Overview](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/README.md#architecture-overview)
   — the generated CDK diagram and per-stack workflows

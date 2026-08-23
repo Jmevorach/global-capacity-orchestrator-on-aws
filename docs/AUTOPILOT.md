@@ -46,7 +46,7 @@ gco autopilot
 With git and a container runtime installed, this is the whole journey from nothing to a working Claude Code setup:
 
 ```bash
-git clone https://github.com/awslabs/global-capacity-orchestrator-on-aws.git
+git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws
 ./scripts/setup-dev-alias.sh    # builds the dev container + installs the `gco` shell function
 source ~/.zshrc                 # or ~/.bashrc — the script prints which file it updated

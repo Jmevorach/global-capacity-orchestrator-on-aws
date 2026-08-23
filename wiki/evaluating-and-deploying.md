@@ -1,7 +1,7 @@
 # Evaluating & deploying
 
 The
-[Quick Start Guide](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/QUICKSTART.md)
+[Quick Start Guide](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/QUICKSTART.md)
 is the authoritative walkthrough — it aims to take you from a clean machine
 to a running deployment in under 60 minutes, and it marks the exact point
 where AWS charges begin. This page summarizes the journey so you know what
@@ -15,7 +15,7 @@ you are signing up for.
   resolution entirely.
 - **Host installs are the advanced path.** GCO pins exact versions of many
   Python packages; the README's
-  [Prerequisites](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/README.md#prerequisites)
+  [Prerequisites](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/README.md#prerequisites)
   section covers the clean-virtualenv route and its known caveats.
 
 ## The journey
@@ -29,14 +29,14 @@ you are signing up for.
    converge asynchronously afterwards and can take 10–30+ minutes.
 4. **Submit a test job and (optionally) an inference endpoint** — the
    repository ships ready-to-submit
-   [example manifests](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/examples/README.md).
+   [example manifests](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/examples/README.md).
 5. **Tear down** — one command destroys the stacks with best-effort cleanup
    of known resources.
 
 Prefer to let an agent drive? `gco autopilot` launches a configured Claude
 Code session on Amazon Bedrock with the GCO MCP server wired in — deploying,
 checking capacity, and submitting jobs conversationally. See
-[docs/AUTOPILOT.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/AUTOPILOT.md).
+[docs/AUTOPILOT.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/AUTOPILOT.md).
 
 ![Listing deployed CDK stacks via natural language through the GCO MCP server](assets/images/gco_mcp_list_stacks.png)
 
@@ -46,7 +46,7 @@ stacks via the GCO MCP server.*
 ## What it costs
 
 The README's
-[sample cost table](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/README.md#sample-cost-table)
+[sample cost table](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/README.md#sample-cost-table)
 breaks down a single-region deployment with default settings:
 
 - **~$210/month fixed platform cost** — the largest items are the EKS
@@ -62,7 +62,7 @@ breaks down a single-region deployment with default settings:
 
 Deployment configuration is a single file: `cdk.json` defines the regions,
 features, and thresholds. The
-[Customization Guide](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CUSTOMIZATION.md)
+[Customization Guide](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CUSTOMIZATION.md)
 is the reference for all of it — deployment regions (any SDK-known region in
 one partition, no count limit), endpoint access modes, GPU NodePool instance
 types and spot preferences, security policy toggles, Helm chart
@@ -72,11 +72,11 @@ zero cost until enabled.
 
 ## Where to go next
 
-- [QUICKSTART.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/QUICKSTART.md)
+- [QUICKSTART.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/QUICKSTART.md)
   — the full step-by-step walkthrough
-- [docs/CUSTOMIZATION.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CUSTOMIZATION.md)
+- [docs/CUSTOMIZATION.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CUSTOMIZATION.md)
   — every knob, from regions to NodePools to feature toggles
-- [docs/CLI.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CLI.md)
+- [docs/CLI.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CLI.md)
   — the complete command reference
 - [What you can run](what-you-can-run.md) — the workload catalog this
   platform serves

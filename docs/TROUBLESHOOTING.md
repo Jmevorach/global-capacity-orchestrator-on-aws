@@ -952,4 +952,4 @@ Include:
 
 ---
 
-**Still stuck?** Check the [AWS EKS documentation](https://docs.aws.amazon.com/eks/) or open a [GitHub issue](https://github.com/awslabs/global-capacity-orchestrator-on-aws/issues).
+**Still stuck?** Check the [AWS EKS documentation](https://docs.aws.amazon.com/eks/) or open a [GitHub issue](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/issues).

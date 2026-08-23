@@ -8,12 +8,12 @@
 
 <!-- BEGIN BADGE TABLE -->
 <p>
-  <a href="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/unit-tests.yml"><img src="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/unit-tests.yml/badge.svg?branch=main" alt="Unit Tests"></a>
-  <a href="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/integration-tests.yml"><img src="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/integration-tests.yml/badge.svg?branch=main" alt="Integration Tests"></a>
-  <a href="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/security.yml"><img src="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/security.yml/badge.svg?branch=main" alt="Security"></a>
-  <a href="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/lint.yml"><img src="https://github.com/awslabs/global-capacity-orchestrator-on-aws/actions/workflows/lint.yml/badge.svg?branch=main" alt="Linting"></a>
-  <a href="https://awslabs.github.io/global-capacity-orchestrator-on-aws/coverage/"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fawslabs.github.io%2Fglobal-capacity-orchestrator-on-aws%2Fcoverage-badge.json" alt="Coverage"></a>
-  <a href="https://awslabs.github.io/global-capacity-orchestrator-on-aws/"><img src="https://img.shields.io/badge/docs-wiki-blue" alt="Wiki"></a>
+  <a href="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/unit-tests.yml"><img src="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/unit-tests.yml/badge.svg?branch=main" alt="Unit Tests"></a>
+  <a href="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/integration-tests.yml"><img src="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/integration-tests.yml/badge.svg?branch=main" alt="Integration Tests"></a>
+  <a href="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/security.yml"><img src="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/security.yml/badge.svg?branch=main" alt="Security"></a>
+  <a href="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/lint.yml"><img src="https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/workflows/lint.yml/badge.svg?branch=main" alt="Linting"></a>
+  <a href="https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/coverage/"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Faws-solutions-library-samples.github.io%2Fglobal-capacity-orchestrator-on-aws%2Fcoverage-badge.json" alt="Coverage"></a>
+  <a href="https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/"><img src="https://img.shields.io/badge/docs-wiki-blue" alt="Wiki"></a>
 </p>
 <!-- END BADGE TABLE -->
 
@@ -78,7 +78,7 @@ cleanup scope.
 **The easiest way to get started — let an agent drive.** With git and a container runtime installed, the whole journey from nothing to the agent session in the 🤖 recording above is:
 
 ```bash
-git clone https://github.com/awslabs/global-capacity-orchestrator-on-aws.git
+git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws
 ./scripts/setup-dev-alias.sh   # builds the dev container + installs the `gco` shell function
 source ~/.zshrc                # or ~/.bashrc — the script prints which file it updated
@@ -92,7 +92,7 @@ gco autopilot                  # offers the pinned Claude Code install, then lau
 **Let the setup script do it all — build the image and wire up a `gco` command for you.** You shouldn't hand-write `docker run …` invocations or live inside an interactive container shell — [`scripts/setup-dev-alias.sh`](./scripts/setup-dev-alias.sh) builds the `gco-dev` image and installs the wiring, so `gco` runs straight from your normal shell:
 
 ```bash
-git clone git@github.com:awslabs/global-capacity-orchestrator-on-aws.git
+git clone git@github.com:aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws
 
 ./scripts/setup-dev-alias.sh   # builds gco-dev from Dockerfile.dev + installs the `gco` shell function
@@ -134,7 +134,7 @@ docker run -it --rm \
 Host installs are the advanced, non-recommended path. GCO pins exact versions of many Python packages, so installing on top of an existing Python environment frequently fails with dependency-resolver errors (`ResolutionImpossible`). The dev container shown above is the recommended path — it ships every dependency at the pinned versions — and the [Quick Start Guide](QUICKSTART.md) walks through it end to end. If you still want a host install, use a clean virtual environment or pipx.
 
 ```bash
-git clone git@github.com:awslabs/global-capacity-orchestrator-on-aws.git
+git clone git@github.com:aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws && pipx install -e .
 ```
 
@@ -491,10 +491,10 @@ Goal-directed iteration loop for orchestrated workflows. The operator declares a
 
 ## Documentation
 
-**Prefer a website?** The [project wiki](https://awslabs.github.io/global-capacity-orchestrator-on-aws/)
+**Prefer a website?** The [project wiki](https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/)
 is a short orientation site — what GCO is, how it works, what you can run, and
 where to go deeper — published from this repository with the
-[live coverage report](https://awslabs.github.io/global-capacity-orchestrator-on-aws/coverage/)
+[live coverage report](https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/coverage/)
 embedded.
 
 **New to GCO?** Start here:
@@ -614,7 +614,7 @@ This is host-socket pass-through, not true Docker-in-Docker. Anyone with access 
 ├── images/                              # Screenshots and visual assets for docs and the wiki
 ├── scripts/                             # Utility scripts (version bump, cluster access setup)
 ├── tests/                               # PyTest + BATS test suites (counts tracked via badges)
-└── wiki/                                # GitHub Pages wiki sources (published at awslabs.github.io/global-capacity-orchestrator-on-aws)
+└── wiki/                                # GitHub Pages wiki sources (published at aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws)
 ```
 
 ## Contributing
@@ -646,7 +646,7 @@ See the [LICENSE](LICENSE) file for details.
 
 - Check [Troubleshooting](docs/TROUBLESHOOTING.md) for common issues
 - Review CloudWatch logs for Lambda and EKS errors
-- Open an issue on [GitHub](https://github.com/awslabs/global-capacity-orchestrator-on-aws/issues)
+- Open an issue on [GitHub](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/issues)
 
 ## Security
 

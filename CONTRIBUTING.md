@@ -612,7 +612,7 @@ gco stacks destroy-all -y
 
 ### Developing the wiki
 
-The [project wiki](https://awslabs.github.io/global-capacity-orchestrator-on-aws/)
+The [project wiki](https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/)
 is a small MkDocs site built from `wiki/*.md` and `mkdocs.yml`, published to
 GitHub Pages by `pages.yml` with the coverage report embedded at `/coverage/`.
 It is an orientation layer: pages **summarize and link** to the authoritative
@@ -966,4 +966,4 @@ gco jobs logs JOB-NAME -n gco-jobs -r us-east-1
 
 ---
 
-**Questions?** Open an issue on the [GCO GitHub repository](https://github.com/awslabs/global-capacity-orchestrator-on-aws/issues).
+**Questions?** Open an issue on the [GCO GitHub repository](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/issues).

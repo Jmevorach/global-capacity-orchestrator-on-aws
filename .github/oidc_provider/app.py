@@ -11,7 +11,7 @@ GCO stacks. Deploy it independently:
 Configuration is read from ``cdk.json`` context values:
 
     github_repo    — GitHub repository in owner/repo format
-                     (default: awslabs/global-capacity-orchestrator-on-aws)
+                     (default: aws-solutions-library-samples/global-capacity-orchestrator-on-aws)
     github_branch  — Branch restriction; "main" = main only (default),
                      "*" = explicit opt-in to any branch/tag
 """
@@ -23,7 +23,7 @@ app = cdk.App()
 
 # Read configuration from cdk.json context — users edit cdk.json, not this file.
 github_repo = (
-    app.node.try_get_context("github_repo") or "awslabs/global-capacity-orchestrator-on-aws"
+    app.node.try_get_context("github_repo") or "aws-solutions-library-samples/global-capacity-orchestrator-on-aws"
 )
 github_branch = app.node.try_get_context("github_branch") or "main"
 

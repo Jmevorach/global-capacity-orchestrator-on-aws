@@ -860,7 +860,7 @@ spacer
 echo "  ${BOLD}All of this runs on a single platform, deployed with one command:${RESET}"
 echo "  ${CYAN}gco stacks deploy-all -y${RESET}"
 spacer
-echo "  ${DIM}Repository: https://github.com/awslabs/global-capacity-orchestrator-on-aws${RESET}"
+echo "  ${DIM}Repository: https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws${RESET}"
 spacer
 
 # ── Cleanup Prompt ───────────────────────────────────────────────────────────

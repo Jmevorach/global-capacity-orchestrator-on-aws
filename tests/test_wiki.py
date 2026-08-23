@@ -24,13 +24,13 @@ WIKI_DIR = PROJECT_ROOT / "wiki"
 MKDOCS_YML = PROJECT_ROOT / "mkdocs.yml"
 
 #: Canonical Pages origin; the nav's external coverage entry must live there.
-PAGES_ORIGIN = "https://awslabs.github.io/global-capacity-orchestrator-on-aws/"
+PAGES_ORIGIN = "https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/"
 
 #: Canonical repository URL. Kept as a plain literal (and the deep-link regex
 #: built from it with ``re.escape``) so scripts/migrate_fork.py's existing
 #: repo-url rule rewrites it on forks — the guard then keeps checking the
 #: fork's own rewritten wiki links instead of going stale.
-REPO_URL = "https://github.com/awslabs/global-capacity-orchestrator-on-aws"
+REPO_URL = "https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws"
 
 #: GitHub deep links into this repository, as required by the wiki content
 #: contract (docs/ is not part of the built site, so wiki pages link to

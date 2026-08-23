@@ -44,7 +44,7 @@ class GCOGitHubOIDCStack(Stack):
 
     Parameters:
         github_repo: GitHub repository in ``owner/repo`` format.
-            Default: ``awslabs/global-capacity-orchestrator-on-aws``.
+            Default: ``aws-solutions-library-samples/global-capacity-orchestrator-on-aws``.
         github_branch: Exact branch restriction. Defaults to ``"main"``.
             Set this to the repository's actual default branch when it differs;
             use ``"*"`` only as an explicit opt-in to any branch or tag.
@@ -55,7 +55,7 @@ class GCOGitHubOIDCStack(Stack):
         scope: Construct,
         construct_id: str,
         *,
-        github_repo: str = "awslabs/global-capacity-orchestrator-on-aws",
+        github_repo: str = "aws-solutions-library-samples/global-capacity-orchestrator-on-aws",
         github_branch: str = "main",
         **kwargs: object,
     ) -> None:

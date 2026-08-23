@@ -19,7 +19,7 @@ from stack import GCOGitHubOIDCStack
 
 
 def _synth_stack(
-    github_repo: str = "awslabs/global-capacity-orchestrator-on-aws",
+    github_repo: str = "aws-solutions-library-samples/global-capacity-orchestrator-on-aws",
     github_branch: str = "main",
 ) -> Template:
     """Synthesize the OIDC stack and return a CDK Template for assertions."""
@@ -96,7 +96,7 @@ class TestOIDCTrustPolicy:
                                         {
                                             "StringEquals": Match.object_like(
                                                 {
-                                                    "token.actions.githubusercontent.com:sub": "repo:awslabs/global-capacity-orchestrator-on-aws:ref:refs/heads/main"
+                                                    "token.actions.githubusercontent.com:sub": "repo:aws-solutions-library-samples/global-capacity-orchestrator-on-aws:ref:refs/heads/main"
                                                 }
                                             )
                                         }
@@ -124,7 +124,7 @@ class TestOIDCTrustPolicy:
                                         {
                                             "StringEquals": Match.object_like(
                                                 {
-                                                    "token.actions.githubusercontent.com:sub": "repo:awslabs/global-capacity-orchestrator-on-aws:ref:refs/heads/release"
+                                                    "token.actions.githubusercontent.com:sub": "repo:aws-solutions-library-samples/global-capacity-orchestrator-on-aws:ref:refs/heads/release"
                                                 }
                                             ),
                                         }
@@ -151,7 +151,7 @@ class TestOIDCTrustPolicy:
                                     "Condition": Match.object_like(
                                         {
                                             "StringLike": {
-                                                "token.actions.githubusercontent.com:sub": "repo:awslabs/global-capacity-orchestrator-on-aws:*"
+                                                "token.actions.githubusercontent.com:sub": "repo:aws-solutions-library-samples/global-capacity-orchestrator-on-aws:*"
                                             }
                                         }
                                     ),
@@ -356,7 +356,7 @@ class TestOIDCRoleProperties:
             "AWS::IAM::Role",
             {
                 "Description": Match.string_like_regexp(
-                    ".*awslabs/global-capacity-orchestrator-on-aws.*"
+                    ".*aws-solutions-library-samples/global-capacity-orchestrator-on-aws.*"
                 ),
             },
         )

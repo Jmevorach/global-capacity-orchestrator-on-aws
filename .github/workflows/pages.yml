@@ -11,7 +11,7 @@
 #   /coverage-badge.json — the shields.io badge endpoint JSON, kept at the
 #                  site ROOT so the README badge's percent-encoded shields
 #                  URL never changes
-# served at https://awslabs.github.io/global-capacity-orchestrator-on-aws/.
+# served at https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/.
 # GitHub Pages via Actions supports exactly one deployment per repository,
 # which is why the wiki and the coverage report ship together.
 #

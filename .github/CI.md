@@ -431,7 +431,7 @@ To turn the check on without introducing long-lived access keys, configure a Git
        "Action": "sts:AssumeRoleWithWebIdentity",
        "Condition": {
          "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-         "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:awslabs/global-capacity-orchestrator-on-aws:ref:refs/heads/main" }
+         "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:aws-solutions-library-samples/global-capacity-orchestrator-on-aws:ref:refs/heads/main" }
        }
      }]
    }

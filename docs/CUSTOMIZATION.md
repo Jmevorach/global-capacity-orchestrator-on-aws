@@ -266,7 +266,7 @@ and the `gco` backward-compat guarantee are both enforced in CI by
 job).
 
 > Tracking: this scoping was completed in
-> [issue #139](https://github.com/awslabs/global-capacity-orchestrator-on-aws/issues/139).
+> [issue #139](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/issues/139).
 
 ## Adding Regions
 
@@ -2486,4 +2486,4 @@ Costs vary significantly by instance type, spot availability, and utilization. U
 
 ---
 
-**Need Help?** Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md) or open a [GitHub issue](https://github.com/awslabs/global-capacity-orchestrator-on-aws/issues).
+**Need Help?** Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md) or open a [GitHub issue](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/issues).
