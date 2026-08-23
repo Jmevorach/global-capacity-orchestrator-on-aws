@@ -152,6 +152,36 @@ CVE-2026-69152 exp:2026-09-22
 # Advisory: https://avd.aquasec.com/nvd/cve-2026-69192
 CVE-2026-69192 exp:2026-09-22
 
+# CVE-2026-73566 — node-tar denial of service: a crafted GNU L / PAX x
+# long-path header with thousands of slash-separated segments drives the
+# filesFilter mapHas helper into unbounded path.dirname() recursion, and the
+# resulting uncatchable RangeError terminates async/stream consumers of
+# tar.t()/tar.x() called with a member-selection list. Fixed upstream in tar
+# 7.5.21. Present only as tar 7.5.19 vendored inside npm's own node_modules
+# in the dev image, surfaced by security:trivy:container-scan on
+# Dockerfile.dev. Neither repository-owned npm graph (root or
+# lambda/inference-streaming-proxy) depends on tar at all.
+#
+# Not clearable by a pin bump: checked 2026-08-23 — npm 12.0.2 (ARG
+# NPM_VERSION in Dockerfile.dev) is the latest npm release on any dist-tag
+# and declares tar ^7.5.19, shipping 7.5.19 inside its published tarball,
+# out of reach of `npm audit fix` and `overrides`. Vendored-tar refresh is
+# tracked upstream in https://github.com/npm/cli/issues/8917. The
+# DNF_SECURITY_EPOCH knob only refreshes RPM packages and cannot touch
+# npm's bundled node_modules.
+#
+# Low runtime risk: the vulnerable path requires npm itself to list/extract
+# a hostile tarball with a selection filter; in the dev image npm handles
+# registry tarballs during contributor/CI installs, impact is limited to
+# process termination (DoS, no code execution), and the dev image is never
+# deployed to a cluster.
+#
+# Clears when npm ships a release that re-vendors tar >= 7.5.21: bump
+# ARG NPM_VERSION in Dockerfile.dev (plus the packageManager pins the
+# consistency check holds in lockstep) and drop this entry.
+# Advisory: https://avd.aquasec.com/nvd/cve-2026-73566
+CVE-2026-73566 exp:2026-10-15
+
 # CVE-2026-50163 (GHSA-77gc-fj98-665h) — oras.land/oras-go/v2 v2.6.1
 # information disclosure / arbitrary file access via crafted tarball
 # hardlinks, statically linked into the pinned Helm binary
