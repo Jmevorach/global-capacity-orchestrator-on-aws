@@ -3,7 +3,7 @@
 GCO treats CI as part of the product: every invariant worth keeping is
 enforced by a check, and the checks themselves are documented in one
 reference —
-[.github/CI.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/.github/CI.md).
+[.github/CI.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/.github/CI.md).
 This page is the fly-over.
 
 ## CI at a glance
@@ -38,7 +38,7 @@ a combining job merges their coverage, and the final report applies the
 floor. The HTML report published from every `main` run is embedded in this
 site:
 
-**[Browse the live coverage report](https://awslabs.github.io/global-capacity-orchestrator-on-aws/coverage/)**
+**[Browse the live coverage report](https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/coverage/)**
 
 The README's coverage badge reads a JSON endpoint generated from the same
 run, so the badge, the report, and the gate can never tell three different
@@ -59,10 +59,10 @@ stories.
 
 The dev container is the supported path for everything from running tests
 to deploying stacks.
-[CONTRIBUTING.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/CONTRIBUTING.md)
+[CONTRIBUTING.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/CONTRIBUTING.md)
 documents the pre-PR verification sequence (format, lint, types, catalog
 validation, tests with the coverage floor) and the container-based lockfile
 regeneration that is the only supported dependency workflow.
-[tests/README.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/tests/README.md)
+[tests/README.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/tests/README.md)
 maps the suite's organization — every test module is registered there, and
 a guard test keeps it that way.

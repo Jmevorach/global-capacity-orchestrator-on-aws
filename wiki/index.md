@@ -12,9 +12,9 @@ runs it, and can persist outputs to shared storage after pods terminate.
 This wiki is an **orientation layer**: each page summarizes one facet of the
 project and routes you to the authoritative documentation on GitHub. The deep
 reference material lives in the repository — start with the
-[README](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/README.md)
+[README](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/README.md)
 and the
-[documentation index](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/README.md).
+[documentation index](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/README.md).
 
 ## Is GCO for you?
 
@@ -31,9 +31,9 @@ kubeconfig distribution. It fits when:
 - You need job outputs to persist after pods terminate (EFS/FSx).
 
 The full problem/solution comparison lives in the README's
-[Why GCO?](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/README.md#why-gco)
+[Why GCO?](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/README.md#why-gco)
 section, and
-[Core Concepts](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md)
+[Core Concepts](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CONCEPTS.md)
 explains the ideas behind it.
 
 ## What you get
@@ -58,12 +58,12 @@ GPU capacity question in an AI-powered IDE.*
 - **An agent-first front door**: `gco autopilot` turns a terminal into a
   configured Claude Code session on Amazon Bedrock, grounded by the project's
   own MCP server — see
-  [docs/AUTOPILOT.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/AUTOPILOT.md).
+  [docs/AUTOPILOT.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/AUTOPILOT.md).
 
 ## Guided by ordered tenets
 
 Every trade-off in GCO is resolved against ten prioritized
-[project tenets](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/TENETS.md),
+[project tenets](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/TENETS.md),
 beginning with *Protect Workloads, Data, and Accounts* and *Tell the Truth
 About State and Capacity*. Earlier tenets outrank later ones, and durable
 exceptions require an Architecture Decision Record.
@@ -71,7 +71,7 @@ exceptions require an Architecture Decision Record.
 ## What it costs
 
 The README's
-[sample cost table](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/README.md#sample-cost-table)
+[sample cost table](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/README.md#sample-cost-table)
 estimates a single-region deployment at roughly **$210/month of fixed platform
 cost** (EKS cluster, NAT gateways, ALB, monitoring, and friends) — GPU
 instances dominate real spend and scale with usage. Multi-region deployments
@@ -88,5 +88,5 @@ scale linearly.
 | Ready to contribute or fork | [Contributing](contributing.md) |
 
 New to Kubernetes itself? The repository ships a staged
-[Learning Path](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/LEARNING_PATH.md)
+[Learning Path](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/LEARNING_PATH.md)
 with a primer and role-based tracks.

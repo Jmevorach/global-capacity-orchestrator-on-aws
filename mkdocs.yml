@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Builds the seven-page wiki under wiki/ into the site served at
-# https://awslabs.github.io/global-capacity-orchestrator-on-aws/. The wiki is
+# https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/. The wiki is
 # an orientation and routing layer ABOVE the reference docs: pages summarize
 # and link to README/docs/package READMEs on GitHub, never restate them
 # (duplicated reference content rots; the deep docs carry the CI freshness
@@ -27,9 +27,9 @@ site_name: Global Capacity Orchestrator on AWS
 site_description: >-
   Orientation wiki for GCO — intelligent global capacity orchestration for
   GPU/accelerated workloads on AWS.
-site_url: https://awslabs.github.io/global-capacity-orchestrator-on-aws/
-repo_url: https://github.com/awslabs/global-capacity-orchestrator-on-aws
-repo_name: awslabs/global-capacity-orchestrator-on-aws
+site_url: https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/
+repo_url: https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws
+repo_name: aws-solutions-library-samples/global-capacity-orchestrator-on-aws
 edit_uri: ""
 
 docs_dir: wiki
@@ -85,4 +85,4 @@ nav:
   # The coverage report is merged into the Pages artifact by pages.yml at
   # /coverage/ — outside this MkDocs build — so the nav entry must be the
   # full external URL (a local path would trip strict link validation).
-  - Coverage report: https://awslabs.github.io/global-capacity-orchestrator-on-aws/coverage/
+  - Coverage report: https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/coverage/

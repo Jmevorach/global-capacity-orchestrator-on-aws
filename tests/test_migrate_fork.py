@@ -8,13 +8,14 @@ makes the tool safe to trust. A new reference in an unanticipated shape — a
 name — fails this test until a rule classifies it, rather than silently being
 left pointing upstream (or, worse, rewritten when it should not be).
 
-The distinction the rules encode is not cosmetic. This repository contains
-roughly twice as many occurrences of ``awslabs`` that must survive untouched
-(links to seven other AWS Labs projects, and the ``awslabs.*`` MCP server
-package names that ``mcp.json`` resolves at runtime) as occurrences that identify
-*this* repository. A blanket find-and-replace produces dead documentation links
-and MCP servers that cannot start, so preservation is tested as explicitly as
-rewriting.
+The distinction the rules encode is not cosmetic. Beyond the references that
+identify *this* repository, the tree carries references that must survive any
+migration untouched: links to sibling projects under the upstream org, other
+projects' GitHub Pages hosts, and the ``awslabs.*`` MCP server package names
+that ``mcp.json`` resolves at runtime — a relic of the project's original org
+that still names real published packages. A blanket find-and-replace produces
+dead documentation links and MCP servers that cannot start, so preservation is
+tested as explicitly as rewriting.
 """
 
 from __future__ import annotations
@@ -77,9 +78,9 @@ def _tracked_text_files(migrate: Any) -> list[Path]:
 def test_every_upstream_reference_is_classified(migrate: Any, rules: tuple[Any, ...]) -> None:
     """No occurrence of the upstream org or repo name escapes classification.
 
-    Every character span containing ``awslabs`` or the upstream repository name
-    must be covered by a rule match, so the tool can never encounter a reference
-    it has no opinion about.
+    Every character span containing the upstream org or repository name must be
+    covered by a rule match, so the tool can never encounter a reference it has
+    no opinion about.
     """
     unclassified: list[str] = []
     scanned = 0
@@ -114,13 +115,12 @@ def test_every_upstream_reference_is_classified(migrate: Any, rules: tuple[Any, 
     )
 
 
-def test_other_awslabs_projects_are_preserved(migrate: Any, rules: tuple[Any, ...]) -> None:
-    """Links to different AWS Labs projects must never be rewritten."""
+def test_other_upstream_org_projects_are_preserved(migrate: Any, rules: tuple[Any, ...]) -> None:
+    """Links to different projects under the upstream org must never be rewritten."""
     samples = (
-        "see https://github.com/awslabs/aws-sigv4-proxy for details",
-        "https://github.com/awslabs/amazon-eks-ami",
-        "https://awslabs.github.io/ai-on-eks/docs/blueprints/",
-        "https://awslabs.github.io/mcp/servers/eks-mcp-server/",
+        "see https://github.com/aws-solutions-library-samples/guidance-for-x for details",
+        "https://github.com/aws-solutions-library-samples/another-guidance-sample",
+        "https://aws-solutions-library-samples.github.io/some-other-guidance/docs/",
     )
     for line in samples:
         report = migrate.Report()
@@ -129,38 +129,72 @@ def test_other_awslabs_projects_are_preserved(migrate: Any, rules: tuple[Any, ..
         assert report.preserved, f"failed to classify as preserved: {line}"
 
 
+def test_original_org_references_survive_untouched(migrate: Any, rules: tuple[Any, ...]) -> None:
+    """References from the project's original ``awslabs`` home never rewrite.
+
+    Since the August 2026 org move these no longer contain the upstream
+    identity, so no rule fires at all — which is itself the guarantee that
+    ``awslabs.*`` MCP package names and AWS Labs project links keep working.
+    """
+    samples = (
+        "see https://github.com/awslabs/aws-sigv4-proxy for details",
+        "https://github.com/awslabs/amazon-eks-ami",
+        "https://awslabs.github.io/ai-on-eks/docs/blueprints/",
+        "https://awslabs.github.io/mcp/servers/eks-mcp-server/",
+        '"args": ["awslabs.aws-documentation-mcp-server@latest"]',
+    )
+    for line in samples:
+        report = migrate.Report()
+        assert migrate.rewrite_text(line, "sample", rules, report) == line
+        assert report.rewrites == [], f"rewrote an original-org reference: {line}"
+
+
 def test_mcp_package_names_are_preserved(migrate: Any, rules: tuple[Any, ...]) -> None:
-    """``awslabs.*`` package names are resolved at runtime and must not change."""
-    line = '"args": ["awslabs.aws-documentation-mcp-server@latest"]'
+    """Package names resolved at runtime must not change.
+
+    An ``aws-solutions-library-samples.*`` name contains the upstream org, so
+    it must be claimed by the preservation rule; ``awslabs.*`` names no longer
+    match any rule and survive by construction (covered above).
+    """
+    line = '"args": ["aws-solutions-library-samples.example-mcp-server@latest"]'
     report = migrate.Report()
     assert migrate.rewrite_text(line, "mcp.json", rules, report) == line
     assert report.rewrites == []
+    assert report.preserved, "upstream-org package name should classify as preserved"
 
 
 @pytest.mark.parametrize(
     ("before", "after"),
     [
         (
-            "https://github.com/awslabs/global-capacity-orchestrator-on-aws/issues",
+            "https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/issues",
             "https://github.com/acme-labs/gco-fork/issues",
         ),
         (
-            "git clone git@github.com:awslabs/global-capacity-orchestrator-on-aws.git",
+            "git clone git@github.com:aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git",
             "git clone git@github.com:acme-labs/gco-fork.git",
         ),
         (
-            "https://awslabs.github.io/global-capacity-orchestrator-on-aws/",
+            "https://aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws/",
             "https://acme-labs.github.io/gco-fork/",
         ),
         # The shields.io coverage badge embeds the Pages URL percent-encoded; a
         # plain URL rewrite misses it and the badge keeps reporting upstream.
         (
-            "url=https%3A%2F%2Fawslabs.github.io%2Fglobal-capacity-orchestrator-on-aws%2Fx.json",
+            "url=https%3A%2F%2Faws-solutions-library-samples.github.io%2Fglobal-capacity-orchestrator-on-aws%2Fx.json",
             "url=https%3A%2F%2Facme-labs.github.io%2Fgco-fork%2Fx.json",
+        ),
+        # A percent-encoded Pages URL whose owner is NOT upstream (an org move
+        # or a second migration) must still have its repo-name segment
+        # rewritten — pages-url-encoded cannot match a foreign owner's host,
+        # so the repo-name rule claims the segment after "%2F".
+        (
+            "url=https%3A%2F%2Fsomeone-else.github.io%2Fglobal-capacity-orchestrator-on-aws%2Fx.json",
+            "url=https%3A%2F%2Fsomeone-else.github.io%2Fgco-fork%2Fx.json",
         ),
         # The OIDC trust-policy subject is a bare owner/repo slug.
         (
-            '"github_repo": "awslabs/global-capacity-orchestrator-on-aws",',
+            '"github_repo": "aws-solutions-library-samples/global-capacity-orchestrator-on-aws",',
             '"github_repo": "acme-labs/gco-fork",',
         ),
         (
@@ -188,9 +222,9 @@ def test_differently_prefixed_directory_is_left_alone(migrate: Any, rules: tuple
 def test_rewriting_is_idempotent(migrate: Any, rules: tuple[Any, ...]) -> None:
     """Running the tool twice changes nothing the second time."""
     original = (
-        "https://github.com/awslabs/global-capacity-orchestrator-on-aws\n"
-        "git@github.com:awslabs/global-capacity-orchestrator-on-aws\n"
-        "awslabs.github.io/global-capacity-orchestrator-on-aws\n"
+        "https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws\n"
+        "git@github.com:aws-solutions-library-samples/global-capacity-orchestrator-on-aws\n"
+        "aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws\n"
         "awslabs.aws-pricing-mcp-server\n"
     )
     once = migrate.rewrite_text(original, "sample", rules, migrate.Report())

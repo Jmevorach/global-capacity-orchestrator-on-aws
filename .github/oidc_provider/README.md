@@ -99,7 +99,7 @@ Common additions:
 
 ## Using with a Fork or Different Repo
 
-The trust policy restricts which GitHub repository can assume the role. By default it's set to `awslabs/global-capacity-orchestrator-on-aws`.
+The trust policy restricts which GitHub repository can assume the role. By default it's set to `aws-solutions-library-samples/global-capacity-orchestrator-on-aws`.
 
 To use with your fork, edit `cdk.json`:
 

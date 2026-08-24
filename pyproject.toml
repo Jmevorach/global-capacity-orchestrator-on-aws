@@ -241,8 +241,8 @@ gco = "cli.main:main"
 gco-mcp = "gco_mcp.run_mcp:main"
 
 [project.urls]
-Documentation = "https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CLI.md"
-Repository = "https://github.com/awslabs/global-capacity-orchestrator-on-aws"
+Documentation = "https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CLI.md"
+Repository = "https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws"
 
 # =============================================================================
 # Tool Configurations

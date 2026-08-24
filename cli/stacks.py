@@ -1486,7 +1486,7 @@ class StackManager:
             "`app.py` and `cdk.json`.\n"
             "Install the `[cdk]` extra one of these ways:\n"
             '  - uv:  uv tool install "gco-cli[cdk] @ '
-            'git+https://github.com/awslabs/global-capacity-orchestrator-on-aws.git@<tag>"\n'
+            'git+https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git@<tag>"\n'
             '  - pip: pip install -e ".[cdk,mcp]"   (from a clone)\n'
             "  - or use the dev container (see QUICKSTART.md), which bundles the "
             "full toolchain.\n"

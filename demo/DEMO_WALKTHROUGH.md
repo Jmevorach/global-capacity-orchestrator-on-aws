@@ -30,7 +30,7 @@ Global Capacity Orchestrator (GCO) is a production-ready platform that submits G
 
 This document walks through the live demo so you can follow along or replicate it in your own account afterward.
 
-**Repository:** <https://github.com/awslabs/global-capacity-orchestrator-on-aws>
+**Repository:** <https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws>
 
 ---
 
@@ -52,7 +52,7 @@ cdk --version
 Install the GCO CLI:
 
 ```bash
-git clone https://github.com/awslabs/global-capacity-orchestrator-on-aws.git
+git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws
 pipx install -e .
 gco --version
@@ -456,11 +456,11 @@ Other AWS partitions omit Global Accelerator; users call the selected Region's I
 
 ## Links
 
-- **Repository:** <https://github.com/awslabs/global-capacity-orchestrator-on-aws>
-- **Architecture:** <https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/ARCHITECTURE.md>
-- **CLI Reference:** <https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/CLI.md>
-- **Quick Start:** <https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/QUICKSTART.md>
-- **Examples:** <https://github.com/awslabs/global-capacity-orchestrator-on-aws/tree/main/examples>
+- **Repository:** <https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws>
+- **Architecture:** <https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/ARCHITECTURE.md>
+- **CLI Reference:** <https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/CLI.md>
+- **Quick Start:** <https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/QUICKSTART.md>
+- **Examples:** <https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/tree/main/examples>
 
 ---
 

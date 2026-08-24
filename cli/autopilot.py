@@ -309,7 +309,7 @@ def _gco_server_entry(mcp_env: dict[str, str] | None = None) -> dict[str, object
                 "--python",
                 "3.14",
                 "--from",
-                "git+https://github.com/awslabs/global-capacity-orchestrator-on-aws.git"
+                "git+https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git"
                 f"@v{__version__}",
                 "gco-mcp",
             ],

@@ -4,7 +4,7 @@ GCO runs accelerated and CPU workloads of most shapes: batch jobs,
 gang-scheduled distributed training, Ray clusters, Slurm workloads,
 multi-region inference endpoints, and multi-step DAG pipelines. Every
 category below ships with a ready-to-submit manifest in
-[examples/](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/examples/README.md).
+[examples/](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/examples/README.md).
 
 ## Schedulers for every workload pattern
 
@@ -20,7 +20,7 @@ and Kueue enabled by default, Slurm (Slinky) and YuniKorn opt-in:
 
 They operate at different layers (admission, scaling, pod scheduling, node
 provisioning) and can be combined — the
-[Schedulers Overview](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/SCHEDULERS.md)
+[Schedulers Overview](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/SCHEDULERS.md)
 has the comparison table, the decision guide, and the GPU-quota coordination
 warning you should read before enabling several at once. The scheduler set is
 not the whole Helm-managed ecosystem: workload operators ship alongside it,
@@ -40,7 +40,7 @@ Kubeflow Trainer v2 is included and enabled by default: you submit a
 pass the same security validation pipeline as every other submission. Plain
 Kubernetes Jobs, hand-rolled indexed Jobs, and EFA-enabled multi-node
 training are all supported alternatives — see
-[docs/DISTRIBUTED_TRAINING.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/DISTRIBUTED_TRAINING.md).
+[docs/DISTRIBUTED_TRAINING.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/DISTRIBUTED_TRAINING.md).
 
 ## Inference serving
 
@@ -51,7 +51,7 @@ DynamoDB with continuous reconciliation, so rolling updates, scaling, and
 stop/start never lose configuration. Disaggregated prefill/decode serving
 (Mooncake), streaming responses, canary deployments, and spot GPUs are all
 covered in
-[docs/INFERENCE.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/INFERENCE.md).
+[docs/INFERENCE.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/INFERENCE.md).
 
 ## Observability, cost, and experiment tracking
 
@@ -80,9 +80,9 @@ MLflow experiment tracking is on by default with observability:
 produced by one of the shipped example manifests.*
 
 See
-[docs/MONITORING.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/MONITORING.md)
+[docs/MONITORING.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/MONITORING.md)
 and
-[docs/COST_MONITORING.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/COST_MONITORING.md).
+[docs/COST_MONITORING.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/COST_MONITORING.md).
 
 ## Interactive analytics (optional)
 
@@ -97,11 +97,11 @@ deployment — off by default and zero cost until enabled:
 
 Details, sub-toggles (HyperPod, Canvas, managed MLflow), and cleanup
 behavior are in
-[docs/ANALYTICS.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/ANALYTICS.md).
+[docs/ANALYTICS.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/ANALYTICS.md).
 
 ## And a goal-directed loop
 
 Mission is GCO's opt-in iteration loop: five-phase iterations
 (propose → execute → observe → evaluate → decide) against machine-checkable
 success criteria until a verdict is reached — see
-[docs/MISSION.md](https://github.com/awslabs/global-capacity-orchestrator-on-aws/blob/main/docs/MISSION.md).
+[docs/MISSION.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/MISSION.md).

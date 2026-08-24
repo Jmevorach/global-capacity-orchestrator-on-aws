@@ -489,7 +489,7 @@ is yours to install.
 Open a JupyterLab terminal (`File` → `New` → `Terminal`) and run:
 
 ```bash
-git clone https://github.com/awslabs/global-capacity-orchestrator-on-aws ~/gco
+git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws ~/gco
 pip install -e ~/gco
 ```
 
@@ -868,7 +868,7 @@ End-to-end flow:
     full command tree. If not, install it first via:
 
     ```bash
-    git clone https://github.com/awslabs/global-capacity-orchestrator-on-aws ~/gco
+    git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws ~/gco
     pip install -e ~/gco
     ```
 
