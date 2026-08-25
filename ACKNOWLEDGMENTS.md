@@ -16,4 +16,20 @@ This project would not have been possible without the support of some incredible
 
 **Carlos Manzanedo Rueda** — For helping navigate security reviews and getting the project released.
 
+**Daniel Zilberman** — For getting the solution published to the AWS Solutions Library and helping land the repository in its new GitHub home.
+
+**Anindith Reddy Bujala** — For getting the solution published to the AWS Solutions Library and helping land the repository in its new GitHub home.
+
+**Joshua Yoon** — For being an important internal advocate for the project.
+
+**Luka Ralic** — For being an important internal advocate for the project.
+
+**John Dzialo** — For being an early tester and adopter of the project.
+
+**Mark Vinciguerra** — For being an early tester and adopter of the project.
+
+**Pascal Dao** — For being an early tester and adopter of the project.
+
+**Sagar Dubey** — For being an early tester and adopter of the project.
+
 And to the countless other AWS colleagues who contributed feedback, tested early versions, and helped navigate the open-source process — thank you.
