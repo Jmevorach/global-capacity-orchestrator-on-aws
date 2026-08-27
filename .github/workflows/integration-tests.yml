@@ -1410,6 +1410,24 @@ jobs:
           kubectl apply -f lambda/kubectl-applier-simple/manifests/01-serviceaccounts.yaml
           kubectl apply -f lambda/kubectl-applier-simple/manifests/02-rbac.yaml
           kubectl apply -f lambda/kubectl-applier-simple/manifests/05-priority-classes.yaml
+      - name: Seed API workload TLS Secrets for Kind
+        # Production creates these Secrets through the post-Helm cert-manager
+        # Certificates. This raw-manifest Kind job deliberately does not install
+        # Helm add-ons, so provide an equivalent short-lived ECDSA keypair before
+        # applying the required pod volumes. The real TLS proxy still parses,
+        # serves, and probes this certificate end to end.
+        run: |
+          set -euo pipefail
+          key="${RUNNER_TEMP}/gco-ci-tls.key"
+          cert="${RUNNER_TEMP}/gco-ci-tls.crt"
+          openssl ecparam -name prime256v1 -genkey -noout -out "${key}"
+          openssl req -new -x509 -sha256 -key "${key}" -out "${cert}" \
+            -days 1 -subj "/CN=gco-ci"
+          for secret in health-monitor-tls manifest-processor-tls inference-proxy-tls; do
+            kubectl -n gco-system create secret tls "${secret}" \
+              --cert="${cert}" --key="${key}" --dry-run=client -o yaml \
+              | kubectl apply -f -
+          done
       - name: Apply NetworkPolicies (Calico-enforced)
         # The whole point of the Calico CNI install is that kindnet silently
         # accepts NetworkPolicy but does not enforce it. Apply the policies
@@ -1499,6 +1517,11 @@ jobs:
           kubectl -n gco-system get pods -o wide
           kubectl -n gco-system describe deploy health-monitor manifest-processor inference-monitor inference-proxy cost-monitor
           exit 1
+      - name: Wait for inference proxy TLS rollout
+        # HPA resource metrics do not exist until kubelet has started the
+        # containers. Require the TLS sidecar and loopback application to pass
+        # their independent startup/readiness probes before polling HPA state.
+        run: kubectl -n gco-system rollout status deployment/inference-proxy --timeout=3m
       - name: Verify inference proxy HPA is actively computing replicas
         # Admission/readback alone does not prove autoscaling works. Wait for
         # Metrics Server samples and require the controller's ScalingActive

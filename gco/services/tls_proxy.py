@@ -198,16 +198,18 @@ class TlsProxy:
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.config.poll_seconds)
-                continue
             except TimeoutError:
-                pass
-            try:
-                context, digest = _ssl_context(self.config)
-            except OSError, RuntimeError, ssl.SSLError:
-                logger.exception("Rejected an unreadable or invalid rotated TLS keypair")
-                continue
-            if digest != self._keypair_digest:
-                await self._reload_certificate(context, digest)
+                # The polling interval elapsed normally; inspect the projected
+                # keypair and reload only when its content digest changed.
+                try:
+                    context, digest = _ssl_context(self.config)
+                except OSError, RuntimeError, ssl.SSLError:
+                    logger.exception("Rejected an unreadable or invalid rotated TLS keypair")
+                    continue
+                if digest != self._keypair_digest:
+                    await self._reload_certificate(context, digest)
+            else:
+                break
 
     async def shutdown(self) -> None:
         """Stop accepting connections and drain established streams."""

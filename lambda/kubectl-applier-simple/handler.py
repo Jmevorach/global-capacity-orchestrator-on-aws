@@ -2127,7 +2127,9 @@ def _certificate_secret_failure(
     secret = _as_plain_dict(response)
     data_value = secret.get("data")
     data: dict[str, Any] = data_value if isinstance(data_value, dict) else {}
-    missing = [key for key in ("tls.crt", "tls.key") if not isinstance(data.get(key), str) or not data[key]]
+    missing = [
+        key for key in ("tls.crt", "tls.key") if not isinstance(data.get(key), str) or not data[key]
+    ]
     if missing:
         return f"Certificate Secret {secret_name!r} has no nonempty {', '.join(missing)}"
     return None
