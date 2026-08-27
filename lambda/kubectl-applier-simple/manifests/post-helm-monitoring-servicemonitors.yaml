@@ -168,10 +168,11 @@ spec:
 ---
 # GCO's own services expose Prometheus /metrics (see gco/services/service_metrics
 # .py). They run with multiple replicas, so PodMonitors scrape each pod directly
-# rather than round-robining one pod through a Service. health-monitor and
-# manifest-processor serve /metrics on their existing http port (the auth
-# middleware exempts /metrics); the inference proxy does the same on its HTTP
-# port, while the inference monitor serves metrics on a dedicated port.
+# rather than round-robining one pod through a Service. The ALB-facing APIs
+# expose /metrics on the same cert-manager-backed HTTPS listener used for
+# application traffic; Prometheus encrypts the scrape while skipping leaf
+# verification because these deployment-local leaves are self-signed. The
+# inference monitor continues to serve metrics on its dedicated HTTP port.
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
@@ -190,7 +191,10 @@ spec:
     matchLabels:
       app: health-monitor
   podMetricsEndpoints:
-    - port: http
+    - port: https
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: true
       interval: 30s
       path: /metrics
 ---
@@ -212,7 +216,10 @@ spec:
     matchLabels:
       app: manifest-processor
   podMetricsEndpoints:
-    - port: http
+    - port: https
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: true
       interval: 30s
       path: /metrics
 ---
@@ -234,7 +241,10 @@ spec:
     matchLabels:
       app: inference-proxy
   podMetricsEndpoints:
-    - port: http
+    - port: https
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: true
       interval: 30s
       path: /metrics
 ---

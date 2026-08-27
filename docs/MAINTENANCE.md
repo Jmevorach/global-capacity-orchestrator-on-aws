@@ -679,8 +679,11 @@ release train to keep.
 ### Cutting a release
 
 Actions → **Release** → *Run workflow* → pick `patch` / `minor` / `major`.
-`release.yml` then bumps the version, commits, pushes a `v<x.y.z>` tag, and
-creates a GitHub Release. Full steps (and the manual fallback) are in
+Stage 1 (`release.yml`) opens a dedicated version-bump pull request and
+pre-dispatches its required CI. After that PR is reviewed and squash-merged,
+Stage 2 (`release-publish.yml`) verifies the release commit, creates the
+immutable tag, and publishes generated GitHub Release notes. Full steps (and
+the manual fallback) are in
 [Creating a Release](../CONTRIBUTING.md#creating-a-release).
 
 ### Changelog

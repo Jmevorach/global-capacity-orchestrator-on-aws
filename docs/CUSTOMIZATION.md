@@ -2295,7 +2295,7 @@ opted-in user follows the same first hop:
 Aggregator or authorized direct user
   → Regional API Gateway (AWS-managed TLS + IAM SigV4)
   → VPC Lambda (request-bound HMAC)
-  → Internal ALB (private-root TLS) → EKS pod (HTTP)
+  → Internal ALB (private-root TLS) → EKS pod (re-encrypted HTTPS)
 ```
 
 The Lambda resolves the current ALB from

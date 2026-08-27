@@ -62,7 +62,7 @@ Actions run in registry order. Selecting an individual action automatically incl
 | `preflight` | None | Verify the clean Git checkout, exact AWS account, topology profile, enabled Regions, bootstrap stacks, and project ownership boundary |
 | `baseline` | `preflight` | Capture protected CloudFormation and ECR state |
 | `deploy` | `baseline` | Deploy the checked-in GCO topology |
-| `topology` | `deploy` | Verify stacks, EKS, API endpoints, queues, and DynamoDB |
+| `topology` | `deploy` | Verify stacks, EKS, API endpoints, queues, and DynamoDB; require the owned internal ALB to materialize at least three HTTPS/IP target groups on pod port 8443 with HTTPS `/healthz` checks and healthy workload targets, recording bounded ELBv2 convergence samples |
 | `policy` | `topology` | `GET /api/v1/policy` reports all three admission layers per Region: the front-door caps, the per-container `LimitRange`, and the namespace `ResourceQuota`. Asserted on the response body, because a Kubernetes read failure degrades to HTTP 200 with a per-namespace `status` and is invisible to a transport-level check. Also requires the project's own ECR hostnames in `trusted_registries`, which CDK appends at synth time. |
 | `api` | `topology` | Run an authenticated API Job through its complete lifecycle |
 | `sqs` | `topology` | Run a direct regional SQS Job through its complete lifecycle |

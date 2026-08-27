@@ -63,7 +63,7 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 | `30-39` | System services | health-monitor, manifest-processor, inference-monitor |
 | `40-49` | NodePools | GPU (x86, ARM), inference, [EFA](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html) (training + mooncake), Neuron, CPU |
 | `50-59` | GPU observability | DCGM exporter |
-| `post-helm-*` | Post-Helm | Resources needing Helm CRDs: Gateway API entrypoint, KEDA ScaledJob, Prometheus monitors, Grafana dashboards/rotation, Kueue metrics RBAC |
+| `post-helm-*` | Post-Helm | Resources needing Helm CRDs: cert-manager API workload certificates, Gateway API entrypoint, KEDA ScaledJob, Prometheus monitors, Grafana dashboards/rotation, Kueue metrics RBAC |
 
 ## Files
 
@@ -95,10 +95,10 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 
 | File | Contents |
 |------|----------|
-| `30-health-monitor.yaml` | `Deployment` + `PodDisruptionBudget` + `Service` |
-| `31-manifest-processor.yaml` | `Deployment` + `PodDisruptionBudget` + `Service` |
+| `30-health-monitor.yaml` | `Deployment` + `PodDisruptionBudget` + TLS-only `Service`; the application binds pod loopback and a same-image sidecar hot-reloads the cert-manager leaf on port 8443 |
+| `31-manifest-processor.yaml` | `Deployment` + `PodDisruptionBudget` + TLS-only `Service`; the application binds pod loopback and a same-image sidecar hot-reloads the cert-manager leaf on port 8443 |
 | `32-inference-monitor.yaml` | `Deployment` + `PodDisruptionBudget` |
-| `33-inference-proxy.yaml` | Dedicated inference `Deployment` (three replicas on create; HPA owns updates) + CPU/memory `HorizontalPodAutoscaler` + two-pod `PodDisruptionBudget` + 15-minute stream-drain lifecycle + `Service` |
+| `33-inference-proxy.yaml` | Dedicated inference `Deployment` with a hot-reloading TLS proxy sidecar (three replicas on create; HPA owns updates) + CPU/memory `HorizontalPodAutoscaler` + two-pod `PodDisruptionBudget` + 15-minute stream-drain lifecycle + TLS-only `Service` |
 | `34-cost-monitor.yaml` | Cost monitor `ServiceAccount` + single-replica `Recreate` `Deployment` + `Service` + three `NetworkPolicy` rules (manifest-processor ingress/egress, [OpenCost](https://opencost.io/) egress) — **skipped and pruned when cost monitoring is disabled** |
 
 ### NodePools (40–49)
@@ -131,7 +131,8 @@ here from upgraded clusters.
 
 | File | Contents |
 |------|----------|
-| `post-helm-gateway.yaml` | Gateway API entrypoint: `GatewayClass`, `TargetGroupConfiguration` (`/healthz` target-group health checks + 900-second deregistration drain), `LoadBalancerConfiguration` (internal HTTPS ALB, `gco.aws/gateway` ownership tag, TLS certificate), `Gateway` `gco-system/gco-gateway`, and the shared `HTTPRoute` routing `/api/v1/health` + `/api/v1/metrics` + `/healthz` to health-monitor, `/inference` to inference-proxy, and everything else to manifest-processor via the `/` catch-all — applied after the AWS Load Balancer Controller chart installs the Gateway API CRDs. Every prefix must name a Service that actually serves it; `tests/test_gateway_route_coverage.py` fails otherwise |
+| `post-helm-api-workload-certificates.yaml` | Namespaced self-signed `Issuer` plus rotating ECDSA `Certificate` resources for health-monitor, manifest-processor, and inference-proxy; generated TLS Secrets are mounted only by the hot-reloading TLS proxy sidecars |
+| `post-helm-gateway.yaml` | Gateway API entrypoint: `GatewayClass`, `TargetGroupConfiguration` (`/healthz` HTTPS target-group health checks + 900-second deregistration drain), `LoadBalancerConfiguration` (internal HTTPS ALB, `gco.aws/gateway` ownership tag, TLS certificate), `Gateway` `gco-system/gco-gateway`, and the shared `HTTPRoute` routing `/api/v1/health` + `/api/v1/metrics` + `/healthz` to health-monitor, `/inference` to inference-proxy, and everything else to manifest-processor via the `/` catch-all — the ALB re-encrypts traffic to each pod's TLS-only proxy sidecar. Every prefix must name a Service that actually serves it; `tests/test_gateway_route_coverage.py` fails otherwise |
 | `post-helm-sqs-consumer.yaml` | KEDA `ScaledJob` for the [SQS](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html) queue processor — **skipped when queue_processor disabled** |
 | `post-helm-grafana-cost-dashboard.yaml` | The *GCO Cost (OpenCost)* Grafana dashboard `ConfigMap` (sidecar-imported) — **skipped and pruned when cost monitoring is disabled** |
 | `post-helm-monitoring-servicemonitors.yaml` | `ServiceMonitor`s (schedulers/operators + DCGM) and `PodMonitor`s (GCO services, including inference-proxy) — **skipped when observability disabled** |

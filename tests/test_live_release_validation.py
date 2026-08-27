@@ -1044,6 +1044,9 @@ class TestDeterministicTopologyReadiness:
         metadata: dict[str, dict[str, object]] = {}
         parameter_values: dict[str, str] = {}
         clients: dict[tuple[str, str], MagicMock] = {}
+        target_groups: dict[str, list[dict[str, object]]] = {}
+        listeners: dict[str, list[dict[str, object]]] = {}
+        listener_certificates: dict[str, list[dict[str, object]]] = {}
         events: list[str] = []
 
         for region in regions:
@@ -1092,6 +1095,11 @@ class TestDeterministicTopologyReadiness:
                 zlib.compress(input_json.encode("utf-8"), 9)
             ).decode("ascii")
             parameter_values[f"{parameter_root}/_execution"] = self._canonical(execution_metadata)
+            certificate_arn = (
+                f"arn:aws:acm:{region}:123456789012:certificate/"
+                f"00000000-0000-0000-0000-{region.replace('-', '')}"
+            )
+            parameter_values[f"/gco-live/backend-tls/certificate-arn/{region}"] = certificate_arn
 
             ssm = MagicMock()
 
@@ -1185,6 +1193,89 @@ class TestDeterministicTopologyReadiness:
             }
             clients[("eks", region)] = eks
 
+            load_balancer_arn = (
+                f"arn:aws:elasticloadbalancing:{region}:123456789012:"
+                f"loadbalancer/app/gco-live-{region}/abc123"
+            )
+            regional_target_groups = [
+                {
+                    "TargetGroupArn": (
+                        f"arn:aws:elasticloadbalancing:{region}:123456789012:"
+                        f"targetgroup/gco-live-{index}/tg{index}"
+                    ),
+                    "Protocol": "HTTPS",
+                    "Port": 8443,
+                    "HealthCheckProtocol": "HTTPS",
+                    "HealthCheckPath": "/healthz",
+                    "TargetType": "ip",
+                }
+                for index in range(3)
+            ]
+            target_groups[region] = regional_target_groups
+            regional_listeners = [
+                {
+                    "ListenerArn": f"{load_balancer_arn}/listener/https443",
+                    "Protocol": "HTTPS",
+                    "Port": 443,
+                    "SslPolicy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+                    "Certificates": [{"CertificateArn": certificate_arn}],
+                }
+            ]
+            listeners[region] = regional_listeners
+            regional_listener_certificates = [
+                {"CertificateArn": certificate_arn, "IsDefault": True}
+            ]
+            listener_certificates[region] = regional_listener_certificates
+            load_balancer_paginator = MagicMock()
+            load_balancer_paginator.paginate.return_value = [
+                {
+                    "LoadBalancers": [
+                        {
+                            "LoadBalancerArn": load_balancer_arn,
+                            "Scheme": "internal",
+                            "Type": "application",
+                            "State": {"Code": "active"},
+                        }
+                    ]
+                }
+            ]
+            target_group_paginator = MagicMock()
+            target_group_paginator.paginate.return_value = [
+                {"TargetGroups": regional_target_groups}
+            ]
+            listener_paginator = MagicMock()
+            listener_paginator.paginate.return_value = [{"Listeners": regional_listeners}]
+            listener_certificate_paginator = MagicMock()
+            listener_certificate_paginator.paginate.return_value = [
+                {"Certificates": regional_listener_certificates}
+            ]
+            paginators = {
+                "describe_load_balancers": load_balancer_paginator,
+                "describe_target_groups": target_group_paginator,
+                "describe_listeners": listener_paginator,
+                "describe_listener_certificates": listener_certificate_paginator,
+            }
+            elbv2 = MagicMock()
+            elbv2.get_paginator.side_effect = paginators.__getitem__
+            elbv2.describe_tags.return_value = {
+                "TagDescriptions": [
+                    {
+                        "ResourceArn": load_balancer_arn,
+                        "Tags": [
+                            {"Key": "gco.aws/gateway", "Value": "gco-system/gco-gateway"},
+                            {"Key": "elbv2.k8s.aws/cluster", "Value": stack_name},
+                        ],
+                    }
+                ]
+            }
+            elbv2.describe_target_health.return_value = {
+                "TargetHealthDescriptions": [
+                    {"TargetHealth": {"State": "healthy"}},
+                    {"TargetHealth": {"State": "healthy"}},
+                ]
+            }
+            clients[("elbv2", region)] = elbv2
+
         dynamodb = MagicMock()
         dynamodb.describe_table.return_value = {
             "Table": {
@@ -1249,6 +1340,9 @@ class TestDeterministicTopologyReadiness:
             ctx=ctx,
             stacks=stacks,
             clients=clients,
+            target_groups=target_groups,
+            listeners=listeners,
+            listener_certificates=listener_certificates,
             events=events,
             inputs=inputs,
             metadata=metadata,
@@ -1292,6 +1386,31 @@ class TestDeterministicTopologyReadiness:
         assert regional["deployment_token"] == "deployment-us-east-1"
         assert regional["terminal"]["manifestValidation"]["ExpectedCount"] == 12
         assert regional["terminal"]["helmValidation"]["validated_resource_count"] == 18
+        tls_evidence = result["alb_https_targets"]["us-east-1"]
+        assert tls_evidence["scheme"] == "internal"
+        assert tls_evidence["listener"] == {
+            "listener_arn": (
+                "arn:aws:elasticloadbalancing:us-east-1:123456789012:"
+                "loadbalancer/app/gco-live-us-east-1/abc123/listener/https443"
+            ),
+            "protocol": "HTTPS",
+            "port": 443,
+            "ssl_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+            "certificates": [
+                "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-useast1"
+            ],
+            "default_certificates": [
+                "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-useast1"
+            ],
+        }
+        assert len(tls_evidence["target_groups"]) == 3
+        assert all(group["protocol"] == "HTTPS" for group in tls_evidence["target_groups"])
+        assert all(
+            group["health_check_protocol"] == "HTTPS" for group in tls_evidence["target_groups"]
+        )
+        assert environment.ctx.checkpoint.state["topology_alb_https_targets"] == {
+            "us-east-1": tls_evidence
+        }
         assert environment.ctx.checkpoint.state["topology_convergence"] is convergence
         cloudformation = environment.clients[("cloudformation", "us-east-1")]
         cloudformation.get_paginator.assert_called_once_with("list_stack_resources")
@@ -1395,6 +1514,90 @@ class TestDeterministicTopologyReadiness:
         for field in ("error", "cause", "output"):
             assert len(terminal[field]) <= checks_topology._MAX_TOPOLOGY_EVIDENCE_CHARS
             assert terminal[field].endswith("... [truncated]")
+
+    def test_non_https_listener_is_rejected_before_api_probes(self) -> None:
+        environment = self._environment()
+        environment.listeners["us-east-1"][0].update({"Protocol": "HTTP", "Port": 80})
+
+        with pytest.raises(RuntimeError, match="exact HTTPS-only contract"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_unregistered_listener_certificate_is_rejected(self) -> None:
+        environment = self._environment()
+        environment.listeners["us-east-1"][0]["Certificates"] = [
+            {
+                "CertificateArn": (
+                    "arn:aws:acm:us-east-1:123456789012:certificate/"
+                    "11111111-1111-1111-1111-111111111111"
+                )
+            }
+        ]
+
+        with pytest.raises(RuntimeError, match="exact HTTPS-only contract"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_additional_sni_listener_certificate_is_rejected(self) -> None:
+        environment = self._environment()
+        environment.listener_certificates["us-east-1"].append(
+            {
+                "CertificateArn": (
+                    "arn:aws:acm:us-east-1:123456789012:certificate/"
+                    "22222222-2222-2222-2222-222222222222"
+                ),
+                "IsDefault": False,
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="exact HTTPS-only contract"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_plaintext_target_group_is_rejected_before_api_probes(self) -> None:
+        environment = self._environment()
+        environment.target_groups["us-east-1"][0]["Protocol"] = "HTTP"
+
+        with pytest.raises(RuntimeError, match="not HTTPS-hardened"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_initial_target_registration_is_polled_to_healthy(self) -> None:
+        environment = self._environment()
+        elbv2 = environment.clients[("elbv2", "us-east-1")]
+        healthy = {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}]}
+        elbv2.describe_target_health.side_effect = [
+            {"TargetHealthDescriptions": [{"TargetHealth": {"State": "initial"}}]},
+            healthy,
+            healthy,
+            healthy,
+        ]
+
+        result = self._invoke(environment)
+
+        observations = result["alb_https_targets"]["us-east-1"]["target_groups"][0][
+            "health_observations"
+        ]
+        assert [item["states"] for item in observations] == [["initial"], ["healthy"]]
+        environment.sleep.assert_any_call(1.0)
+
+    def test_target_group_without_healthy_https_target_is_rejected(self) -> None:
+        environment = self._environment()
+        elbv2 = environment.clients[("elbv2", "us-east-1")]
+        elbv2.describe_target_health.return_value = {
+            "TargetHealthDescriptions": [
+                {"TargetHealth": {"State": "unhealthy", "Reason": "Target.FailedHealthChecks"}}
+            ]
+        }
+
+        with pytest.raises(RuntimeError, match="nonhealthy targets"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
 
     def test_first_504_fails_without_consuming_lucky_second_response(self) -> None:
         environment = self._environment()

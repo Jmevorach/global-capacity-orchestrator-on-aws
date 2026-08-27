@@ -275,6 +275,8 @@ class TestKubernetesManifests:
             "apiregistration.k8s.io/v1",
             "keda.sh/v1alpha1",
             "monitoring.coreos.com/v1",
+            # API workload TLS identities (post-helm-api-workload-certificates.yaml).
+            "cert-manager.io/v1",
             # Kueue default queue topology (post-helm-kueue-default-queues.yaml);
             # keep in lockstep with _QUEUEING_CUSTOM_OBJECTS in the applier.
             "kueue.x-k8s.io/v1beta1",
@@ -479,23 +481,49 @@ class TestKubernetesManifests:
                     "IRSA won't work without it."
                 )
 
-                # Check env vars on containers
+                # Require IRSA only on containers that intentionally mount the
+                # projected token. Supporting sidecars (for example the TLS
+                # proxy) must not inherit AWS credentials they never use.
                 containers = template_spec.get("containers", [])
+                skip_value = (
+                    doc.get("spec", {})
+                    .get("template", {})
+                    .get("metadata", {})
+                    .get("annotations", {})
+                    .get("eks.amazonaws.com/skip-containers", "")
+                )
+                skipped_containers = {
+                    item.strip() for item in skip_value.split(",") if item.strip()
+                }
+                credentialed_containers = 0
                 for container in containers:
                     env_names = {e.get("name") for e in container.get("env", [])}
+                    mount_names = {mount.get("name") for mount in container.get("volumeMounts", [])}
+                    if "aws-iam-token" not in mount_names:
+                        assert container.get("name") in skipped_containers, (
+                            f"Deployment '{name}' container '{container.get('name')}' has no "
+                            "IRSA token mount but is not excluded from EKS credential injection"
+                        )
+                        assert "AWS_ROLE_ARN" not in env_names
+                        assert "AWS_WEB_IDENTITY_TOKEN_FILE" not in env_names
+                        continue
+                    credentialed_containers += 1
                     assert "AWS_ROLE_ARN" in env_names or "TEMPLATE_PLACEHOLDER" in str(
                         container.get("env", [])
                     ), (
                         f"Deployment '{name}' container '{container.get('name')}' "
-                        "missing AWS_ROLE_ARN env var for IRSA"
+                        "mounts the IRSA token but is missing AWS_ROLE_ARN"
                     )
                     assert (
                         "AWS_WEB_IDENTITY_TOKEN_FILE" in env_names
                         or "TEMPLATE_PLACEHOLDER" in str(container.get("env", []))
                     ), (
                         f"Deployment '{name}' container '{container.get('name')}' "
-                        "missing AWS_WEB_IDENTITY_TOKEN_FILE env var for IRSA"
+                        "mounts the IRSA token but is missing AWS_WEB_IDENTITY_TOKEN_FILE"
                     )
+                assert credentialed_containers >= 1, (
+                    f"Deployment '{name}' uses {sa_name} but no container consumes its IRSA token"
+                )
 
         assert gco_deployments_checked >= 4, (
             f"Expected at least 4 GCO deployments with dedicated service accounts, "

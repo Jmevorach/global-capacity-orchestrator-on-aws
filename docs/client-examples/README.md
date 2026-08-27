@@ -69,7 +69,7 @@ In the commercial `aws` partition, the global workload path is:
 Client → edge-optimized API Gateway (AWS-managed TLS + SigV4)
   → proxy Lambda (request-bound HMAC)
   → Global Accelerator (TCP/443 pass-through)
-  → internal regional ALB (private-root TLS) → EKS service (HTTP)
+  → internal regional ALB (private-root TLS) → EKS service (re-encrypted HTTPS)
 ```
 
 [Global Accelerator](https://docs.aws.amazon.com/global-accelerator/latest/dg/what-is-global-accelerator.html) chooses a healthy registered backend. The global proxy
@@ -99,7 +99,7 @@ The direct path is:
 ```text
 Client → regional API Gateway (AWS-managed TLS + SigV4)
   → VPC Lambda (request-bound HMAC)
-  → internal regional ALB (private-root TLS) → EKS service (HTTP)
+  → internal regional ALB (private-root TLS) → EKS service (re-encrypted HTTPS)
 ```
 
 Sign requests in the region that owns the selected API Gateway endpoint. The

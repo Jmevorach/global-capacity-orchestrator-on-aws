@@ -1,7 +1,9 @@
 # GCO Gateway API entrypoint managed by AWS Load Balancer Controller v3.4.2.
 # The ALB is internal and HTTPS-only. Global Accelerator and the regional VPC
-# proxy remain the only supported callers; all pod targets use HTTP inside the
-# cluster boundary.
+# proxy remain the only supported callers. The ALB re-encrypts every request
+# to hot-reloading TLS proxy sidecars on the API workload pods; request-bound
+# HMAC proves possession of the trusted proxy key and request integrity on
+# protected paths; original caller identity is authenticated by API Gateway IAM.
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -24,9 +26,12 @@ metadata:
 spec:
   defaultConfiguration:
     targetType: ip
-    protocol: HTTP
+    protocol: HTTPS
     healthCheckConfig:
-      healthCheckProtocol: HTTP
+      # ALB encrypts target traffic but does not validate target certificates;
+      # HMAC proves trusted-proxy key possession and request integrity on
+      # protected paths after TLS termination.
+      healthCheckProtocol: HTTPS
       healthCheckPath: /healthz
       healthCheckInterval: 15
       healthCheckTimeout: 5
@@ -119,7 +124,7 @@ spec:
         - group: ""
           kind: Service
           name: health-monitor
-          port: 80
+          port: 443
           weight: 1
     - matches:
         - path:
@@ -129,7 +134,7 @@ spec:
         - group: ""
           kind: Service
           name: health-monitor
-          port: 80
+          port: 443
           weight: 1
     - matches:
         - path:
@@ -139,7 +144,7 @@ spec:
         - group: ""
           kind: Service
           name: manifest-processor
-          port: 80
+          port: 443
           weight: 1
     - matches:
         - path:
@@ -149,7 +154,7 @@ spec:
         - group: ""
           kind: Service
           name: inference-proxy
-          port: 80
+          port: 443
           weight: 1
     - matches:
         - path:
@@ -159,7 +164,7 @@ spec:
         - group: ""
           kind: Service
           name: health-monitor
-          port: 80
+          port: 443
           weight: 1
     # Catch-all. Everything not matched above reaches the manifest processor,
     # which owns the bulk of /api/v1.
@@ -183,5 +188,5 @@ spec:
         - group: ""
           kind: Service
           name: manifest-processor
-          port: 80
+          port: 443
           weight: 1

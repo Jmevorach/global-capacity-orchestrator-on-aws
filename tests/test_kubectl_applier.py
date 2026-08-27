@@ -536,6 +536,52 @@ class TestLegacyRemovedResources:
         assert post_helm["PrunedCount"] == 0
 
 
+class TestCertManagerCRDs:
+    """Issuer and Certificate resources are applied after cert-manager installs its CRDs."""
+
+    @pytest.mark.parametrize(
+        ("kind", "plural"),
+        (("Issuer", "issuers"), ("Certificate", "certificates")),
+    )
+    def test_tls_resource_applied_as_namespaced_custom_object(
+        self,
+        handler_module,
+        tmp_path,
+        kind: str,
+        plural: str,
+    ):
+        (tmp_path / f"post-helm-{plural}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "cert-manager.io/v1",
+                    "kind": kind,
+                    "metadata": {"name": f"test-{plural}", "namespace": "gco-system"},
+                    "spec": {"selfSigned": {}} if kind == "Issuer" else {"secretName": "tls"},
+                }
+            )
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_custom = MagicMock()
+            mock_client.CustomObjectsApi.return_value = mock_custom
+
+            result = handler_module.apply_manifests(
+                "c", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        args = mock_custom.create_namespaced_custom_object.call_args.args
+        assert args[:4] == ("cert-manager.io", "v1", "gco-system", plural)
+
+
 class TestPrometheusOperatorCRDs:
     """ServiceMonitor / PodMonitor are applied as monitoring.coreos.com objects.
 
@@ -2037,14 +2083,20 @@ class TestAuthoritativeManifestPlanner:
         dispatched = set(re.findall(r'(?:el)?if kind == "([A-Za-z0-9]+)"', source))
         for group in re.findall(r"(?:el)?if kind in \(([^)]*)\)", source):
             dispatched.update(re.findall(r'"([A-Za-z0-9]+)"', group))
-        # Table-driven branches: `elif kind in _GATEWAY_CUSTOM_OBJECTS or
-        # kind in _QUEUEING_CUSTOM_OBJECTS`. Require the branch to exist so
-        # the maps' keys genuinely reach the apply loop.
-        assert re.search(
-            r"kind in _GATEWAY_CUSTOM_OBJECTS or kind in _QUEUEING_CUSTOM_OBJECTS", source
-        ), "table-driven custom-object dispatch branch disappeared; update this test"
+        # Table-driven branches use the three custom-object maps. Require each
+        # map name to appear in the dispatch condition so adding a map cannot
+        # leave its kinds admitted by planning but unreachable at apply time.
+        for map_name in (
+            "_GATEWAY_CUSTOM_OBJECTS",
+            "_QUEUEING_CUSTOM_OBJECTS",
+            "_CERT_MANAGER_CUSTOM_OBJECTS",
+        ):
+            assert f"kind in {map_name}" in source, (
+                f"table-driven custom-object dispatch omitted {map_name}; update the apply loop"
+            )
         dispatched.update(handler_module._GATEWAY_CUSTOM_OBJECTS)
         dispatched.update(handler_module._QUEUEING_CUSTOM_OBJECTS)
+        dispatched.update(handler_module._CERT_MANAGER_CUSTOM_OBJECTS)
 
         supported = set(handler_module._SUPPORTED_MANIFEST_KINDS)
         assert supported - dispatched == set(), (
@@ -2454,6 +2506,57 @@ class TestManifestReadinessValidation:
             call.kwargs["kind"] for call in dynamic_client.resources.get.call_args_list
         }
         assert "Deployment" not in discovered_kinds
+
+    @pytest.mark.parametrize("kind", ["Issuer", "Certificate"])
+    def test_cert_manager_resource_requires_current_ready_condition(self, handler_module, kind):
+        pending = {"metadata": {"generation": 2}, "status": {"conditions": []}}
+        stale = {
+            "metadata": {"generation": 2},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]
+            },
+        }
+        ready = {
+            "metadata": {"generation": 2},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 2}]
+            },
+        }
+
+        assert handler_module._resource_readiness_failure(kind, pending) == (
+            f"{kind} condition Ready is missing"
+        )
+        stale_failure = handler_module._resource_readiness_failure(kind, stale)
+        assert stale_failure is not None
+        assert "is stale" in stale_failure
+        assert handler_module._resource_readiness_failure(kind, ready) is None
+
+    def test_certificate_readiness_requires_a_nonempty_generated_secret(self, handler_module):
+        dynamic_client = MagicMock()
+        secret_api = MagicMock()
+        dynamic_client.resources.get.return_value = secret_api
+        planned = {"namespace": "gco-system"}
+        certificate = {"spec": {"secretName": "api-tls"}}
+
+        secret_api.get.return_value = {"data": {"tls.crt": "", "tls.key": "a2V5"}}
+        failure = handler_module._certificate_secret_failure(
+            dynamic_client,
+            {},
+            planned,
+            certificate,
+        )
+        assert failure == "Certificate Secret 'api-tls' has no nonempty tls.crt"
+
+        secret_api.get.return_value = {"data": {"tls.crt": "Y2VydA==", "tls.key": "a2V5"}}
+        assert (
+            handler_module._certificate_secret_failure(
+                dynamic_client,
+                {},
+                planned,
+                certificate,
+            )
+            is None
+        )
 
     @pytest.mark.parametrize(
         "resource",

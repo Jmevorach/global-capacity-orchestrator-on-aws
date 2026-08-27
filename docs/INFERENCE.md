@@ -84,7 +84,9 @@ global inference-streaming Lambda (request-bound HMAC) → Global Accelerator (T
    timestamp, and nonce into a short-lived HMAC envelope, then uses strict
    private-root TLS through Global Accelerator to a healthy regional ALB.
    Global Accelerator forwards TCP/443 and never terminates TLS; the ALB
-   forwards HTTP to the dedicated inference proxy after termination.
+   terminates that private-root connection and re-encrypts the target hop to
+   the dedicated inference proxy pod's TLS-only sidecar. The sidecar
+   hot-reloads its projected leaf and forwards the stream over pod loopback.
 6. The inference proxy validates that envelope, checks endpoint state and an
    allowlist of serving paths, then streams the response from a strictly derived
    in-cluster Service name. Mooncake admin, metrics, debug, and documentation
@@ -426,7 +428,8 @@ The `store` and `both` modes enable the shared KV-cache store automatically — 
 
 ```text
 API Gateway (AWS TLS + SigV4) → streaming HMAC proxy → Global Accelerator (TCP/443)
-  → internal ALB (private-root TLS) → authenticated inference proxy (HTTP)
+  → internal ALB (private-root TLS) → pod TLS proxy (re-encrypted HTTPS)
+  → authenticated inference proxy (pod-loopback HTTP)
                                                           │
                                                           ▼
                                                 {name}-proxy Service

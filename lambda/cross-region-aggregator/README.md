@@ -46,7 +46,8 @@ Global API Gateway → aggregator Lambda
   → regional API Gateway (AWS-managed TLS + SigV4)
   → regional VPC proxy (HMAC signing)
   → internal ALB (deployment-local private-root TLS)
-  → Kubernetes pod (HTTP after ALB termination)
+  → pod TLS proxy (re-encrypted HTTPS)
+  → Kubernetes application (pod-loopback HTTP)
 ```
 
 The aggregator trusts the AWS-managed API Gateway certificate chain. It does **not** read the backend HMAC secret, the ALB-hostname [SSM](https://docs.aws.amazon.com/systems-manager/latest/userguide/what-is-systems-manager.html) registry, the private-root public trust bundle, the root private-key secret, or the root [KMS](https://docs.aws.amazon.com/kms/latest/developerguide/overview.html) key. The regional [VPC](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html) proxy owns [ALB](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html) resolution, HMAC signing, and the private-root TLS hop.
