@@ -13,19 +13,19 @@ MCP tool definitions — one file per domain. Each module registers tools agains
 
 Counts are tools registered per module; tools gated behind a feature flag only
 appear when that flag (or the umbrella `GCO_ENABLE_ALL_TOOLS`) is set. At
-default registration the server exposes 135 tools; with every flag enabled the
-ceiling is 189. See [Feature Flags](../README.md#feature-flags) for the
+default registration the server exposes 138 tools; with every flag enabled the
+ceiling is 192. See [Feature Flags](../README.md#feature-flags) for the
 flag-to-tool mapping.
 
 | File | Tools | Description |
 |------|-------|-------------|
-| `jobs.py` | 13 | `list_jobs`, `submit_job_sqs`, `submit_job_api`, `get_job`, `get_job_logs`, `get_job_events`, `get_job_pods`, `get_pod_logs`, `get_job_metrics`, `retry_job`, `delete_job` (gated), `cluster_health`, `queue_status` |
+| `jobs.py` | 15 | `list_jobs`, `submit_job_sqs`, `submit_job_api`, `get_job`, `get_job_logs`, `get_job_events`, `get_job_pods`, `get_pod_logs`, `get_job_metrics`, `retry_job`, `delete_job` (gated), `cluster_health`, `queue_status`, `get_job_validation_policy`, `check_job_policy` |
 | `capacity.py` | 18 | `check_capacity`, `instance_info`, `recommend_capacity`, `capacity_status`, `recommend_region`, `spot_prices`, `ai_recommend`, `list_reservations`, `reservation_check`, `find_capacity_blocks`, `find_capacity_reservations`, `capacity_history_show`, `capacity_history_stats`, `capacity_history_patterns`, `capacity_predict`, `reserve_capacity` (gated), `create_reservation` (gated), `cancel_reservation` (gated) |
 | `inference.py` | 20 | `deploy_inference`, `list_inference_endpoints`, `inference_status`, `scale_inference`, `update_inference_image`, `stop_inference`, `start_inference`, `delete_inference` (gated), `canary_deploy`, `promote_canary`, `rollback_canary`, `invoke_inference`, `chat_inference`, `inference_health`, `list_endpoint_models`, `deploy_disaggregated_inference`, `set_mooncake_topology`, `configure_mooncake_store`, `mooncake_topology_status`, `populate_kv_cache` |
 | `costs.py` | 14 | `cost_summary`, `cost_by_region`, `cost_trend`, `cost_forecast`, `cost_workloads`, `cost_allocation_status`, `cost_allocation_activate`, `cost_k8s_namespaces`, `cost_k8s_regions`, `cost_k8s_trend`, `cost_k8s_top`, `cost_report_status`, `cost_report_list`, `cost_report_generate` |
 | `stacks.py` | 29 | `list_stacks`, `stack_status`, `setup_cluster_access`, `fsx_status`, `stack_diff`, `stack_outputs`, `stack_synth`, `addons_status`, `valkey_status`, `aurora_status`, `enable_fsx`, `disable_fsx`, `enable_valkey`, `disable_valkey`, `enable_aurora`, `disable_aurora`, `addons_install` (gated), `deploy_stack` (gated), `deploy_all` (gated), `bootstrap_cdk` (gated), `destroy_stack` (gated), `destroy_all` (gated), `list_deployment_regions` (gated), `add_deployment_region` (gated), `remove_deployment_region` (gated), `set_deployment_region` (gated), `set_mission_default_model` (gated), `set_capacity_advisor_default_model` (gated), `set_claude_code_default_model` (gated) |
 | `status.py` | 1 | `fleet_status` |
-| `storage.py` | 7 | `list_storage_contents`, `list_file_systems`, `list_storage_buckets`, `files_get`, `files_access_points`, `upload_to_regional_bucket` (gated by `GCO_ENABLE_MODEL_UPLOAD`), `sync_storage_bucket` (gated by `GCO_ENABLE_LOCAL_STORAGE_SYNC`) |
+| `storage.py` | 8 | `list_storage_contents`, `list_file_systems`, `list_storage_buckets`, `s3_inventory`, `files_get`, `files_access_points`, `upload_to_regional_bucket` (gated by `GCO_ENABLE_MODEL_UPLOAD`), `sync_storage_bucket` (gated by `GCO_ENABLE_LOCAL_STORAGE_SYNC`) |
 | `models.py` | 4 | `list_models`, `get_model_uri`, `models_upload` (gated), `delete_model` (gated) |
 | `nodepools.py` | 5 | `nodepools_list`, `nodepools_describe`, `nodepools_create_odcr`, `nodepools_create_capacity_block`, `delete_nodepool` (gated) |
 | `analytics.py` | 8 | `analytics_doctor`, `analytics_status`, `analytics_login_url`, `analytics_users_list`, `enable_analytics`, `disable_analytics`, `analytics_user_add`, `analytics_user_remove` (gated) |
@@ -60,6 +60,8 @@ Every registered MCP tool, grouped by module, with a one-line description from t
 | `get_job_logs` | Get logs from a job. |
 | `get_job_metrics` | Get CPU and memory usage for all pods in a job. |
 | `get_job_pods` | Get pod details, placement, and container status for a job. |
+| `get_job_validation_policy` | Get the job validation policy a region actually enforces, as deployed — per-manifest caps, namespace/kind/registry allowlists, pod-security flags, and the live `LimitRange` / `ResourceQuota` ceilings. Reads the cluster, not a local `cdk.json`. |
+| `check_job_policy` | Check which regions would admit a manifest and whether the regions still agree on policy. Evaluates the manifest against each region's deployed policy using the manifest processor's own checks; any field differing across regions means a region was deployed from a different `cdk.json` checkout. `offline=True` reads `cdk.json` with no AWS calls, reporting the configured rather than deployed policy. Advisory. |
 | `get_pod_logs` | Get a bounded log tail from one specific pod belonging to a job. |
 | `list_jobs` | List jobs across GCO clusters. |
 | `queue_status` | View [SQS](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html) queue status (pending, in-flight, DLQ counts). |
@@ -82,7 +84,7 @@ Every registered MCP tool, grouped by module, with a one-line description from t
 | `create_reservation` | Create a new On-Demand Capacity Reservation (ODCR) (gated by `GCO_ENABLE_CAPACITY_PURCHASE`). |
 | `find_capacity_blocks` | Find [EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/concepts.html) [Capacity Blocks](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-blocks.html) across regions x durations x a start-date window in one consolidated, ranked, de-duplicated report. |
 | `find_capacity_reservations` | Find existing ODCRs across regions in one parallel, ranked, priced report. |
-| `instance_info` | Get hardware and pricing metadata for an EC2 instance type. |
+| `instance_info` | Describe an EC2 instance type's compute characteristics, resolved live from `ec2:DescribeInstanceTypes` on every call (no checked-in specification table): vCPUs/cores/threads, memory, every accelerator class with per-model counts and memory, EFA and network limits, local NVMe and EBS, purchase options, platform capabilities. Carries no pricing. |
 | `list_reservations` | List On-Demand Capacity Reservations (ODCRs) across regions. |
 | `recommend_capacity` | Recommend spot or on-demand capacity for a workload. |
 | `recommend_region` | Get optimal region recommendation based on capacity. |
@@ -182,6 +184,7 @@ Every registered MCP tool, grouped by module, with a one-line description from t
 | `files_get` | `gco files get` — get file system details for a region (EFS/FSx). |
 | `list_file_systems` | List EFS and FSx file systems. |
 | `list_storage_buckets` | List deployed GCO [S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html) buckets and their human-friendly aliases. |
+| `s3_inventory` | Describe every S3 bucket the deployment creates — central and per-region shared buckets, model weights, cost reports, the optional analytics bucket, and every access-log sink — with owning stack, purpose, reserved prefixes, pod read/write access and how pods discover it, removal policy, and deployed status. `summary.pod_writable` answers "where can a job write?". |
 | `list_storage_contents` | List contents of shared EFS storage. |
 | `sync_storage_bucket` | Sync between a GCO S3 bucket and a confined local path using explicit `download` (default) or `upload` direction; neither direction deletes destination-only data (gated by `GCO_ENABLE_LOCAL_STORAGE_SYNC` and confined to `GCO_STORAGE_LOCAL_ROOT`). |
 | `upload_to_regional_bucket` | `gco models upload-regional` — upload a descriptor-backed snapshot of a source confined beneath `GCO_STORAGE_LOCAL_ROOT` to a regional bucket (gated by `GCO_ENABLE_MODEL_UPLOAD`; links, special files, and filesystem crossings fail closed). |

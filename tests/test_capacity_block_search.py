@@ -353,8 +353,31 @@ class TestDedupeSortRank:
 
 
 class TestValidateInstanceType:
-    def test_known_offline_spec(self):
+    @staticmethod
+    def _checker_describing_8_gpus():
+        """A checker whose EC2 client reports an 8-GPU type.
+
+        These cases used to need no mock because a checked-in offline catalog
+        answered them without touching AWS. That catalog is gone, so the EC2 call
+        must be stubbed — otherwise the test passes only on a machine that
+        happens to have credentials and silently makes a live API call in CI.
+        """
         checker = _make_checker()
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_instance_types.return_value = {
+            "InstanceTypes": [
+                {
+                    "GpuInfo": {
+                        "Gpus": [{"Count": 8, "Name": "H100", "Manufacturer": "NVIDIA"}],
+                    }
+                }
+            ]
+        }
+        checker._session.client = MagicMock(return_value=mock_ec2)
+        return checker
+
+    def test_confirmed_type_is_valid_and_known(self):
+        checker = self._checker_describing_8_gpus()
         result = checker.validate_instance_type("p5.48xlarge")
         assert result["valid"] is True
         assert result["known"] is True
@@ -362,16 +385,20 @@ class TestValidateInstanceType:
         assert result["instance_type"] == "p5.48xlarge"
 
     def test_alias_expands_and_is_known(self):
-        checker = _make_checker()
+        checker = self._checker_describing_8_gpus()
         result = checker.validate_instance_type("p6-b200")
         assert result["instance_type"] == "p6-b200.48xlarge"
         assert result["valid"] is True
         assert result["known"] is True
         assert result["gpu_count"] == 8
         assert "p6-b200.48xlarge" in result["note"]
+        # The canonical name is what reaches EC2, not the friendly alias.
+        checker._session.client.return_value.describe_instance_types.assert_called_once_with(
+            InstanceTypes=["p6-b200.48xlarge"]
+        )
 
     def test_b300_is_valid_standalone(self):
-        checker = _make_checker()
+        checker = self._checker_describing_8_gpus()
         result = checker.validate_instance_type("p6-b300")
         assert result["instance_type"] == "p6-b300.48xlarge"
         assert result["valid"] is True
@@ -395,7 +422,13 @@ class TestValidateInstanceType:
         result = checker.validate_instance_type("zz9.fake")
         assert result["valid"] is False
 
-    def test_unknown_but_valid_via_ec2(self):
+    def test_ec2_confirmation_marks_the_type_known(self):
+        """``known`` now means "EC2 described it", not "it is in our catalog".
+
+        The hardcoded GPU catalog that used to define ``known`` was removed, so
+        the flag reflects live confirmation. It is reported for information only
+        and gates nothing.
+        """
         checker = _make_checker()
         mock_ec2 = MagicMock()
         mock_ec2.describe_instance_types.return_value = {
@@ -404,16 +437,36 @@ class TestValidateInstanceType:
         checker._session.client = MagicMock(return_value=mock_ec2)
         result = checker.validate_instance_type("g6.48xlarge")
         assert result["valid"] is True
-        assert result["known"] is False
+        assert result["known"] is True
         assert result["gpu_count"] == 4
 
-    def test_empty_instance_types_is_invalid(self):
+    def test_gpu_count_sums_across_accelerator_models(self):
+        """A heterogeneous Gpus[] list must not be read as Gpus[0]."""
+        checker = _make_checker()
+        mock_ec2 = MagicMock()
+        mock_ec2.describe_instance_types.return_value = {
+            "InstanceTypes": [{"GpuInfo": {"Gpus": [{"Count": 4}, {"Count": 2}]}}]
+        }
+        checker._session.client = MagicMock(return_value=mock_ec2)
+        assert checker.validate_instance_type("g6.48xlarge")["gpu_count"] == 6
+
+    def test_empty_instance_types_is_valid_but_not_offered_here(self):
+        """An empty result means "not offered in this region", not "bogus type".
+
+        EC2 raises InvalidInstanceType for a type that does not exist; it returns
+        an empty list for a real type the consulted region does not offer.
+        Collapsing the two would reject a p5 in a region that merely lacks it —
+        which the removed hardcoded catalog used to paper over by short-circuiting
+        the lookup entirely.
+        """
         checker = _make_checker()
         mock_ec2 = MagicMock()
         mock_ec2.describe_instance_types.return_value = {"InstanceTypes": []}
         checker._session.client = MagicMock(return_value=mock_ec2)
-        result = checker.validate_instance_type("phantom.type")
-        assert result["valid"] is False
+        result = checker.validate_instance_type("p5.48xlarge")
+        assert result["valid"] is True
+        assert result["known"] is False
+        assert "not offered" in (result["note"] or "")
 
     def test_transient_api_error_leaves_unverified(self):
         checker = _make_checker()
@@ -516,10 +569,33 @@ class TestListCapacityBlockOfferingsEnhanced:
                 ]
             }
         )
+        # GPUs per instance is resolved live now that the offline catalog is gone,
+        # so the same mock client answers DescribeInstanceTypes too.
+        mock_ec2.describe_instance_types.return_value = {
+            "InstanceTypes": [
+                {
+                    "InstanceType": "p5.48xlarge",
+                    "VCpuInfo": {"DefaultVCpus": 192},
+                    "MemoryInfo": {"SizeInMiB": 2097152},
+                    "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                    "GpuInfo": {
+                        "Gpus": [
+                            {
+                                "Name": "H100",
+                                "Manufacturer": "NVIDIA",
+                                "Count": 8,
+                                "MemoryInfo": {"SizeInMiB": 81920},
+                            }
+                        ],
+                        "TotalGpuMemoryInMiB": 655360,
+                    },
+                }
+            ]
+        }
         checker._session.client = MagicMock(return_value=mock_ec2)
         offerings = checker.list_capacity_block_offerings("us-east-1", "p5.48xlarge")
         o = offerings[0]
-        # p5.48xlarge = 8 GPUs from offline specs.
+        # p5.48xlarge = 8 GPUs, per the live description above.
         assert o["upfront_fee"] == "4800.00"  # raw preserved
         assert o["upfront_fee_usd"] == 4800.0
         assert o["price_per_hour"] == 200.0
@@ -601,7 +677,14 @@ class TestListCapacityBlockOfferingsEnhanced:
         mock_ec2 = self._ec2_with({"CapacityBlockOfferings": []})
         checker._session.client = MagicMock(return_value=mock_ec2)
         checker.list_capacity_block_offerings("us-east-1", "p5.48xlarge")
-        cfg = checker._session.client.call_args.kwargs["config"]
+        # Resolving GPUs per instance opens its own plain client, so pick the
+        # capacity-block call by the kwarg under test rather than trusting the
+        # call order.
+        cfg = next(
+            call.kwargs["config"]
+            for call in checker._session.client.call_args_list
+            if "config" in call.kwargs
+        )
         assert cfg.retries["mode"] == "adaptive"
         assert cfg.retries["max_attempts"] == 10
 

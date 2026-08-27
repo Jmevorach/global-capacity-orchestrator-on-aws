@@ -176,6 +176,7 @@ gco status --output json
 
 # Include the billed and cluster-bound sections
 gco status --with-costs --with-nodepools
+gco status --with-policy
 
 # Refresh in place while watching a deploy or a queue drain
 gco status --watch 10
@@ -191,6 +192,7 @@ gco status --fail-on-findings
 | `--region`, `-r` | Restrict the gather to a single region |
 | `--with-costs` | Include the `costs` section (Cost Explorer bills per `GetCostAndUsage` request) |
 | `--with-nodepools` | Include the `nodepools` section (needs a reachable cluster API endpoint; private endpoints report `unavailable` and point at `gco cluster tunnel`) |
+| `--with-policy` | Include the `policy` section: compare the job-validation policy each region enforces and report any field that differs (one API call per region) |
 | `--watch SECONDS` | Re-gather and redraw on an interval (minimum 5 seconds; table output only). With `--with-costs`, the costs section is re-fetched at most every 15 minutes and carries an `as_of` timestamp |
 | `--fail-on-findings` | Exit 1 after rendering when any `error`-severity finding is present |
 
@@ -208,6 +210,7 @@ Kubernetes API, so both are opt-in flags.
 | `capacity` | 1 | Queue depth and GPU/CPU utilization per region, with telemetry provenance |
 | `inference` | 1 | Inference endpoint desired state from the global registry |
 | `costs` | 2 | Cost Explorer 30-day total by service, plus cost-allocation-tag status (`--with-costs`) |
+| `policy` | 1 per region | Cross-region job-validation policy agreement (`--with-policy`). No per-region overrides exist, so a differing field means a region was deployed from a different `cdk.json` checkout; each one becomes a warn finding |
 | `nodepools` | 3 | Karpenter NodePools per region after an endpoint reachability probe (`--with-nodepools`) |
 
 **Section status vocabulary.** Every section carries a `status`; anything that
@@ -250,7 +253,7 @@ discovering stacks wherever they exist.
 Manage jobs across GCO clusters.
 
 <details>
-<summary>All <code>gco jobs</code> commands (16) — click to expand</summary>
+<summary>All <code>gco jobs</code> commands (17) — click to expand</summary>
 
 | Command | Description |
 | --- | --- |
@@ -269,6 +272,8 @@ Manage jobs across GCO clusters.
 | [`gco jobs retry`](#gco-jobs-retry) | Retry a failed job. |
 | [`gco jobs bulk-delete`](#gco-jobs-bulk-delete) | Bulk delete jobs based on filters. |
 | [`gco jobs health`](#gco-jobs-health) | Get health status of GCO clusters. |
+| [`gco jobs check-policy`](#gco-jobs-check-policy) | Check which regions would admit a manifest, and whether regions still agree on policy. |
+| [`gco jobs policy`](#gco-jobs-policy) | Show the job validation policy a region actually enforces. |
 | [`gco jobs queue-status`](#gco-jobs-queue-status) | View SQS queue status across regions. |
 
 </details>
@@ -292,6 +297,7 @@ gco jobs submit MANIFEST_PATH [OPTIONS]
 | `--namespace` | `-n` | Fallback namespace for manifests that don't declare their own (manifest `metadata.namespace` takes precedence) |
 | `--region` | `-r` | Target specific region |
 | `--dry-run` | | Validate without applying |
+| `--check-policy` | | Check the manifests against the target region's deployed policy first and report anything that would be rejected (advisory; submission continues) |
 | `--label` | `-l` | Add labels (key=value), can be repeated |
 | `--wait` | `-w` | Wait for job completion |
 | `--timeout` | | Wait timeout in seconds (default: 3600) |
@@ -650,6 +656,106 @@ gco jobs health [OPTIONS]
 gco jobs health --region us-east-1
 gco jobs health --all-regions
 ```
+
+#### `gco jobs check-policy`
+
+Check which regions would admit a manifest, and whether the regions still agree
+on policy.
+
+Two questions [`gco jobs policy`](#gco-jobs-policy) leaves to you. It shows one
+region's policy; this evaluates a manifest against every region's policy using
+the same checks the manifest processor runs, and compares the regions to each
+other.
+
+**Which regions would take this job.** A 32-GPU job can be admissible in one
+region and over-cap in another. Without this you find out by submitting and
+being rejected.
+
+**Whether the regions still agree.** There are no per-region policy overrides —
+every region is deployed from the same `cdk.json` — so any field that differs
+means at least one region is running a different deployment of that file. Each
+region looks individually healthy, so this stays invisible until a manifest that
+was admitted yesterday is refused. `trusted_registries` is compared with ECR
+hostnames stripped, because CDK appends the project's own registries at synth
+time and those encode a region; the stripped entries are reported separately as
+synth-time augmentation.
+
+Omit `MANIFEST_PATH` to compare policies without judging anything.
+
+Advisory. The cluster is the authoritative gate and this reads a snapshot of its
+policy over the network, so it exits 0 unless you pass `--fail-on-reject`. A
+check that blocked on its own opinion would refuse valid jobs whenever it was
+stale or wrong.
+
+```bash
+gco jobs check-policy [MANIFEST_PATH] [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--region` | `-r` | Region to check (repeatable). Defaults to every configured region. |
+| `--namespace` | `-n` | Namespace to assume for manifests that don't declare their own |
+| `--offline` | | Read `cdk.json` instead of calling AWS (no credentials needed) |
+| `--fail-on-reject` | | Exit 1 when any checked region would reject, after printing |
+
+`--offline` answers the same question with no AWS calls, for pre-commit hooks and
+air-gapped checkouts. It is strictly weaker: it reports what the file
+*configures*, not what any region has *deployed*, and since CDK adds project ECR
+registries at synth time an image-provenance rejection offline may pass in a real
+region. The output says so.
+
+**Example:**
+
+```bash
+gco jobs check-policy examples/gpu-job.yaml
+gco jobs check-policy examples/gpu-job.yaml -r us-east-1 -r us-east-2
+gco jobs check-policy                       # policy comparison only
+gco jobs check-policy examples/gpu-job.yaml --offline --fail-on-reject
+gco -o json jobs check-policy examples/gpu-job.yaml | jq '.policy_drift'
+```
+
+To surface policy drift across the whole fleet instead of per manifest, use
+[`gco status --with-policy`](#status-commands), which reports each differing field as
+a warn-severity finding.
+
+#### `gco jobs policy`
+
+Show the job validation policy a region actually enforces — the per-manifest
+cpu/memory/gpu caps, `allowed_namespaces`, `allowed_kinds`, `trusted_registries`,
+the pod-security `block_*` flags, and the namespace's live `LimitRange` /
+`ResourceQuota` ceilings.
+
+Use it before submitting to check whether a manifest will be admitted, rather
+than discovering a policy conflict after a region has been provisioned.
+
+This reads the deployed cluster, not your local `cdk.json`. The two diverge
+whenever the stack was deployed from a different checkout, and CDK adds the
+project's own ECR registries to `trusted_registries` at synth time, so the
+effective allowlist is always larger than the configured one. Note that
+`gco jobs submit --dry-run` is a client-side `kubectl` parse, not an admission
+preview — it never consults this policy.
+
+```bash
+gco jobs policy [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--region` | `-r` | Target region (required) |
+
+**Example:**
+
+```bash
+gco jobs policy --region us-east-1
+gco jobs policy -r us-east-1 -o json | jq '.policy.trusted_registries'
+```
+
+See [Reading the deployed validation policy](API.md#reading-the-deployed-validation-policy)
+for the response shape and the three admission layers.
 
 #### `gco jobs queue-status`
 
@@ -2018,7 +2124,7 @@ Check and manage cluster capacity.
 | [`gco capacity reservation-check`](#gco-capacity-reservation-check) | Check reservation availability and Capacity Block offerings for ML workloads. |
 | [`gco capacity find-blocks`](#gco-capacity-find-blocks) | Find Capacity Blocks across regions, durations, and a start-date window in one consolidated, ranked report. |
 | [`gco capacity reserve`](#gco-capacity-reserve) | Purchase a Capacity Block offering by ID. |
-| [`gco capacity instance-info`](#gco-capacity-instance-info) | Print AWS-published metadata for an instance type — vCPUs, memory, GPU count, network performance, and supported architectures. |
+| [`gco capacity instance-info`](#gco-capacity-instance-info) | Describe an instance type's compute characteristics, resolved live from `ec2:DescribeInstanceTypes` — vCPUs/cores/threads, memory, every accelerator class, EFA and network limits, local NVMe and EBS, purchase options, platform capabilities. |
 | [`gco capacity spot-prices`](#gco-capacity-spot-prices) | Get spot price history for an instance type in a region. |
 | [`gco capacity history`](#gco-capacity-history) | Query the historical capacity surface (optional global-stack add-on, on by default). |
 | [`gco capacity history show`](#gco-capacity-history-show) | Show the recorded capacity time-series for an instance type in a region. |
@@ -2386,19 +2492,54 @@ gco capacity cancel-reservation -o cr-0123456789abcdef0 -r us-east-1 -y
 
 #### `gco capacity instance-info`
 
-Print AWS-published metadata for an instance type — vCPUs, memory,
-GPU count, network performance, and supported architectures. Read-only
-and does not call the EC2 RunInstances API.
+Describe an instance type's compute characteristics. Read-only — it calls
+`ec2:DescribeInstanceTypes` and never `RunInstances`.
+
+Resolved live on every call. There is deliberately no checked-in specification
+table behind this, so a newly launched accelerator family is reported the day it
+ships. (One used to exist — a 25-entry GPU catalog that short-circuited the API —
+and it was removed because a hand-maintained catalog hides new families until
+someone edits it, and a stale number feeds straight into NodePool sizing and
+capacity scores.)
+
+Reported fields:
+
+| Group | Fields |
+|-------|--------|
+| Processor | vCPUs, cores, threads per core, architectures, sustained clock speed, manufacturer, current-generation and bare-metal flags, hypervisor, burstable |
+| Accelerators | NVIDIA GPUs (per-model name, manufacturer, count, memory) with the node total; AWS Neuron devices with core counts; Inferentia; media accelerators; FPGAs |
+| Network | EFA support and max EFA interfaces, network performance, max ENIs and network cards, IPv6, ENA, encryption in transit |
+| Storage | local NVMe total and per-disk layout, EBS optimized/encryption/NVMe support, baseline and maximum EBS IOPS and throughput |
+| Purchasing | supported usage classes (on-demand / spot / capacity-block), placement-group strategies, dedicated-host support |
+| Platform | root device and virtualization types, boot modes, hibernation, auto-recovery, Nitro Enclaves, Nitro TPM |
+
+GPU memory is reported as the **total** across devices, with the per-device
+figure in `gpu_devices`.
+
+`DescribeInstanceTypes` is region-scoped: a type is described only where it is
+offered. If it is missing, try another region or
+[`gco capacity recommend-region`](#gco-capacity-recommend-region).
 
 ```bash
-gco capacity instance-info INSTANCE_TYPE
+gco capacity instance-info INSTANCE_TYPE [OPTIONS]
 ```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--region` | `-r` | Region to describe the type in (default: the configured default region) |
 
 **Example:**
 
 ```bash
 gco capacity instance-info g5.xlarge
 gco capacity instance-info p5.48xlarge
+gco capacity instance-info trn2.48xlarge --region us-east-1
+
+# Machine-readable, for a specific field
+gco -o json capacity instance-info p5.48xlarge | jq '.gpu_devices'
+gco -o json capacity instance-info p5.48xlarge | jq '{efa: .efa_supported, gpus: .gpu_count}'
 ```
 
 #### `gco capacity spot-prices`
@@ -3211,11 +3352,12 @@ Bucket names are resolved from the SSM parameters and CloudFormation metadata
 published by the deployed stacks; GCO does not guess or reconstruct them.
 
 <details>
-<summary>All <code>gco storage</code> commands (2) — click to expand</summary>
+<summary>All <code>gco storage</code> commands (3) — click to expand</summary>
 
 | Command | Description |
 | --- | --- |
 | [`gco storage list`](#gco-storage-list) | List deployed user-facing buckets and their stable aliases. |
+| [`gco storage s3-inventory`](#gco-storage-s3-inventory) | Describe every S3 bucket the deployment creates, with owning stack, purpose, pod access, and removal policy. |
 | [`gco storage sync`](#gco-storage-sync) | Incrementally download from or upload to a bucket or prefix. |
 
 </details>
@@ -3253,6 +3395,58 @@ gco storage list [OPTIONS]
 gco storage list
 gco storage list --region us-east-1
 gco --output json storage list
+```
+
+#### `gco storage s3-inventory`
+
+Describe **every** S3 bucket the deployment creates, as a JSON document. Broader
+than [`gco storage list`](#gco-storage-list), which reports only the four
+user-facing buckets addressable by [`gco storage sync`](#gco-storage-sync).
+
+Covers the always-on central [`Cluster_Shared_Bucket`](CLUSTER_SHARED_BUCKET.md)
+and per-region [`Regional_Shared_Bucket`](REGIONAL_SHARED_BUCKET.md), the model
+weights bucket, the cost report bucket, the optional analytics Studio bucket, and
+every server-access-log sink.
+
+Each entry carries the deployment-contract facts, not just the name:
+
+| Field | Meaning |
+|-------|---------|
+| `id`, `role`, `scope` | Stable identifier; `primary` vs `access-logs`; `global` / `regional` / `monitoring` / `analytics` |
+| `owning_stack`, `region` | Which stack creates it, and where |
+| `bucket`, `arn`, `s3_uri` | Physical identity, resolved from SSM or CloudFormation — never reconstructed |
+| `status`, `detail` | `deployed` or `not-deployed`, with the reason |
+| `purpose`, `reserved_prefixes` | What it is for, and which object-key prefixes the platform already owns |
+| `pod_access`, `discovery` | `read-write` / `read-only` / `none` for the job-pod role, and the ConfigMap key or SSM path a pod resolves it through |
+| `removal_policy` | What teardown does to it |
+| `sync_alias`, `opt_in` | The alias `storage sync` accepts, and the `cdk.json` toggle if it is optional |
+
+`summary.pod_writable` is the short answer to "where can a job write?".
+
+Buckets whose stack is not deployed are **included** with
+`status: "not-deployed"` rather than omitted, so the inventory is complete even
+before a region is rolled out.
+
+```bash
+gco storage s3-inventory [OPTIONS]
+```
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--region` | `-r` | Limit regional entries to one region; global, monitoring, and analytics entries are always included |
+
+```bash
+gco -o json storage s3-inventory
+gco -o json storage s3-inventory --region us-east-1
+
+# Where can a job write?
+gco -o json storage s3-inventory | jq '.summary.pod_writable'
+
+# Full records for the pod-writable buckets
+gco -o json storage s3-inventory | jq '.buckets[] | select(.pod_access=="read-write")'
+
+# What is not deployed yet, and why
+gco -o json storage s3-inventory | jq '.buckets[] | select(.status=="not-deployed") | {id, detail}'
 ```
 
 #### `gco storage sync`

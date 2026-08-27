@@ -188,12 +188,14 @@ from tools.inference import (  # noqa: E402, F401
     update_inference_image,
 )
 from tools.jobs import (  # noqa: E402, F401
+    check_job_policy,
     cluster_health,
     get_job,
     get_job_events,
     get_job_logs,
     get_job_metrics,
     get_job_pods,
+    get_job_validation_policy,
     get_pod_logs,
     list_jobs,
     queue_status,
@@ -246,6 +248,7 @@ from tools.storage import (  # noqa: E402, F401
     list_file_systems,
     list_storage_buckets,
     list_storage_contents,
+    s3_inventory,
 )
 from tools.tasks import task_status, task_tail  # noqa: E402, F401
 from tools.templates import (  # noqa: E402, F401
@@ -625,6 +628,7 @@ _PUBLIC_EXPORTS = [
     "capacity_status",
     "chat_inference",
     "check_capacity",
+    "check_job_policy",
     "cluster_health",
     "cluster_tunnel_command",
     "config_get",
@@ -682,6 +686,7 @@ _PUBLIC_EXPORTS = [
     "get_job_logs",
     "get_job_metrics",
     "get_job_pods",
+    "get_job_validation_policy",
     "get_model_uri",
     "get_pod_logs",
     "get_project_version",
@@ -759,6 +764,7 @@ _PUBLIC_EXPORTS = [
     "reserve_capacity",
     "retry_job",
     "rollback_canary",
+    "s3_inventory",
     "scale_inference",
     "set_capacity_advisor_default_model",
     "set_claude_code_default_model",

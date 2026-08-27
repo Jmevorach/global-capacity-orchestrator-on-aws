@@ -247,6 +247,77 @@ def cluster_health(region: str | None = None) -> str:
 
 @mcp.tool(tags={"safe", "jobs"})
 @audit_logged
+def get_job_validation_policy(region: str) -> str:
+    """Get the job validation policy a region actually enforces, as deployed.
+
+    Use this before submitting to check whether a manifest will be admitted,
+    rather than paying to provision a region and discovering the conflict at
+    submit time. Returns the per-manifest cpu/memory/gpu caps,
+    allowed_namespaces, allowed_kinds, trusted_registries, the pod-security
+    block_* flags, and the namespace's live ResourceQuota / LimitRange
+    ceilings.
+
+    This reads the deployed cluster, not a local cdk.json. The two diverge
+    whenever a stack was deployed from a different checkout, and CDK augments
+    trusted_registries with the project's own ECR hostnames at synth time, so
+    the effective allowlist is strictly larger than the configured one.
+
+    A manifest must clear all three layers: the front-door policy, the
+    per-container LimitRange, and the aggregate ResourceQuota.
+
+    Args:
+        region: AWS region (e.g. us-east-1).
+    """
+    return cli_runner._run_cli("jobs", "policy", "-r", region)
+
+
+@mcp.tool(tags={"safe", "jobs"})
+@audit_logged
+def check_job_policy(
+    manifest_path: str,
+    regions: list[str] | None = None,
+    namespace: str | None = None,
+    offline: bool = False,
+) -> str:
+    """Check which regions would admit a manifest, and whether regions agree.
+
+    Answers two questions get_job_validation_policy leaves to the caller.
+
+    Which regions would take this job: the same manifest is evaluated against
+    each region's deployed policy using the code the manifest processor runs,
+    so a job that is admissible in one region and over-cap in another is
+    reported as such instead of being discovered by submitting.
+
+    Whether the regions still agree: there are no per-region policy overrides,
+    so any field that differs across regions means a region was deployed from a
+    different checkout of cdk.json. That is invisible until a manifest that
+    worked yesterday is refused. trusted_registries is compared with ECR
+    hostnames stripped, since CDK adds those per deployment.
+
+    Advisory. The cluster is the authoritative gate and this reads a snapshot
+    of its policy, so a reject here is a strong signal, not a verdict.
+
+    Args:
+        manifest_path: Path to a manifest file or a directory of them.
+        regions: Regions to check. Omit for every configured region.
+        namespace: Namespace to assume for manifests that don't declare one.
+        offline: Read cdk.json instead of calling AWS. Needs no credentials,
+            but reports the CONFIGURED policy rather than the deployed one, and
+            a deployed region trusts ECR registries cdk.json never mentions --
+            so an image rejection may be a false positive.
+    """
+    args = ["jobs", "check-policy", manifest_path]
+    for region in regions or []:
+        args += ["-r", region]
+    if namespace:
+        args += ["-n", namespace]
+    if offline:
+        args.append("--offline")
+    return cli_runner._run_cli(*args)
+
+
+@mcp.tool(tags={"safe", "jobs"})
+@audit_logged
 def queue_status(region: str | None = None) -> str:
     """View SQS queue status (pending, in-flight, DLQ counts).
 

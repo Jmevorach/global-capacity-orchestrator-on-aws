@@ -313,6 +313,18 @@ strict_equality = true
 extra_checks = true
 warn_redundant_casts = true
 warn_unused_ignores = true
+# gco_mcp ships as a PEP 420 namespace package whose modules import each other
+# bare off sys.path (`from server import mcp`, `from mission.state import ...`),
+# so `mission`, `server`, and `cli_runner` are top-level modules that only
+# resolve when gco_mcp/ is on the search path. Without this, the result of a
+# mypy run depends on which paths you pass it: CI's
+# `mypy gco/ cli/ gco_mcp/ scripts/` resolves them to real types and is clean,
+# while a narrower `mypy cli/` leaves them Any and reports four *spurious*
+# unused-ignore/no-any-return errors in cli/commands/swarm_cmd.py — whose
+# `type: ignore[arg-type]` comments are in fact required. Pinning the path here
+# makes every invocation agree with CI, so nobody "fixes" a real suppression
+# and breaks the build.
+mypy_path = "gco_mcp"
 # Ignore missing imports from untyped third-party libraries (boto3, kubernetes,
 # aws_cdk, etc. don't ship type stubs we can rely on). This is NOT a license
 # to skip annotating our own code — it only suppresses errors from imports.
@@ -342,6 +354,16 @@ warn_unused_ignores = false
 
 # Tests can use looser rules — the test runner resolves fixtures at runtime so
 # `disallow_untyped_defs` creates too much noise for little real-world benefit.
+#
+# This override IS live, despite appearances. No mypy job passes tests/ on the
+# command line, so a narrow run like `mypy cli/` reports it as an unused section
+# — but lint:mypy:strict reaches test modules by following imports out of the
+# packages it does check, and without this it fails on them (e.g.
+# tests/test_nag_compliance.py under disallow_untyped_decorators). Do not delete
+# it on the strength of that note: confirm against the real CI command,
+# `mypy gco/ cli/ gco_mcp/ scripts/ --exclude 'gco/stacks/'`, which does not
+# report the section as unused. Typechecking tests/ wholesale is a separate
+# project — it currently reports ~3.3k errors across 229 modules.
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
