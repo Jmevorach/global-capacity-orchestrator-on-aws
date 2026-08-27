@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..checks.alb_tls import _alb_https_target_evidence
 from ..checks.topology import (
-    _alb_https_target_evidence,
     _bounded_topology_evidence,
     _converge_region_addons,
     _health_stability_samples,

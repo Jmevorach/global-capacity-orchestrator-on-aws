@@ -1519,9 +1519,20 @@ jobs:
           exit 1
       - name: Wait for inference proxy TLS rollout
         # HPA resource metrics do not exist until kubelet has started the
-        # containers. Require the TLS sidecar and loopback application to pass
-        # their independent startup/readiness probes before polling HPA state.
-        run: kubectl -n gco-system rollout status deployment/inference-proxy --timeout=3m
+        # containers. The prior gate already proved every other deployment
+        # created pods; scale those non-target fixtures down to release the
+        # single Kind node's CPU for all three HPA-owned inference replicas.
+        # Then require the TLS sidecar and loopback application to pass their
+        # independent startup/readiness probes before polling HPA state.
+        run: |
+          set -euo pipefail
+          kubectl -n gco-system scale \
+            deployment/health-monitor \
+            deployment/manifest-processor \
+            deployment/inference-monitor \
+            deployment/cost-monitor \
+            --replicas=0
+          kubectl -n gco-system rollout status deployment/inference-proxy --timeout=3m
       - name: Verify inference proxy HPA is actively computing replicas
         # Admission/readback alone does not prove autoscaling works. Wait for
         # Metrics Server samples and require the controller's ScalingActive
