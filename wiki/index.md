@@ -55,9 +55,10 @@ GPU capacity question in an AI-powered IDE.*
   NodePools (GPU x86/ARM, inference, EFA, Neuron, CPU).
 - **Multi-region inference endpoint management** (vLLM, TGI, Triton,
   TorchServe, SGLang) with rolling updates, scaling, and canary deployments.
-- **An agent-first front door**: `gco autopilot` turns a terminal into a
-  configured Claude Code session on Amazon Bedrock, grounded by the project's
-  own MCP server — see
+- **An agent-first front door**: `gco autopilot` launches Claude Code by
+  default, while `gco autopilot --engine codex` launches OpenAI Codex. Both
+  run on Amazon Bedrock, grounded by the project's own MCP server and
+  recommended companion MCPs—see
   [docs/AUTOPILOT.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/AUTOPILOT.md).
 
 ## Guided by ordered tenets

@@ -166,6 +166,21 @@ def _build_rules(owner: str, repo: str) -> tuple[Rule, ...]:
             why="GitHub Pages URL",
         ),
         Rule(
+            name="oidc-immutable-subject-prefix",
+            pattern=re.compile(rf"repo:{up_owner}@[1-9]\d*/{up_repo}@[1-9]\d*"),
+            replacement="REPLACE_WITH_GITHUB_OIDC_SUBJECT_PREFIX",
+            why=(
+                "immutable GitHub OIDC repository subject; target owner/repository "
+                "IDs must be resolved from GitHub before deployment"
+            ),
+        ),
+        Rule(
+            name="github-api-repo-path",
+            pattern=re.compile(rf"repos/{up_owner}/{up_repo}(?=/|$)"),
+            replacement=f"repos/{owner}/{repo}",
+            why="GitHub REST API repository path",
+        ),
+        Rule(
             name="repo-url",
             pattern=re.compile(rf"github\.com/{up_owner}/{up_repo}"),
             replacement=f"github.com/{owner}/{repo}",
@@ -377,10 +392,12 @@ def _detect_follow_ups() -> list[tuple[str, str]]:
         follow_ups.append(
             (
                 ".github/oidc_provider/",
-                "The github_repo context value is the OIDC trust-policy subject. This "
-                "script updates the string, but the change only takes effect once you "
-                "redeploy the OIDC stack in your AWS account — until then your workflows "
-                "cannot assume the deploy role.",
+                "The github_repo context value and github_subject_prefix define the OIDC "
+                "trust-policy subject. This script updates github_repo and replaces an "
+                "upstream immutable prefix with an explicit placeholder. Query your fork's "
+                "prefix with `gh api repos/OWNER/REPO/actions/oidc/customization/sub "
+                "--jq .sub_claim_prefix`, set it in cdk.json, then redeploy the OIDC stack. "
+                "Until then your workflows cannot assume the role.",
             )
         )
 

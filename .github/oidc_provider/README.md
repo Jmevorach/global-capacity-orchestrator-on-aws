@@ -28,7 +28,7 @@ This stack is **standalone** — it does not depend on or affect the main GCO in
 ## What Gets Created
 
 1. **IAM OIDC Identity Provider** — trusts `token.actions.githubusercontent.com` (the GitHub OIDC issuer). Skipped if one already exists in the account.
-2. **IAM Role** — assumable only by GitHub Actions workflows from your repository. The trust policy restricts access to a specific GitHub org/repo.
+2. **IAM Role** — assumable only by GitHub Actions workflows from your repository. The trust policy restricts access to a specific GitHub repository subject prefix and branch; repositories created or transferred after July 15, 2026 use immutable owner and repository IDs in that prefix.
 3. **IAM Policy** — attached to the role. By default grants only the read APIs used by the monthly dependency scan: [Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html) model/profile discovery, [EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/concepts.html) Region and accelerator-catalog discovery, [EKS](https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html) add-on and cluster-version discovery, EMR release labels, RDS engine versions, and [STS](https://docs.aws.amazon.com/STS/latest/APIReference/) caller identity. You can expand this for your own needs.
 
 ## Prerequisites
@@ -47,12 +47,26 @@ cd .github/oidc_provider
 # Install dependencies
 pip install -e "../../[cdk]"
 
+# Verify GitHub's current repository subject prefix matches cdk.json.
+# Repositories created or transferred after July 15, 2026 include immutable IDs.
+gh api \
+  repos/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/oidc/customization/sub \
+  --jq .sub_claim_prefix
+
 # Deploy (uses your default AWS credentials and region)
 cdk deploy GCOGitHubOIDCStack
 
 # Note the role ARN from the stack output
 # Add it as a GitHub Actions secret: GCO_CI_ROLE_ARN
 ```
+
+The checked-in upstream `github_subject_prefix` is
+`repo:aws-solutions-library-samples@109766924/global-capacity-orchestrator-on-aws@1219314144`.
+GitHub moved this repository to the immutable format when it was transferred
+after July 15, 2026. The role trust must match the API-reported prefix exactly;
+a name-only trust policy fails with `sts:AssumeRoleWithWebIdentity` even when
+`GCO_CI_ROLE_ARN` is correct. See GitHub's
+[immutable subject claims](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims).
 
 ## Customizing the IAM Policy
 
@@ -101,18 +115,32 @@ Common additions:
 
 The trust policy restricts which GitHub repository can assume the role. By default it's set to `aws-solutions-library-samples/global-capacity-orchestrator-on-aws`.
 
-To use with your fork, edit `cdk.json`:
+To use with your fork, query the exact subject prefix GitHub issues for it:
+
+```bash
+gh api repos/your-org/your-repo/actions/oidc/customization/sub \
+  --jq .sub_claim_prefix
+```
+
+Then edit `cdk.json` with both the human-readable repository and that exact
+prefix:
 
 ```json
 {
   "context": {
     "github_repo": "your-org/your-repo",
+    "github_subject_prefix": "repo:your-org@OWNER_ID/your-repo@REPO_ID",
     "github_branch": "main"
   }
 }
 ```
 
-Then redeploy from `.github/oidc_provider`: `cdk deploy GCOGitHubOIDCStack`
+Older repositories can still report `repo:your-org/your-repo`; use exactly what
+the API returns. Repositories created or transferred after July 15, 2026 report
+the immutable `name@ID` form. The stack validates that the names in an immutable
+prefix match `github_repo`, and refuses unresolved migration placeholders.
+
+Then redeploy from `.github/oidc_provider`: `cdk deploy GCOGitHubOIDCStack`.
 
 The default `github_branch` value is `"main"`, matching this upstream
 repository. The dependency workflow itself runs only on
@@ -145,7 +173,7 @@ steps:
 | `app.py` | CDK app entry point — instantiates the OIDC stack |
 | `stack.py` | CDK stack definition — OIDC provider, IAM role, IAM policy |
 | `policy.json` | IAM policy document attached to the role (edit this to change permissions) |
-| `cdk.json` | CDK configuration — edit `github_repo` and `github_branch` here |
+| `cdk.json` | CDK configuration — edit `github_repo`, `github_subject_prefix`, and `github_branch` here |
 | `README.md` | This file |
 
 ## Testing
@@ -161,6 +189,8 @@ The tests verify:
 - Stack synthesizes without errors
 - OIDC provider is created with the correct issuer URL
 - IAM role trust policy restricts to the correct GitHub repo
+- Mutable and immutable GitHub subject prefixes synthesize correctly
+- Immutable prefixes must carry numeric IDs and names matching `github_repo`
 - IAM policy contains the complete read-only dependency-scan action set, including EC2 catalog discovery
 - Branch restriction works when specified
 - Custom repo names are reflected in the trust policy

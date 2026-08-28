@@ -69,7 +69,8 @@ touched. In a clean checkout the tool finds about 155 references across roughly
 | SSH clone URLs | `git@github.com:aws-solutions-library-samples/...` | The clone commands in `README.md` and `QUICKSTART.md` |
 | GitHub Pages URL | `aws-solutions-library-samples.github.io/global-capacity-orchestrator-on-aws` | The published site: orientation wiki at the root, coverage report at `/coverage/`, badge JSON at `/coverage-badge.json` (in `mkdocs.yml`, `wiki/*.md`, the README badge, and the wiki guard test) |
 | Percent-encoded Pages URL | `aws-solutions-library-samples.github.io%2Fglobal-capacity...` | The shields.io coverage badge embeds the Pages URL as a query parameter. Missing this leaves the badge reporting upstream's coverage while every other badge reports yours |
-| Bare `owner/repo` slug | `"github_repo": "aws-solutions-library-samples/global-capacity-orchestrator-on-aws"` | The **OIDC trust-policy subject**. Until this changes, your workflows cannot assume the deploy role |
+| Bare `owner/repo` slug | `"github_repo": "aws-solutions-library-samples/global-capacity-orchestrator-on-aws"` | Human-readable repository identity used to validate the OIDC subject prefix |
+| Immutable OIDC subject | `repo:aws-solutions-library-samples@109766924/global-capacity-orchestrator-on-aws@1219314144` | Stable GitHub owner/repository IDs in the role trust. The migration replaces this with a fail-closed placeholder because it cannot infer your fork's IDs offline |
 | Bare repository name | `cd global-capacity-orchestrator-on-aws`, `/path/to/global-capacity-orchestrator-on-aws` | Clone directory names and the MCP server setup paths |
 
 ## What the Tool Preserves, and Why
@@ -117,17 +118,29 @@ out-of-repository actions, not string substitutions.
 
 ### Redeploy the OIDC provider stack
 
-The most important one. `scripts/migrate_fork.py` updates the `github_repo`
-context value in `.github/oidc_provider/cdk.json`, but the deployed IAM role
-still trusts the old subject until you redeploy it in your AWS account:
+The most important one. `scripts/migrate_fork.py` updates `github_repo` in
+`.github/oidc_provider/cdk.json` and replaces the upstream immutable
+`github_subject_prefix` with a fail-closed placeholder. Resolve your fork's
+exact prefix before deployment:
+
+```bash
+gh api repos/myorg/my-gco/actions/oidc/customization/sub \
+  --jq .sub_claim_prefix
+```
+
+Put that value in `github_subject_prefix`, then redeploy the stack in your AWS
+account:
 
 ```bash
 cd .github/oidc_provider
-cdk deploy --context github_repo=myorg/my-gco
+cdk deploy GCOGitHubOIDCStack
 ```
 
-Until then, workflows fail at the credential step with an STS error rather than
-anything that mentions forking. See
+Repositories created or transferred after July 15, 2026 use the immutable
+`repo:owner@OWNER_ID/repo@REPO_ID` format. Older repositories can still return
+`repo:owner/repo`; use the API value exactly. Until the checked-in prefix and
+deployed role match, workflows fail at the credential step with
+`sts:AssumeRoleWithWebIdentity` rather than anything that mentions forking. See
 [`.github/oidc_provider/README.md`](../.github/oidc_provider/README.md).
 
 ### Enable GitHub Pages

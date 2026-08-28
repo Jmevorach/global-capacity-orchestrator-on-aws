@@ -14,6 +14,7 @@ An MCP (Model Context Protocol) server that exposes the Global Capacity Orchestr
   - [Kiro](#kiro)
   - [Claude Desktop](#claude-desktop)
   - [Claude Code](#claude-code)
+  - [OpenAI Codex](#openai-codex)
   - [Cursor](#cursor)
   - [Other MCP Clients](#other-mcp-clients)
 - [Feature Flags](#feature-flags)
@@ -333,7 +334,7 @@ Replace `/path/to/global-capacity-orchestrator-on-aws` with the absolute path to
 
 ### Claude Code
 
-> **Shortcut: `gco autopilot`.** If you have the [GCO CLI](../docs/CLI.md) installed, one command launches a Claude Code session with this MCP server *and* every [recommended companion server](#recommended-companion-mcp-servers) below already wired up, on an Amazon Bedrock backend defaulting to GCO's Claude Code model default. See [docs/AUTOPILOT.md](../docs/AUTOPILOT.md). The manual steps below remain the right path for adding the GCO server to an existing Claude Code setup.
+> **Shortcut: `gco autopilot`.** If you have the [GCO CLI](../docs/CLI.md) installed, `gco autopilot` launches Claude Code by default and `gco autopilot --engine codex` launches OpenAI Codex. Both run on Amazon Bedrock with this GCO MCP server and every [recommended companion server](#recommended-companion-mcp-servers) below already wired up. See [docs/AUTOPILOT.md](../docs/AUTOPILOT.md). The manual steps below remain the right path for adding GCO to an existing Claude Code setup.
 
 [Claude Code](https://code.claude.com/docs/en/mcp) registers stdio servers with the `claude mcp add` CLI. The recommended `uvx` form needs no clone — everything after `--` is the launch command:
 
@@ -370,6 +371,28 @@ Pass `--scope project` to write a shareable `.mcp.json` at the project root (che
 ```
 
 Any release `>= v3.2.0` works — bump the `@v3.2.0` tag as needed. For a local clone (development), swap the launch command for `python3 /absolute/path/to/global-capacity-orchestrator-on-aws/gco_mcp/run_mcp.py`.
+
+### OpenAI Codex
+
+> **Shortcut: `gco autopilot --engine codex`.** This is the recommended path: Autopilot selects the reviewed Amazon Bedrock provider/model/reasoning settings, generates an isolated `CODEX_HOME`, and wires in this GCO MCP server plus the [recommended companions](#recommended-companion-mcp-servers). See [docs/AUTOPILOT.md](../docs/AUTOPILOT.md).
+
+To add only the GCO server to an existing Codex setup instead, add this table to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.gco]
+command = "uvx"
+args = [
+  "--python",
+  "3.14",
+  "--from",
+  "git+https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git@v3.2.0",
+  "gco-mcp",
+]
+enabled = true
+startup_timeout_sec = 60.0
+```
+
+That table configures the MCP server only; it does not select Codex's model provider, Bedrock profile, reasoning effort, or isolation policy. Use `gco autopilot --engine codex` for the complete reviewed session configuration. Any release `>= v3.2.0` works—bump the tag as newer releases ship. For a local clone, replace `command`/`args` with the interpreter and absolute `gco_mcp/run_mcp.py` path used by the other clone-based examples above.
 
 ### Cursor
 

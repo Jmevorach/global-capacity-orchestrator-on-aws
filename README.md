@@ -45,11 +45,20 @@
 </details>
 
 <details>
-<summary>🤖 Autopilot recording — one command to a working Claude Code setup, the easiest way to start</summary>
+<summary>🤖 Claude Code Autopilot recording — the default engine, ready in one command</summary>
 
-![GCO Autopilot — one command to a fully configured Claude Code session on Amazon Bedrock, grounded by the GCO MCP server](demo/autopilot-claude-code.gif)
+![GCO Autopilot with Claude Code](demo/autopilot-claude-code.gif)
 
-*A real session: `gco autopilot` launches [Claude Code](https://code.claude.com/docs/en/overview) on [Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html) (GCO's default Claude Opus 5 profile) with the [GCO MCP server](gco_mcp/README.md) + [companion MCPs](gco_mcp/README.md#recommended-companion-mcp-servers) wired in, and it answers from the project's own MCP tools ([docs](docs/AUTOPILOT.md) · [re-record](demo/record_autopilot.sh))*
+*A real session: `gco autopilot` launches [Claude Code](https://code.claude.com/docs/en/overview) on [Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html) (GCO's default Claude Opus 5 profile) with the [GCO MCP server](gco_mcp/README.md) + [companion MCPs](gco_mcp/README.md#recommended-companion-mcp-servers) wired in, and it answers from the project's own MCP tools ([docs](docs/AUTOPILOT.md) · [re-record](demo/record_autopilot.sh)).*
+
+</details>
+
+<details>
+<summary>🤖 OpenAI Codex Autopilot recording — the same GCO context with the Codex engine</summary>
+
+![GCO Autopilot with OpenAI Codex](demo/autopilot-codex.gif)
+
+*A real Bedrock-backed `gco autopilot --engine codex --no-companions` session using a least-privilege recording profile: required GCO MCP, only `find_docs`/`read_resource`, no built-in shell, and no trust or approval prompts. A normal `gco autopilot --engine codex` launch includes the recommended companions ([docs](docs/AUTOPILOT.md) · [re-record](demo/record_autopilot.sh) with `DEMO_ENGINE=codex DEMO_MODE=live`).*
 
 </details>
 
@@ -75,14 +84,15 @@ resources configured for retention, and unexpected resources can remain. See
 [`gco stacks destroy-all`](docs/CLI.md#gco-stacks-destroy-all) for the exact
 cleanup scope.
 
-**The easiest way to get started — let an agent drive.** With git and a container runtime installed, the whole journey from nothing to the agent session in the 🤖 recording above is:
+**The easiest way to get started — let an agent drive.** With git and a container runtime installed, the whole journey from nothing to either agent session in the 🤖 recordings above is:
 
 ```bash
 git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws
 ./scripts/setup-dev-alias.sh   # builds the dev container + installs the `gco` shell function
 source ~/.zshrc                # or ~/.bashrc — the script prints which file it updated
-gco autopilot                  # offers the selected pinned agent CLI, then launches
+gco autopilot                  # default Claude Code session
+gco autopilot --engine codex   # or an OpenAI Codex session
 ```
 
 `gco autopilot` turns your terminal into a fully configured agent session for GCO: [Claude Code](https://code.claude.com/docs/en/overview) by default, or OpenAI Codex with `--engine codex`. Both engines use an [Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html) backend with your AWS credentials, per-engine reviewed model defaults, the [GCO MCP server](gco_mcp/README.md), and every [recommended companion MCP server](gco_mcp/README.md#recommended-companion-mcp-servers) already wired in. Then just ask for what you want — *"deploy everything"*, *"where is p5 capacity cheapest right now?"*, *"submit examples/simple-job.yaml to the region with the most capacity"*. Sessions resume where you left off (`--continue`/`--resume`), the GCO MCP server's opt-in tool groups are one flag away (`-e mission`, `-e all-tools`), your own skills come along for either engine (Claude also supports `--agents`/`--plugin`), and `--dry-run` previews the whole plan first. See [docs/AUTOPILOT.md](docs/AUTOPILOT.md).
@@ -378,7 +388,7 @@ Flowcharts of Lambda handlers, CLI commands, stack constructors, and MCP control
 | [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) | Cost tracking by service, region, and workload via the `gco costs` commands |
 | [Amazon Athena](https://aws.amazon.com/athena/) | Cross-region cost analytics — a KMS-enforced workgroup queried by `gco costs k8s` |
 | [AWS Glue](https://aws.amazon.com/glue/) | Data Catalog database and table (partition projection) over the Parquet cost reports — no crawlers or scheduled repair jobs |
-| [Amazon Bedrock](https://aws.amazon.com/bedrock/) | Optional AI capacity advisor (`gco capacity ai-recommend` / `predict`) and Mission strategy sampling |
+| [Amazon Bedrock](https://aws.amazon.com/bedrock/) | Dual-engine Autopilot (`gco autopilot` for Claude Code or `--engine codex` for OpenAI Codex), the optional AI capacity advisor (`gco capacity ai-recommend` / `predict`), and Mission strategy sampling |
 
 ## Sample Cost Table
 
@@ -469,6 +479,7 @@ GPU instance availability varies by region. Use `gco capacity check -i <instance
 
 ### Operations
 
+- **[Dual-engine Autopilot](docs/AUTOPILOT.md)**: launch Claude Code by default with `gco autopilot`, or OpenAI Codex with `gco autopilot --engine codex`; both use Amazon Bedrock with the GCO MCP server and recommended companion MCPs preconfigured
 - **Cost visibility**: Track spend by service, region, and workload via [Cost Explorer](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html) integration
 - **Cost monitoring & analytics** (on by default): per-cluster [OpenCost](https://opencost.io/) with a [Grafana](https://grafana.com/docs/grafana/latest/) cost dashboard, scheduled [Parquet](https://parquet.apache.org/docs/) cost reports to a central S3 bucket, and cross-region [Athena](https://docs.aws.amazon.com/athena/latest/ug/what-is.html) analytics via `gco costs k8s` — see [Cost Monitoring Guide](docs/COST_MONITORING.md)
 - **Spot price-aware scheduling**: central-queue jobs can set a max spot price per instance type and dispatch only when the market clears it
@@ -505,6 +516,7 @@ embedded.
 | Understand what GCO does | [Core Concepts](docs/CONCEPTS.md) |
 | Follow a guided learning path (new to GCO or Kubernetes) | [Learning Path](docs/LEARNING_PATH.md) |
 | Get running in under 60 minutes | [Quick Start Guide](QUICKSTART.md) |
+| Let Claude Code or OpenAI Codex drive GCO from your terminal | [Autopilot Guide](docs/AUTOPILOT.md) |
 | Learn the architecture | [Architecture Details](docs/ARCHITECTURE.md) |
 | Browse every guide in one place | [Documentation Index](docs/README.md) |
 
