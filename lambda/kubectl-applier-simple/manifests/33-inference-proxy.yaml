@@ -176,8 +176,10 @@ spec:
               value: "900"
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              # Reserve enough CPU and memory that utilization-based scaling is
+              # driven by TLS throughput rather than the Python runtime baseline.
+              cpu: 100m
+              memory: 128Mi
             limits:
               cpu: 250m
               memory: 256Mi
@@ -267,8 +269,8 @@ spec:
           value: 1
           periodSeconds: 60
   metrics:
-    # Scale on the application container only. The TLS sidecar has independent
-    # resource requests and must not shift the established utilization targets.
+    # ContainerResource signals are evaluated independently and the largest
+    # desired replica count wins, so TLS pressure cannot mask application load.
     - type: ContainerResource
       containerResource:
         name: cpu
@@ -283,6 +285,16 @@ spec:
         target:
           type: Utilization
           averageUtilization: 80
+    # TLS CPU tracks distributable encrypted throughput. Avoid proxy-memory
+    # scaling: established streams stay on their original pod and Python may
+    # retain RSS, so adding replicas might not reduce average memory usage.
+    - type: ContainerResource
+      containerResource:
+        name: cpu
+        container: api-tls-proxy
+        target:
+          type: Utilization
+          averageUtilization: 70
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

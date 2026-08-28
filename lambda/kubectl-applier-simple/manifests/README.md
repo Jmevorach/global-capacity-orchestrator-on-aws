@@ -98,7 +98,7 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 | `30-health-monitor.yaml` | `Deployment` + `PodDisruptionBudget` + TLS-only `Service`; the application binds pod loopback and a same-image sidecar hot-reloads the cert-manager leaf on port 8443 |
 | `31-manifest-processor.yaml` | `Deployment` + `PodDisruptionBudget` + TLS-only `Service`; the application binds pod loopback and a same-image sidecar hot-reloads the cert-manager leaf on port 8443 |
 | `32-inference-monitor.yaml` | `Deployment` + `PodDisruptionBudget` |
-| `33-inference-proxy.yaml` | Dedicated inference `Deployment` with a hot-reloading TLS proxy sidecar (three replicas on create; HPA owns updates) + CPU/memory `HorizontalPodAutoscaler` + two-pod `PodDisruptionBudget` + 15-minute stream-drain lifecycle + TLS-only `Service` |
+| `33-inference-proxy.yaml` | Dedicated inference `Deployment` with a hot-reloading TLS proxy sidecar (three replicas on create; HPA owns updates) + per-container application CPU/memory and TLS CPU `HorizontalPodAutoscaler` signals + two-pod `PodDisruptionBudget` + 15-minute stream-drain lifecycle + TLS-only `Service` |
 | `34-cost-monitor.yaml` | Cost monitor `ServiceAccount` + single-replica `Recreate` `Deployment` + `Service` + three `NetworkPolicy` rules (manifest-processor ingress/egress, [OpenCost](https://opencost.io/) egress) — **skipped and pruned when cost monitoring is disabled** |
 
 ### NodePools (40–49)

@@ -208,6 +208,21 @@ def test_api_workload_uses_tls_only_sidecar_probe_and_service(
 
     assert tls_proxy["command"] == ["python", "-m", "gco.services.tls_proxy"]
     assert tls_proxy["ports"] == [{"name": "https", "containerPort": 8443, "protocol": "TCP"}]
+    expected_proxy_resources = {
+        "health-monitor": {
+            "requests": {"cpu": "25m", "memory": "32Mi"},
+            "limits": {"cpu": "100m", "memory": "128Mi"},
+        },
+        "manifest-processor": {
+            "requests": {"cpu": "25m", "memory": "32Mi"},
+            "limits": {"cpu": "100m", "memory": "128Mi"},
+        },
+        "inference-proxy": {
+            "requests": {"cpu": "100m", "memory": "128Mi"},
+            "limits": {"cpu": "250m", "memory": "256Mi"},
+        },
+    }
+    assert tls_proxy["resources"] == expected_proxy_resources[app]
     proxy_environment = {item["name"]: item.get("value") for item in tls_proxy["env"]}
     assert proxy_environment[TLS_CERT_FILE_ENV] == "/var/run/gco/tls/tls.crt"
     assert proxy_environment[TLS_KEY_FILE_ENV] == "/var/run/gco/tls/tls.key"

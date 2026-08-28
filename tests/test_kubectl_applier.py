@@ -1891,6 +1891,14 @@ class TestInferenceProxyAutoscalingManifest:
                     "target": {"type": "Utilization", "averageUtilization": 80},
                 },
             },
+            {
+                "type": "ContainerResource",
+                "containerResource": {
+                    "name": "cpu",
+                    "container": "api-tls-proxy",
+                    "target": {"type": "Utilization", "averageUtilization": 70},
+                },
+            },
         ]
         assert hpa["spec"]["behavior"]["scaleDown"] == {
             "stabilizationWindowSeconds": 900,
