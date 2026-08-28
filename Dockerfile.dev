@@ -257,12 +257,12 @@ RUN case "${TARGETARCH}" in \
     && uvx --version
 
 # Runtime npm prefix for tools installed *inside* a running container —
-# most notably the pinned Claude Code release that `gco autopilot` installs
-# on first use. Every image-baked npm global above (npm itself, the CDK CLI)
-# was already installed under /usr/local before this line, so those stay in
-# the image; this prefix only affects `npm install -g` at runtime. The
-# setup-dev-alias.sh `gco` function mounts a named volume here, so the
-# autopilot install survives the `--rm` container lifecycle instead of
+# notably the pinned Claude Code or Codex release that `gco autopilot`
+# installs on first use. Every image-baked npm global above (npm itself, the
+# CDK CLI) was already installed under /usr/local before this line, so those
+# stay in the image; this prefix only affects `npm install -g` at runtime. The
+# setup-dev-alias.sh `gco` function mounts a named volume here, so either
+# Autopilot engine install survives the `--rm` container lifecycle instead of
 # re-downloading on every launch.
 ENV NPM_CONFIG_PREFIX=/root/.npm-global \
     PATH="/root/.npm-global/bin:${PATH}"

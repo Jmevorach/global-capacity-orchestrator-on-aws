@@ -18,7 +18,8 @@
 #   - Bedrock default model ids from cdk.json
 #     context.bedrock.mission_default_model_id (Mission sampling),
 #     context.bedrock.capacity_advisor_default_model_id (capacity advisor),
-#     context.bedrock.claude_code_default_model_id (autopilot),
+#     context.bedrock.claude_code_default_model_id (Claude Autopilot),
+#     context.bedrock.codex_default_model_id (Codex Autopilot),
 #     context.bedrock.embedding_model_id (Mission memory), and
 #     context.vector_store.embedding_model_id (workload RAG corpus), each
 #     compared against the newest same-family release — inference profiles
@@ -30,9 +31,9 @@
 #     AWS CLI v2, Docker CLI, Docker Buildx, uv) and the immutable AWS CLI
 #     runtime image in gco/services/inference_monitor.py — public registries,
 #     no AWS creds needed
-#   - GCO Autopilot pins from cli/autopilot.py: the CLAUDE_CODE_VERSION
-#     install pin vs the npm latest dist-tag, and companion MCP server
-#     liveness (missing/deprecated/yanked on npm or PyPI) — public
+#   - GCO Autopilot pins from cli/autopilot.py: CLAUDE_CODE_VERSION and
+#     CODEX_VERSION install pins vs their npm latest dist-tags, plus companion
+#     MCP server liveness (missing/deprecated/yanked on npm or PyPI) — public
 #     endpoints, no AWS creds needed
 #   - Pre-commit hook revisions in .pre-commit-config.yaml compared
 #     against the latest tag published upstream (GitHub API)
@@ -893,8 +894,9 @@ EMR_COUNT="$(wc -l < "$EMR_RESULTS" 2>/dev/null | tr -d ' ')"
 # context.bedrock.mission_default_model_id (Mission sampling),
 # context.bedrock.capacity_advisor_default_model_id (the capacity
 # advisor), context.bedrock.claude_code_default_model_id (the session
-# model gco autopilot hands to Claude Code), and
-# context.bedrock.embedding_model_id (Mission memory's text-embedding
+# model GCO Autopilot hands to Claude Code),
+# context.bedrock.codex_default_model_id (the session model it hands to Codex),
+# and context.bedrock.embedding_model_id (Mission memory's text-embedding
 # model) — against the newest release in the SAME model family. The three
 # generation keys compare against system-defined inference profiles
 # (aws bedrock list-inference-profiles); the embedding key is a plain
@@ -930,7 +932,7 @@ if ! aws sts get-caller-identity >/dev/null 2>&1; then
   BEDROCK_MODEL_SKIP_REASON="No AWS credentials available (scan needs bedrock:ListInferenceProfiles). Configure OIDC to enable."
   echo "  $BEDROCK_MODEL_SKIP_REASON"
 else
-  for BEDROCK_MODEL_LEAF in mission_default_model_id capacity_advisor_default_model_id claude_code_default_model_id embedding_model_id; do
+  for BEDROCK_MODEL_LEAF in mission_default_model_id capacity_advisor_default_model_id claude_code_default_model_id codex_default_model_id embedding_model_id; do
     CURRENT_BEDROCK_MODEL="$(extract_default_bedrock_model cdk.json "$BEDROCK_MODEL_LEAF")"
     if [ -z "$CURRENT_BEDROCK_MODEL" ]; then
       BEDROCK_MODEL_SKIP_REASON="Could not read context.bedrock.${BEDROCK_MODEL_LEAF} from cdk.json."
@@ -1151,16 +1153,15 @@ DOCKERFILE_COUNT="$(wc -l < "$DOCKERFILE_RESULTS" 2>/dev/null | tr -d ' ')"
 [ -z "$DOCKERFILE_COUNT" ] && DOCKERFILE_COUNT=0
 
 # ---------------------------------------------------------------------------
-# GCO Autopilot pins (Claude Code release + companion MCP servers)
+# GCO Autopilot pins (agent CLI releases + companion MCP servers)
 #
-# ``gco autopilot`` (cli/autopilot.py) carries two dependency surfaces that
+# ``gco autopilot`` (cli/autopilot.py) carries three dependency surfaces that
 # live in Python constants, invisible to Dependabot and to every sweep above:
 #
-#   CLAUDE_CODE_VERSION      the exact @anthropic-ai/claude-code release the
-#                            command installs on first use. Compared against
-#                            the npm ``latest`` dist-tag — the same source and
-#                            compare_semver treatment as the Dockerfile.dev
-#                            npm-installed pins.
+#   CLAUDE_CODE_VERSION      exact @anthropic-ai/claude-code release installed
+#                            by the default engine on first use.
+#   CODEX_VERSION            exact @openai/codex release installed by the Codex
+#                            engine on first use.
 #   COMPANION_MCP_SERVERS    the npx/uvx-launched companion MCP servers wired
 #                            into every autopilot session. Nothing pins them
 #                            (they resolve at launch), so the risk isn't
@@ -1187,33 +1188,48 @@ if [ ! -f "$AUTOPILOT_SOURCE" ]; then
   AUTOPILOT_SKIP_REASON="${AUTOPILOT_SOURCE} not found."
   echo "  $AUTOPILOT_SKIP_REASON"
 else
-  CLAUDE_CODE_PIN="$(extract_claude_code_pin "$AUTOPILOT_SOURCE")"
-  if [ -z "$CLAUDE_CODE_PIN" ]; then
-    AUTOPILOT_SKIP_REASON="CLAUDE_CODE_VERSION not found in ${AUTOPILOT_SOURCE}."
-    echo "  $AUTOPILOT_SKIP_REASON"
-  else
-    CLAUDE_CODE_STATUS="$(get_registry_package_status npm "@anthropic-ai/claude-code")"
-    if [ -z "$CLAUDE_CODE_STATUS" ]; then
-      AUTOPILOT_SKIP_REASON="npm lookup for @anthropic-ai/claude-code failed (network)."
+  check_autopilot_npm_pin() {
+    local constant_name="$1"
+    local package_name="$2"
+    local extractor="$3"
+    local pin="" package_status="" latest="" verdict=""
+    local package_url="https://www.npmjs.com/package/${package_name}"
+
+    pin="$("$extractor" "$AUTOPILOT_SOURCE")"
+    if [ -z "$pin" ]; then
+      AUTOPILOT_SKIP_REASON="${constant_name} not found in ${AUTOPILOT_SOURCE}."
       echo "  $AUTOPILOT_SKIP_REASON"
-    else
-      CLAUDE_CODE_LATEST="${CLAUDE_CODE_STATUS#*|}"
-      case "$CLAUDE_CODE_STATUS" in
-        ok\|*)
-          if [ -n "$CLAUDE_CODE_LATEST" ] \
-             && [ "$(compare_semver "$CLAUDE_CODE_PIN" "$CLAUDE_CODE_LATEST")" = "newer" ]; then
-            echo "  - CLAUDE_CODE_VERSION: ${CLAUDE_CODE_PIN} -> ${CLAUDE_CODE_LATEST}"
-            echo "@anthropic-ai/claude-code (CLAUDE_CODE_VERSION)|${CLAUDE_CODE_PIN}|${CLAUDE_CODE_LATEST}|https://www.npmjs.com/package/@anthropic-ai/claude-code" >> "$AUTOPILOT_RESULTS"
-          fi
-          ;;
-        *)
-          # The install pin itself is deprecated/unpublished — always drift.
-          echo "  - @anthropic-ai/claude-code: ${CLAUDE_CODE_STATUS%%|*}"
-          echo "@anthropic-ai/claude-code (CLAUDE_CODE_VERSION)|${CLAUDE_CODE_PIN}|${CLAUDE_CODE_STATUS%%|*}|https://www.npmjs.com/package/@anthropic-ai/claude-code" >> "$AUTOPILOT_RESULTS"
-          ;;
-      esac
+      return
     fi
-  fi
+
+    package_status="$(get_registry_package_status npm "$package_name")"
+    if [ -z "$package_status" ]; then
+      AUTOPILOT_SKIP_REASON="npm lookup for ${package_name} failed (network)."
+      echo "  $AUTOPILOT_SKIP_REASON"
+      return
+    fi
+
+    latest="${package_status#*|}"
+    case "$package_status" in
+      ok\|*)
+        if [ -n "$latest" ] \
+           && [ "$(compare_semver "$pin" "$latest")" = "newer" ]; then
+          echo "  - ${constant_name}: ${pin} -> ${latest}"
+          echo "${package_name} (${constant_name})|${pin}|${latest}|${package_url}" >> "$AUTOPILOT_RESULTS"
+        fi
+        ;;
+      *)
+        verdict="${package_status%%|*}"
+        echo "  - ${package_name}: ${verdict}"
+        echo "${package_name} (${constant_name})|${pin}|${verdict}|${package_url}" >> "$AUTOPILOT_RESULTS"
+        ;;
+    esac
+  }
+
+  check_autopilot_npm_pin \
+    "CLAUDE_CODE_VERSION" "@anthropic-ai/claude-code" extract_claude_code_pin
+  check_autopilot_npm_pin \
+    "CODEX_VERSION" "@openai/codex" extract_codex_pin
 
   # Companion MCP server liveness. Missing/deprecated/yanked is drift; a
   # network failure marks the scan incomplete rather than inventing findings.
@@ -2321,8 +2337,9 @@ summary_row() {
     echo "## Bedrock Default Model"
     echo ""
     echo "A Bedrock model default configured in \`cdk.json\` is behind a newer"
-    echo "release in the same model family. For \`bedrock.mission_default_model_id\`,"
-    echo "update the value and re-capture the scaffold fixture"
+    echo "release in the same model family. For"
+    echo "\`bedrock.mission_default_model_id\` and \`bedrock.codex_default_model_id\`,"
+    echo "update the value and re-capture the matching scaffold fixture"
     echo "(\`scripts/capture_scaffold_fixtures.py\`). For"
     echo "\`bedrock.capacity_advisor_default_model_id\` and"
     echo "\`bedrock.claude_code_default_model_id\`, updating the value is enough."
@@ -2374,8 +2391,9 @@ summary_row() {
     echo "## GCO Autopilot Pins"
     echo ""
     echo "\`gco autopilot\`'s dependency surfaces in \`cli/autopilot.py\`: the"
-    echo "pinned \`CLAUDE_CODE_VERSION\` it installs (compared against the npm"
-    echo "\`latest\` dist-tag) and the launch-time companion MCP servers"
+    echo "pinned \`CLAUDE_CODE_VERSION\` and \`CODEX_VERSION\` agent CLIs"
+    echo "(each compared against its npm \`latest\` dist-tag) and the launch-time"
+    echo "companion MCP servers"
     echo "(reported when a package is missing, deprecated, or yanked on its"
     echo "registry — an unhealthy companion breaks every new session, so treat"
     echo "it like the removals documented in \`gco_mcp/README.md\`). When"

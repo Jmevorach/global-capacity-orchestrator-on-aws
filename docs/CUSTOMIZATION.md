@@ -1840,31 +1840,38 @@ gco mission start "..." --bedrock-model-id us.meta.llama3-3-70b-instruct-v1:0
 
 The `ai_recommend` MCP tool takes the same override as a `model="..."` argument; omit it to use the default.
 
-**2. Per environment (env vars)** — the first two apply to the Mission
-sampling backend, the third to `gco autopilot`:
+**2. Per environment (env vars)** — the first two apply to Mission; the
+remaining controls select an Autopilot engine/model for one environment:
 
 ```bash
 export GCO_MISSION_BEDROCK_MODEL_ID="us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 export GCO_MISSION_BEDROCK_REGION="eu-west-1"   # default: us-east-1
-export GCO_AUTOPILOT_MODEL="us.anthropic.claude-sonnet-4-6"   # Claude Code sessions
+export GCO_AUTOPILOT_MODEL="us.anthropic.claude-sonnet-4-6"   # shared/Claude model
+export GCO_AUTOPILOT_ENGINE="codex"
+export GCO_AUTOPILOT_CODEX_MODEL="global.openai.gpt-5.6-sol"  # Codex-specific
 ```
 
 **3. Change the defaults for everyone** — edit the canonical values:
 
 | File | Keys |
 |------|------|
-| `cdk.json` | `context.bedrock.mission_default_model_id` (Mission sampling) and `context.bedrock.capacity_advisor_default_model_id` (capacity advisor), sharing `context.bedrock.thinking.effort` |
+| `cdk.json` | `context.bedrock.mission_default_model_id` (Mission sampling) and `context.bedrock.capacity_advisor_default_model_id` (capacity advisor), sharing `context.bedrock.generation_reasoning.effort` |
 | `cdk.json` | `context.bedrock.claude_code_default_model_id` (the model `gco autopilot` hands to Claude Code) |
+| `cdk.json` | `context.bedrock.codex_default_model_id` and `context.bedrock.codex.reasoning_effort` (the reviewed Codex model/effort pair) |
 | `cdk.json` | `context.bedrock.embedding_model_id` (the text-embedding model [mission memory](MISSION.md#mission-memory) uses for its vector index) |
 
 Each consumer has its own key, deliberately independent, so repointing one
-feature never silently repoints another (`gco stacks bedrock
-set-mission-model` / `set-capacity-advisor-model` / `set-claude-code-model`
-edit them safely). Every consumer resolves its key through `gco.bedrock`,
-and the pre-v6 single `default_model_id` key fails validation with rename
-instructions instead of being silently ignored. The same `cdk.json` is
-shipped as package data so installed CLI and MCP entry points retain the
-defaults when they run outside a source checkout.
+feature never silently repoints another. The managed-config commands
+`set-mission-model`, `set-capacity-advisor-model`, and
+`set-claude-code-model` safely edit the three legacy scalar defaults. Codex's
+model and reasoning effort form a reviewed pair and are edited together
+directly in `cdk.json`; `gco.bedrock` validates both when a launch uses the
+canonical Codex default. An explicit model override bypasses the pair and omits
+the canonical effort. The
+pre-v6 single `default_model_id` key fails validation with rename instructions
+instead of being silently ignored. The same `cdk.json` is shipped as package
+data so installed CLI and MCP entry points retain the defaults outside a source
+checkout.
 
 The embedding key carries a **one-way-door coupling**: the mission-memory
 vector index is created with `mission_memory.dimensions` (default 1024,
@@ -1877,7 +1884,7 @@ model therefore means recreating the index and re-embedding stored items
 per-consumer accessors, package-data declaration, inference-profile shape,
 reasoning translation, and captured fixture.
 
-The canonical thinking setting applies only when the selected model id is one
+The canonical generation-reasoning setting applies only when the selected model id is one
 of the configured generation defaults, and it is translated into whichever reasoning dialect
 that model speaks — Claude adaptive `thinking` + `output_config` for Opus 4.6+,
 Sonnet 4.6, and the Mythos/Fable lines, or Nova 2 `reasoningConfig` for Nova 2
@@ -1888,12 +1895,18 @@ and receives no reasoning fields.
 
 Resolution order (Mission sampling): `--bedrock-model-id` flag → `GCO_MISSION_BEDROCK_MODEL_ID` → `cdk.json` `context.bedrock.mission_default_model_id`. Resolution order (capacity advisor): `--model` flag / MCP `model=` → `cdk.json` `context.bedrock.capacity_advisor_default_model_id`.
 
-Resolution order (`gco autopilot`): `--model` / `-m` flag → `GCO_AUTOPILOT_MODEL` → `cdk.json` `context.bedrock.claude_code_default_model_id`. See [Autopilot → Choosing a Model](AUTOPILOT.md#choosing-a-model).
+Resolution order (Claude Code Autopilot): `--model` / `-m` →
+`GCO_AUTOPILOT_MODEL` → `context.bedrock.claude_code_default_model_id`.
+Resolution order (Codex Autopilot): `--model` / `-m` →
+`GCO_AUTOPILOT_CODEX_MODEL` → `GCO_AUTOPILOT_MODEL` →
+`context.bedrock.codex_default_model_id`; the canonical
+`context.bedrock.codex.reasoning_effort` is omitted whenever a model override
+wins. See [Autopilot → Choosing a Model](AUTOPILOT.md#choosing-a-model-and-reasoning).
 
 ### What to check when choosing a model
 
 - **Access** — the model (or its cross-Region inference profile) must be enabled in your account and reachable from the configured Region. Third-party models may require AWS Marketplace subscription permissions and, for Anthropic, the [FTU form](#accepting-the-anthropic-first-time-use-form). See the AWS guide on [model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
-- **Reasoning dialect** — GCO translates `context.bedrock.thinking.effort` for Claude adaptive-thinking models and Nova 2 profiles. Another family still works; it simply receives no reasoning fields, so set an effort the model actually supports or accept its default.
+- **Reasoning dialect** — GCO translates `context.bedrock.generation_reasoning.effort` for Claude adaptive-thinking models and Nova 2 profiles. Another family still works; it simply receives no reasoning fields, so set an effort the model actually supports or accept its default.
 - **Inference profile vs base id** — GCO pins a system-defined **global
   inference profile** id (`global.`) for maximum throughput. Global profiles
   may route worldwide; use a geography-scoped profile (`us.`, `eu.`, `jp.`,

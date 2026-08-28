@@ -24,6 +24,10 @@ This project would not have been possible without the support of some incredible
 
 **Luka Ralic** — For being an important internal advocate for the project.
 
+**Erik Swanson** — For early support, feedback, and belief in the project.
+
+**Ernst Schmid** — For early support, feedback, and belief in the project.
+
 **John Dzialo** — For being an early tester and adopter of the project.
 
 **Mark Vinciguerra** — For being an early tester and adopter of the project.

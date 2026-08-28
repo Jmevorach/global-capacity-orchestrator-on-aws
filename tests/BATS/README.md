@@ -51,7 +51,7 @@ bats tests/BATS/ --tap
 
 ## CI Integration
 
-BATS tests run on every push and PR as the `unit:bats:shell` job in `.github/workflows/unit-tests.yml`. They run in parallel with pytest, linting, and security scans — see the workflow file for the exact image pin and installed dependencies.
+BATS tests run on every push and PR as the `unit:bats:shell` job in `.github/workflows/unit-tests.yml`. Their focused ShellCheck assertions are optional local checks and skip when `shellcheck` is absent. The authoritative pinned gate is `lint:shellcheck:shell` in `.github/workflows/lint.yml`; it runs ShellCheck 0.11.0 at `style` severity with external sources enabled over every tracked `*.sh` path using NUL-safe Git-index discovery.
 
 ## Adding New Tests
 

@@ -492,7 +492,7 @@ def managed_scalar_set(
             raise ManagedConfigError(f"refusing to update {key.key_id}: {exc}") from exc
 
         _require_writable(path)
-        # Materialize only the managed leaf; sibling keys (e.g. bedrock.thinking)
+        # Materialize only the managed leaf; sibling keys (e.g. bedrock.generation_reasoning)
         # and absent sibling scalars keep their current state / reader defaults.
         container = document["context"].setdefault(key.container, {})
         container[key.leaf] = value
@@ -574,7 +574,12 @@ def set_deployment_region_role(
 
 
 def get_bedrock_model_status(*, config_path: Path | str | None = None) -> dict[str, Any]:
-    """Return every configured Bedrock model default and its backing path."""
+    """Return the three managed model defaults and their backing path.
+
+    Codex's model/reasoning pair is validated by :mod:`gco.bedrock` but is not
+    part of this legacy one-scalar managed setter surface; edit those canonical
+    keys together in ``cdk.json`` as documented in the customization guide.
+    """
     path = _resolve_config_path(config_path)
     document, _ = _load_document(path)
     return {

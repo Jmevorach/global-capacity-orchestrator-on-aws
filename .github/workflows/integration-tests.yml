@@ -1068,16 +1068,11 @@ jobs:
         run: >-
           python3 .github/scripts/verify_container_tool_versions.py
           dev --image gco-dev
-      - name: Exercise gco autopilot inside the dev container
-        # The dev container is the recommended autopilot front door (via the
-        # setup-dev-alias.sh shell function), so prove the pieces the image
-        # contributes without needing AWS credentials or Claude Code:
-        #   1. the runtime npm prefix that the function's gco-dev-tools
-        #      volume mounts over (where the pinned Claude Code install
-        #      persists), and its PATH wiring;
-        #   2. full launch-plan resolution in-container;
-        #   3. MCP config generation with a feature flag, running the GCO
-        #      server from the mounted checkout.
+      - name: Exercise both Autopilot engines inside the dev container
+        # The setup-dev-alias front door persists /root/.npm-global and
+        # /root/.gco. Prove both engine plans/configs, then use two separate
+        # --rm containers with the same volumes to prove Codex's lazily
+        # installed binary and isolated CODEX_HOME survive container removal.
         run: |
           set -euo pipefail
           docker run --rm gco-dev bash -c '
@@ -1088,22 +1083,61 @@ jobs:
               *) echo "/root/.npm-global/bin missing from PATH" >&2; exit 1 ;;
             esac
           '
+
           docker run --rm -v "$PWD":/workspace -w /workspace gco-dev \
             gco autopilot --dry-run
           docker run --rm -v "$PWD":/workspace -w /workspace gco-dev \
+            gco autopilot --engine codex --dry-run
+
+          docker run --rm -v "$PWD":/workspace -w /workspace gco-dev \
             gco autopilot -e all-tools --print-config > /tmp/autopilot-config.json
-          # Shared autopilot CI contract: full server-set/shape/env checks
-          # from the same single source unit:cli:autopilot and the boot
-          # probe use; --gco-args additionally proves the gco server runs
-          # from the mounted checkout, the assertion specific to this step.
-          # Runs inside the image (the contract imports the cli package,
-          # and the dev container ships the project environment).
+          docker run --rm -v "$PWD":/workspace -w /workspace gco-dev \
+            gco autopilot --engine codex -e all-tools --print-config \
+              > /tmp/autopilot-codex.toml
+
           docker run --rm -v "$PWD":/workspace -w /workspace \
             -v /tmp/autopilot-config.json:/tmp/autopilot-config.json:ro gco-dev \
             python3 .github/scripts/autopilot_ci_contract.py \
               verify-config /tmp/autopilot-config.json \
               --expect-gco-env GCO_ENABLE_ALL_TOOLS=true \
               --gco-args /workspace/gco_mcp/run_mcp.py
+          docker run --rm -v "$PWD":/workspace -w /workspace \
+            -v /tmp/autopilot-codex.toml:/tmp/autopilot-codex.toml:ro gco-dev \
+            python3 .github/scripts/autopilot_ci_contract.py \
+              verify-codex-config /tmp/autopilot-codex.toml \
+              --expect-gco-env GCO_ENABLE_ALL_TOOLS=true \
+              --gco-args /workspace/gco_mcp/run_mcp.py
+
+          tools_volume="gco-codex-tools-${{ matrix.arch }}-${GITHUB_RUN_ID}"
+          state_volume="gco-codex-state-${{ matrix.arch }}-${GITHUB_RUN_ID}"
+          cleanup_codex_volumes() {
+            docker volume rm -f "$tools_volume" "$state_volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup_codex_volumes EXIT
+          docker volume create "$tools_volume" >/dev/null
+          docker volume create "$state_volume" >/dev/null
+
+          # First disposable container installs the exact pin and writes
+          # /root/.gco/autopilot/codex/config.toml before execing --version.
+          docker run --rm -v "$PWD":/workspace -w /workspace \
+            -v "${tools_volume}:/root/.npm-global" \
+            -v "${state_volume}:/root/.gco" gco-dev \
+            gco autopilot --engine codex --yes -- --version
+
+          # A second disposable container sees both persisted artifacts and
+          # validates the generated TOML with the production-derived contract.
+          docker run --rm -v "$PWD":/workspace -w /workspace \
+            -v "${tools_volume}:/root/.npm-global" \
+            -v "${state_volume}:/root/.gco" gco-dev bash -c '
+              set -euo pipefail
+              test -x /root/.npm-global/bin/codex
+              test -f /root/.gco/autopilot/codex/config.toml
+              expected="$(python3 .github/scripts/autopilot_ci_contract.py \
+                pin --engine codex)"
+              codex --version | grep -qF "$expected"
+              python3 .github/scripts/autopilot_ci_contract.py \
+                verify-codex-config /root/.gco/autopilot/codex/config.toml
+            '
       - name: Verify image contains native ${{ matrix.arch }} binaries
         # Two layers of verification:
         #   1. `uname -m` inside the container reports the expected arch.

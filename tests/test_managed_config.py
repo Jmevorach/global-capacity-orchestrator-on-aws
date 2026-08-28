@@ -78,7 +78,7 @@ BASE_CONFIG: dict = {
             "mission_default_model_id": "global.anthropic.claude-opus-5",
             "capacity_advisor_default_model_id": "global.anthropic.claude-opus-5",
             "claude_code_default_model_id": "global.anthropic.claude-opus-5",
-            "thinking": {"effort": "high"},
+            "generation_reasoning": {"effort": "high"},
         },
         "project_name": "gco",
     },
@@ -718,7 +718,7 @@ class TestEngineScalars:
         written = json.loads(cdk_json.read_text(encoding="utf-8"))
         bedrock = written["context"]["bedrock"]
         assert bedrock["mission_default_model_id"] == "us.amazon.nova-2-lite-v1:0"
-        assert bedrock["thinking"] == {"effort": "high"}
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
         # Repointing Mission never repoints the advisor or autopilot.
         assert bedrock["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"
         assert bedrock["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
@@ -731,7 +731,7 @@ class TestEngineScalars:
         written = json.loads(cdk_json.read_text(encoding="utf-8"))
         bedrock = written["context"]["bedrock"]
         assert bedrock["capacity_advisor_default_model_id"] == "us.amazon.nova-2-lite-v1:0"
-        assert bedrock["thinking"] == {"effort": "high"}
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
         # Repointing the advisor never repoints Mission or autopilot.
         assert bedrock["mission_default_model_id"] == "global.anthropic.claude-opus-5"
         assert bedrock["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
@@ -744,7 +744,7 @@ class TestEngineScalars:
         written = json.loads(cdk_json.read_text(encoding="utf-8"))
         bedrock = written["context"]["bedrock"]
         assert bedrock["claude_code_default_model_id"] == "us.anthropic.claude-sonnet-4-6"
-        assert bedrock["thinking"] == {"effort": "high"}
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
         # Repointing autopilot never repoints Mission or the advisor.
         assert bedrock["mission_default_model_id"] == "global.anthropic.claude-opus-5"
         assert bedrock["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"

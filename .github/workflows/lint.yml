@@ -19,7 +19,7 @@
 #   - lint:mypy:stacks            — mypy on gco/stacks/ + app.py (requires CDK)
 #   - lint:mypy:lambda            — mypy on each lambda/ subdir independently
 #   - lint:ruff:python            — ruff format --check + ruff check (via astral-sh/ruff-action)
-#   - lint:shellcheck:shell       — shellcheck -x on every .sh file
+#   - lint:shellcheck:shell       — strict ShellCheck on every tracked *.sh file
 #   - lint:yamllint:yaml          — yamllint --strict across the repo
 #
 # Every job has `timeout-minutes` to cap runaway runs.
@@ -243,40 +243,39 @@ jobs:
     name: "lint:shellcheck:shell"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Exact release tag shared by pre-pull and execution.
+      SHELLCHECK_IMAGE: "koalaman/shellcheck-alpine:v0.11.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Pre-pull shellcheck image
         uses: ./.github/actions/docker-pull-with-retry
         with:
-          images: koalaman/shellcheck-alpine:v0.11.0
-      - name: Run shellcheck
-        # -x follows source directives so sourced files are resolved.
+          images: ${{ env.SHELLCHECK_IMAGE }}
+      - name: Run strict ShellCheck on every tracked shell script
+        # The Git index is the policy boundary: every tracked *.sh path is
+        # checked, independent of its directory. NUL delimiters preserve every
+        # valid pathname; an empty set fails instead of silently passing.
         run: |
           set -euo pipefail
-          # The image entrypoint is shellcheck; override it so this shell loop
-          # executes instead of being parsed as shellcheck file arguments.
-          docker run --rm --entrypoint sh -v "$PWD":/repo -w /repo \
-            koalaman/shellcheck-alpine:v0.11.0 \
-            -c '
-              set -eu
-              FOUND=0
-              find . -name "*.sh" \
-                -not -path "./.git/*" \
-                -not -path "./cdk.out/*" \
-                -not -path "./.venv/*" \
-                -not -path "./lambda/kubectl-applier-simple-build/*" \
-                -not -path "./lambda/helm-installer-build/*" \
-                > /tmp/shellfiles
-              while IFS= read -r sh; do
-                FOUND=1
-                echo "=== Checking $sh ==="
-                shellcheck -x "$sh"
-              done < /tmp/shellfiles
-              if [ "$FOUND" -eq 0 ]; then
-                echo "No shell scripts found — failing to avoid silent pass."
-                exit 1
-              fi
-            '
+          targets="${RUNNER_TEMP}/shellcheck-files.z"
+          trap 'rm -f "$targets"' EXIT
+
+          git ls-files -z -- '*.sh' > "$targets"
+          if [[ ! -s "$targets" ]]; then
+            echo '::error::No tracked *.sh files found; refusing to pass.' >&2
+            exit 1
+          fi
+
+          xargs -0 -r -- \
+            docker run --rm \
+              --entrypoint /bin/shellcheck \
+              -v "${PWD}:/repo:ro" \
+              -w /repo \
+              "$SHELLCHECK_IMAGE" \
+              --severity=style \
+              --external-sources \
+              -- < "$targets"
 
   lint-mypy-strict:
     name: "lint:mypy:strict"

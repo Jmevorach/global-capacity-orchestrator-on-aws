@@ -699,7 +699,10 @@ from mission.sampling import (  # noqa: E402
     BedrockSamplingBackend,
 )
 
-from gco.bedrock import get_default_mission_model_id  # noqa: E402
+from gco.bedrock import (  # noqa: E402
+    get_default_codex_model_id,
+    get_default_mission_model_id,
+)
 
 
 class _FakeBedrockClient:
@@ -960,6 +963,22 @@ def test_bedrock_backend_passes_correct_inference_config() -> None:
     # GCO sets no output-token cap, so the Converse default (the model's own
     # maximum output length) applies.
     assert kwargs["inferenceConfig"] == {"temperature": BEDROCK_TEMPERATURE}
+    assert "additionalModelRequestFields" not in kwargs
+
+
+def test_bedrock_backend_uses_openai_gpt_without_temperature() -> None:
+    """The Codex default is a working explicit Mission Converse override."""
+    fake_client = _FakeBedrockClient(response=_well_shaped_response("ok"))
+    with _patch_boto3_session(fake_client):
+        backend = BedrockSamplingBackend(
+            model_id=get_default_codex_model_id(),
+            region="us-east-1",
+        )
+        _run(backend.sample(_make_prompt()))
+
+    kwargs = fake_client.converse_calls[0]
+    assert kwargs["modelId"] == get_default_codex_model_id()
+    assert "inferenceConfig" not in kwargs
     assert "additionalModelRequestFields" not in kwargs
 
 

@@ -35,7 +35,8 @@ class GifPolicy:
 # These ceilings leave modest re-recording headroom while keeping decoder work
 # bounded. Any new GIF or intentional increase requires a review of this list.
 GIF_POLICIES = {
-    Path("demo/autopilot.gif"): GifPolicy(4 * MIB, 1024, 700, 800),
+    Path("demo/autopilot-codex.gif"): GifPolicy(2 * MIB, 1024, 700, 800),
+    Path("demo/autopilot-claude-code.gif"): GifPolicy(4 * MIB, 1024, 700, 800),
     Path("demo/deploy.gif"): GifPolicy(75 * MIB, 1360, 803, 1000),
     Path("demo/destroy.gif"): GifPolicy(2 * MIB, 1024, 744, 150),
     Path("demo/live_demo.gif"): GifPolicy(8 * MIB, 1024, 744, 250),
@@ -200,6 +201,26 @@ def _validate_gif(relative_path: Path, policy: GifPolicy) -> tuple[int, tuple[in
                     f"{relative_path}: parser/decoder canvas mismatch "
                     f"({width}x{height} versus {image.size[0]}x{image.size[1]})"
                 )
+            # Autopilot GIFs are embedded as product demos, and static clients
+            # use frame zero as their preview. Reject the near-empty PTY frame
+            # agg produces when a cast's first visible output starts after t=0.
+            if relative_path in {
+                Path("demo/autopilot-codex.gif"),
+                Path("demo/autopilot-claude-code.gif"),
+            }:
+                first_frame = image.convert("RGB")
+                colors = first_frame.getcolors(maxcolors=width * height)
+                if colors is None:  # pragma: no cover - maxcolors is the pixel count
+                    raise ValidationError(
+                        f"{relative_path}: could not measure first-frame color coverage"
+                    )
+                dominant_pixels = max(count for count, _color in colors)
+                visible_ratio = (width * height - dominant_pixels) / (width * height)
+                if visible_ratio < 0.05:
+                    raise ValidationError(
+                        f"{relative_path}: first frame is effectively blank "
+                        f"({visible_ratio:.2%} non-background pixels; require 5.00%)"
+                    )
             image.verify()
 
         # verify() intentionally invalidates the decoder, so reopen and load

@@ -47,7 +47,7 @@
 <details>
 <summary>🤖 Autopilot recording — one command to a working Claude Code setup, the easiest way to start</summary>
 
-![GCO Autopilot — one command to a fully configured Claude Code session on Amazon Bedrock, grounded by the GCO MCP server](demo/autopilot.gif)
+![GCO Autopilot — one command to a fully configured Claude Code session on Amazon Bedrock, grounded by the GCO MCP server](demo/autopilot-claude-code.gif)
 
 *A real session: `gco autopilot` launches [Claude Code](https://code.claude.com/docs/en/overview) on [Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html) (GCO's default Claude Opus 5 profile) with the [GCO MCP server](gco_mcp/README.md) + [companion MCPs](gco_mcp/README.md#recommended-companion-mcp-servers) wired in, and it answers from the project's own MCP tools ([docs](docs/AUTOPILOT.md) · [re-record](demo/record_autopilot.sh))*
 
@@ -82,10 +82,10 @@ git clone https://github.com/aws-solutions-library-samples/global-capacity-orche
 cd global-capacity-orchestrator-on-aws
 ./scripts/setup-dev-alias.sh   # builds the dev container + installs the `gco` shell function
 source ~/.zshrc                # or ~/.bashrc — the script prints which file it updated
-gco autopilot                  # offers the pinned Claude Code install, then launches
+gco autopilot                  # offers the selected pinned agent CLI, then launches
 ```
 
-`gco autopilot` turns your terminal into a fully configured [Claude Code](https://code.claude.com/docs/en/overview) session for GCO: an [Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html) backend using your AWS credentials (defaulting to GCO's Claude Code default — the Claude Opus 5 inference profile — overridable to any Claude model on Bedrock with `-m`), the [GCO MCP server](gco_mcp/README.md), and every [recommended companion MCP server](gco_mcp/README.md#recommended-companion-mcp-servers) already wired in. Then just ask for what you want — *"deploy everything"*, *"where is p5 capacity cheapest right now?"*, *"submit examples/simple-job.yaml to the region with the most capacity"*. Sessions resume where you left off (`--continue`, or say yes to the prompt), the GCO MCP server's opt-in tool groups are one flag away (`-e mission`, `-e all-tools`), your own skills/agents/plugins come along for the ride (`--skills`, `--agents`, `--plugin`), and `--dry-run` previews the whole plan first. See [docs/AUTOPILOT.md](docs/AUTOPILOT.md).
+`gco autopilot` turns your terminal into a fully configured agent session for GCO: [Claude Code](https://code.claude.com/docs/en/overview) by default, or OpenAI Codex with `--engine codex`. Both engines use an [Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html) backend with your AWS credentials, per-engine reviewed model defaults, the [GCO MCP server](gco_mcp/README.md), and every [recommended companion MCP server](gco_mcp/README.md#recommended-companion-mcp-servers) already wired in. Then just ask for what you want — *"deploy everything"*, *"where is p5 capacity cheapest right now?"*, *"submit examples/simple-job.yaml to the region with the most capacity"*. Sessions resume where you left off (`--continue`/`--resume`), the GCO MCP server's opt-in tool groups are one flag away (`-e mission`, `-e all-tools`), your own skills come along for either engine (Claude also supports `--agents`/`--plugin`), and `--dry-run` previews the whole plan first. See [docs/AUTOPILOT.md](docs/AUTOPILOT.md).
 
 **Recommended: run everything from the dev container.** GCO pins exact versions of a lot of Python packages ([CDK](https://docs.aws.amazon.com/cdk/v2/guide/work-with-cdk-python.html), [AWS SDKs](https://pypi.org/project/boto3/), [FastAPI](https://fastapi.tiangolo.com/), [mypy](https://mypy-lang.org/), [Ruff](https://docs.astral.sh/ruff/), etc.), and installing them on top of an existing Python environment is the most common source of "it doesn't install" reports. The dev container ships a fully resolved environment (Python 3.14, Node.js 24, CDK, [kubectl](https://kubernetes.io/docs/reference/kubectl/), [AWS CLI](https://aws.amazon.com/cli/), Docker CLI + [Buildx](https://github.com/docker/buildx), all Python deps) so you skip the whole problem.
 

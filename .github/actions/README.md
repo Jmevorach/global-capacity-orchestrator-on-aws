@@ -155,12 +155,20 @@ Pulls one or more pinned container images with a retry loop, so a following `doc
 **Usage:**
 
 ```yaml
-- name: Pre-pull shellcheck image
-  uses: ./.github/actions/docker-pull-with-retry
-  with:
-    images: koalaman/shellcheck-alpine:v0.11.0
-- name: Run shellcheck
-  run: docker run --rm -v "$PWD":/repo -w /repo koalaman/shellcheck-alpine:v0.11.0 ...
+env:
+  SHELLCHECK_IMAGE: "koalaman/shellcheck-alpine:v0.11.0"
+steps:
+  - name: Pre-pull shellcheck image
+    uses: ./.github/actions/docker-pull-with-retry
+    with:
+      images: ${{ env.SHELLCHECK_IMAGE }}
+  - name: Run strict ShellCheck on every tracked shell script
+    run: |
+      git ls-files -z -- '*.sh' > "${RUNNER_TEMP}/shellcheck-files.z"
+      xargs -0 -r -- docker run --rm --entrypoint /bin/shellcheck \
+        -v "${PWD}:/repo:ro" -w /repo "$SHELLCHECK_IMAGE" \
+        --severity=style --external-sources -- \
+        < "${RUNNER_TEMP}/shellcheck-files.z"
 ```
 
 ### `free-disk-space`

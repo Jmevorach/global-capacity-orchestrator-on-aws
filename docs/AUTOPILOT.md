@@ -1,197 +1,403 @@
 # Autopilot
 
-One command from a plain terminal to a fully configured agent session:
+One command turns a plain terminal into a fully configured agent session:
 
 ```bash
-gco autopilot
+gco autopilot                         # Claude Code (default)
+gco autopilot --engine codex          # OpenAI Codex
 ```
 
+Both engines use Amazon Bedrock with your AWS credentials, the GCO MCP server,
+and the recommended companion MCP servers. Claude Code remains the default for
+backward compatibility; selecting Codex is explicit and does not change an
+existing workflow.
+
 <details>
-<summary>🤖 Autopilot recording (click to expand)</summary>
+<summary>Claude Code recording (click to expand)</summary>
 
-![GCO Autopilot](../demo/autopilot.gif)
+![GCO Autopilot with Claude Code](../demo/autopilot-claude-code.gif)
 
-*`gco autopilot --dry-run` resolving the launch plan ([re-record](../demo/record_autopilot.sh))*
+*A real Claude Code session grounded by the GCO MCP server
+([re-record](../demo/record_autopilot.sh)).*
 
 </details>
 
-`gco autopilot` turns the current terminal into an opinionated [Claude Code](https://code.claude.com/docs/en/overview) session that is ready to operate GCO:
+<details>
+<summary>Codex recording (click to expand)</summary>
 
-| What you get | Details |
-|--------------|---------|
-| **Amazon Bedrock backend** | The session uses your AWS credentials (`CLAUDE_CODE_USE_BEDROCK=1`) — no Anthropic account or API key. The model defaults to GCO's Claude Code default (`cdk.json` → `context.bedrock.claude_code_default_model_id`, currently the Claude Opus 5 global cross-Region inference profile) and can be any Claude model or inference profile enabled on Bedrock. |
-| **GCO MCP server** | Wired in automatically. From a source checkout the session runs your working tree (`gco_mcp/run_mcp.py`); from an installed `gco-cli` it runs the matching release tag via `uvx`. |
-| **Companion MCP servers** | Every server from the [Recommended Companion MCP Servers](../gco_mcp/README.md#recommended-companion-mcp-servers) list — AWS docs, pricing, EKS, filesystem, web search, memory, sequential thinking, and the rest — generated into a session-scoped config. |
-| **Hermetic MCP config** | The generated config is passed with `--strict-mcp-config`, so every autopilot session starts from the same known-good server set regardless of personal or project MCP configs on the machine. |
-| **Lazy, pinned install** | Claude Code is deliberately **not** baked into the dev container. When the `claude` binary is missing, autopilot offers to install the exact pinned release (`npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@<pin>` — the scoped allowance lets the postinstall fetch the platform-native binary under npm ≥ 12's script blocking); the monthly deps-scan reports drift against npm's `latest`. |
+![GCO Autopilot with Codex](../demo/autopilot-codex.gif)
+
+*A real Bedrock-backed Codex session grounded by only the GCO MCP
+`find_docs` and `read_resource` tools. The recording disables companions and
+shell access and fails on trust/approval prompts ([docs](#security-notes) ·
+[re-record](../demo/record_autopilot.sh) with
+`DEMO_ENGINE=codex DEMO_MODE=live`).*
+
+</details>
+
+## What Autopilot Provides
+
+| Capability | Claude Code | Codex |
+|---|---|---|
+| Engine selection | Default | `--engine codex` or `GCO_AUTOPILOT_ENGINE=codex` |
+| Bedrock default | `context.bedrock.claude_code_default_model_id` | `context.bedrock.codex_default_model_id` |
+| Generated config | `~/.gco/autopilot/mcp.json` | `~/.gco/autopilot/codex/config.toml` |
+| Isolation | `--strict-mcp-config` | Isolated `CODEX_HOME`, project config disabled per launch, and session-precedence Bedrock controls |
+| Canonical reasoning | Model-native Claude configuration | `context.bedrock.codex.reasoning_effort` (`xhigh` for the shipped default) |
+| Lazy npm package | `@anthropic-ai/claude-code` | `@openai/codex` |
+| Imported context | Skills, agents, and plugins | Skills |
+| Resume mapping | `--continue`, `--resume [ID]` | `codex resume --last`, `codex resume [ID]` |
+
+The selected CLI is deliberately not baked into `gco-dev`. Autopilot detects
+its binary and offers the exact pinned npm install on first use. The monthly
+dependency scan reports drift for both pins.
 
 ## Table of Contents
 
 - [The Front Door](#the-front-door)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
-- [Choosing a Model](#choosing-a-model)
+- [Choosing an Engine](#choosing-an-engine)
+- [Choosing a Model and Reasoning](#choosing-a-model-and-reasoning)
 - [Region Resolution](#region-resolution)
-- [The Generated MCP Config](#the-generated-mcp-config)
+- [Generated Configuration and Isolation](#generated-configuration-and-isolation)
 - [Resuming Sessions](#resuming-sessions)
 - [GCO MCP Feature Flags](#gco-mcp-feature-flags)
-- [Bring Your Own Skills, Agents, and Plugins](#bring-your-own-skills-agents-and-plugins)
-- [Passing Arguments to Claude Code](#passing-arguments-to-claude-code)
+- [Bring Your Own Context](#bring-your-own-context)
+- [Passing Native Engine Arguments](#passing-native-engine-arguments)
+- [Dev-Container Persistence](#dev-container-persistence)
 - [Security Notes](#security-notes)
-- [How It's Tested and Kept Fresh](#how-its-tested-and-kept-fresh)
+- [Mission Compatibility](#mission-compatibility)
+- [How It Is Tested and Kept Fresh](#how-it-is-tested-and-kept-fresh)
 - [Troubleshooting](#troubleshooting)
 
 ## The Front Door
 
-With git and a container runtime installed, this is the whole journey from nothing to a working Claude Code setup:
+With Git and a container runtime installed, this is the whole journey:
 
 ```bash
 git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws
-./scripts/setup-dev-alias.sh    # builds the dev container + installs the `gco` shell function
-source ~/.zshrc                 # or ~/.bashrc — the script prints which file it updated
-gco autopilot                   # offers the pinned Claude Code install, then launches
+./scripts/setup-dev-alias.sh
+source ~/.zshrc                 # or ~/.bashrc; the script prints the target
+gco autopilot                  # default Claude Code session
+gco autopilot --engine codex   # or a Codex session
 ```
 
-The dev-container `gco` function is autopilot-aware: it mounts a named volume over the container's npm prefix (so the pinned Claude Code install from the first launch **persists** across the otherwise-ephemeral containers), and it mounts `~/.claude` and `~/.gco` from your home directory (so onboarding state, session transcripts — and therefore [session resume](#resuming-sessions) — and the generated MCP config all survive too). The dev image ships `uv`/`uvx` and `node`/`npx` at pinned versions, which is everything the companion MCP servers need at launch.
+The setup script builds `gco-dev` and installs a shell function that runs each
+`gco` command against the current checkout. It also supplies the persistent
+mounts both Autopilot engines need; see [Dev-Container Persistence](#dev-container-persistence).
 
 ## Requirements
 
-- **AWS credentials** with `bedrock:InvokeModel` for the chosen model (the standard credential chain — env vars, `~/.aws`, SSO, instance roles — all work).
-- **Model access enabled** in your account. Anthropic models on Bedrock are gated behind a one-time first-time-use form; see the remediation printed by any GCO Bedrock feature, or [docs/CUSTOMIZATION.md](CUSTOMIZATION.md) for the override mechanics.
-- **The GCO CLI** (`gco`). The [dev container](../QUICKSTART.md#step-1-clone-and-build-the-dev-container) is the recommended way to get it.
-- **npm** — only on first use, if Claude Code isn't already installed. The dev container ships Node.js + npm; on a bare host any Node 18+ works.
-- **`uvx` and `npx` at session runtime** — the companion MCP servers launch through them (the dev container and any Python 3.14 + Node environment have both).
+- AWS credentials with `bedrock:InvokeModel`. Claude requires the selected
+  model/profile resource. Codex's Bedrock Responses path authorizes the same
+  action against both the selected inference target and the account's default
+  Bedrock project, so least-privilege policies must include both resources (see
+  [Bedrock conversation inference](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)).
+  The normal AWS credential chain works: environment variables, `~/.aws`, SSO,
+  web identity, and instance or task roles.
+- Model access in the account and calling Region. Anthropic models have a
+  first-time-use requirement; the OpenAI GPT profile does not use that form.
+- The GCO CLI. The dev container is the recommended environment.
+- Node.js 24 and npm 12.0.2 for the repository-pinned lazy installation. The
+  dev container already supplies both.
+- `uvx` and `npx` at session runtime for companion MCP servers. The dev
+  container supplies these too.
 
 ## Quick Start
 
 ```bash
-# See exactly what would happen — model, region, servers, install plan:
+# Preview without writing config, installing a CLI, or launching it:
 gco autopilot --dry-run
+gco autopilot --engine codex --dry-run
 
-# Launch. If Claude Code is missing you'll be offered the pinned install
-# (pass -y to skip the prompt):
+# Launch; add -y to accept an absent selected engine's exact pinned install:
 gco autopilot
+gco autopilot --engine codex
 ```
 
-The terminal becomes the Claude Code session (the `gco` process is replaced, not wrapped). Exit Claude Code and you're back in your shell.
-
-Useful variants:
+Useful shared options:
 
 ```bash
-gco autopilot --continue                              # resume the last session
-gco autopilot --resume                                # pick a session to resume
-gco autopilot --skills ~/team-skills                  # import your own skills
-gco autopilot --plugin ~/plugins/incident-response    # load a plugin for the session
-gco autopilot -m global.anthropic.claude-sonnet-4-6   # different Claude model
-gco autopilot --no-companions                         # GCO MCP server only
-gco autopilot --print-config                          # dump the MCP config JSON
-gco -o json autopilot --dry-run                       # machine-readable plan
+gco autopilot --no-companions
+gco autopilot -e mission -e infrastructure-deploy
+gco autopilot --mcp-env GCO_MCP_TOOL_SEARCH=bm25
+gco autopilot --skills ~/team-skills
+gco -o json autopilot --engine codex --dry-run
+gco autopilot --engine codex --print-config
 ```
 
-## Choosing a Model
+On POSIX, the `gco` process is replaced by the selected engine, so terminal,
+signal, and exit behavior are native rather than wrapped.
 
-Resolution order:
+## Choosing an Engine
 
-1. `--model` / `-m` flag
-2. `GCO_AUTOPILOT_MODEL` environment variable
-3. `cdk.json` → `context.bedrock.claude_code_default_model_id`, resolved through `gco.bedrock` — autopilot's own default, deliberately separate from the advisory `default_model_id` that Mission sampling and the capacity advisor share. Repointing the interactive agent (`gco stacks bedrock set-claude-code-model`) never repoints the advisory features, and vice versa; future agent runners get their own sibling keys. Both keys ship the same profile today.
+Engine resolution is deterministic:
 
-Any Claude model or inference profile available on Bedrock works, including application inference-profile ARNs. A model id that doesn't look like a Claude model produces a warning (Claude Code is tuned for Claude models) but is not refused.
+1. `--engine claude-code|codex`
+2. `GCO_AUTOPILOT_ENGINE`
+3. `claude-code`
 
-Claude Code also uses a small/fast model for background tasks. Autopilot leaves that unset by default — the right haiku-class profile depends on what your account has enabled — but you can pin one with `--small-fast-model` or `GCO_AUTOPILOT_SMALL_FAST_MODEL`.
+Examples:
+
+```bash
+gco autopilot                                  # Claude Code
+GCO_AUTOPILOT_ENGINE=codex gco autopilot       # Codex by environment
+gco autopilot --engine claude-code             # flag wins over environment
+```
+
+A malformed or blank environment value fails instead of silently falling back.
+
+## Choosing a Model and Reasoning
+
+### Claude Code
+
+Claude model precedence is:
+
+1. `--model` / `-m`
+2. `GCO_AUTOPILOT_MODEL`
+3. `context.bedrock.claude_code_default_model_id`
+
+The shipped default is the global Claude Opus 5 inference profile. A non-Claude
+ID is allowed with a warning because Claude Code is tuned for Claude models.
+`--small-fast-model` and `GCO_AUTOPILOT_SMALL_FAST_MODEL` optionally select a
+background model and apply only to Claude Code.
+
+### Codex
+
+Codex model precedence is:
+
+1. `--model` / `-m`
+2. `GCO_AUTOPILOT_CODEX_MODEL`
+3. `GCO_AUTOPILOT_MODEL`
+4. `context.bedrock.codex_default_model_id`
+
+The shipped model is `global.openai.gpt-5.6-sol`. The generated TOML selects
+`model_provider = "amazon-bedrock-runtime"` and the Responses wire API so the
+cross-Region inference profile is sent to the Bedrock Runtime endpoint. The canonical
+model receives `context.bedrock.codex.reasoning_effort`, currently `xhigh`.
+
+Reasoning is deliberately omitted when the model comes from a CLI or
+environment override: Autopilot cannot assume that an arbitrary replacement
+accepts the canonical model's effort level. Put a new canonical model and its
+reviewed effort in `cdk.json`; do not override provider/reasoning through native
+Codex passthrough.
+
+Blank model overrides fail closed for both engines.
 
 ## Region Resolution
 
-The Bedrock calls go to `AWS_REGION`. If it's already set in your environment it wins (least surprise). Otherwise autopilot sets it from the GCO CLI's configured default region (`gco --region …`, `GCO_DEFAULT_REGION`, or the first regional deployment in `cdk.json`). Cross-Region inference profiles like the default `global.…` profile route within their geography regardless of the calling Region.
+`AWS_REGION` wins, then `AWS_DEFAULT_REGION`, then the GCO CLI's configured
+default Region. Claude receives that Region in its Bedrock environment; Codex
+receives it in `[model_providers.amazon-bedrock-runtime.aws]`. Global inference
+profiles still route across their supported geography.
 
-## The Generated MCP Config
+## Generated Configuration and Isolation
 
-Every launch regenerates `~/.gco/autopilot/mcp.json` (override the directory with `GCO_AUTOPILOT_CONFIG_DIR`) and passes it to Claude Code with `--mcp-config … --strict-mcp-config`. Two consequences:
+### Claude Code
 
-- **Hand edits don't survive** — the file is rewritten on the next launch. Persistent customization belongs in your own MCP config; see [gco_mcp/README.md](../gco_mcp/README.md) for per-client setup and the full companion list with rationale.
-- **Nothing else leaks in** — `--strict-mcp-config` makes this the *only* MCP config for the session, so a broken or surprising server in `~/.claude` or a project `.mcp.json` can't affect an autopilot session.
+Every launch regenerates `~/.gco/autopilot/mcp.json` and passes it with
+`--mcp-config` and `--strict-mcp-config`. The generated file is the session's
+only MCP config, so personal or project MCP entries cannot leak into the plan.
+Autopilot also sets `DISABLE_AUTOUPDATER=1`; Claude Code upgrades happen only
+when GCO's reviewed npm pin changes, not by mutating the launched installation.
 
-Inspect what would be generated without launching:
+### Codex
 
-```bash
-gco autopilot --print-config
-```
+Every launch regenerates `~/.gco/autopilot/codex/config.toml` and sets
+`CODEX_HOME=~/.gco/autopilot/codex`, so personal `~/.codex` state is neither
+read nor modified. Codex 0.150.1 normally layers a trusted workspace's
+`.codex/config.toml` above that user file, so Autopilot also:
 
-The `filesystem` companion is scoped to the directory you launch from, and the `eks` companion runs **read-only** (no `--allow-write`, no `--allow-sensitive-data-access`) — see [Security Notes](#security-notes).
+- identifies Codex's Git project root (including linked worktrees);
+- marks that project layer `untrusted` for this process only, disabling project
+  config/hooks without persisting a trust decision; and
+- repeats the selected model, provider, reasoning (when canonical), Region,
+  Responses wire API, and update policy at session precedence.
+
+The generated TOML still contains:
+
+- the selected model and `amazon-bedrock-runtime` provider;
+- canonical reasoning only when appropriate;
+- the resolved AWS Region and `wire_api = "responses"`;
+- update checks disabled; and
+- the same GCO and companion MCP server registry as Claude.
+
+Organization-managed Codex policy remains authoritative by design. Codex
+0.150.1 has no Claude-equivalent strict replacement switch for system/managed
+MCP layers; Autopilot's guarantee is isolation from personal and project
+configuration, not bypassing administrator policy.
+
+`--print-config` emits JSON for Claude and the generated user-layer TOML for
+Codex; session-precedence safeguards are applied only when Codex launches.
+`--dry-run` writes neither file. Set `GCO_AUTOPILOT_CONFIG_DIR` to relocate the
+generated root. Hand edits do not survive the next launch.
 
 ## Resuming Sessions
 
-Autopilot picks up where you left off:
+Shared top-level controls map to each engine:
 
-- **Interactive prompt.** When Claude Code already has a session for this workspace, launching `gco autopilot` on a terminal asks `Resume your previous Claude Code session in this workspace?` — one keypress to continue, Enter to start fresh. The prompt never appears for `--yes` or non-interactive (piped/CI) runs, so scripts can't hang.
-- **`--continue` / `-c`** resumes the most recent session directly, no prompt.
-- **`--resume [SESSION_ID]`** resumes a specific session, or opens claude's interactive session picker when no id is given.
+```bash
+gco autopilot --continue
+gco autopilot --resume
+gco autopilot --resume SESSION_ID
 
-A resumed conversation keeps its history, but the MCP servers and Bedrock environment come from *this* launch — so model overrides and feature flags apply to resumed sessions too.
+gco autopilot --engine codex --continue
+gco autopilot --engine codex --resume
+gco autopilot --engine codex --resume SESSION_ID
+```
+
+Claude maps these to its native continue/session picker behavior and may offer
+an interactive workspace-resume prompt when no explicit option was supplied.
+Codex maps them to `codex resume --last`, `codex resume`, or
+`codex resume SESSION_ID`. Codex does not use Claude's transcript probe or
+prompt.
+
+A resumed session still receives this launch's model, Region, MCP registry,
+feature flags, and generated config.
 
 ## GCO MCP Feature Flags
 
-The GCO MCP server keeps its mutating and sensitive tool groups behind opt-in feature flags — deploys, destroys, capacity purchases, model uploads, Mission, and friends stay unmounted until you ask (see [gco_mcp/README.md](../gco_mcp/README.md#feature-flags) for what each flag gates). Autopilot exposes that directly:
+Feature flags are shared across engines and apply only to the `gco` server:
 
 ```bash
-gco autopilot                                     # default: read-only toolset
-gco autopilot -e mission                          # one flag
-gco autopilot -e mission -e infrastructure-deploy # several
-gco autopilot -e all-tools                        # everything (umbrella flag)
-gco autopilot --mcp-env GCO_MCP_TOOL_SEARCH=bm25  # any other server env var
+gco autopilot                                     # read-only default tools
+gco autopilot --engine codex -e mission
+gco autopilot -e mission -e infrastructure-deploy
+gco autopilot -e all-tools
+gco autopilot --mcp-env GCO_MCP_TOOL_SEARCH=bm25
 ```
 
-Details worth knowing:
+`--enable` accepts a short name or full `GCO_ENABLE_*` variable. Unknown names
+and malformed `--mcp-env` values fail before launch. The resolved environment
+appears in both dry-run plans and generated config formats.
 
-- `--enable` / `-e` accepts the short form (`mission`, `all-tools`, `infrastructure-deploy`) or the full `GCO_ENABLE_*` name. Unknown flags fail immediately with the valid list — a typo never silently launches a session missing the tools you wanted. The valid set comes from the server's own flag registry, so it can't drift.
-- Flags apply to the **gco server only**; companions are unaffected.
-- `--mcp-env KEY=VALUE` is the generic escape hatch for non-flag server settings, and it wins over `--enable` for the same key.
-- The umbrella `all-tools` flag overrides per-flag values by design (that's the server's own semantics), so there is no `--disable`: to run with less, enable less.
-- Enabled flags show up in `--dry-run` (`GCO MCP env:` line) and in the `env` of the `gco` entry in `--print-config`.
+## Bring Your Own Context
 
-## Bring Your Own Skills, Agents, and Plugins
-
-Claude Code's normal discovery still applies inside an autopilot session — skills and subagents in `~/.claude/` and in the workspace's `.claude/` load exactly as they always do (only the *MCP config* is strict). For everything that lives somewhere else — a team repo of skills, a scratch directory of agent definitions, a packaged plugin — autopilot adds three doors:
+`--skills DIR` works with both engines. Each source must contain at least one
+`<skill>/SKILL.md` or the launch fails:
 
 ```bash
-gco autopilot --skills ~/team-skills               # dirs of <skill>/SKILL.md
-gco autopilot --agents ~/my-agents                 # dirs of *.md subagents
-gco autopilot --plugin ~/plugins/incident-response # a full plugin dir or .zip
+gco autopilot --skills ~/team-skills
+gco autopilot --engine codex --skills ~/team-skills
 ```
 
-- **`--skills DIR` / `--agents DIR`** (repeatable) import loose directories. Autopilot packages them into a session-scoped plugin (`~/.gco/autopilot/gco-autopilot-imports/`, rebuilt from scratch every launch) and hands it to claude with `--plugin-dir` — nothing is copied into your project or `~/.claude`, and nothing persists beyond the staged copy. Sources are validated up front: a skills dir must contain at least one `*/SKILL.md`, an agents dir at least one `*.md`, and a typo'd path fails the launch instead of silently starting a session without your tools.
-- **`--plugin PATH`** (repeatable) loads a ready-made [Claude Code plugin](https://code.claude.com/docs/en/plugins) directory or `.zip` for this session — plugins can bundle skills, agents, commands, and hooks together. Set `GCO_AUTOPILOT_PLUGIN_DIRS` (colon-separated) for plugins you want in *every* autopilot session.
-- Imports show up in `--dry-run` (`Plugins:` / `Imports:` lines) so you can check what a launch would load.
+Claude packages imported skills and `--agents DIR` into a session plugin and
+also supports `--plugin PATH` plus `GCO_AUTOPILOT_PLUGIN_DIRS`. Codex copies
+skills into its isolated `CODEX_HOME/skills`; Claude plugins and agent files
+are rejected before their paths are inspected because those formats are not
+Codex concepts. Nothing is written into the project or personal `~/.codex`.
 
-## Passing Arguments to Claude Code
+## Passing Native Engine Arguments
 
-Everything after `--` goes to the `claude` CLI unchanged:
+Everything after the first `--` goes to the selected CLI:
 
 ```bash
-gco autopilot -- --continue          # resume the previous conversation
 gco autopilot -- --permission-mode plan
+gco autopilot --engine codex -- --no-alt-screen
+gco autopilot --engine codex -- -c 'sandbox_mode="read-only"'
 ```
+
+Codex passthrough may not override the isolated Bedrock plan. Autopilot rejects
+native model/profile/provider/reasoning settings, project/trust roots, working-
+directory or remote-session switches, in-place updates, and arbitrary MCP
+process definitions—including attached short flags and quoted TOML dotted keys.
+The only MCP config passthrough accepted is a fail-closed narrowing of the `gco`
+server to `find_docs`/`read_resource`, as used by the reviewed live recorder.
+Use top-level `--model`, `--no-companions`, or `cdk.json` instead. A second
+native `--` ends option scanning, so prompt text after it is preserved.
+
+For resumed Codex sessions, Autopilot places its owned root policy first, then
+`resume [--last|ID]`, then native options/prompt text. This matches Codex's
+resume grammar; resume-only flags no longer land at the root parser.
+
+## Dev-Container Persistence
+
+The `gco` function emitted by `scripts/setup-dev-alias.sh` mounts:
+
+- `gco-dev-tools` at `/root/.npm-global`, preserving either lazily installed
+  agent CLI across `--rm` containers;
+- host `~/.gco` at `/root/.gco`, preserving generated config, Codex's isolated
+  home, skills, and Codex session state; and
+- host `~/.claude` at `/root/.claude`, preserving Claude onboarding and
+  transcripts.
+
+The generated function also forwards `GCO_AUTOPILOT_ENGINE`,
+`GCO_AUTOPILOT_MODEL`, `GCO_AUTOPILOT_CODEX_MODEL`,
+`GCO_AUTOPILOT_SMALL_FAST_MODEL`, and `GCO_AUTOPILOT_CONFIG_DIR` by name in
+both TTY branches for Docker, Finch, and Podman. A config-dir override must be
+a writable container path (normally under `/root/.gco` or `/workspace`), not
+an unrelated absolute host path.
+
+The image itself contains neither agent CLI. CI launches two separate Codex
+containers with the same mounts and proves both the binary and
+`/root/.gco/autopilot/codex/config.toml` survive.
 
 ## Security Notes
 
-- **Each MCP server is a separate process with your credentials' reach.** The companion set is curated, but review [gco_mcp/README.md](../gco_mcp/README.md#recommended-companion-mcp-servers) before treating the session as low-privilege — the AWS-focused servers can read whatever your credentials can.
-- **EKS server is read-only by default.** An auto-generated agent session should not silently hold cluster write access. If you want the mutating tools, add the server with `--allow-write` to your own MCP config instead of autopilot's.
-- **Shell server allowlist is tight.** `ls,cat,pwd,grep,wc,touch,find` — no `rm`, no `git`. Widen it in your own config only with care.
-- **The Bedrock session itself** is ordinary AWS API traffic under your IAM identity: CloudTrail applies, and no code or prompts leave AWS for Anthropic's API.
+- Every MCP server is a separate process with the caller's credential reach.
+  Review the companion registry before using broad AWS credentials.
+- The EKS companion is read-only by default.
+- The MCP shell companion has a narrow allowlist:
+  `ls,cat,pwd,grep,wc,touch,find`. Codex also has a separate built-in shell;
+  use native `--disable shell_tool` when that capability must be absent.
+- Claude uses a strict MCP config. Codex isolates personal state, disables the
+  workspace project-config layer for each launch, and repeats Bedrock controls
+  at session precedence; organization-managed policy still applies.
+- Bedrock traffic uses ordinary AWS IAM and CloudTrail. Autopilot does not send
+  prompts to Anthropic's or OpenAI's direct API.
+- Native Codex project/provider/profile/reasoning/update overrides are blocked
+  so dry-run, generated config, and effective execution cannot disagree.
+- The live Codex demo is intentionally narrower than default Autopilot:
+  `--no-companions`, required GCO startup, only `find_docs`/`read_resource`,
+  built-in shell disabled, read-only sandbox, and no trust/approval prompts.
 
-## How It's Tested and Kept Fresh
+## Mission Compatibility
 
-- `tests/test_cli_autopilot.py` covers plan resolution, config generation, the install flow, and — via lockstep guards — keeps the companion registry, the `gco_mcp/README.md` tables, and the deps-scan extraction regexes agreeing with each other.
-- The `unit:cli:autopilot` CI job resolves the plan without Claude Code, validates the generated config, then installs the pinned release from npm and verifies detection — proving the pin is actually installable on every PR.
-- The monthly [deps-scan](../.github/CI.md#dependency-scan-script) reports when the pinned Claude Code release falls behind npm's `latest`, and when any companion MCP package goes **missing, deprecated, or yanked** on its registry. Companions launch unpinned through `npx`/`uvx`, so registry health is their real dependency surface — exactly the failure mode that got `mcp-server-fetch` and `mcp-server-calculator` pruned in 2026-08.
+`global.openai.gpt-5.6-sol` is also supported as an explicit Mission sampling
+model. Mission uses Bedrock Converse rather than Codex's Responses API. The
+shared provider-aware request builder removes `temperature`, which this GPT
+profile rejects, while leaving unrelated explicit-model controls intact.
+
+The repository includes a live-captured three-directive playback fixture at
+`tests/fixtures/scaffold_responses/global_openai_gpt_5_6_sol.json`. Every
+capture is replayed through Mission's parse, normalize, autofix, and validation
+pipeline. This is compatibility evidence for Mission, not a change to Mission's
+separate default model.
+
+## How It Is Tested and Kept Fresh
+
+- `tests/test_cli_autopilot.py` covers engine resolution, model precedence,
+  generated JSON/TOML, isolation, skills, install flow, resume mapping, and
+  native-override rejection.
+- `tests/test_autopilot_ci_contract.py` derives both pins, defaults, provider,
+  reasoning, and config schemas from production modules.
+- `unit:cli:autopilot` installs both real npm pins and verifies both binaries.
+- The live recorder contract requires Codex to start only GCO, successfully call
+  `find_docs` and `read_resource`, expose no shell/companions, show no trust or
+  approval dialog, and contain none of the caller's AWS credential values.
+- GIF validation fully decodes every frame and requires both Autopilot assets to
+  open on a nonblank banner frame for static previews.
+- `integration:docker:dev-container` validates both engines on amd64 and arm64
+  and proves Codex install/config persistence across separate containers.
+- The monthly dependency scan checks both lazy npm pins, companion package
+  health, and every Bedrock default. Dotted OpenAI versions are compared in one
+  model family, so a newer GPT release is advisory drift rather than an
+  automatic model change.
+- Mission's GPT fixture is a real Bedrock capture and participates in the full
+  cross-model replay suite.
 
 ## Troubleshooting
 
 | Symptom | Fix |
-|---------|-----|
-| `claude` not found right after a successful install | Your npm global bin dir isn't on `PATH` for this shell. Open a new shell, or add `$(npm prefix -g)/bin` to `PATH`. |
-| Bedrock returns a 404 with `FTUFormNotFilled` | The account hasn't submitted Anthropic's one-time use-case form. Bedrock console → Model access → request the Anthropic model, or `aws bedrock put-use-case-for-model-access`. |
-| `AccessDeniedException` on first message | The chosen model/profile isn't enabled in this account/Region, or the IAM identity lacks `bedrock:InvokeModel`. Try `-m` with a model you know is enabled. |
-| Companion server fails to start inside the session | Run `claude --debug` via `gco autopilot -- --debug` and check the MCP logs; a registry outage or a newly-broken upstream package will show at launch. The monthly deps-scan flags dead companions — see the removals note in [gco_mcp/README.md](../gco_mcp/README.md#recommended-companion-mcp-servers). |
-| You want a different companion set every time | Put your preferred servers in your own MCP config (see [gco_mcp/README.md](../gco_mcp/README.md)) and run `claude` directly, or launch with `--no-companions` and add servers with `claude mcp add`. |
+|---|---|
+| Selected engine not found after installation | Ensure `$(npm prefix -g)/bin` is on `PATH`. In `gco-dev`, rebuild or rerun `setup-dev-alias.sh` so `/root/.npm-global/bin` is present. |
+| `FTUFormNotFilled` | Submit Anthropic's one-time use-case form. This applies to Claude, not the OpenAI GPT profile. |
+| `AccessDeniedException` on first message | Enable the selected profile and grant `bedrock:InvokeModel` in the calling Region. |
+| Codex reports a different provider/profile than dry-run | Autopilot blocks native/project overrides; inspect organization-managed Codex policy, which remains authoritative. |
+| You expected `xhigh` after `--model` | Canonical reasoning is intentionally omitted for explicit model overrides. Review and change `context.bedrock.codex_*` instead. |
+| Personal `~/.codex` settings are missing | Expected: Autopilot uses an isolated `CODEX_HOME`. Run `codex` directly for personal configuration. |
+| Claude plugin or `--agents` rejected under Codex | Codex supports imported skills, not Claude plugin/agent formats. |
+| Companion server fails to start | Run the selected engine with its debug options after `--`; check registry/network status and the generated config. |
+| You need a permanently different MCP set | Use `--no-companions` or run the engine directly with your own MCP configuration. |

@@ -930,13 +930,13 @@ def regions_set(config: Any, role: Any, region: Any, config_path: Any, yes: Any)
 @stacks.group("bedrock")
 @pass_config
 def bedrock_cmd(config: Any) -> None:
-    """Manage the Bedrock model defaults in cdk.json.
+    """Manage three legacy one-scalar Bedrock defaults in cdk.json.
 
-    Three independent keys live under context.bedrock, one per consumer:
-    mission_default_model_id (Mission sampling), capacity_advisor_default_model_id
-    (`gco capacity advise`), and claude_code_default_model_id (the session
-    model `gco autopilot` hands to Claude Code). Edits go through the
-    managed-config engine: validated, atomic, idempotent, and audited.
+    This managed surface covers Mission sampling, the capacity advisor, and
+    Claude Code. Codex's reviewed model/reasoning pair lives beside them under
+    ``context.bedrock`` but is edited together directly in ``cdk.json``; see the
+    customization guide. Managed edits remain validated, atomic, idempotent,
+    and audited.
     """
     pass
 
@@ -945,7 +945,7 @@ def bedrock_cmd(config: Any) -> None:
 @click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
 @pass_config
 def bedrock_show(config: Any, config_path: Any) -> None:
-    """Show every configured Bedrock model default and its backing path."""
+    """Show the three managed model defaults and their backing path."""
     from ..managed_config import ManagedConfigError, get_bedrock_model_status
 
     formatter = get_output_formatter(config)
@@ -971,7 +971,7 @@ def bedrock_set_mission_model(config: Any, model_id: Any, config_path: Any, yes:
     set-claude-code-model). Model and inference-profile IDs are free-form
     (custom profiles, marketplace models), so validation mirrors the runtime
     reader: a non-empty string without surrounding whitespace. Sibling
-    settings (bedrock.thinking, the other model keys) are preserved.
+    settings (bedrock.generation_reasoning, the other model keys) are preserved.
 
     Examples:
         gco stacks bedrock set-mission-model us.amazon.nova-pro-v1:0
@@ -1017,7 +1017,7 @@ def bedrock_set_capacity_advisor_model(
     set-mission-model and set-claude-code-model). Model and inference-profile
     IDs are free-form (custom profiles, marketplace models), so validation
     mirrors the runtime reader: a non-empty string without surrounding
-    whitespace. Sibling settings (bedrock.thinking, the other model keys)
+    whitespace. Sibling settings (bedrock.generation_reasoning, the other model keys)
     are preserved.
 
     Examples:

@@ -657,7 +657,7 @@ if is_enabled(FLAG_CONFIG_MANAGEMENT):
         set_claude_code_default_model). Model and inference-profile IDs are
         free-form (custom profiles, marketplace models); validation mirrors
         the runtime reader (non-empty, no surrounding whitespace). Sibling
-        settings (bedrock.thinking, the other model keys) are preserved;
+        settings (bedrock.generation_reasoning, the other model keys) are preserved;
         explicit --bedrock-model-id / env overrides still take precedence
         at run time.
 
@@ -679,7 +679,7 @@ if is_enabled(FLAG_CONFIG_MANAGEMENT):
         autopilot have their own keys (set_mission_default_model and
         set_claude_code_default_model). Validation mirrors the runtime
         reader (non-empty, no surrounding whitespace). Sibling settings
-        (bedrock.thinking, the other model keys) are preserved; explicit
+        (bedrock.generation_reasoning, the other model keys) are preserved; explicit
         --model overrides still take precedence at run time.
 
         Args:
