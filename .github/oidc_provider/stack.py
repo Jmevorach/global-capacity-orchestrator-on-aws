@@ -16,17 +16,20 @@ directory. Edit that file to grant additional permissions for your CI needs.
 Trust Policy:
     The role's trust policy restricts assumption to GitHub Actions workflows
     running in a specific repository (and optionally a specific branch).
-    The OIDC subject claim format is:
-        repo:<owner>/<repo>:ref:refs/heads/<branch>   (branch push)
-        repo:<owner>/<repo>:pull_request               (PR)
-        repo:<owner>/<repo>:ref:refs/tags/<tag>        (tag push)
+    Legacy repositories use ``repo:<owner>/<repo>``. Repositories created or
+    transferred after July 15, 2026 use the immutable
+    ``repo:<owner>@<owner-id>/<repo>@<repo-id>`` prefix. The remainder is:
+        :ref:refs/heads/<branch>   (branch push)
+        :pull_request              (PR)
+        :ref:refs/tags/<tag>       (tag push)
 
     ``github_branch`` defaults to ``"main"`` and uses ``StringEquals`` for
     that exact branch. ``"*"`` is an explicit opt-in that uses ``StringLike``
-    with ``repo:<owner>/<repo>:*`` to allow any ref.
+    with the configured repository subject prefix plus ``:*``.
 """
 
 import json
+import re
 from pathlib import Path
 
 from aws_cdk import CfnOutput, Stack
@@ -37,6 +40,44 @@ GITHUB_OIDC_ISSUER = "token.actions.githubusercontent.com"
 GITHUB_OIDC_AUDIENCE = "sts.amazonaws.com"
 GITHUB_OIDC_THUMBPRINT = "6938fd4d98bab03faadb97b34396831e3780aea1"
 GITHUB_OIDC_BACKUP_THUMBPRINT = "1c58a3a8518e8759bf075b76b750d4f2df264fcd"
+_IMMUTABLE_SUBJECT_PREFIX_RE = re.compile(
+    r"^repo:(?P<owner>[^/@:]+)@[1-9]\d*/(?P<repo>[^/@:]+)@[1-9]\d*$"
+)
+
+
+def _validated_subject_prefix(github_repo: str, configured: str | None) -> str:
+    """Return a mutable or immutable GitHub repository subject prefix.
+
+    GitHub repositories created or transferred after July 15, 2026 use
+    ``repo:OWNER@OWNER_ID/REPO@REPO_ID``. The explicit prefix is validated
+    against ``github_repo`` so a copied ID pair cannot silently trust a
+    different named repository.
+    """
+    try:
+        owner, repository = github_repo.split("/", 1)
+    except ValueError as exc:
+        raise ValueError("github_repo must use owner/repo format") from exc
+    if not owner or not repository or "/" in repository:
+        raise ValueError("github_repo must use owner/repo format")
+
+    mutable_prefix = f"repo:{github_repo}"
+    if configured is None:
+        return mutable_prefix
+    if not isinstance(configured, str):
+        raise ValueError("github_subject_prefix must be a string")
+    if configured != configured.strip() or not configured:
+        raise ValueError("github_subject_prefix must be a non-empty trimmed string")
+    if configured == mutable_prefix:
+        return configured
+
+    match = _IMMUTABLE_SUBJECT_PREFIX_RE.fullmatch(configured)
+    if match is None:
+        raise ValueError(
+            "github_subject_prefix must be repo:owner/repo or repo:owner@OWNER_ID/repo@REPO_ID"
+        )
+    if (match.group("owner"), match.group("repo")) != (owner, repository):
+        raise ValueError("github_subject_prefix names must match github_repo")
+    return configured
 
 
 class GCOGitHubOIDCStack(Stack):
@@ -45,6 +86,9 @@ class GCOGitHubOIDCStack(Stack):
     Parameters:
         github_repo: GitHub repository in ``owner/repo`` format.
             Default: ``aws-solutions-library-samples/global-capacity-orchestrator-on-aws``.
+        github_subject_prefix: Exact repository prefix GitHub reports for the
+            OIDC ``sub`` claim. Omit for the legacy ``repo:owner/repo`` format;
+            immutable repositories use ``repo:owner@OWNER_ID/repo@REPO_ID``.
         github_branch: Exact branch restriction. Defaults to ``"main"``.
             Set this to the repository's actual default branch when it differs;
             use ``"*"`` only as an explicit opt-in to any branch or tag.
@@ -56,6 +100,7 @@ class GCOGitHubOIDCStack(Stack):
         construct_id: str,
         *,
         github_repo: str = "aws-solutions-library-samples/global-capacity-orchestrator-on-aws",
+        github_subject_prefix: str | None = None,
         github_branch: str = "main",
         **kwargs: object,
     ) -> None:
@@ -75,11 +120,12 @@ class GCOGitHubOIDCStack(Stack):
         # ---------------------------------------------------------------------
         # Trust policy — restrict to the specified GitHub repo (and branch)
         # ---------------------------------------------------------------------
+        subject_prefix = _validated_subject_prefix(github_repo, github_subject_prefix)
         if github_branch == "*":
-            subject_claim = f"repo:{github_repo}:*"
+            subject_claim = f"{subject_prefix}:*"
             condition = {"StringLike": {"token.actions.githubusercontent.com:sub": subject_claim}}
         else:
-            subject_claim = f"repo:{github_repo}:ref:refs/heads/{github_branch}"
+            subject_claim = f"{subject_prefix}:ref:refs/heads/{github_branch}"
             condition = {"StringEquals": {"token.actions.githubusercontent.com:sub": subject_claim}}
 
         # Also require the audience claim to match

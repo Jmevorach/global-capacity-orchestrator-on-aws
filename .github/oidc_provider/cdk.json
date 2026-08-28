@@ -3,6 +3,7 @@
   "context": {
     "@aws-cdk/core:stackRelativeExports": true,
     "github_repo": "aws-solutions-library-samples/global-capacity-orchestrator-on-aws",
+    "github_subject_prefix": "repo:aws-solutions-library-samples@109766924/global-capacity-orchestrator-on-aws@1219314144",
     "github_branch": "main"
   }
 }

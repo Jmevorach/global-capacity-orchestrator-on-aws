@@ -171,6 +171,10 @@ def test_mcp_package_names_are_preserved(migrate: Any, rules: tuple[Any, ...]) -
             "https://github.com/acme-labs/gco-fork/issues",
         ),
         (
+            "repos/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/actions/oidc/customization/sub",
+            "repos/acme-labs/gco-fork/actions/oidc/customization/sub",
+        ),
+        (
             "git clone git@github.com:aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git",
             "git clone git@github.com:acme-labs/gco-fork.git",
         ),
@@ -196,6 +200,10 @@ def test_mcp_package_names_are_preserved(migrate: Any, rules: tuple[Any, ...]) -
         (
             '"github_repo": "aws-solutions-library-samples/global-capacity-orchestrator-on-aws",',
             '"github_repo": "acme-labs/gco-fork",',
+        ),
+        (
+            '"github_subject_prefix": "repo:aws-solutions-library-samples@109766924/global-capacity-orchestrator-on-aws@1219314144",',
+            '"github_subject_prefix": "REPLACE_WITH_GITHUB_OIDC_SUBJECT_PREFIX",',
         ),
         (
             "cd global-capacity-orchestrator-on-aws",

@@ -533,7 +533,7 @@ Static analysis tests act as guardrails against regressions in specific drift di
 
 | File | Description |
 |------|-------------|
-| `test_oidc_stack.py` | GitHub OIDC provider CDK stack — synthesis, OIDC provider config, trust policy (wildcard/branch/custom repo), IAM policy actions, role properties, `policy.json` validation |
+| `test_oidc_stack.py` | GitHub OIDC provider CDK stack — synthesis, provider config, mutable and immutable repository subject prefixes, branch/wildcard trust, prefix/name validation, IAM policy actions, role properties, and `policy.json` validation |
 | `test_feature_toggles.py` | Generic feature toggle helpers, Valkey config (get/update/enable/disable), Aurora config (get/update/enable/disable), FSx refactor regression |
 | `test_managed_config.py` | Managed deployment-config engine (`cli/managed_config.py`) and its veneers: writable-config resolution (installed-mode refusal), result-only validation incl. the repair path, idempotent no-ops, atomic writes preserving comments/order/mode/trailing-newline, flat and nested scalar keys (Region roles plus all four Bedrock model defaults and Codex reasoning effort) with sibling preservation, `gco.cli.managed_config` audit lines, full `gco stacks regions` / `gco stacks bedrock` CliRunner coverage, and all nine `GCO_ENABLE_CONFIG_MANAGEMENT`-gated MCP tools (registration + argv). |
 

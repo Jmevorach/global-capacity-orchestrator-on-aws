@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import aws_cdk as cdk
+import pytest
 from aws_cdk.assertions import Match, Template
 
 # Ensure the oidc_provider directory is importable
@@ -17,9 +18,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / ".github" / "oidc_provider
 
 from stack import GCOGitHubOIDCStack
 
+_OIDC_CONFIG_PATH = Path(__file__).parent.parent / ".github" / "oidc_provider" / "cdk.json"
+_OIDC_CONTEXT = json.loads(_OIDC_CONFIG_PATH.read_text(encoding="utf-8"))["context"]
+_UPSTREAM_SUBJECT_PREFIX = str(_OIDC_CONTEXT["github_subject_prefix"])
+
 
 def _synth_stack(
     github_repo: str = "aws-solutions-library-samples/global-capacity-orchestrator-on-aws",
+    github_subject_prefix: str | None = None,
     github_branch: str = "main",
 ) -> Template:
     """Synthesize the OIDC stack and return a CDK Template for assertions."""
@@ -28,6 +34,7 @@ def _synth_stack(
         app,
         "TestOIDCStack",
         github_repo=github_repo,
+        github_subject_prefix=github_subject_prefix,
         github_branch=github_branch,
     )
     return Template.from_stack(stack)
@@ -77,6 +84,11 @@ class TestOIDCProviderConfig:
         assert len(GITHUB_OIDC_THUMBPRINT) == 40
         assert len(GITHUB_OIDC_BACKUP_THUMBPRINT) == 40
 
+    def test_checked_in_context_pins_current_immutable_subject_prefix(self):
+        """The deployed upstream stack must follow GitHub's reported prefix."""
+        owner, repository = str(_OIDC_CONTEXT["github_repo"]).split("/", 1)
+        assert f"repo:{owner}@109766924/{repository}@1219314144" == _UPSTREAM_SUBJECT_PREFIX
+
 
 class TestOIDCTrustPolicy:
     """Verify the IAM role trust policy is correctly scoped."""
@@ -108,6 +120,84 @@ class TestOIDCTrustPolicy:
                 }
             },
         )
+
+    def test_immutable_subject_prefix_main_branch(self):
+        """Transferred repositories should trust the exact immutable subject."""
+        prefix = _UPSTREAM_SUBJECT_PREFIX
+        template = _synth_stack(github_subject_prefix=prefix)
+        template.has_resource_properties(
+            "AWS::IAM::Role",
+            {
+                "AssumeRolePolicyDocument": {
+                    "Statement": Match.array_with(
+                        [
+                            Match.object_like(
+                                {
+                                    "Condition": Match.object_like(
+                                        {
+                                            "StringEquals": Match.object_like(
+                                                {
+                                                    "token.actions.githubusercontent.com:sub": f"{prefix}:ref:refs/heads/main"
+                                                }
+                                            )
+                                        }
+                                    ),
+                                }
+                            )
+                        ]
+                    )
+                }
+            },
+        )
+
+    def test_immutable_subject_prefix_supports_explicit_branch_wildcard(self):
+        """The any-ref opt-in should retain the immutable repository identity."""
+        prefix = "repo:my-org@12345/my-repo@67890"
+        template = _synth_stack(
+            github_repo="my-org/my-repo",
+            github_subject_prefix=prefix,
+            github_branch="*",
+        )
+        template.has_resource_properties(
+            "AWS::IAM::Role",
+            {
+                "AssumeRolePolicyDocument": {
+                    "Statement": Match.array_with(
+                        [
+                            Match.object_like(
+                                {
+                                    "Condition": Match.object_like(
+                                        {
+                                            "StringLike": {
+                                                "token.actions.githubusercontent.com:sub": f"{prefix}:*"
+                                            }
+                                        }
+                                    ),
+                                }
+                            )
+                        ]
+                    )
+                }
+            },
+        )
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "",
+            " repo:my-org/my-repo",
+            "repo:my-org@12345/other-repo@67890",
+            "repo:other-org@12345/my-repo@67890",
+            "repo:my-org@abc/my-repo@67890",
+            "repo:my-org@12345/my-repo@67890:*",
+        ],
+    )
+    def test_invalid_subject_prefix_is_rejected(self, prefix: str):
+        with pytest.raises(ValueError, match="github_subject_prefix"):
+            _synth_stack(
+                github_repo="my-org/my-repo",
+                github_subject_prefix=prefix,
+            )
 
     def test_specific_branch_uses_string_equals(self):
         """An explicit branch name should be represented exactly."""
