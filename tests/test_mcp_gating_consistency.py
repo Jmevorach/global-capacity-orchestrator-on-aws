@@ -6,7 +6,7 @@ flag-off, so the gated families are invisible to it. That blind spot let two
 real drifts ship: ``mission_memory_search`` registered under
 ``GCO_ENABLE_MISSION`` yet missed the gating table, the import block, the
 reload re-export loop, and ``_PUBLIC_EXPORTS`` (fixed in d44f2b4), and the
-seven ``GCO_ENABLE_CONFIG_MANAGEMENT`` tools missed the import block and
+nine ``GCO_ENABLE_CONFIG_MANAGEMENT`` tools missed the import block and
 ``_PUBLIC_EXPORTS`` (fixed alongside this guard). Both were one-name-per-
 roster omissions: exactly the drift class hand-maintained rosters invite.
 

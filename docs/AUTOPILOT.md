@@ -79,9 +79,9 @@ With Git and a container runtime installed, this is the whole journey:
 git clone https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws.git
 cd global-capacity-orchestrator-on-aws
 ./scripts/setup-dev-alias.sh
-source ~/.zshrc                 # or ~/.bashrc; the script prints the target
-gco autopilot                  # default Claude Code session
-gco autopilot --engine codex   # or a Codex session
+source ~/.zshrc                       # or ~/.bashrc; the script prints the target
+gco autopilot                         # default Claude Code session
+gco autopilot --engine codex          # or a Codex session
 ```
 
 The setup script builds `gco-dev` and installs a shell function that runs each

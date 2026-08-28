@@ -1851,7 +1851,15 @@ export GCO_AUTOPILOT_ENGINE="codex"
 export GCO_AUTOPILOT_CODEX_MODEL="global.openai.gpt-5.6-sol"  # Codex-specific
 ```
 
-**3. Change the defaults for everyone** — edit the canonical values:
+**3. Change the defaults for everyone** — from a writable checkout, use the managed-config commands for every generation/session default:
+
+```bash
+gco stacks bedrock set-mission-model global.anthropic.claude-opus-5 -y
+gco stacks bedrock set-capacity-advisor-model global.anthropic.claude-opus-5 -y
+gco stacks bedrock set-claude-code-model us.anthropic.claude-sonnet-4-6 -y
+gco stacks bedrock set-codex-model global.openai.gpt-5.6-sol -y
+gco stacks bedrock set-codex-reasoning-effort xhigh -y
+```
 
 | File | Keys |
 |------|------|
@@ -1861,17 +1869,18 @@ export GCO_AUTOPILOT_CODEX_MODEL="global.openai.gpt-5.6-sol"  # Codex-specific
 | `cdk.json` | `context.bedrock.embedding_model_id` (the text-embedding model [mission memory](MISSION.md#mission-memory) uses for its vector index) |
 
 Each consumer has its own key, deliberately independent, so repointing one
-feature never silently repoints another. The managed-config commands
-`set-mission-model`, `set-capacity-advisor-model`, and
-`set-claude-code-model` safely edit the three legacy scalar defaults. Codex's
-model and reasoning effort form a reviewed pair and are edited together
-directly in `cdk.json`; `gco.bedrock` validates both when a launch uses the
-canonical Codex default. An explicit model override bypasses the pair and omits
-the canonical effort. The
-pre-v6 single `default_model_id` key fails validation with rename instructions
-instead of being silently ignored. The same `cdk.json` is shipped as package
-data so installed CLI and MCP entry points retain the defaults outside a source
-checkout.
+feature never silently repoints another. The five managed setters above are
+validated, atomic, idempotent, and audited; each changes only its target leaf
+and preserves every sibling. In particular, the Codex model and reasoning
+effort are separate managed edits so neither replaces the other—review the pair
+together when changing model families. An explicit Codex model override bypasses
+the canonical pair and omits its effort. Edit `generation_reasoning` and the
+one-way-door embedding key directly only when changing those broader contracts.
+The pre-v6 single `default_model_id` key fails validation with rename
+instructions instead of being silently ignored. The same `cdk.json` is shipped
+as package data so installed CLI and MCP entry points retain the defaults outside
+a source checkout; managed writes intentionally require a writable checkout or
+an explicit writable `--config-path`.
 
 The embedding key carries a **one-way-door coupling**: the mission-memory
 vector index is created with `mission_memory.dimensions` (default 1024,

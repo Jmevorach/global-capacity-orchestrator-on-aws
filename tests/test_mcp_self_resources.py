@@ -212,6 +212,8 @@ class TestFeatureFlags:
                 "set_mission_default_model",
                 "set_capacity_advisor_default_model",
                 "set_claude_code_default_model",
+                "set_codex_default_model",
+                "set_codex_reasoning_effort",
             },
             "GCO_ENABLE_SWARM": {
                 "swarm_start",

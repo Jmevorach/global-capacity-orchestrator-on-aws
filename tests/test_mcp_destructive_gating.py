@@ -81,6 +81,8 @@ UMBRELLA_FLAG_TOOLS = (
     "set_mission_default_model",
     "set_capacity_advisor_default_model",
     "set_claude_code_default_model",
+    "set_codex_default_model",
+    "set_codex_reasoning_effort",
     # Mission family.
     "mission_start",
     "mission_status",
@@ -390,6 +392,25 @@ class TestModelUploadGating:
         root = tmp_path / "local-root"
         source = root / "weights"
         source.mkdir(parents=True)
+        if not (
+            os.name == "posix"
+            and hasattr(os, "O_NOFOLLOW")
+            and hasattr(os, "O_DIRECTORY")
+            and Path("/dev/fd").is_dir()
+        ):
+            pytest.skip("secure upload staging requires descriptor-relative /dev/fd support")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(root, flags)
+        try:
+            try:
+                os.stat(
+                    f"/dev/fd/{descriptor}/{source.name}",
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                pytest.skip(f"/dev/fd directory traversal is unavailable: {exc}")
+        finally:
+            os.close(descriptor)
         with patch.dict(os.environ, {"GCO_STORAGE_LOCAL_ROOT": str(root)}):
             importlib.reload(run_mcp)
             with patch("cli_runner.subprocess.run") as mock:
