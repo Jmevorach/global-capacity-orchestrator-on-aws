@@ -1629,6 +1629,9 @@ def _delete_gateway_resources(cluster_name: str, region: str) -> dict[str, Any]:
         ("HTTPRoute", "gco-routes"),
         ("Gateway", "gco-gateway"),
         ("LoadBalancerConfiguration", "gco-gateway-load-balancer"),
+        ("TargetGroupConfiguration", "gco-health-monitor-target-group"),
+        ("TargetGroupConfiguration", "gco-manifest-processor-target-group"),
+        ("TargetGroupConfiguration", "gco-inference-proxy-target-group"),
         ("TargetGroupConfiguration", "gco-default-target-group"),
         ("GatewayClass", "gco-aws-alb"),
     )

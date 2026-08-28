@@ -1566,7 +1566,7 @@ class TestGatewayResourceDeletion:
     def test_deletes_routes_first_and_gateway_class_last_waiting_for_absence(self, handler_module):
         custom_api = MagicMock()
         custom_api.get_namespaced_custom_object.side_effect = [
-            self._not_found(handler_module) for _ in range(4)
+            self._not_found(handler_module) for _ in range(7)
         ]
         custom_api.get_cluster_custom_object.side_effect = self._not_found(handler_module)
         delete_options = MagicMock()
@@ -1581,24 +1581,24 @@ class TestGatewayResourceDeletion:
         configure.assert_called_once_with("gco-us-east-1", "us-east-1")
         assert result == {
             "status": "deleted",
-            "DeletedCount": 5,
+            "DeletedCount": 8,
             "Deleted": [
                 "HTTPRoute/gco-system/gco-routes",
                 "Gateway/gco-system/gco-gateway",
                 "LoadBalancerConfiguration/gco-system/gco-gateway-load-balancer",
+                "TargetGroupConfiguration/gco-system/gco-health-monitor-target-group",
+                "TargetGroupConfiguration/gco-system/gco-manifest-processor-target-group",
+                "TargetGroupConfiguration/gco-system/gco-inference-proxy-target-group",
                 "TargetGroupConfiguration/gco-system/gco-default-target-group",
                 "GatewayClass/gco-aws-alb",
             ],
         }
+        expected_namespaced_calls = [
+            "delete_namespaced_custom_object",
+            "get_namespaced_custom_object",
+        ] * 7
         assert [entry[0] for entry in custom_api.mock_calls] == [
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
+            *expected_namespaced_calls,
             "delete_cluster_custom_object",
             "get_cluster_custom_object",
         ]
@@ -1621,7 +1621,7 @@ class TestGatewayResourceDeletion:
     def test_already_absent_resources_are_idempotent(self, handler_module):
         custom_api = MagicMock()
         custom_api.delete_namespaced_custom_object.side_effect = [
-            self._not_found(handler_module) for _ in range(4)
+            self._not_found(handler_module) for _ in range(7)
         ]
         custom_api.delete_cluster_custom_object.side_effect = self._not_found(handler_module)
 
@@ -1632,7 +1632,7 @@ class TestGatewayResourceDeletion:
         ):
             result = handler_module._delete_gateway_resources("cluster", "us-east-1")
 
-        assert result["DeletedCount"] == 5
+        assert result["DeletedCount"] == 8
         assert all(item.endswith(":already-absent") for item in result["Deleted"])
         custom_api.get_namespaced_custom_object.assert_not_called()
         custom_api.get_cluster_custom_object.assert_not_called()
@@ -1659,7 +1659,7 @@ class TestGatewayResourceDeletion:
         sleep.assert_not_called()
 
     def test_task_action_dispatches_and_records_gateway_teardown(self, handler_module):
-        deleted = {"status": "deleted", "DeletedCount": 5, "Deleted": ["five objects"]}
+        deleted = {"status": "deleted", "DeletedCount": 8, "Deleted": ["eight objects"]}
         with (
             patch.object(
                 handler_module, "_delete_gateway_resources", return_value=deleted
@@ -1676,7 +1676,7 @@ class TestGatewayResourceDeletion:
 
         assert result is deleted
         delete_gateway.assert_called_once_with("gco-us-east-1", "us-east-1")
-        record.assert_called_once_with("gateway-teardown", "deleted", "deleted=5")
+        record.assert_called_once_with("gateway-teardown", "deleted", "deleted=8")
 
 
 class TestHorizontalPodAutoscalerApply:
@@ -1876,16 +1876,18 @@ class TestInferenceProxyAutoscalingManifest:
         assert hpa["spec"]["maxReplicas"] == 10
         assert hpa["spec"]["metrics"] == [
             {
-                "type": "Resource",
-                "resource": {
+                "type": "ContainerResource",
+                "containerResource": {
                     "name": "cpu",
+                    "container": "inference-proxy",
                     "target": {"type": "Utilization", "averageUtilization": 70},
                 },
             },
             {
-                "type": "Resource",
-                "resource": {
+                "type": "ContainerResource",
+                "containerResource": {
                     "name": "memory",
+                    "container": "inference-proxy",
                     "target": {"type": "Utilization", "averageUtilization": 80},
                 },
             },
@@ -1908,6 +1910,11 @@ class TestInferenceProxyAutoscalingManifest:
             "-c",
             "import time; time.sleep(10)",
         ]
+        containers = {container["name"]: container for container in pod_spec["containers"]}
+        assert (
+            containers["api-tls-proxy"]["lifecycle"]["preStop"]
+            == containers["inference-proxy"]["lifecycle"]["preStop"]
+        )
         assert pdb["spec"]["minAvailable"] == 2
         assert pdb["spec"]["selector"]["matchLabels"] == {"app": "inference-proxy"}
 

@@ -212,6 +212,16 @@ def test_api_workload_uses_tls_only_sidecar_probe_and_service(
     assert proxy_environment[TLS_CERT_FILE_ENV] == "/var/run/gco/tls/tls.crt"
     assert proxy_environment[TLS_KEY_FILE_ENV] == "/var/run/gco/tls/tls.key"
     assert proxy_environment["TLS_PROXY_UPSTREAM_PORT"] == "9000"
+    # Both containers delay SIGTERM by the same bounded preStop window so the
+    # endpoint can disappear from ALB before the TLS acceptor closes.
+    assert tls_proxy["lifecycle"]["preStop"] == application["lifecycle"]["preStop"]
+    pre_stop_code = tls_proxy["lifecycle"]["preStop"]["exec"]["command"][2]
+    pre_stop_match = re.fullmatch(r"import time; time\.sleep\((\d+)\)", pre_stop_code)
+    assert pre_stop_match is not None
+    shutdown_budget = int(pre_stop_match.group(1)) + int(
+        proxy_environment["GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS"]
+    )
+    assert pod_spec["terminationGracePeriodSeconds"] > shutdown_budget
 
     for probe_name in ("startupProbe", "livenessProbe", "readinessProbe"):
         command = application[probe_name]["exec"]["command"]
@@ -284,16 +294,33 @@ def test_cert_manager_issues_one_rotating_ecdsa_leaf_per_api_workload() -> None:
 
 def test_gateway_reencrypts_to_https_service_ports() -> None:
     documents = _documents("post-helm-gateway.yaml")
-    target_group = next(
+    target_groups = [
         document for document in documents if document["kind"] == "TargetGroupConfiguration"
+    ]
+    default_target_group = next(
+        document
+        for document in target_groups
+        if document["metadata"]["name"] == "gco-default-target-group"
     )
+    service_target_groups = {
+        document["spec"]["targetReference"]["name"]: document
+        for document in target_groups
+        if "targetReference" in document["spec"]
+    }
     route = next(document for document in documents if document["kind"] == "HTTPRoute")
-    default = target_group["spec"]["defaultConfiguration"]
+    default = default_target_group["spec"]["defaultConfiguration"]
 
     assert default["targetType"] == "ip"
     assert default["protocol"] == "HTTPS"
     assert default["healthCheckConfig"]["healthCheckProtocol"] == "HTTPS"
     assert default["healthCheckConfig"]["healthCheckPath"] == "/healthz"
+    assert set(service_target_groups) == {
+        "health-monitor",
+        "manifest-processor",
+        "inference-proxy",
+    }
+    for backend, configuration in service_target_groups.items():
+        assert configuration["spec"]["defaultConfiguration"]["tags"] == {"gco.aws/backend": backend}
     assert {
         backend["port"] for rule in route["spec"]["rules"] for backend in rule["backendRefs"]
     } == {443}

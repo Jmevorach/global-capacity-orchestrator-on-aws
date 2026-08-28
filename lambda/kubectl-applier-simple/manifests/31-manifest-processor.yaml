@@ -33,7 +33,7 @@ spec:
       serviceAccountName: gco-manifest-processor-sa
       priorityClassName: gco-platform-critical
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 75
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -281,6 +281,11 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Keep the TLS acceptor open while endpoint removal reaches ALB.
+                command: ["python", "-c", "import time; time.sleep(10)"]
           volumeMounts:
             - name: api-tls
               mountPath: /var/run/gco/tls

@@ -226,6 +226,11 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Keep the TLS acceptor open while endpoint removal reaches ALB.
+                command: ["python", "-c", "import time; time.sleep(5)"]
           volumeMounts:
             - name: api-tls
               mountPath: /var/run/gco/tls

@@ -201,6 +201,11 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Keep the TLS acceptor open while endpoint removal reaches ALB.
+                command: ["python", "-c", "import time; time.sleep(10)"]
           volumeMounts:
             - name: api-tls
               mountPath: /var/run/gco/tls
@@ -262,15 +267,19 @@ spec:
           value: 1
           periodSeconds: 60
   metrics:
-    - type: Resource
-      resource:
+    # Scale on the application container only. The TLS sidecar has independent
+    # resource requests and must not shift the established utilization targets.
+    - type: ContainerResource
+      containerResource:
         name: cpu
+        container: inference-proxy
         target:
           type: Utilization
           averageUtilization: 70
-    - type: Resource
-      resource:
+    - type: ContainerResource
+      containerResource:
         name: memory
+        container: inference-proxy
         target:
           type: Utilization
           averageUtilization: 80

@@ -1045,6 +1045,7 @@ class TestDeterministicTopologyReadiness:
         parameter_values: dict[str, str] = {}
         clients: dict[tuple[str, str], MagicMock] = {}
         target_groups: dict[str, list[dict[str, object]]] = {}
+        target_group_tags: dict[str, dict[str, dict[str, str]]] = {}
         listeners: dict[str, list[dict[str, object]]] = {}
         listener_certificates: dict[str, list[dict[str, object]]] = {}
         events: list[str] = []
@@ -1212,9 +1213,23 @@ class TestDeterministicTopologyReadiness:
                     "HealthCheckPath": "/healthz",
                     "TargetType": "ip",
                 }
-                for index in range(3)
+                for index, _backend in enumerate(
+                    ("health-monitor", "manifest-processor", "inference-proxy")
+                )
             ]
             target_groups[region] = regional_target_groups
+            regional_target_group_tags = {
+                str(target_group["TargetGroupArn"]): {
+                    "gco.aws/backend": backend,
+                    "elbv2.k8s.aws/cluster": stack_name,
+                }
+                for target_group, backend in zip(
+                    regional_target_groups,
+                    ("health-monitor", "manifest-processor", "inference-proxy"),
+                    strict=True,
+                )
+            }
+            target_group_tags[region] = regional_target_group_tags
             regional_listeners = [
                 {
                     "ListenerArn": f"{load_balancer_arn}/listener/https443",
@@ -1260,17 +1275,34 @@ class TestDeterministicTopologyReadiness:
             }
             elbv2 = MagicMock()
             elbv2.get_paginator.side_effect = paginators.__getitem__
-            elbv2.describe_tags.return_value = {
-                "TagDescriptions": [
-                    {
-                        "ResourceArn": load_balancer_arn,
-                        "Tags": [
-                            {"Key": "gco.aws/gateway", "Value": "gco-system/gco-gateway"},
-                            {"Key": "elbv2.k8s.aws/cluster", "Value": stack_name},
-                        ],
-                    }
-                ]
-            }
+
+            def describe_tags(
+                *,
+                ResourceArns: list[str],
+                _load_balancer_arn: str = load_balancer_arn,
+                _target_group_tags: dict[str, dict[str, str]] = regional_target_group_tags,
+                _stack_name: str = stack_name,
+            ) -> dict[str, list[dict[str, object]]]:
+                descriptions: list[dict[str, object]] = []
+                for arn in ResourceArns:
+                    if arn == _load_balancer_arn:
+                        tags = {
+                            "gco.aws/gateway": "gco-system/gco-gateway",
+                            "elbv2.k8s.aws/cluster": _stack_name,
+                        }
+                    else:
+                        tags = _target_group_tags.get(arn, {})
+                    descriptions.append(
+                        {
+                            "ResourceArn": arn,
+                            "Tags": [
+                                {"Key": key, "Value": value} for key, value in sorted(tags.items())
+                            ],
+                        }
+                    )
+                return {"TagDescriptions": descriptions}
+
+            elbv2.describe_tags.side_effect = describe_tags
             elbv2.describe_target_health.return_value = {
                 "TargetHealthDescriptions": [
                     {
@@ -1360,6 +1392,7 @@ class TestDeterministicTopologyReadiness:
             stacks=stacks,
             clients=clients,
             target_groups=target_groups,
+            target_group_tags=target_group_tags,
             listeners=listeners,
             listener_certificates=listener_certificates,
             events=events,
@@ -1423,6 +1456,11 @@ class TestDeterministicTopologyReadiness:
             ],
         }
         assert len(tls_evidence["target_groups"]) == 3
+        assert {group["backend"] for group in tls_evidence["target_groups"]} == {
+            "health-monitor",
+            "manifest-processor",
+            "inference-proxy",
+        }
         assert all(group["default_port"] == 1 for group in tls_evidence["target_groups"])
         assert all(group["protocol"] == "HTTPS" for group in tls_evidence["target_groups"])
         assert all(
@@ -1591,6 +1629,36 @@ class TestDeterministicTopologyReadiness:
 
         environment.ctx.aws_client.call_api.assert_not_called()
 
+    def test_missing_target_group_backend_identity_is_rejected(self) -> None:
+        environment = self._environment()
+        first_arn = str(environment.target_groups["us-east-1"][0]["TargetGroupArn"])
+        environment.target_group_tags["us-east-1"][first_arn].pop("gco.aws/backend")
+
+        with pytest.raises(RuntimeError, match="invalid gco.aws/backend identity"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_duplicate_target_group_backend_identity_is_rejected(self) -> None:
+        environment = self._environment()
+        second_arn = str(environment.target_groups["us-east-1"][1]["TargetGroupArn"])
+        environment.target_group_tags["us-east-1"][second_arn]["gco.aws/backend"] = "health-monitor"
+
+        with pytest.raises(RuntimeError, match="duplicate target groups"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_missing_expected_target_group_backend_is_rejected(self) -> None:
+        environment = self._environment()
+        removed = environment.target_groups["us-east-1"].pop()
+        environment.target_group_tags["us-east-1"].pop(str(removed["TargetGroupArn"]))
+
+        with pytest.raises(RuntimeError, match="missing target groups.*inference-proxy"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
     def test_numeric_target_group_default_port_is_also_accepted(self) -> None:
         environment = self._environment()
         for target_group in environment.target_groups["us-east-1"]:
@@ -1637,6 +1705,54 @@ class TestDeterministicTopologyReadiness:
             "target_groups"
         ][0]["health_observations"][0]
         assert observation["registered_targets"][0]["port"] == 9000
+
+    def test_wrong_health_check_port_is_rejected_before_api_probes(self) -> None:
+        environment = self._environment()
+        elbv2 = environment.clients[("elbv2", "us-east-1")]
+        elbv2.describe_target_health.return_value["TargetHealthDescriptions"][0][
+            "HealthCheckPort"
+        ] = "9000"
+
+        with pytest.raises(RuntimeError, match="health-check port other than 8443"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_wrong_port_draining_target_is_polled_until_absent(self) -> None:
+        environment = self._environment()
+        elbv2 = environment.clients[("elbv2", "us-east-1")]
+        healthy_response = elbv2.describe_target_health.return_value
+        draining_response = {
+            "TargetHealthDescriptions": [
+                *healthy_response["TargetHealthDescriptions"],
+                {
+                    "Target": {
+                        "Id": "10.0.3.10",
+                        "Port": 9000,
+                        "AvailabilityZone": "us-east-1c",
+                    },
+                    "HealthCheckPort": "9000",
+                    "TargetHealth": {"State": "draining"},
+                },
+            ]
+        }
+        elbv2.describe_target_health.side_effect = [
+            draining_response,
+            healthy_response,
+            healthy_response,
+            healthy_response,
+        ]
+
+        result = self._invoke(environment)
+
+        observations = result["alb_https_targets"]["us-east-1"]["target_groups"][0][
+            "health_observations"
+        ]
+        assert [item["states"] for item in observations] == [
+            ["healthy", "healthy", "draining"],
+            ["healthy", "healthy"],
+        ]
+        environment.sleep.assert_any_call(1.0)
 
     def test_initial_target_registration_is_polled_to_healthy(self) -> None:
         environment = self._environment()

@@ -42,6 +42,53 @@ spec:
       - key: deregistration_delay.timeout_seconds
         value: "900"
 ---
+# Service-level configurations inherit the HTTPS/default attributes above and
+# add an immutable backend identity that live validation can prove on AWS.
+apiVersion: gateway.k8s.aws/v1
+kind: TargetGroupConfiguration
+metadata:
+  name: gco-health-monitor-target-group
+  namespace: gco-system
+  labels:
+    app: health-monitor
+    project: gco
+spec:
+  targetReference:
+    name: health-monitor
+  defaultConfiguration:
+    tags:
+      gco.aws/backend: health-monitor
+---
+apiVersion: gateway.k8s.aws/v1
+kind: TargetGroupConfiguration
+metadata:
+  name: gco-manifest-processor-target-group
+  namespace: gco-system
+  labels:
+    app: manifest-processor
+    project: gco
+spec:
+  targetReference:
+    name: manifest-processor
+  defaultConfiguration:
+    tags:
+      gco.aws/backend: manifest-processor
+---
+apiVersion: gateway.k8s.aws/v1
+kind: TargetGroupConfiguration
+metadata:
+  name: gco-inference-proxy-target-group
+  namespace: gco-system
+  labels:
+    app: inference-proxy
+    project: gco
+spec:
+  targetReference:
+    name: inference-proxy
+  defaultConfiguration:
+    tags:
+      gco.aws/backend: inference-proxy
+---
 apiVersion: gateway.k8s.aws/v1
 kind: LoadBalancerConfiguration
 metadata:

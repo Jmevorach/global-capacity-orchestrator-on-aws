@@ -13,6 +13,10 @@ from ..models import RunContext, utc_now
 _GATEWAY_TAG = "gco.aws/gateway"
 _GATEWAY_TAG_VALUE = "gco-system/gco-gateway"
 _CLUSTER_TAG = "elbv2.k8s.aws/cluster"
+_TARGET_GROUP_BACKEND_TAG = "gco.aws/backend"
+_EXPECTED_TARGET_GROUP_BACKENDS = frozenset(
+    {"health-monitor", "manifest-processor", "inference-proxy"}
+)
 _TARGET_CONVERGENCE_TIMEOUT_SECONDS = 5 * 60
 _EXPECTED_REGISTERED_TARGET_PORT = 8443
 _ALLOWED_TARGET_GROUP_DEFAULT_PORTS = frozenset({1, _EXPECTED_REGISTERED_TARGET_PORT})
@@ -154,10 +158,40 @@ def _alb_https_target_evidence(
         LoadBalancerArn=load_balancer_arn
     ):
         target_groups.extend(page.get("TargetGroups", []))
-    if len(target_groups) < 3:
-        raise RuntimeError(
-            f"GCO Gateway ALB in {region} has {len(target_groups)} target groups; expected at least 3"
-        )
+    target_group_arns = [
+        str(target_group.get("TargetGroupArn") or "") for target_group in target_groups
+    ]
+    if not all(target_group_arns):
+        raise RuntimeError(f"ELBv2 returned a target group without an ARN in {region}")
+
+    target_group_tags_by_arn: dict[str, dict[str, str]] = {}
+    for start in range(0, len(target_group_arns), 20):
+        batch = target_group_arns[start : start + 20]
+        for description in client.describe_tags(ResourceArns=batch).get("TagDescriptions", []):
+            arn = str(description.get("ResourceArn") or "")
+            target_group_tags_by_arn[arn] = {
+                str(tag.get("Key") or ""): str(tag.get("Value") or "")
+                for tag in description.get("Tags", [])
+            }
+
+    backend_to_arn: dict[str, str] = {}
+    for arn in target_group_arns:
+        tags = target_group_tags_by_arn.get(arn, {})
+        backend = tags.get(_TARGET_GROUP_BACKEND_TAG, "")
+        if backend not in _EXPECTED_TARGET_GROUP_BACKENDS:
+            raise RuntimeError(
+                f"GCO Gateway target group {arn} has invalid {_TARGET_GROUP_BACKEND_TAG} "
+                f"identity {backend!r}; expected one of {sorted(_EXPECTED_TARGET_GROUP_BACKENDS)}"
+            )
+        if backend in backend_to_arn:
+            raise RuntimeError(
+                f"GCO Gateway has duplicate target groups for backend {backend!r}: "
+                f"{backend_to_arn[backend]}, {arn}"
+            )
+        backend_to_arn[backend] = arn
+    missing_backends = sorted(_EXPECTED_TARGET_GROUP_BACKENDS - set(backend_to_arn))
+    if missing_backends:
+        raise RuntimeError(f"GCO Gateway is missing target groups for backends: {missing_backends}")
 
     evidence: dict[str, Any] = {
         "region": region,
@@ -210,8 +244,11 @@ def _alb_https_target_evidence(
                 f"{json.dumps(mismatches, sort_keys=True)}"
             )
 
+        group_tags = target_group_tags_by_arn[arn]
         group_evidence: dict[str, Any] = {
             "target_group_arn": arn,
+            "backend": group_tags[_TARGET_GROUP_BACKEND_TAG],
+            "tags": group_tags,
             # The controller uses 1 as the group-wide sentinel when a Service
             # has a named targetPort. The effective data-plane port is carried
             # by every TargetHealthDescription.Target registration below.
@@ -255,21 +292,26 @@ def _alb_https_target_evidence(
             )
             ctx.persist()
 
-            incorrect_ports = [
+            incorrect_effective_ports = [
                 {
                     "id": target["id"],
                     "port": target["port"],
+                    "health_check_port": target["health_check_port"],
                     "state": target["state"],
                 }
                 for target in registered_targets
-                if target["state"] != "draining"
-                and target["port"] != _EXPECTED_REGISTERED_TARGET_PORT
+                if target["port"] != _EXPECTED_REGISTERED_TARGET_PORT
+                or str(target["health_check_port"]) != str(_EXPECTED_REGISTERED_TARGET_PORT)
             ]
-            if incorrect_ports:
+            group_evidence["incorrect_effective_ports"] = incorrect_effective_ports
+            active_incorrect_ports = [
+                target for target in incorrect_effective_ports if target["state"] != "draining"
+            ]
+            if active_incorrect_ports:
                 raise RuntimeError(
-                    f"GCO Gateway target group {arn} has non-draining targets registered "
-                    f"on a port other than {_EXPECTED_REGISTERED_TARGET_PORT}: "
-                    f"{json.dumps(incorrect_ports, sort_keys=True)}"
+                    f"GCO Gateway target group {arn} has non-draining targets with a traffic "
+                    f"or health-check port other than {_EXPECTED_REGISTERED_TARGET_PORT}: "
+                    f"{json.dumps(active_incorrect_ports, sort_keys=True)}"
                 )
 
             invalid_states = sorted(
@@ -279,7 +321,12 @@ def _alb_https_target_evidence(
                     if state_value not in {"healthy", "draining"}
                 }
             )
-            if descriptions and "healthy" in states and not invalid_states:
+            if (
+                descriptions
+                and "healthy" in states
+                and not invalid_states
+                and not incorrect_effective_ports
+            ):
                 break
             terminal_states = sorted(
                 {
@@ -296,7 +343,8 @@ def _alb_https_target_evidence(
             if remaining <= 0:
                 raise RuntimeError(
                     f"GCO Gateway target group {arn} did not acquire healthy HTTPS targets "
-                    f"within {_TARGET_CONVERGENCE_TIMEOUT_SECONDS} seconds; states={states}"
+                    f"within {_TARGET_CONVERGENCE_TIMEOUT_SECONDS} seconds; states={states}; "
+                    f"incorrect_effective_ports={incorrect_effective_ports}"
                 )
             time.sleep(min(poll_seconds, remaining))
 
