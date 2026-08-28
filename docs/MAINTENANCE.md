@@ -370,56 +370,63 @@ Because it is a deployment configuration value — not a `pyproject.toml` entry,
 a Dockerfile `FROM`, or a manifest image — Dependabot never sees it. The monthly
 [`deps-scan`](../.github/CI.md#dependency-scan-script) closes that gap: its
 **Bedrock default model** check reads each managed `cdk.json` context value and
-flags a newer release **in the same model family** — a future global Claude
-Opus release, never a jump to a different scope, tier, or provider (that is a
-choice, not drift). The generation keys (`mission_default_model_id`,
-`capacity_advisor_default_model_id`,
-`claude_code_default_model_id`) compare against the system-defined inference
-profiles in `us-east-1`; `embedding_model_id` — Mission memory's text-embedding
-model, resolved through `gco.bedrock.get_default_embedding_model_id()` — is a
-plain foundation model, so it compares against
-`bedrock list-foundation-models --by-output-modality EMBEDDING` instead. Family
-derivation tolerates all three revision shapes Bedrock ships
-(`-vMAJOR:MINOR`, a bare `-vMAJOR`, and no suffix at all), so one model line
-stays one family. The check needs AWS
-credentials via OIDC; without them the scan skips it with a noted reason, so a
-credential-less run is not a false "up to date".
+flags a newer release **in the same model family**—a future global Claude Opus
+or OpenAI GPT release, never a jump to a different scope, tier, or provider
+(that is a choice, not drift). The generation keys
+(`mission_default_model_id`, `capacity_advisor_default_model_id`) and Autopilot
+session keys (`claude_code_default_model_id`, `codex_default_model_id`) compare
+against system-defined inference profiles in `us-east-1`;
+`embedding_model_id`—Mission memory's text-embedding model, resolved through
+`gco.bedrock.get_default_embedding_model_id()`—is a plain foundation model, so
+it compares against `bedrock list-foundation-models --by-output-modality
+EMBEDDING` instead. Family derivation tolerates all three revision shapes
+Bedrock ships (`-vMAJOR:MINOR`, a bare `-vMAJOR`, and no suffix at all), so one
+model line stays one family. The check needs AWS credentials via OIDC; without
+them the scan skips it with a noted reason, so a credential-less run is not a
+false "up to date".
 
 When the scan flags a newer same-family model (or you decide to move the default
 deliberately):
 
-1. Change the flagged `cdk.json` key — `context.bedrock.mission_default_model_id`
-   (Mission sampling) or `context.bedrock.capacity_advisor_default_model_id`
-   (capacity advisor) — to the new id and set
-   `context.bedrock.generation_reasoning.effort` to a level the model supports (the two
-   generation knobs share it). Decide
-   separately whether the sibling generation knob and
-   `context.bedrock.claude_code_default_model_id` — the
-   independent default `gco autopilot` hands to Claude Code — should move too:
-   the generation defaults can be any Converse-capable family, while the Claude
-   Code default should stay a Claude model. The stock
-   value is a system-defined **global inference profile**; global profiles can
-   route worldwide and are unsuitable when a geography boundary is required.
-   Use an appropriate geography-scoped profile (`us.` / `eu.` / `jp.` / etc.)
-   where data residency requires it. If the new model speaks a reasoning
+1. Change the flagged `cdk.json` key. The two Converse generation defaults—
+   `context.bedrock.mission_default_model_id` (Mission sampling) and
+   `context.bedrock.capacity_advisor_default_model_id` (capacity advisor)—share
+   `context.bedrock.generation_reasoning.effort`, so review that effort and the
+   sibling generation key together. Treat the two Autopilot session defaults
+   independently: `context.bedrock.claude_code_default_model_id` should remain
+   a Claude model, while `context.bedrock.codex_default_model_id` should remain
+   a Codex-compatible OpenAI profile and must be reviewed with
+   `context.bedrock.codex.reasoning_effort`. The stock values are
+   system-defined **global inference profiles**; global profiles can route
+   worldwide and are unsuitable when a geography boundary is required. Use an
+   appropriate geography-scoped profile (`us.` / `eu.` / `jp.` / etc.) where
+   data residency requires it. If a new generation model speaks a reasoning
    dialect GCO does not yet translate, add it to the dialect dispatch in
-   `gco/bedrock.py` — otherwise the configured effort is silently inert. Update
-   the intentionally independent `_EXPECTED_MISSION_MODEL_ID`,
-   `_EXPECTED_CAPACITY_ADVISOR_MODEL_ID`,
-   `_EXPECTED_CLAUDE_CODE_MODEL_ID` (when moving the autopilot default),
-   `_EXPECTED_FIXTURE_NAME`, and thinking review
-   pins in `tests/test_default_bedrock_model_consistency.py`; those assertions
-   are not runtime defaults, but they make model, fixture, and reasoning changes
-   explicit in review.
-2. When the Mission key moved, capture a genuine fixture for the exact profile
-   id:
+   `gco/bedrock.py`; if a new Codex model supports a different effort set,
+   update the strict Codex configuration contract instead of carrying an
+   unreviewed value forward.
+
+   Update the intentionally independent `_EXPECTED_MISSION_MODEL_ID`,
+   `_EXPECTED_CAPACITY_ADVISOR_MODEL_ID`, `_EXPECTED_CLAUDE_CODE_MODEL_ID`,
+   `_EXPECTED_CODEX_MODEL_ID`, `_EXPECTED_CODEX`, `_EXPECTED_FIXTURE_NAME`,
+   `_EXPECTED_CODEX_FIXTURE_NAME`, and generation-reasoning pins in
+   `tests/test_default_bedrock_model_consistency.py` as applicable. Those
+   assertions are not runtime defaults, but they make every model, fixture, and
+   reasoning change explicit in review. Update the exact shipped Codex model,
+   `xhigh` effort, Mission-compatibility model, and fixture-path literals in
+   `docs/AUTOPILOT.md` at the same time; that guide is the authoritative
+   user-facing contract and must not describe the previous reviewed pair.
+2. When the Mission default or Codex default moves, capture a genuine fixture
+   for the exact profile id:
    `python3 scripts/capture_scaffold_fixtures.py --model <id> --region us-east-1`.
    The canonical directive set makes three paid calls; high reasoning can make
-   the run substantially slower and more expensive. (Scaffold fixtures replay
-   Mission sampling, so a capacity-advisor-only move needs no re-capture.)
-3. Run the Mission and capacity suites, then open a PR. The consistency guard
-   proves each consumer accessor and the dependency scanner still resolve the
-   same `cdk.json` values.
+   the run substantially slower and more expensive. Mission's fixture proves
+   its default sampling path; the Codex fixture proves that profile remains a
+   valid explicit Mission override. A capacity-advisor-only or Claude-Code-only
+   move needs no re-capture.
+3. Run the Mission, capacity, Autopilot, fixture-replay, and default-consistency
+   suites, then open a PR. The consistency guard proves every consumer accessor
+   and the dependency scanner still resolve the same `cdk.json` values.
 
 The scan also tracks `context.vector_store.embedding_model_id` — the workload
 RAG corpus's deliberately independent embedding model — through the same
@@ -436,15 +443,17 @@ changing the pin, and updating `_EXPECTED_EMBEDDING_MODEL_ID` in
 `tests/test_default_bedrock_model_consistency.py` alongside the `cdk.json`
 value.
 
-Picking a *different* model — for regulatory, data-residency, model-governance,
-or cost reasons, or to avoid the Anthropic FTU form — rather than tracking
-Claude Opus releases is an operator choice,
-not routine maintenance; the override paths (per-call flag,
-`GCO_MISSION_BEDROCK_MODEL_ID`, or changing the default) live in
-[Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). Both
-features are advisory and degrade gracefully: when no model is reachable Mission
-falls back to deterministic templates and the advisor surfaces a clear error, so
-a stale pin never blocks core orchestration.
+Picking a *different* model—for regulatory, data-residency,
+model-governance, or cost reasons, or to avoid the Anthropic FTU form—rather
+than tracking a newer release in the existing Claude or OpenAI family is an
+operator choice, not routine maintenance. Generation override paths live in
+[Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection); Autopilot's
+per-engine precedence and reasoning behavior live in
+[Autopilot](AUTOPILOT.md#choosing-a-model-and-reasoning). Mission and the
+capacity advisor are advisory: when no model is reachable Mission falls back to
+deterministic templates and the advisor surfaces a clear error, so a stale pin
+never blocks core orchestration. An Autopilot session instead reports the
+selected engine/model access failure directly.
 
 ## Maintaining the MCP server
 

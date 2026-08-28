@@ -112,45 +112,56 @@ gco jobs list --region us-east-1
 
 ### Autopilot Command
 
-Launch a fully configured [Claude Code](https://code.claude.com/docs/en/overview) session for GCO — the fastest way to start working with a deployment. Full guide: [docs/AUTOPILOT.md](AUTOPILOT.md).
+Launch a fully configured agent session for GCO—[Claude Code](https://code.claude.com/docs/en/overview) by default, or OpenAI Codex with `--engine codex`. Both use Amazon Bedrock with the GCO MCP server and recommended companion MCP servers preconfigured. Full guide: [docs/AUTOPILOT.md](AUTOPILOT.md).
 
 ```bash
-# Turn this terminal into an agent session: Claude Code on Amazon Bedrock
-# (defaults to cdk.json context.bedrock.claude_code_default_model_id) with the
-# GCO MCP server + the recommended companion MCP servers wired in
+# Default engine: Claude Code on Amazon Bedrock
+# (context.bedrock.claude_code_default_model_id)
 gco autopilot
 
-# Preview the launch plan without installing, writing, or launching
+# Alternate engine: OpenAI Codex on Amazon Bedrock
+# (context.bedrock.codex_default_model_id + codex.reasoning_effort)
+gco autopilot --engine codex
+
+# Preview either launch without installing, writing, or starting the agent
 gco autopilot --dry-run
+gco autopilot --engine codex --dry-run
 
-# Use any Claude model or inference profile enabled on Bedrock
+# Override the selected engine's Bedrock model or inference profile.
+# Any explicit Codex override intentionally omits canonical reasoning,
+# even when its ID equals the configured default.
 gco autopilot -m global.anthropic.claude-sonnet-4-6
+gco autopilot --engine codex -m global.openai.gpt-5.6-sol
 
-# Resume the previous session for this workspace (an interactive launch
-# also offers this when a previous session exists)
+# Resume the previous workspace session using engine-native semantics
 gco autopilot --continue
+gco autopilot --engine codex --continue
 
-# Enable opt-in GCO MCP tool groups for the session (repeatable; short or
-# full GCO_ENABLE_* form; -e all-tools for everything)
+# Enable opt-in GCO MCP tool groups (shared by both engines; repeatable)
 gco autopilot -e mission -e infrastructure-deploy
+gco autopilot --engine codex -e mission
 
-# Import your own skills/agents directories, or load Claude Code plugins,
-# for this session only (nothing is copied into the project or ~/.claude)
-gco autopilot --skills ~/team-skills --agents ~/my-agents
+# Import skills into either engine
+gco autopilot --skills ~/team-skills
+gco autopilot --engine codex --skills ~/team-skills
+
+# Agents and plugins are Claude Code concepts and are rejected by Codex
+gco autopilot --agents ~/my-agents
 gco autopilot --plugin ~/plugins/incident-response
 
-# GCO MCP server only, no companions
+# GCO MCP server only, no companions (shared)
 gco autopilot --no-companions
 
-# Dump the generated MCP config JSON (written to ~/.gco/autopilot/mcp.json
-# at launch and passed with --strict-mcp-config)
+# Print the selected engine's generated config: Claude JSON or Codex TOML
 gco autopilot --print-config
+gco autopilot --engine codex --print-config
 
-# Install Claude Code without prompting if absent, then pass args through
-gco autopilot -y -- --continue
+# Install the selected pinned CLI without prompting if it is absent
+gco autopilot -y
+gco autopilot --engine codex -y
 ```
 
-If the `claude` binary is missing, autopilot offers to install the exact pinned release via `npm install -g` — Claude Code is intentionally not baked into the dev container, so setup happens on first use and stays reproducible (the monthly deps-scan tracks the pin).
+If the selected `claude` or `codex` binary is missing, Autopilot offers that engine's exact pinned npm install. Neither agent CLI is baked into the dev container; first-use setup stays reproducible, and the monthly dependency scan tracks both pins. See the [Autopilot guide](AUTOPILOT.md) for model and Region precedence, generated JSON/TOML isolation, native argument passthrough, and each engine's resume behavior.
 
 ### Status Commands
 

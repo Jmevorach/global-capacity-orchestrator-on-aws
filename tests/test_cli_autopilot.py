@@ -1032,6 +1032,45 @@ def test_claude_code_pin_is_an_exact_semver() -> None:
     assert re.fullmatch(r"\d+\.\d+\.\d+", CLAUDE_CODE_VERSION)
 
 
+def test_public_entry_points_document_both_autopilot_engines() -> None:
+    """Claude-first entry points must expose the equivalent Codex path."""
+    entry_points = (
+        "README.md",
+        "QUICKSTART.md",
+        "docs/README.md",
+        "docs/CLI.md",
+        "gco_mcp/README.md",
+        "wiki/index.md",
+        "wiki/evaluating-and-deploying.md",
+    )
+    missing = []
+    for relative_path in entry_points:
+        text = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        if "Claude Code" not in text or "gco autopilot --engine codex" not in text:
+            missing.append(relative_path)
+    assert not missing, f"public Autopilot docs missing Claude/Codex parity: {missing}"
+
+    root_readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "demo/autopilot-claude-code.gif" in root_readme
+    assert "demo/autopilot-codex.gif" in root_readme
+
+    mcp_readme = _MCP_README.read_text(encoding="utf-8")
+    assert "### Claude Code" in mcp_readme
+    assert "### OpenAI Codex" in mcp_readme
+    codex_section = mcp_readme.split("### OpenAI Codex", 1)[1].split("### Cursor", 1)[0]
+    codex_block = re.search(r"```toml\n(.*?)```", codex_section, re.S)
+    assert codex_block is not None
+    codex_config = tomllib.loads(codex_block.group(1))
+    assert set(codex_config["mcp_servers"]) == {"gco"}
+    assert codex_config["mcp_servers"]["gco"]["enabled"] is True
+
+    maintenance = (_REPO_ROOT / "docs" / "MAINTENANCE.md").read_text(encoding="utf-8")
+    assert "claude_code_default_model_id" in maintenance
+    assert "codex_default_model_id" in maintenance
+    assert "codex.reasoning_effort" in maintenance
+    assert "docs/AUTOPILOT.md" in maintenance
+
+
 def test_companion_registry_matches_the_mcp_readme_tables() -> None:
     """The code registry and the README recommendation tables move together."""
     readme = _MCP_README.read_text(encoding="utf-8")

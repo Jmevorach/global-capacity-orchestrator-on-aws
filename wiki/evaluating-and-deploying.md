@@ -33,9 +33,10 @@ you are signing up for.
 5. **Tear down** — one command destroys the stacks with best-effort cleanup
    of known resources.
 
-Prefer to let an agent drive? `gco autopilot` launches a configured Claude
-Code session on Amazon Bedrock with the GCO MCP server wired in — deploying,
-checking capacity, and submitting jobs conversationally. See
+Prefer to let an agent drive? `gco autopilot` launches Claude Code by
+default; `gco autopilot --engine codex` launches OpenAI Codex. Both run on
+Amazon Bedrock with the GCO MCP server and recommended companions wired in—so
+you can deploy, check capacity, and submit jobs conversationally. See
 [docs/AUTOPILOT.md](https://github.com/aws-solutions-library-samples/global-capacity-orchestrator-on-aws/blob/main/docs/AUTOPILOT.md).
 
 ![Listing deployed CDK stacks via natural language through the GCO MCP server](assets/images/gco_mcp_list_stacks.png)
