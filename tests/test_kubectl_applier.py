@@ -1354,9 +1354,10 @@ class TestMainPassRestartsAddonControllers:
     installs.
     """
 
-    def test_main_pass_restarts_efs_and_fsx_controllers(self, handler_module, tmp_path):
-        """efs-csi-controller and fsx-csi-controller are restarted in kube-system."""
-        # Minimal manifest so apply_manifests completes.
+    def test_main_pass_avoids_duplicate_gco_rollout_and_restarts_csi_controllers(
+        self, handler_module, tmp_path
+    ):
+        """GCO rolls via manifest annotation; CSI controllers still restart for IRSA."""
         (tmp_path / "00-ns.yaml").write_text(
             yaml.dump({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "demo"}})
         )
@@ -1380,16 +1381,10 @@ class TestMainPassRestartsAddonControllers:
                 "test-cluster", "us-east-1", str(tmp_path), {}, post_helm=False
             )
 
-        # Collect every (namespace, names) pair restart_deployments was
-        # called with. We don't care about argument order between gco-system
-        # and kube-system — we only care both restarts happened.
         deploy_calls = {
             (call.args[0], tuple(call.args[1])) for call in mock_restart_deploy.call_args_list
         }
-        assert (
-            "gco-system",
-            ("health-monitor", "manifest-processor", "inference-monitor", "inference-proxy"),
-        ) in deploy_calls
+        assert not any(namespace == "gco-system" for namespace, _names in deploy_calls)
         assert ("kube-system", ("efs-csi-controller", "fsx-csi-controller")) in deploy_calls
 
     def test_main_pass_restarts_csi_and_cloudwatch_daemonsets(self, handler_module, tmp_path):

@@ -1539,16 +1539,11 @@ def apply_manifests(
             "PruneFailures": ",".join(prune_failures) if prune_failures else "None",
         }
 
-    # Restart deployments in gco-system namespace to pick up new images
-    # This ensures that any updated container images are actually deployed
-    gco_deployments = [
-        "health-monitor",
-        "manifest-processor",
-        "inference-monitor",
-        "inference-proxy",
-    ]
-    logger.info(f"Restarting deployments in gco-system: {gco_deployments}")
-    restart_result = restart_deployments("gco-system", gco_deployments)
+    # GCO Deployments already roll exactly once through their
+    # gco.aws/deployment-timestamp pod-template annotation (and any image patch).
+    # Do not immediately add kubectl.kubernetes.io/restartedAt: a second
+    # back-to-back revision can pin maxUnavailable=0/maxSurge=1 Deployments at
+    # their surge ceiling while the first revision is still converging.
 
     # Restart the EFS CSI controller so it picks up the IRSA role-ARN
     # annotation that the EKS addon update patched onto its service account.
@@ -1600,10 +1595,7 @@ def apply_manifests(
 
     # Combine the restart results for the return payload.
     all_restarted = (
-        restart_result["restarted"]
-        + ks_deploy_restart["restarted"]
-        + ks_ds_restart["restarted"]
-        + cw_ds_restart["restarted"]
+        ks_deploy_restart["restarted"] + ks_ds_restart["restarted"] + cw_ds_restart["restarted"]
     )
 
     return {
