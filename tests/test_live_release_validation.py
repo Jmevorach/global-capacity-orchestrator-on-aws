@@ -1204,7 +1204,10 @@ class TestDeterministicTopologyReadiness:
                         f"targetgroup/gco-live-{index}/tg{index}"
                     ),
                     "Protocol": "HTTPS",
-                    "Port": 8443,
+                    # A named Kubernetes targetPort is represented by the
+                    # controller as a group-wide sentinel; each registration
+                    # below carries the effective pod port.
+                    "Port": 1,
                     "HealthCheckProtocol": "HTTPS",
                     "HealthCheckPath": "/healthz",
                     "TargetType": "ip",
@@ -1270,8 +1273,24 @@ class TestDeterministicTopologyReadiness:
             }
             elbv2.describe_target_health.return_value = {
                 "TargetHealthDescriptions": [
-                    {"TargetHealth": {"State": "healthy"}},
-                    {"TargetHealth": {"State": "healthy"}},
+                    {
+                        "Target": {
+                            "Id": "10.0.1.10",
+                            "Port": 8443,
+                            "AvailabilityZone": f"{region}a",
+                        },
+                        "HealthCheckPort": "8443",
+                        "TargetHealth": {"State": "healthy"},
+                    },
+                    {
+                        "Target": {
+                            "Id": "10.0.2.10",
+                            "Port": 8443,
+                            "AvailabilityZone": f"{region}b",
+                        },
+                        "HealthCheckPort": "8443",
+                        "TargetHealth": {"State": "healthy"},
+                    },
                 ]
             }
             clients[("elbv2", region)] = elbv2
@@ -1404,10 +1423,16 @@ class TestDeterministicTopologyReadiness:
             ],
         }
         assert len(tls_evidence["target_groups"]) == 3
+        assert all(group["default_port"] == 1 for group in tls_evidence["target_groups"])
         assert all(group["protocol"] == "HTTPS" for group in tls_evidence["target_groups"])
         assert all(
             group["health_check_protocol"] == "HTTPS" for group in tls_evidence["target_groups"]
         )
+        assert all(
+            group["registered_target_ports"] == [8443] for group in tls_evidence["target_groups"]
+        )
+        first_observation = tls_evidence["target_groups"][0]["health_observations"][0]
+        assert {target["port"] for target in first_observation["registered_targets"]} == {8443}
         assert environment.ctx.checkpoint.state["topology_alb_https_targets"] == {
             "us-east-1": tls_evidence
         }
@@ -1566,12 +1591,75 @@ class TestDeterministicTopologyReadiness:
 
         environment.ctx.aws_client.call_api.assert_not_called()
 
+    def test_numeric_target_group_default_port_is_also_accepted(self) -> None:
+        environment = self._environment()
+        for target_group in environment.target_groups["us-east-1"]:
+            target_group["Port"] = 8443
+
+        result = self._invoke(environment)
+
+        assert all(
+            group["default_port"] == 8443
+            for group in result["alb_https_targets"]["us-east-1"]["target_groups"]
+        )
+
+    def test_unexpected_target_group_default_port_is_rejected_before_api_probes(self) -> None:
+        environment = self._environment()
+        environment.target_groups["us-east-1"][0]["Port"] = 443
+
+        with pytest.raises(RuntimeError, match="not HTTPS-hardened"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+
+    def test_wrong_registered_target_port_is_rejected_before_api_probes(self) -> None:
+        environment = self._environment()
+        elbv2 = environment.clients[("elbv2", "us-east-1")]
+        elbv2.describe_target_health.return_value = {
+            "TargetHealthDescriptions": [
+                {
+                    "Target": {
+                        "Id": "10.0.1.10",
+                        "Port": 9000,
+                        "AvailabilityZone": "us-east-1a",
+                    },
+                    "HealthCheckPort": "9000",
+                    "TargetHealth": {"State": "healthy"},
+                }
+            ]
+        }
+
+        with pytest.raises(RuntimeError, match="port other than 8443"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
+        observation = environment.ctx.checkpoint.state["topology_alb_https_targets"]["us-east-1"][
+            "target_groups"
+        ][0]["health_observations"][0]
+        assert observation["registered_targets"][0]["port"] == 9000
+
     def test_initial_target_registration_is_polled_to_healthy(self) -> None:
         environment = self._environment()
         elbv2 = environment.clients[("elbv2", "us-east-1")]
-        healthy = {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}]}
+
+        def response(state: str) -> dict[str, object]:
+            return {
+                "TargetHealthDescriptions": [
+                    {
+                        "Target": {
+                            "Id": "10.0.1.10",
+                            "Port": 8443,
+                            "AvailabilityZone": "us-east-1a",
+                        },
+                        "HealthCheckPort": "8443",
+                        "TargetHealth": {"State": state},
+                    }
+                ]
+            }
+
+        healthy = response("healthy")
         elbv2.describe_target_health.side_effect = [
-            {"TargetHealthDescriptions": [{"TargetHealth": {"State": "initial"}}]},
+            response("initial"),
             healthy,
             healthy,
             healthy,
@@ -1590,7 +1678,18 @@ class TestDeterministicTopologyReadiness:
         elbv2 = environment.clients[("elbv2", "us-east-1")]
         elbv2.describe_target_health.return_value = {
             "TargetHealthDescriptions": [
-                {"TargetHealth": {"State": "unhealthy", "Reason": "Target.FailedHealthChecks"}}
+                {
+                    "Target": {
+                        "Id": "10.0.1.10",
+                        "Port": 8443,
+                        "AvailabilityZone": "us-east-1a",
+                    },
+                    "HealthCheckPort": "8443",
+                    "TargetHealth": {
+                        "State": "unhealthy",
+                        "Reason": "Target.FailedHealthChecks",
+                    },
+                }
             ]
         }
 

@@ -242,6 +242,9 @@ def test_api_workload_uses_tls_only_sidecar_probe_and_service(
     assert tls_volume["secret"] == {"secretName": secret_name, "defaultMode": 0o440}
 
     assert service["metadata"]["name"] == app
+    # Keep the named targetPort: the AWS controller may represent it with a
+    # target-group-wide port-1 sentinel while registering every pod on 8443.
+    # Live validation checks those per-target registrations, not the sentinel.
     assert service["spec"]["ports"] == [
         {"port": 443, "targetPort": "https", "protocol": "TCP", "name": "https"}
     ]

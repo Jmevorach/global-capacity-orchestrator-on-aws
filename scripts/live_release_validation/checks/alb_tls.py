@@ -14,6 +14,8 @@ _GATEWAY_TAG = "gco.aws/gateway"
 _GATEWAY_TAG_VALUE = "gco-system/gco-gateway"
 _CLUSTER_TAG = "elbv2.k8s.aws/cluster"
 _TARGET_CONVERGENCE_TIMEOUT_SECONDS = 5 * 60
+_EXPECTED_REGISTERED_TARGET_PORT = 8443
+_ALLOWED_TARGET_GROUP_DEFAULT_PORTS = frozenset({1, _EXPECTED_REGISTERED_TARGET_PORT})
 
 
 def _ssm_string_parameter(client: Any, name: str) -> str:
@@ -187,7 +189,6 @@ def _alb_https_target_evidence(
             raise RuntimeError(f"ELBv2 returned a target group without an ARN in {region}")
         expected = {
             "Protocol": "HTTPS",
-            "Port": 8443,
             "HealthCheckProtocol": "HTTPS",
             "TargetType": "ip",
             "HealthCheckPath": "/healthz",
@@ -197,6 +198,12 @@ def _alb_https_target_evidence(
             for field, value in expected.items()
             if target_group.get(field) != value
         }
+        default_port = target_group.get("Port")
+        if default_port not in _ALLOWED_TARGET_GROUP_DEFAULT_PORTS:
+            mismatches["Port"] = {
+                "expected_any_of": sorted(_ALLOWED_TARGET_GROUP_DEFAULT_PORTS),
+                "actual": default_port,
+            }
         if mismatches:
             raise RuntimeError(
                 f"GCO Gateway target group {arn} is not HTTPS-hardened: "
@@ -205,7 +212,10 @@ def _alb_https_target_evidence(
 
         group_evidence: dict[str, Any] = {
             "target_group_arn": arn,
-            "port": target_group.get("Port"),
+            # The controller uses 1 as the group-wide sentinel when a Service
+            # has a named targetPort. The effective data-plane port is carried
+            # by every TargetHealthDescription.Target registration below.
+            "default_port": default_port,
             "protocol": target_group.get("Protocol"),
             "health_check_protocol": target_group.get("HealthCheckProtocol"),
             "health_check_path": target_group.get("HealthCheckPath"),
@@ -217,20 +227,50 @@ def _alb_https_target_evidence(
         while True:
             health_response = client.describe_target_health(TargetGroupArn=arn)
             descriptions = health_response.get("TargetHealthDescriptions", [])
-            states = [
-                str((item.get("TargetHealth") or {}).get("State") or "") for item in descriptions
-            ]
+            registered_targets: list[dict[str, Any]] = []
+            for item in descriptions:
+                target = item.get("Target") or {}
+                target_health = item.get("TargetHealth") or {}
+                registered_targets.append(
+                    {
+                        "id": str(target.get("Id") or ""),
+                        "port": target.get("Port"),
+                        "availability_zone": target.get("AvailabilityZone"),
+                        "health_check_port": item.get("HealthCheckPort"),
+                        "state": str(target_health.get("State") or ""),
+                        "reason": str(target_health.get("Reason") or ""),
+                    }
+                )
+            states = [target["state"] for target in registered_targets]
             observation = {
                 "observed_at": utc_now(),
                 "states": states,
-                "reasons": [
-                    str((item.get("TargetHealth") or {}).get("Reason") or "")
-                    for item in descriptions
-                ],
+                "reasons": [target["reason"] for target in registered_targets],
+                "registered_targets": registered_targets,
             }
             group_evidence["health_observations"].append(observation)
             group_evidence["target_states"] = states
+            group_evidence["registered_target_ports"] = sorted(
+                {target["port"] for target in registered_targets if isinstance(target["port"], int)}
+            )
             ctx.persist()
+
+            incorrect_ports = [
+                {
+                    "id": target["id"],
+                    "port": target["port"],
+                    "state": target["state"],
+                }
+                for target in registered_targets
+                if target["state"] != "draining"
+                and target["port"] != _EXPECTED_REGISTERED_TARGET_PORT
+            ]
+            if incorrect_ports:
+                raise RuntimeError(
+                    f"GCO Gateway target group {arn} has non-draining targets registered "
+                    f"on a port other than {_EXPECTED_REGISTERED_TARGET_PORT}: "
+                    f"{json.dumps(incorrect_ports, sort_keys=True)}"
+                )
 
             invalid_states = sorted(
                 {
