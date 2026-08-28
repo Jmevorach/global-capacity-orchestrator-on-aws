@@ -657,7 +657,7 @@ if is_enabled(FLAG_CONFIG_MANAGEMENT):
         set_claude_code_default_model). Model and inference-profile IDs are
         free-form (custom profiles, marketplace models); validation mirrors
         the runtime reader (non-empty, no surrounding whitespace). Sibling
-        settings (bedrock.thinking, the other model keys) are preserved;
+        settings (bedrock.generation_reasoning, the other model keys) are preserved;
         explicit --bedrock-model-id / env overrides still take precedence
         at run time.
 
@@ -679,7 +679,7 @@ if is_enabled(FLAG_CONFIG_MANAGEMENT):
         autopilot have their own keys (set_mission_default_model and
         set_claude_code_default_model). Validation mirrors the runtime
         reader (non-empty, no surrounding whitespace). Sibling settings
-        (bedrock.thinking, the other model keys) are preserved; explicit
+        (bedrock.generation_reasoning, the other model keys) are preserved; explicit
         --model overrides still take precedence at run time.
 
         Args:
@@ -710,3 +710,44 @@ if is_enabled(FLAG_CONFIG_MANAGEMENT):
                 (e.g. us.anthropic.claude-sonnet-4-6).
         """
         return cli_runner._run_cli("stacks", "bedrock", "set-claude-code-model", model_id, "-y")
+
+    @mcp.tool(tags={"low-risk", "stacks"})
+    @audit_logged
+    def set_codex_default_model(model_id: str) -> str:
+        """[gated by GCO_ENABLE_CONFIG_MANAGEMENT]
+
+        Set cdk.json bedrock.codex_default_model_id.
+
+        Config-only and idempotent. The reviewed
+        bedrock.codex.reasoning_effort sibling is preserved; review the pair
+        together when changing model families. Explicit --model,
+        GCO_AUTOPILOT_CODEX_MODEL, and GCO_AUTOPILOT_MODEL overrides still
+        take precedence at launch.
+
+        Args:
+            model_id: Bedrock model or inference-profile ID
+                (e.g. global.openai.<model-id>).
+        """
+        return cli_runner._run_cli("stacks", "bedrock", "set-codex-model", model_id, "-y")
+
+    @mcp.tool(tags={"low-risk", "stacks"})
+    @audit_logged
+    def set_codex_reasoning_effort(reasoning_effort: str) -> str:
+        """[gated by GCO_ENABLE_CONFIG_MANAGEMENT]
+
+        Set cdk.json bedrock.codex.reasoning_effort.
+
+        Allowed values are minimal, low, medium, high, and xhigh. The setting
+        applies only to the canonical Codex model; explicit model overrides
+        intentionally omit canonical reasoning.
+
+        Args:
+            reasoning_effort: Reviewed canonical Codex reasoning effort.
+        """
+        return cli_runner._run_cli(
+            "stacks",
+            "bedrock",
+            "set-codex-reasoning-effort",
+            reasoning_effort,
+            "-y",
+        )

@@ -336,7 +336,14 @@ jobs:
             3.2.*) ;;
             *) echo "Expected macOS Bash 3.2, found $bash_version" >&2; exit 1 ;;
           esac
-          /bin/bash -n demo/lib_demo.sh demo/record_deploy.sh demo/record_destroy.sh demo/record_autopilot.sh
+          for script in \
+            demo/lib_demo.sh \
+            demo/record_deploy.sh \
+            demo/record_destroy.sh \
+            demo/record_autopilot.sh
+          do
+            /bin/bash -n "$script"
+          done
           /bin/bash -eu <<'BASH32'
           source demo/lib_demo.sh
           GCO_EXPECTED_GIT_SHA=$(git rev-parse HEAD)
@@ -421,12 +428,12 @@ jobs:
           python -m pytest --noconftest -q
           tests/test_managed_config.py::TestEngineWriteMechanics::test_process_update_waits_for_shared_lock
 
-  # End-to-end smoke for `gco autopilot`: the launch plan resolves without
-  # Claude Code present, the generated MCP config is valid and matches the
-  # companion registry, and the pinned @anthropic-ai/claude-code release
-  # actually installs from npm and is then detected. Complements the mocked
-  # pytest coverage (tests/test_cli_autopilot.py) with the one thing mocks
-  # can't prove — that the pin is installable.
+  # End-to-end smoke for both `gco autopilot` engines: each launch plan
+  # resolves without its agent CLI present, both generated config formats are
+  # validated against the shared companion registry, and the exact pinned
+  # Claude Code and Codex npm releases install and are detected. Complements
+  # mocked pytest coverage with the one thing mocks cannot prove: both lazy
+  # runtime pins are installable.
   unit-cli-autopilot:
     name: "unit:cli:autopilot"
     runs-on: ubuntu-latest
@@ -441,25 +448,33 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version-file: ".nvmrc"
+      - name: Install and verify the declared npm version
+        run: bash .github/scripts/use-pinned-npm.sh package.json
       - name: Install CLI
         run: |
           pip install -e .
-      - name: Resolve the launch plan without Claude Code installed
+      - name: Resolve both launch plans without agent CLIs installed
         run: |
           gco autopilot --help
           gco autopilot --dry-run
           gco -o json autopilot --dry-run > /tmp/autopilot-plan.json
-          # Assertions live in the shared autopilot CI contract — the same
-          # checks the dev-container step and the boot probe consume, so
-          # the expected server set / model / pin are asserted from ONE
-          # place (.github/scripts/autopilot_ci_contract.py).
+          gco autopilot --engine codex --dry-run
+          gco -o json autopilot --engine codex --dry-run > /tmp/codex-plan.json
+          # Assertions live in the shared engine-aware CI contract — the same
+          # checks the dev-container step and boot probe consume.
           python3 .github/scripts/autopilot_ci_contract.py \
             verify-plan /tmp/autopilot-plan.json --claude-binary absent
-      - name: Validate the generated MCP config
+          python3 .github/scripts/autopilot_ci_contract.py \
+            verify-plan /tmp/codex-plan.json \
+            --engine codex --codex-binary absent
+      - name: Validate both generated MCP configs
         run: |
           gco autopilot --print-config > /tmp/autopilot-mcp.json
           python3 .github/scripts/autopilot_ci_contract.py \
             verify-config /tmp/autopilot-mcp.json
+          gco autopilot --engine codex --print-config > /tmp/autopilot-codex.toml
+          python3 .github/scripts/autopilot_ci_contract.py \
+            verify-codex-config /tmp/autopilot-codex.toml
       - name: Validate feature-flag and resume-flag handling
         run: |
           # Feature flags land on the gco server entry only (the contract's
@@ -467,6 +482,11 @@ jobs:
           gco autopilot -e all-tools --print-config > /tmp/autopilot-flags.json
           python3 .github/scripts/autopilot_ci_contract.py \
             verify-config /tmp/autopilot-flags.json \
+            --expect-gco-env GCO_ENABLE_ALL_TOOLS=true
+          gco autopilot --engine codex -e all-tools --print-config \
+            > /tmp/codex-flags.toml
+          python3 .github/scripts/autopilot_ci_contract.py \
+            verify-codex-config /tmp/codex-flags.toml \
             --expect-gco-env GCO_ENABLE_ALL_TOOLS=true
           # Bad inputs fail loudly instead of launching a wrong session.
           if gco autopilot -e bogus-flag --print-config; then
@@ -497,16 +517,44 @@ jobs:
             echo "missing --skills path was accepted" >&2; exit 1
           fi
           echo "imports handling OK"
-      - name: Install the pinned Claude Code release and re-resolve
-        # Runs the exact command autopilot itself executes (including the
-        # scoped --allow-scripts: npm >= 12 blocks the postinstall that
-        # fetches the platform-native binary, leaving a broken shim).
+      - name: Install both pinned agent CLIs and re-resolve
+        # Execute the exact lazy-install commands production Autopilot uses,
+        # then prove each real binary and installed-plan state.
         run: |
-          python3 -c 'from cli.autopilot import claude_install_command; import subprocess; subprocess.run(claude_install_command(), check=True)'
-          claude --version | grep -qF "$(python3 .github/scripts/autopilot_ci_contract.py pin)"
+          python3 - <<'PY'
+          import subprocess
+
+          from cli.autopilot import claude_install_command, codex_install_command
+
+          subprocess.run(claude_install_command(), check=True)
+          subprocess.run(codex_install_command(), check=True)
+          PY
+          claude --version | grep -qF \
+            "$(python3 .github/scripts/autopilot_ci_contract.py pin)"
+          codex --version | grep -qF \
+            "$(python3 .github/scripts/autopilot_ci_contract.py pin --engine codex)"
+          # Parse the exact session-precedence and resume spellings production
+          # uses. This catches a future Codex pin whose CLI/schema moves.
+          codex --model parser-smoke \
+            -c 'model_provider="amazon-bedrock-runtime"' \
+            -c 'model_reasoning_effort="xhigh"' \
+            -c 'model_providers.amazon-bedrock-runtime.wire_api="responses"' \
+            -c 'model_providers.amazon-bedrock-runtime.aws.region="us-east-1"' \
+            -c 'check_for_update_on_startup=false' \
+            -c 'projects={"/tmp"={trust_level="untrusted"}}' \
+            --disable shell_tool --help >/dev/null
+          codex resume --last --no-alt-screen --help >/dev/null
+          if codex --last resume --help >/dev/null 2>&1; then
+            echo "Codex accepted invalid root-level --last ordering" >&2; exit 1
+          fi
           gco -o json autopilot --dry-run > /tmp/autopilot-plan-installed.json
+          gco -o json autopilot --engine codex --dry-run \
+            > /tmp/codex-plan-installed.json
           python3 .github/scripts/autopilot_ci_contract.py \
             verify-plan /tmp/autopilot-plan-installed.json --claude-binary present
+          python3 .github/scripts/autopilot_ci_contract.py \
+            verify-plan /tmp/codex-plan-installed.json \
+            --engine codex --codex-binary present
 
   unit-cdk-synth:
     name: "unit:cdk:synth"

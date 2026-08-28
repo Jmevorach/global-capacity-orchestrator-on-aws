@@ -174,12 +174,12 @@ class TestToolRegistration:
         tools = asyncio.run(run_mcp.mcp._list_tools())
         # The default registry intentionally contains 138 read-only or low-risk
         # tools (134 before fleet_status; 125 before the cost
-        # allocation/k8s/report family added 9). Optional families add 48 more
+        # allocation/k8s/report family added 9). Optional families add 56 more
         # when every flag is enabled: capacity purchase (2), image publish (3),
         # destructive operations (15), model upload (2), infrastructure deploy
         # (4), infrastructure destroy (2), local metrics (1), semantic progress
-        # (1), local storage sync (1), config management (7), and Mission (10).
-        # The all-flags ceiling is therefore 183.
+        # (1), local storage sync (1), config management (9), Mission (10), and
+        # Swarm (6). The all-flags ceiling is therefore 194.
         base_count = 138
         tool_names = [t.name for t in tools]
         expected = base_count
@@ -208,10 +208,10 @@ class TestToolRegistration:
         if "sync_storage_bucket" in tool_names:
             expected += 1  # gated by GCO_ENABLE_LOCAL_STORAGE_SYNC
         if "add_deployment_region" in tool_names:
-            # list/add/remove/set_deployment_region + set_mission_default_model
-            # + set_capacity_advisor_default_model + set_claude_code_default_model
-            # register together under GCO_ENABLE_CONFIG_MANAGEMENT.
-            expected += 7
+            # list/add/remove/set_deployment_region plus the five managed
+            # Bedrock model/reasoning setters register together under
+            # GCO_ENABLE_CONFIG_MANAGEMENT.
+            expected += 9
         if "swarm_start" in tool_names:
             # The six swarm_* tools register together under GCO_ENABLE_SWARM.
             expected += 6
@@ -490,6 +490,8 @@ class TestToolRegistration:
                     "set_mission_default_model",
                     "set_capacity_advisor_default_model",
                     "set_claude_code_default_model",
+                    "set_codex_default_model",
+                    "set_codex_reasoning_effort",
                 }
             )
         # The six swarm_* tools register together under GCO_ENABLE_SWARM.

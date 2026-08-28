@@ -1174,7 +1174,7 @@ Manage CDK infrastructure stacks.
 | [`gco stacks bootstrap`](#gco-stacks-bootstrap) | Bootstrap CDK in a region. |
 | [`gco stacks access`](#gco-stacks-access) | Configure kubectl access to a GCO EKS cluster. |
 | [`gco stacks regions`](#gco-stacks-regions) | Manage deployment Regions in cdk.json (managed-config engine). |
-| [`gco stacks bedrock`](#gco-stacks-bedrock) | Manage the Bedrock model default in cdk.json (managed-config engine). |
+| [`gco stacks bedrock`](#gco-stacks-bedrock) | Manage Bedrock model and reasoning defaults in cdk.json (managed-config engine). |
 | [`gco stacks fsx`](#gco-stacks-fsx) | Manage [FSx for Lustre](https://docs.aws.amazon.com/fsx/latest/LustreGuide/what-is.html) storage. |
 | [`gco stacks valkey`](#gco-stacks-valkey) | Manage [Valkey](https://valkey.io/) Serverless cache. |
 | [`gco stacks aurora`](#gco-stacks-aurora) | Manage Aurora PostgreSQL ([pgvector](https://github.com/pgvector/pgvector)) database. |
@@ -1399,7 +1399,7 @@ gco stacks regions set monitoring us-west-2 -y
 
 #### `gco stacks bedrock`
 
-Manage the three Bedrock model defaults in cdk.json, one per consumer: `context.bedrock.mission_default_model_id` — the model/inference-profile ID Mission sampling uses unless explicitly overridden — `context.bedrock.capacity_advisor_default_model_id` — the capacity advisor's equivalent — and `context.bedrock.claude_code_default_model_id`, the session model `gco autopilot` hands to Claude Code. The keys are independent: repointing one never repoints the others. Edits go through the managed-config engine: validated, atomic, idempotent, and audited. Sibling settings (`bedrock.thinking`, the other model keys) are preserved.
+Manage the four Bedrock model defaults in `context.bedrock`—Mission, capacity advisor, Claude Code, and Codex—plus the canonical Codex `reasoning_effort`. Every edit uses the managed-config engine, so it is validated, atomic, idempotent, and audited, and it preserves all sibling settings. The Codex model and effort remain independently editable so changing one never replaces the other; review them together when changing model families. See [Autopilot](AUTOPILOT.md#choosing-a-model-and-reasoning) for launch-time precedence and why explicit Codex model overrides omit the canonical effort.
 
 ```bash
 gco stacks bedrock COMMAND [OPTIONS]
@@ -1407,10 +1407,12 @@ gco stacks bedrock COMMAND [OPTIONS]
 
 **Subcommands:**
 
-- `show` - Show every configured default model ID and its backing cdk.json path (`gco stacks bedrock show`).
+- `show` - Show all four managed model IDs, the Codex reasoning effort, and their backing cdk.json path (`gco stacks bedrock show`).
 - `set-mission-model` - Set the Mission sampling default model/inference-profile ID (`gco stacks bedrock set-mission-model`). IDs are free-form (custom profiles, marketplace models); validation mirrors the runtime reader — a non-empty string without surrounding whitespace.
 - `set-capacity-advisor-model` - Set the capacity advisor default model/inference-profile ID (`gco stacks bedrock set-capacity-advisor-model`). Same free-form validation; explicit `--model` overrides still win at run time.
 - `set-claude-code-model` - Set the Claude Code session model `gco autopilot` launches with (`gco stacks bedrock set-claude-code-model`). Same free-form validation; explicit `--model`/`GCO_AUTOPILOT_MODEL` overrides still win at launch time.
+- `set-codex-model` - Set the canonical Codex session model (`gco stacks bedrock set-codex-model`) while preserving `context.bedrock.codex.reasoning_effort`. Explicit `--model`, `GCO_AUTOPILOT_CODEX_MODEL`, and `GCO_AUTOPILOT_MODEL` overrides still win at launch time.
+- `set-codex-reasoning-effort` - Set `context.bedrock.codex.reasoning_effort` to `minimal`, `low`, `medium`, `high`, or `xhigh` while preserving the Codex model. This applies only when the canonical Codex model wins resolution.
 
 **Example:**
 
@@ -1419,6 +1421,8 @@ gco stacks bedrock show
 gco stacks bedrock set-mission-model global.anthropic.claude-opus-5 -y
 gco stacks bedrock set-capacity-advisor-model us.amazon.nova-2-lite-v1:0 -y
 gco stacks bedrock set-claude-code-model us.anthropic.claude-sonnet-4-6 -y
+gco stacks bedrock set-codex-model global.openai.gpt-5.6-sol -y
+gco stacks bedrock set-codex-reasoning-effort xhigh -y
 ```
 
 #### `gco stacks fsx`
@@ -2247,7 +2251,7 @@ B200, B300).
 The data is analyzed by the Bedrock model selected by `cdk.json`
 `context.bedrock.capacity_advisor_default_model_id` (Anthropic Claude Opus 5's
 global inference profile in the stock configuration). The stock
-`context.bedrock.thinking.effort=high` runs Claude adaptive thinking at its
+`context.bedrock.generation_reasoning.effort=high` runs Claude adaptive thinking at its
 default effort; reasoning tokens are billed as output and can materially
 increase latency. Explicit model overrides do not inherit the default's
 thinking fields.
@@ -5452,14 +5456,16 @@ Set any threshold to `-1` to disable that health check. This is useful when runn
 | `GCO_CONFIG` | Path to config file |
 | `GCO_REGIONAL_API` | Use regional API endpoints (`true`/`false`) |
 | `CDK_DOCKER` | Docker command (`docker` or `finch`) |
-| `GCO_AUTOPILOT_MODEL` | Override the Bedrock model `gco autopilot` launches Claude Code with (default: `cdk.json` `context.bedrock.claude_code_default_model_id`; the `--model` flag wins over this). See [Autopilot](AUTOPILOT.md). |
-| `GCO_AUTOPILOT_SMALL_FAST_MODEL` | Optional Bedrock model for Claude Code's background/fast tasks (unset by default). |
-| `GCO_AUTOPILOT_CONFIG_DIR` | Directory for the generated autopilot MCP config and staged skill/agent imports (default: `~/.gco/autopilot`). |
-| `GCO_AUTOPILOT_PLUGIN_DIRS` | Colon-separated Claude Code plugin dirs/zips loaded into every `gco autopilot` session (merged with per-launch `--plugin` flags). |
+| `GCO_AUTOPILOT_ENGINE` | Select `claude-code` (default) or `codex`; top-level `--engine` wins. |
+| `GCO_AUTOPILOT_MODEL` | Shared Bedrock model override: Claude uses it directly, and Codex uses it after `GCO_AUTOPILOT_CODEX_MODEL`; top-level `--model` wins. See [Autopilot](AUTOPILOT.md). |
+| `GCO_AUTOPILOT_CODEX_MODEL` | Codex-specific Bedrock model override, ahead of the shared model variable. |
+| `GCO_AUTOPILOT_SMALL_FAST_MODEL` | Optional Bedrock model for Claude Code's background/fast tasks (unset by default; rejected by Codex). |
+| `GCO_AUTOPILOT_CONFIG_DIR` | Directory for generated Claude/Codex config and staged imports (default: `~/.gco/autopilot`; inside `gco-dev`, use a writable container path). |
+| `GCO_AUTOPILOT_PLUGIN_DIRS` | Colon-separated Claude Code plugin dirs/zips loaded into every `gco autopilot` session (merged with per-launch `--plugin` flags; not forwarded across the dev-container boundary because host paths may not exist there). |
 | `GCO_ENABLE_MISSION` | Gate the `gco mission` subcommand group (`true`/`false`). With the flag unset, every subcommand exits 2 with a hint. |
 | `GCO_ENABLE_ALL_TOOLS` | Umbrella flag that satisfies every per-tool gate including `GCO_ENABLE_MISSION`. |
 | `GCO_MISSION_STATE_BACKEND` | Persistence backend for sessions (`filesystem` or `dynamodb`). Unrecognised values fall back to filesystem with a one-line warning. |
-| `GCO_MISSION_BEDROCK_MODEL_ID` | Override the `cdk.json` `context.bedrock.mission_default_model_id` used by the CLI sampling backend (stock value: Anthropic Claude Opus 5, `global.anthropic.claude-opus-5`). Explicit overrides do not inherit the stock `thinking.effort=high` field. See [Customization → Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). |
+| `GCO_MISSION_BEDROCK_MODEL_ID` | Override the `cdk.json` `context.bedrock.mission_default_model_id` used by the CLI sampling backend (stock value: Anthropic Claude Opus 5, `global.anthropic.claude-opus-5`). Explicit overrides do not inherit the stock `generation_reasoning.effort=high` field. See [Customization → Bedrock Model Selection](CUSTOMIZATION.md#bedrock-model-selection). |
 | `GCO_MISSION_BEDROCK_REGION` | Override the default Bedrock region (`us-east-1`). |
 
 ## Examples

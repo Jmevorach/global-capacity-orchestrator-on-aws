@@ -368,11 +368,11 @@ SHIM
 
 # -- Autopilot persistence mounts ----------------------------------------------
 #
-# `gco autopilot` installs the pinned Claude Code on first use and keeps
-# session state under ~/.claude and ~/.gco. The emitted function must carry
-# the three persistence mounts (npm-global named volume, ~/.claude, ~/.gco)
-# and CLAUDE_CONFIG_DIR on every runtime, or those installs and sessions
-# evaporate with the --rm container.
+# `gco autopilot` lazily installs the selected Claude Code or Codex pin and
+# keeps generated/session state under ~/.claude and/or ~/.gco. The emitted
+# function must carry all three persistence mounts (npm-global named volume,
+# ~/.claude, ~/.gco) and CLAUDE_CONFIG_DIR on every runtime, or installs and
+# sessions evaporate with the --rm container.
 
 @test "emitted block carries the autopilot persistence mounts on every runtime" {
     local rt
@@ -467,6 +467,34 @@ SHIM
         for line in "$tty_line" "$notty_line"; do
             [[ "$line" == *'-e AWS_PROFILE'* ]]
             [[ "$line" == *'-e AWS_SESSION_TOKEN'* ]]
+        done
+    done
+}
+
+@test "autopilot controls are forwarded by name on every runtime and TTY branch" {
+    local rt line name tty_line notty_line
+    local names=(
+        GCO_AUTOPILOT_ENGINE
+        GCO_AUTOPILOT_MODEL
+        GCO_AUTOPILOT_CODEX_MODEL
+        GCO_AUTOPILOT_SMALL_FAST_MODEL
+        GCO_AUTOPILOT_CONFIG_DIR
+    )
+
+    for rt in docker finch podman; do
+        run bash "$SCRIPT" --print --runtime "$rt"
+        [ "$status" -eq 0 ]
+        tty_line="$(printf '%s\n' "$output" | grep -- 'run --rm -it')"
+        notty_line="$(printf '%s\n' "$output" | grep -- 'run --rm -i ')"
+        [ -n "$tty_line" ]
+        [ -n "$notty_line" ]
+
+        for line in "$tty_line" "$notty_line"; do
+            [[ "$line" == *"$rt run"* ]]
+            for name in "${names[@]}"; do
+                [[ "$line" == *"-e $name "* ]]
+                [[ "$line" != *"-e $name="* ]]
+            done
         done
     done
 }

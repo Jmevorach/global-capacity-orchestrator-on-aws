@@ -1,16 +1,15 @@
-"""Tests for the managed deployment-config engine and its region veneers.
+"""Tests for the managed deployment-config engine and its CLI/MCP veneers.
 
 Covers the three layers introduced for issue #221:
 
 * ``cli/managed_config.py`` — the engine: writable-config resolution,
   result-only validation (including the repair path), idempotent no-ops,
-  atomic writes that preserve comments/order/mode/trailing-newline, the
-  uniform :class:`ChangeReport`, and the ``gco.cli.managed_config`` audit
-  log lines.
-* ``gco stacks regions list/add/remove`` — the Click veneers (CliRunner).
-* ``list/add/remove_deployment_region`` — the MCP tools: absent by default,
-  registered under ``GCO_ENABLE_CONFIG_MANAGEMENT=true``, and shelling to
-  the documented CLI argv.
+  atomic writes that preserve comments/order/mode/trailing-newline, nested
+  scalar paths, the uniform :class:`ChangeReport`, and
+  ``gco.cli.managed_config`` audit lines.
+* ``gco stacks regions`` and ``gco stacks bedrock`` — the Click veneers.
+* The ``GCO_ENABLE_CONFIG_MANAGEMENT`` MCP family — absent by default,
+  registered under its opt-in flag, and shelling to documented CLI argv.
 """
 
 from __future__ import annotations
@@ -34,6 +33,8 @@ from cli.main import cli
 from cli.managed_config import (
     CAPACITY_ADVISOR_DEFAULT_MODEL,
     CLAUDE_CODE_DEFAULT_MODEL,
+    CODEX_DEFAULT_MODEL,
+    CODEX_REASONING_EFFORT,
     DEPLOYMENT_REGION_SCALARS,
     MISSION_DEFAULT_MODEL,
     REGIONAL_DEPLOYMENT_REGIONS,
@@ -45,6 +46,8 @@ from cli.managed_config import (
     remove_deployment_region,
     set_capacity_advisor_default_model,
     set_claude_code_default_model,
+    set_codex_default_model,
+    set_codex_reasoning_effort,
     set_deployment_region_role,
     set_mission_default_model,
 )
@@ -62,6 +65,8 @@ REGION_TOOLS = (
     "set_mission_default_model",
     "set_capacity_advisor_default_model",
     "set_claude_code_default_model",
+    "set_codex_default_model",
+    "set_codex_reasoning_effort",
 )
 
 BASE_CONFIG: dict = {
@@ -78,7 +83,9 @@ BASE_CONFIG: dict = {
             "mission_default_model_id": "global.anthropic.claude-opus-5",
             "capacity_advisor_default_model_id": "global.anthropic.claude-opus-5",
             "claude_code_default_model_id": "global.anthropic.claude-opus-5",
-            "thinking": {"effort": "high"},
+            "codex_default_model_id": "global.openai.gpt-5.6-sol",
+            "codex": {"reasoning_effort": "xhigh"},
+            "generation_reasoning": {"effort": "high"},
         },
         "project_name": "gco",
     },
@@ -666,9 +673,15 @@ class TestEngineAudit:
         refused = [r for r in caplog.records if "managed-config refused" in r.getMessage()]
         assert refused and refused[0].levelno == logging.WARNING
 
+    def test_nested_codex_write_logs_full_key(self, cdk_json: Path, caplog):
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            set_codex_reasoning_effort("high", config_path=cdk_json)
+        line = next(r for r in caplog.records if "managed-config write" in r.getMessage())
+        assert "key=bedrock.codex.reasoning_effort" in line.getMessage()
+
 
 # =============================================================================
-# Engine: scalar keys (region roles + bedrock default model)
+# Engine: scalar keys (region roles + Bedrock model/reasoning defaults)
 # =============================================================================
 
 
@@ -718,7 +731,7 @@ class TestEngineScalars:
         written = json.loads(cdk_json.read_text(encoding="utf-8"))
         bedrock = written["context"]["bedrock"]
         assert bedrock["mission_default_model_id"] == "us.amazon.nova-2-lite-v1:0"
-        assert bedrock["thinking"] == {"effort": "high"}
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
         # Repointing Mission never repoints the advisor or autopilot.
         assert bedrock["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"
         assert bedrock["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
@@ -731,7 +744,7 @@ class TestEngineScalars:
         written = json.loads(cdk_json.read_text(encoding="utf-8"))
         bedrock = written["context"]["bedrock"]
         assert bedrock["capacity_advisor_default_model_id"] == "us.amazon.nova-2-lite-v1:0"
-        assert bedrock["thinking"] == {"effort": "high"}
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
         # Repointing the advisor never repoints Mission or autopilot.
         assert bedrock["mission_default_model_id"] == "global.anthropic.claude-opus-5"
         assert bedrock["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
@@ -744,10 +757,43 @@ class TestEngineScalars:
         written = json.loads(cdk_json.read_text(encoding="utf-8"))
         bedrock = written["context"]["bedrock"]
         assert bedrock["claude_code_default_model_id"] == "us.anthropic.claude-sonnet-4-6"
-        assert bedrock["thinking"] == {"effort": "high"}
-        # Repointing autopilot never repoints Mission or the advisor.
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
+        assert bedrock["codex_default_model_id"] == "global.openai.gpt-5.6-sol"
+        assert bedrock["codex"] == {"reasoning_effort": "xhigh"}
+        # Repointing Claude Code never repoints Mission, the advisor, or Codex.
         assert bedrock["mission_default_model_id"] == "global.anthropic.claude-opus-5"
         assert bedrock["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"
+
+    def test_set_codex_model_preserves_reasoning_and_siblings(self, cdk_json: Path):
+        report = set_codex_default_model("global.openai.gpt-5.7", config_path=cdk_json)
+        assert report.changed is True
+        written = json.loads(cdk_json.read_text(encoding="utf-8"))
+        bedrock = written["context"]["bedrock"]
+        assert bedrock["codex_default_model_id"] == "global.openai.gpt-5.7"
+        assert bedrock["codex"] == {"reasoning_effort": "xhigh"}
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
+        assert bedrock["mission_default_model_id"] == "global.anthropic.claude-opus-5"
+        assert bedrock["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"
+        assert bedrock["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
+
+    def test_set_codex_reasoning_preserves_model_and_siblings(self, cdk_json: Path):
+        report = set_codex_reasoning_effort("high", config_path=cdk_json)
+        assert report.changed is True
+        written = json.loads(cdk_json.read_text(encoding="utf-8"))
+        bedrock = written["context"]["bedrock"]
+        assert bedrock["codex"] == {"reasoning_effort": "high"}
+        assert bedrock["codex_default_model_id"] == "global.openai.gpt-5.6-sol"
+        assert bedrock["generation_reasoning"] == {"effort": "high"}
+        assert bedrock["mission_default_model_id"] == "global.anthropic.claude-opus-5"
+        assert bedrock["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"
+        assert bedrock["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
+
+    def test_set_codex_reasoning_is_idempotent(self, cdk_json: Path):
+        before = cdk_json.read_bytes()
+        report = set_codex_reasoning_effort("xhigh", config_path=cdk_json)
+        assert report.changed is False
+        assert report.key_id == "bedrock.codex.reasoning_effort"
+        assert cdk_json.read_bytes() == before
 
     def test_set_mission_model_empty_rejected(self, cdk_json: Path):
         with pytest.raises(ManagedConfigError, match="non-empty string"):
@@ -785,11 +831,64 @@ class TestEngineScalars:
         ):
             set_claude_code_default_model(" model-id ", config_path=cdk_json)
 
+    def test_set_codex_model_empty_rejected(self, cdk_json: Path):
+        with pytest.raises(
+            ManagedConfigError,
+            match="bedrock.codex_default_model_id must be a non-empty string",
+        ):
+            set_codex_default_model("   ", config_path=cdk_json)
+
+    def test_absent_codex_model_empty_is_refused_not_noop(self, tmp_path: Path):
+        path = tmp_path / "cdk.json"
+        path.write_text(json.dumps({"context": {"project_name": "gco"}}), encoding="utf-8")
+        before = path.read_bytes()
+        with pytest.raises(
+            ManagedConfigError,
+            match="bedrock.codex_default_model_id must be a non-empty string",
+        ):
+            set_codex_default_model("", config_path=path)
+        assert path.read_bytes() == before
+
+    def test_set_codex_model_surrounding_whitespace_rejected(self, cdk_json: Path):
+        with pytest.raises(
+            ManagedConfigError,
+            match="bedrock.codex_default_model_id must not have",
+        ):
+            set_codex_default_model(" model-id ", config_path=cdk_json)
+
+    @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh"])
+    def test_set_codex_reasoning_accepts_supported_values(self, cdk_json: Path, effort: str):
+        set_codex_reasoning_effort(effort, config_path=cdk_json)
+        status = get_bedrock_model_status(config_path=cdk_json)
+        assert status["codex_reasoning_effort"] == effort
+
+    def test_set_codex_reasoning_rejects_unknown_effort(self, cdk_json: Path):
+        with pytest.raises(ManagedConfigError, match="must be one of"):
+            set_codex_reasoning_effort("extreme", config_path=cdk_json)
+
+    def test_set_codex_reasoning_rejects_non_object_container(self, cdk_json: Path):
+        document = json.loads(cdk_json.read_text(encoding="utf-8"))
+        document["context"]["bedrock"]["codex"] = "xhigh"
+        cdk_json.write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(ManagedConfigError, match="context.bedrock.codex must be a JSON object"):
+            set_codex_reasoning_effort("high", config_path=cdk_json)
+
+    def test_unchanged_codex_reasoning_rejects_unknown_siblings(self, cdk_json: Path):
+        document = json.loads(cdk_json.read_text(encoding="utf-8"))
+        document["context"]["bedrock"]["codex"]["summary"] = "detailed"
+        cdk_json.write_text(json.dumps(document), encoding="utf-8")
+        before = cdk_json.read_bytes()
+        with pytest.raises(ManagedConfigError, match="unexpected keys: summary"):
+            set_codex_reasoning_effort("xhigh", config_path=cdk_json)
+        assert cdk_json.read_bytes() == before
+
     def test_bedrock_status_reads_every_configured_value(self, cdk_json: Path):
         status = get_bedrock_model_status(config_path=cdk_json)
         assert status["mission_default_model_id"] == "global.anthropic.claude-opus-5"
         assert status["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"
         assert status["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
+        assert status["codex_default_model_id"] == "global.openai.gpt-5.6-sol"
+        assert status["codex_reasoning_effort"] == "xhigh"
         assert status["config_path"] == str(cdk_json)
 
     def test_bedrock_container_materialized_when_absent(self, tmp_path: Path):
@@ -813,6 +912,15 @@ class TestEngineScalars:
         assert written["context"]["bedrock"] == {
             "claude_code_default_model_id": "global.anthropic.claude-opus-5"
         }
+
+    def test_codex_nested_path_materialized_when_absent(self, tmp_path: Path):
+        path = tmp_path / "cdk.json"
+        path.write_text(json.dumps({"context": {"project_name": "gco"}}), encoding="utf-8")
+        report = set_codex_reasoning_effort("high", config_path=path)
+        assert report.changed is True
+        assert report.old == ""
+        written = json.loads(path.read_text(encoding="utf-8"))
+        assert written["context"]["bedrock"] == {"codex": {"reasoning_effort": "high"}}
 
 
 # =============================================================================
@@ -974,6 +1082,8 @@ class TestBedrockCli:
         assert payload["mission_default_model_id"] == "global.anthropic.claude-opus-5"
         assert payload["capacity_advisor_default_model_id"] == "global.anthropic.claude-opus-5"
         assert payload["claude_code_default_model_id"] == "global.anthropic.claude-opus-5"
+        assert payload["codex_default_model_id"] == "global.openai.gpt-5.6-sol"
+        assert payload["codex_reasoning_effort"] == "xhigh"
 
     def test_set_claude_code_model_with_yes_writes(self, cdk_json: Path):
         runner = CliRunner()
@@ -1083,6 +1193,81 @@ class TestBedrockCli:
         )
         assert result.exit_code == 1
         assert "refusing to update" in result.output
+
+    def test_set_codex_model_with_yes_writes(self, cdk_json: Path):
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "stacks",
+                "bedrock",
+                "set-codex-model",
+                "global.openai.gpt-5.7",
+                "--config-path",
+                str(cdk_json),
+                "-y",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        written = json.loads(cdk_json.read_text(encoding="utf-8"))
+        bedrock = written["context"]["bedrock"]
+        assert bedrock["codex_default_model_id"] == "global.openai.gpt-5.7"
+        assert bedrock["codex"] == {"reasoning_effort": "xhigh"}
+
+    def test_set_codex_model_empty_exits_nonzero(self, cdk_json: Path):
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "stacks",
+                "bedrock",
+                "set-codex-model",
+                "  ",
+                "--config-path",
+                str(cdk_json),
+                "-y",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "refusing to update" in result.output
+
+    def test_set_codex_reasoning_effort_with_yes_writes(self, cdk_json: Path):
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "stacks",
+                "bedrock",
+                "set-codex-reasoning-effort",
+                "high",
+                "--config-path",
+                str(cdk_json),
+                "-y",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        written = json.loads(cdk_json.read_text(encoding="utf-8"))
+        bedrock = written["context"]["bedrock"]
+        assert bedrock["codex"] == {"reasoning_effort": "high"}
+        assert bedrock["codex_default_model_id"] == "global.openai.gpt-5.6-sol"
+
+    def test_set_codex_reasoning_effort_rejects_unknown_choice(self, cdk_json: Path):
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "stacks",
+                "bedrock",
+                "set-codex-reasoning-effort",
+                "extreme",
+                "--config-path",
+                str(cdk_json),
+                "-y",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "Invalid value for" in result.output
+        assert "'extreme'" in result.output
 
 
 # =============================================================================
@@ -1207,6 +1392,36 @@ class TestMcpRegionToolsArgv:
             "-y",
         ]
 
+    @patch.dict(os.environ, {"GCO_ENABLE_CONFIG_MANAGEMENT": "true"})
+    def test_set_codex_model_argv(self):
+        importlib.reload(run_mcp)
+        with patch("cli_runner.subprocess.run") as mock:
+            mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
+            run_mcp.set_codex_default_model(model_id="global.openai.gpt-5.6-sol")
+            cmd = mock.call_args[0][0]
+        assert cmd[-5:] == [
+            "stacks",
+            "bedrock",
+            "set-codex-model",
+            "global.openai.gpt-5.6-sol",
+            "-y",
+        ]
+
+    @patch.dict(os.environ, {"GCO_ENABLE_CONFIG_MANAGEMENT": "true"})
+    def test_set_codex_reasoning_effort_argv(self):
+        importlib.reload(run_mcp)
+        with patch("cli_runner.subprocess.run") as mock:
+            mock.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
+            run_mcp.set_codex_reasoning_effort(reasoning_effort="xhigh")
+            cmd = mock.call_args[0][0]
+        assert cmd[-5:] == [
+            "stacks",
+            "bedrock",
+            "set-codex-reasoning-effort",
+            "xhigh",
+            "-y",
+        ]
+
 
 # =============================================================================
 # Registry contract
@@ -1246,3 +1461,18 @@ class TestRegistryContract:
         assert key.key_id == "bedrock.claude_code_default_model_id"
         assert key.container == "bedrock"
         assert key.leaf == "claude_code_default_model_id"
+        assert key.nested == ()
+
+    def test_codex_model_registry_entry_shape(self):
+        key = CODEX_DEFAULT_MODEL
+        assert key.key_id == "bedrock.codex_default_model_id"
+        assert key.container == "bedrock"
+        assert key.leaf == "codex_default_model_id"
+        assert key.nested == ()
+
+    def test_codex_reasoning_registry_entry_shape(self):
+        key = CODEX_REASONING_EFFORT
+        assert key.key_id == "bedrock.codex.reasoning_effort"
+        assert key.container == "bedrock"
+        assert key.leaf == "reasoning_effort"
+        assert key.nested == ("codex",)

@@ -1052,14 +1052,16 @@ if isinstance(value, str) and value.strip():
 # Prints the "model family" key for a Bedrock system-defined inference
 # profile id so two releases of the same model line compare equal on
 # family and differ only on version. The family is the geography +
-# provider + the *alphabetic* tokens of the model name, with every
-# purely-numeric token (model version, generation, date) dropped:
+# provider + the non-version tokens of the model name, with numeric model
+# version/generation/date tokens dropped. Numeric tokens may be integers or
+# dotted versions embedded between hyphens:
 #
 #   us.amazon.nova-pro-v1:0                       -> us.amazon.nova-pro
 #   global.amazon.nova-3-lite-v1:0                -> global.amazon.nova-lite
 #   us.anthropic.claude-sonnet-4-5-20250929-v1:0  -> us.anthropic.claude-sonnet
 #   global.anthropic.claude-opus-4-6-v1           -> global.anthropic.claude-opus
 #   global.anthropic.claude-opus-9                -> global.anthropic.claude-opus
+#   global.openai.gpt-5.7-sol                     -> global.openai.gpt-sol
 #
 # The trailing revision appears in three shapes across live profiles:
 # ``-vMAJOR:MINOR``, ``-vMAJOR`` alone (newer Anthropic profiles), and
@@ -1085,7 +1087,9 @@ elif len(parts) == 2:
     geo, provider, name = '', parts[0], parts[1]
 else:
     geo, provider, name = '', '', core
-tokens = [t for t in name.split('-') if t and not t.isdigit()]
+tokens = [
+    t for t in name.split('-') if t and not re.fullmatch(r'\d+(?:\.\d+)*', t)
+]
 prefix = '.'.join([p for p in (geo, provider) if p])
 print(prefix + ('.' + '-'.join(tokens) if tokens else ''))
 " "$1" 2>/dev/null
@@ -1157,7 +1161,9 @@ def family(mid):
         geo, provider, name = '', parts[0], parts[1]
     else:
         geo, provider, name = '', '', core
-    tokens = [t for t in name.split('-') if t and not t.isdigit()]
+    tokens = [
+    t for t in name.split('-') if t and not re.fullmatch(r'\d+(?:\.\d+)*', t)
+]
     prefix = '.'.join([p for p in (geo, provider) if p])
     return prefix + ('.' + '-'.join(tokens) if tokens else '')
 def key(mid):
@@ -1232,7 +1238,9 @@ def family(mid):
         geo, provider, name = '', parts[0], parts[1]
     else:
         geo, provider, name = '', '', core
-    tokens = [t for t in name.split('-') if t and not t.isdigit()]
+    tokens = [
+    t for t in name.split('-') if t and not re.fullmatch(r'\d+(?:\.\d+)*', t)
+]
     prefix = '.'.join([p for p in (geo, provider) if p])
     return prefix + ('.' + '-'.join(tokens) if tokens else '')
 def key(mid):
@@ -2057,6 +2065,25 @@ import re, sys
 with open(sys.argv[1]) as f:
     text = f.read()
 m = re.search(r'^CLAUDE_CODE_VERSION = \"([^\"]+)\"', text, re.MULTILINE)
+if m:
+    print(m.group(1))
+" "$file" 2>/dev/null
+}
+
+# extract_codex_pin [autopilot_py]
+#
+# Prints the exact OpenAI Codex CLI release the Codex Autopilot engine installs,
+# read from the scanner-stable ``CODEX_VERSION`` literal in cli/autopilot.py.
+# Codex is another lazy global npm dependency, so it must flow through the same
+# monthly registry-drift system as Claude Code rather than package.json.
+extract_codex_pin() {
+  local file="${1:-cli/autopilot.py}"
+  [ -f "$file" ] || return 0
+  python3 -c "
+import re, sys
+with open(sys.argv[1]) as f:
+    text = f.read()
+m = re.search(r'^CODEX_VERSION = \"([^\"]+)\"', text, re.MULTILINE)
 if m:
     print(m.group(1))
 " "$file" 2>/dev/null

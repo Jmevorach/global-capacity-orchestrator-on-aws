@@ -288,6 +288,8 @@ with _contextlib.suppress(ImportError):
         remove_deployment_region,
         set_capacity_advisor_default_model,
         set_claude_code_default_model,
+        set_codex_default_model,
+        set_codex_reasoning_effort,
         set_deployment_region,
         set_mission_default_model,
     )
@@ -434,6 +436,8 @@ if _IS_RELOAD and (
         "set_mission_default_model",
         "set_capacity_advisor_default_model",
         "set_claude_code_default_model",
+        "set_codex_default_model",
+        "set_codex_reasoning_effort",
     ):
         if hasattr(_stacks_mod, _name):
             globals()[_name] = getattr(_stacks_mod, _name)
@@ -768,6 +772,8 @@ _PUBLIC_EXPORTS = [
     "scale_inference",
     "set_capacity_advisor_default_model",
     "set_claude_code_default_model",
+    "set_codex_default_model",
+    "set_codex_reasoning_effort",
     "set_deployment_region",
     "set_mission_default_model",
     "set_mooncake_topology",

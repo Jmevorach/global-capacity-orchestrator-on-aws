@@ -3,16 +3,16 @@
 # Record the GCO Autopilot demo as an animated GIF
 # ─────────────────────────────────────────────────────────────────────────────
 # Records a short terminal session of `gco autopilot` and converts it to a
-# GIF with agg. Two modes, selected by DEMO_MODE:
+# GIF with agg. Select the engine with DEMO_ENGINE (``claude-code`` by
+# default, or ``codex``) and the scenario with DEMO_MODE:
 #
-#   live (default)  A real one-shot session: autopilot launches Claude Code
-#                   on Amazon Bedrock in print mode (`-- -p "<question>"`)
-#                   and the model answers a GCO question grounded by the GCO
-#                   MCP server's tools. Requires the `claude` binary and AWS
-#                   credentials with Bedrock access for GCO's default model.
-#                   This is the recording embedded at the top of the README.
-#   plan            Credential-free fallback: records `--dry-run` resolving
-#                   the launch plan (model, MCP server set, install offer).
+#   live (default)  A real interactive session on Amazon Bedrock. The recorder
+#                   launches the selected TUI, types a GCO question, waits for
+#                   an MCP-grounded answer, then exits. Requires the selected
+#                   engine binary, expect(1), and Bedrock-enabled credentials.
+#   plan            Credential-free recording of the selected engine's
+#                   `--dry-run` plan: model, reasoning, MCP set, config path,
+#                   and exact lazy-install pin. This is the Codex demo mode.
 #
 # The recording drives the *checked-out* CLI through a `gco` PATH shim
 # (`python3 -m cli.main`), never a globally installed gco, so the GIF always
@@ -20,8 +20,8 @@
 # asciinema's --idle-time-limit, so the live mode stays a short GIF.
 #
 # Output files (deposited in demo/):
-#   demo/autopilot.cast  — asciinema recording (lightweight JSON text)
-#   demo/autopilot.gif   — animated GIF for embedding in READMEs
+#   Claude: demo/autopilot-claude-code.cast + demo/autopilot-claude-code.gif
+#   Codex:  demo/autopilot-codex.cast + demo/autopilot-codex.gif
 #
 # Prerequisites:
 #   - asciinema: brew install asciinema  (or pip install asciinema)
@@ -33,8 +33,9 @@
 #   bash demo/record_autopilot.sh
 #
 # Options (via environment variables):
-#   DEMO_MODE=live       "live" (real Bedrock-backed answer, default) or
-#                        "plan" (credential-free --dry-run recording)
+#   DEMO_ENGINE=claude-code  "claude-code" (default) or "codex"
+#   DEMO_MODE=live       "live" (real selected-engine Bedrock session, default)
+#                        or "plan" (credential-free engine launch plan)
 #   DEMO_COLS=110        Terminal width for recording (default: 110)
 #   DEMO_ROWS=30         Terminal height for recording (default: 30)
 #   DEMO_SPEED=1.6       Playback speed multiplier for GIF (default: 1.6)
@@ -62,14 +63,25 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "${SCRIPT_DIR}/lib_demo.sh"
 setup_colors
 
-CAST_FILE="${SCRIPT_DIR}/autopilot.cast"
-GIF_FILE="${SCRIPT_DIR}/autopilot.gif"
+DEMO_ENGINE="${DEMO_ENGINE:-claude-code}"
+DEMO_MODE="${DEMO_MODE:-live}"
+
+case "$DEMO_ENGINE" in
+    claude-code)
+        CAST_FILE="${SCRIPT_DIR}/autopilot-claude-code.cast"
+        GIF_FILE="${SCRIPT_DIR}/autopilot-claude-code.gif"
+        ;;
+    codex)
+        CAST_FILE="${SCRIPT_DIR}/autopilot-codex.cast"
+        GIF_FILE="${SCRIPT_DIR}/autopilot-codex.gif"
+        ;;
+    *) echo "error: DEMO_ENGINE must be 'claude-code' or 'codex', got '$DEMO_ENGINE'" >&2; exit 1 ;;
+esac
 
 COLS="${DEMO_COLS:-110}"
 ROWS="${DEMO_ROWS:-30}"
 SPEED="${DEMO_SPEED:-1.6}"
 THEME="${DEMO_THEME:-monokai}"
-DEMO_MODE="${DEMO_MODE:-live}"
 
 case "$DEMO_MODE" in
     live|plan) : ;;
@@ -90,7 +102,7 @@ preflight_fail() {
     PREFLIGHT_FAIL=$((PREFLIGHT_FAIL + 1))
 }
 
-echo "=== GCO Autopilot Demo Recorder ==="
+echo "=== GCO Autopilot Demo Recorder (${DEMO_ENGINE}, ${DEMO_MODE}) ==="
 echo ""
 
 if command -v asciinema &>/dev/null; then
@@ -123,11 +135,30 @@ else
 fi
 
 if [ "$DEMO_MODE" = "live" ]; then
-    if command -v claude &>/dev/null; then
-        preflight_pass "Claude Code installed ($(claude --version 2>&1 | head -1))"
+    if [ "$DEMO_ENGINE" = "codex" ]; then
+        ENGINE_BINARY="codex"
+        ENGINE_LABEL="Codex"
+        INSTALL_HINT="gco autopilot --engine codex -y"
     else
-        preflight_fail "Claude Code not installed (live mode launches a real session)" \
-            "Run 'gco autopilot -y' once to install the pinned release, or set DEMO_MODE=plan"
+        ENGINE_BINARY="claude"
+        ENGINE_LABEL="Claude Code"
+        INSTALL_HINT="gco autopilot -y"
+    fi
+    if command -v "$ENGINE_BINARY" &>/dev/null; then
+        preflight_pass "$ENGINE_LABEL installed ($("$ENGINE_BINARY" --version 2>&1 | head -1))"
+    else
+        preflight_fail "$ENGINE_LABEL not installed (live mode launches a real session)" \
+            "Run '$INSTALL_HINT' once to install the pin, or set DEMO_MODE=plan"
+    fi
+    if [ "$DEMO_ENGINE" != "codex" ]; then
+        for companion_runtime in uvx npx; do
+            if command -v "$companion_runtime" &>/dev/null; then
+                preflight_pass "$companion_runtime installed"
+            else
+                preflight_fail "$companion_runtime not installed (Claude live mode starts companions)" \
+                    "Use gco-dev, install the missing runtime, or set DEMO_MODE=plan"
+            fi
+        done
     fi
     if command -v expect &>/dev/null; then
         preflight_pass "expect installed (drives the interactive TUI)"
@@ -166,7 +197,110 @@ exec python3 -m cli.main "$@"
 GCO_SHIM
 chmod +x "${SHIM_DIR}/gco"
 
-if [ "$DEMO_MODE" = "live" ]; then
+if [ "$DEMO_MODE" = "live" ] && [ "$DEMO_ENGINE" = "codex" ]; then
+    # Mirror the Claude recording with Codex's real inline TUI. Read-only,
+    # never-approve, and run-scoped trust for this reviewed checkout are hidden
+    # recording plumbing: the prompt explicitly uses GCO MCP documentation
+    # tools, no workspace mutation is needed, and no trust setting is persisted.
+    EXPECT_SCRIPT="$(mktemp)"
+    cat > "$EXPECT_SCRIPT" <<'EXPECT_DRIVER'
+#!/usr/bin/expect -f
+set timeout 420
+set stty_init "rows 30 columns 110"
+
+# Codex enables CSI-u keyboard reporting; this emits a physical Enter only
+# after a positively identified composer redraw below.
+proc press_enter {} {
+    send -- "\033\[13u"
+}
+
+# The recording uses only the local GCO MCP server and exposes exactly the two
+# documentation tools needed on camera. GCO startup is required, both tools are
+# explicitly preapproved, and Codex's built-in shell is removed entirely.
+set gco_required {mcp_servers.gco.required=true}
+set gco_tools {mcp_servers.gco.enabled_tools=["find_docs","read_resource"]}
+set find_docs_approval {mcp_servers.gco.tools.find_docs.approval_mode="approve"}
+set read_resource_approval {mcp_servers.gco.tools.read_resource.approval_mode="approve"}
+set prompt {Use only the GCO MCP find_docs tool, then read_resource on a returned documentation URI; do not use shell commands or other tools. Which gco command submits a job through SQS, and why is that recommended? Answer in two short lines. Begin when ready}
+log_user 0
+spawn gco autopilot --engine codex --no-companions -- -c $gco_required -c $gco_tools -c $find_docs_approval -c $read_resource_approval --disable shell_tool --sandbox read-only --ask-for-approval never --no-alt-screen -- $prompt
+log_user 1
+
+# Codex accepts the initial prompt as prefilled composer text. Monitor startup
+# for dialogs, then append one harmless space to force a current composer redraw;
+# only a positive match of that redraw is allowed to submit the turn.
+set submitted 0
+set timeout 20
+expect {
+    -nocase -re {trust the contents|trust the files|do you trust} { exit 6 }
+    -nocase -re {do you want to (proceed|allow)|allow this tool} { exit 7 }
+    -re {Working|Calling gco\.find_docs} { set submitted 1 }
+    timeout {}
+    eof { exit 3 }
+}
+if {!$submitted} {
+    send -- "."
+    set timeout 10
+    expect {
+        -re {Begin when ready.*\.} { press_enter }
+        -nocase -re {trust the contents|trust the files|do you trust} { exit 6 }
+        -nocase -re {do you want to (proceed|allow)|allow this tool} { exit 7 }
+        timeout { exit 8 }
+        eof { exit 3 }
+    }
+}
+# Wait for the explanatory final answer, not an intermediate tool query that
+# happens to mention the command. Trust and approval dialogs remain explicit
+# failures for the entire turn; never send an unqualified keypress on timeout.
+set timeout 420
+expect {
+    -nocase -re {trust the contents|trust the files|do you trust} { exit 6 }
+    -nocase -re {do you want to (proceed|allow)|allow this tool} { exit 7 }
+    -nocase -re {recommended (for production )?because|resilient production|durable, asynchronous} {}
+    timeout { exit 4 }
+    eof { exit 5 }
+}
+# Leave the complete short answer on screen before exiting. The matched phrase
+# can appear just before the final line finishes rendering.
+sleep 35
+
+# Codex uses Ctrl+C for a clean TUI exit; unlike Claude Code, `/exit` is not
+# a terminating slash command in this version.
+send "\003"
+expect eof
+EXPECT_DRIVER
+
+    cat > "$DRIVER" <<DRIVER_SCRIPT
+#!/usr/bin/env bash
+set -euo pipefail
+cd "\$REPO_ROOT"
+export PATH="\${SHIM_DIR}:\${PATH}"
+export COLUMNS="\${COLS}" LINES="\${ROWS}"
+
+# shellcheck source=demo/lib_demo.sh
+source "\${REPO_ROOT}/demo/lib_demo.sh"
+setup_colors
+
+banner "GCO Autopilot — Codex"
+narrate "A live Codex session scoped to GCO documentation tools:"
+narrate "Amazon Bedrock + required GCO MCP; no shell or companion servers."
+sleep 3
+
+echo ""
+echo "  \${MAGENTA}\\\$ \${WHITE}\${BOLD}gco autopilot --engine codex --no-companions\${RESET}"
+sleep 1
+
+expect -f "$EXPECT_SCRIPT"
+
+printf '\033[2J\033[H'
+banner "GCO Autopilot — Codex"
+spacer
+highlight "A real session: Codex used only GCO's approved documentation tools."
+narrate "Default Autopilot can include companions; this recording is least-privilege."
+narrate "Get started:  gco autopilot --engine codex"
+sleep 4
+DRIVER_SCRIPT
+elif [ "$DEMO_MODE" = "live" ]; then
     # A real interactive session, driven end-to-end: expect(1) spawns the
     # actual `gco autopilot` TUI, types a question with human-ish pacing,
     # approves the GCO MCP tool-permission dialog on camera (the security
@@ -182,15 +316,18 @@ set stty_init "rows 30 columns 110"
 # Human-ish typing: avg 80ms/char, 400ms max — visible but not sluggish.
 set send_human {0.08 0.12 1 0.02 0.4}
 
-# Types a question word-by-word. Per-character typing (send -h) makes the
-# TUI composer redraw hundreds of times, which both bloats the cast and
-# renders glitchy under agg; word chunks keep a live typing feel with ~20x
-# fewer redraws.
+# Type with Expect's humanized per-character timing. Claude Code's native TUI
+# processes terminal key events individually; word-sized writes can be discarded
+# while its keyboard protocol is active.
 proc type_words {text} {
-    foreach word [split $text " "] {
-        send -- "$word "
-        sleep 0.1
-    }
+    send -h -- "$text"
+}
+
+# Claude Code 2.1.235 enables CSI-u keyboard reporting after startup. A raw
+# carriage return is text input in that mode; CSI 13 u is the physical Enter
+# key. The resume prompt appears before CSI-u is enabled and still uses \r.
+proc press_enter {} {
+    send -- "\033\[13u"
 }
 
 # The GCO MCP server's tools are pre-approved for the session with
@@ -214,28 +351,29 @@ log_user 1
 # composer is up; a quiet timeout just falls through to the settle sleep.
 expect {
     -re {Resume your previous Claude Code session} { sleep 2; send "n\r"; exp_continue }
-    -nocase -re {trust the files|do you trust} { send "\r"; exp_continue }
-    -nocase -re {choose the text style|select theme} { send "\r"; exp_continue }
-    -re {\? for shortcuts|Try "} {}
+    -nocase -re {trust the files|do you trust|project you created or one you trust|yes, i trust this folder|enter.*confirm} { press_enter; exp_continue }
+    -nocase -re {choose the text style|select theme} { press_enter; exp_continue }
+    -re {Welcome|\? for shortcuts|Try "} {}
     timeout {}
 }
 sleep 4
 
-type_words "Which gco command submits a job via SQS, and why is that the recommended path? Check the GCO MCP docs (no shell commands) and keep it brief."
+type_words "Which gco command submits a job via SQS, and why is that recommended? Check the GCO MCP docs (no shell commands). Answer in exactly two short lines."
 sleep 1
-send -- "\r"
+press_enter
 
 # Wait for the grounded answer itself (it inevitably names submit-sqs),
-# then let it finish rendering (recorded idle is capped at 2s). A stray
-# permission dialog is still answered, belt-and-suspenders.
+# then let the complete two-line answer finish rendering. Recorded idle is
+# capped, so the generous hold improves reliability without bloating the GIF.
 expect {
-    -nocase -re {do you want to (proceed|allow)|allow this tool} { sleep 2; send "2"; exp_continue }
+    -nocase -re {do you want to (proceed|allow)|allow this tool} { sleep 2; send "2"; press_enter; exp_continue }
     -timeout 240 -re {submit-sqs} {}
     timeout {}
 }
-sleep 30
+sleep 60
 
-send -- "/exit\r"
+send -- "/exit"
+press_enter
 expect eof
 EXPECT_DRIVER
 
@@ -273,6 +411,31 @@ spacer
 highlight "A real session: the model grounded its answer in GCO's MCP server."
 narrate "Sessions resume next launch; import your own skills with --skills."
 narrate "Get started:  gco autopilot"
+sleep 4
+DRIVER_SCRIPT
+elif [ "$DEMO_ENGINE" = "codex" ]; then
+    cat > "$DRIVER" <<'DRIVER_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$REPO_ROOT"
+export PATH="${SHIM_DIR}:${PATH}"
+export COLUMNS="${COLS}" LINES="${ROWS}"
+
+# shellcheck source=demo/lib_demo.sh
+source "${REPO_ROOT}/demo/lib_demo.sh"
+setup_colors
+
+banner "GCO Autopilot — Codex"
+narrate "Choose Codex without giving up GCO's one-command setup:"
+narrate "OpenAI Codex + the GCO MCP server + companion MCPs on Amazon Bedrock."
+sleep 3
+
+run_cmd "gco autopilot --engine codex --dry-run"
+sleep 5
+
+spacer
+highlight "Launch it for real with:  gco autopilot --engine codex"
+narrate "The exact Codex pin and isolated CODEX_HOME persist in gco-dev."
 sleep 4
 DRIVER_SCRIPT
 else
@@ -318,6 +481,7 @@ rm -f "$CAST_FILE"
 # so the GIF stays short without editing the cast by hand.
 export REPO_ROOT SHIM_DIR COLS ROWS
 asciinema rec \
+    --return \
     --cols "$COLS" \
     --rows "$ROWS" \
     --idle-time-limit 1.5 \
@@ -333,21 +497,34 @@ echo "✓ Recording saved: ${CAST_FILE}"
 # produce a cast that cuts off early. Fail loudly instead of publishing it.
 if [ "$DEMO_MODE" = "live" ]; then
     # TUI redraws interleave ANSI escapes and can split words across output
-    # events, so the check joins the rendered stream, strips escapes, and
-    # normalizes to alphanumerics before searching for the answer.
-    if python3 - "$CAST_FILE" <<'PYEOF'
+    # events, so checks join the rendered stream and normalize to alphanumerics.
+    # Codex has a stricter contract: successful calls to both approved GCO docs
+    # tools, no shell/companions/prompts, and no live credential values.
+    if python3 - "$CAST_FILE" "$DEMO_ENGINE" <<'PYEOF'
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
+documents = []
 stream = []
 for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     if not line.strip():
         continue
     doc = json.loads(line)
+    documents.append(doc)
     if isinstance(doc, list) and len(doc) >= 3 and doc[1] == "o":
         stream.append(doc[2])
+exit_events = [
+    doc
+    for doc in documents
+    if isinstance(doc, list) and len(doc) >= 3 and doc[1] == "x"
+]
+header_version = documents[0].get("version") if isinstance(documents[0], dict) else None
+valid_exit = header_version != 3 or (
+    bool(exit_events) and str(exit_events[-1][2]) == "0"
+)
 joined = "".join(stream)
 plain = re.sub(
     r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\\\)|\x1b[P^_].*?\x1b\\\\|\x1b.",
@@ -355,13 +532,61 @@ plain = re.sub(
     joined,
 )
 normalized = re.sub(r"[^a-z0-9]", "", plain.lower())
-raise SystemExit(0 if "submitsqs" in normalized else 1)
+required = ["submitsqs"]
+forbidden = []
+if sys.argv[2] == "codex":
+    required.extend(("calledgcofinddocs", "calledgcoreadresource"))
+    forbidden.extend(
+        (
+            "callingshell",
+            "calledshell",
+            "trustthecontents",
+            "trustthefiles",
+            "doyoutrust",
+            "doyouwanttoproceed",
+            "doyouwanttoallow",
+            "allowthistool",
+            "awsdocs",
+            "awspricing",
+            "ddgsearch",
+            "deepwiki",
+            "filesystem",
+            "innermonologue",
+            "mcptasks",
+            "memorymcp",
+            "playwright",
+            "sequentialthinking",
+        )
+    )
+credential_names = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+)
+credential_leak = any(
+    value and len(value) >= 8 and value in joined
+    for name in credential_names
+    if (value := os.environ.get(name))
+)
+raise SystemExit(
+    0
+    if valid_exit
+    and all(marker in normalized for marker in required)
+    and not any(marker in normalized for marker in forbidden)
+    and not credential_leak
+    else 1
+)
 PYEOF
     then
-        echo "✓ Live answer verified in the recording (mentions submit-sqs)"
+        if [ "$DEMO_ENGINE" = "codex" ]; then
+            echo "✓ Live Codex recording verified (GCO docs tools only; no credentials/prompts)"
+        else
+            echo "✓ Live answer verified in the recording (mentions submit-sqs)"
+        fi
     else
-        echo "✗ The recording does not contain the expected answer content." >&2
-        echo "  The session may have stalled or a dialog changed. Re-run the recorder." >&2
+        echo "✗ The recording failed its required answer/tool/security contract." >&2
+        echo "  The session may have stalled, used another tool, prompted, or exposed credentials." >&2
         exit 1
     fi
 fi
@@ -425,6 +650,35 @@ for document in documents:
     if isinstance(document, list) and len(document) >= 3 and document[1] == "o":
         document[2] = ARTIFACTS.sub("", document[2]).translate(TUI_TOFU)
 
+# Static GIF previews show frame zero without advancing the animation. Make the
+# first rendered frame the recorder banner rather than the empty PTY that
+# precedes it. Asciicast v2 uses absolute timestamps; v3 uses per-event delays.
+events = [
+    document
+    for document in documents
+    if isinstance(document, list) and len(document) >= 3
+]
+banner_event = next(
+    (
+        event
+        for event in events
+        if event[1] == "o"
+        and isinstance(event[2], str)
+        and "GCO Autopilot" in event[2]
+    ),
+    None,
+)
+header_version = documents[0].get("version") if isinstance(documents[0], dict) else None
+if banner_event is not None and header_version == 2:
+    banner_time = float(banner_event[0])
+    for event in events:
+        event[0] = round(max(0.0, float(event[0]) - banner_time), 6)
+elif banner_event is not None and header_version == 3:
+    for event in events:
+        event[0] = 0
+        if event is banner_event:
+            break
+
 path.write_text(
     "\n".join(json.dumps(d, ensure_ascii=False, separators=(",", ":")) for d in documents)
     + "\n",
@@ -456,4 +710,5 @@ echo "Any new GIF must satisfy the reviewed policy in"
 echo ".github/scripts/validate_demo_gifs.py (size/dimensions/frames)."
 echo ""
 echo "Embed in README:"
-echo '  ![GCO Autopilot](demo/autopilot.gif)'
+GIF_BASENAME="$(basename "$GIF_FILE")"
+echo "  ![GCO Autopilot](demo/${GIF_BASENAME})"

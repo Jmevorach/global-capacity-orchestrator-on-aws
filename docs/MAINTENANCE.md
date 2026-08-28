@@ -336,7 +336,7 @@ GCO's two optional, advisory Bedrock features — Mission sampling (`gco mission
 `ai_recommend` MCP tool) — default to **Anthropic Claude Opus 5** through its
 global cross-Region inference profile (`global.anthropic.claude-opus-5`). The
 model id and reasoning preference have one checked-in source: `cdk.json`
-`context.bedrock`, whose stock `thinking.effort` is `high` (Claude's default
+`context.bedrock`, whose stock `generation_reasoning.effort` is `high` (Claude's default
 adaptive-thinking level). Mission sampling and the capacity advisor resolve both
 values through the lightweight `gco.bedrock` module; the same file is shipped
 as package data for installed CLI/MCP use. The consistency test guards the
@@ -391,7 +391,7 @@ deliberately):
 1. Change the flagged `cdk.json` key — `context.bedrock.mission_default_model_id`
    (Mission sampling) or `context.bedrock.capacity_advisor_default_model_id`
    (capacity advisor) — to the new id and set
-   `context.bedrock.thinking.effort` to a level the model supports (the two
+   `context.bedrock.generation_reasoning.effort` to a level the model supports (the two
    generation knobs share it). Decide
    separately whether the sibling generation knob and
    `context.bedrock.claude_code_default_model_id` — the

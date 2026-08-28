@@ -930,13 +930,12 @@ def regions_set(config: Any, role: Any, region: Any, config_path: Any, yes: Any)
 @stacks.group("bedrock")
 @pass_config
 def bedrock_cmd(config: Any) -> None:
-    """Manage the Bedrock model defaults in cdk.json.
+    """Manage Bedrock model and reasoning defaults in cdk.json.
 
-    Three independent keys live under context.bedrock, one per consumer:
-    mission_default_model_id (Mission sampling), capacity_advisor_default_model_id
-    (`gco capacity advise`), and claude_code_default_model_id (the session
-    model `gco autopilot` hands to Claude Code). Edits go through the
-    managed-config engine: validated, atomic, idempotent, and audited.
+    Four independent model keys serve Mission sampling, the capacity advisor,
+    Claude Code, and Codex. Codex also owns a reviewed reasoning-effort sibling.
+    Every edit uses the shared managed-config engine: validated, atomic,
+    idempotent, and audited.
     """
     pass
 
@@ -945,7 +944,7 @@ def bedrock_cmd(config: Any) -> None:
 @click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
 @pass_config
 def bedrock_show(config: Any, config_path: Any) -> None:
-    """Show every configured Bedrock model default and its backing path."""
+    """Show every managed Bedrock model/reasoning default and its path."""
     from ..managed_config import ManagedConfigError, get_bedrock_model_status
 
     formatter = get_output_formatter(config)
@@ -971,7 +970,7 @@ def bedrock_set_mission_model(config: Any, model_id: Any, config_path: Any, yes:
     set-claude-code-model). Model and inference-profile IDs are free-form
     (custom profiles, marketplace models), so validation mirrors the runtime
     reader: a non-empty string without surrounding whitespace. Sibling
-    settings (bedrock.thinking, the other model keys) are preserved.
+    settings (bedrock.generation_reasoning, the other model keys) are preserved.
 
     Examples:
         gco stacks bedrock set-mission-model us.amazon.nova-pro-v1:0
@@ -1017,7 +1016,7 @@ def bedrock_set_capacity_advisor_model(
     set-mission-model and set-claude-code-model). Model and inference-profile
     IDs are free-form (custom profiles, marketplace models), so validation
     mirrors the runtime reader: a non-empty string without surrounding
-    whitespace. Sibling settings (bedrock.thinking, the other model keys)
+    whitespace. Sibling settings (bedrock.generation_reasoning, the other model keys)
     are preserved.
 
     Examples:
@@ -1089,6 +1088,97 @@ def bedrock_set_claude_code_model(config: Any, model_id: Any, config_path: Any, 
         formatter.print_info(
             "New autopilot sessions pick this up at launch; explicit "
             "--model/GCO_AUTOPILOT_MODEL overrides still take precedence"
+        )
+    else:
+        formatter.print_info(report.summary())
+
+
+@bedrock_cmd.command("set-codex-model")
+@click.argument("model_id")
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@pass_config
+def bedrock_set_codex_model(config: Any, model_id: Any, config_path: Any, yes: Any) -> None:
+    """Set context.bedrock.codex_default_model_id.
+
+    This is the canonical model for Codex Autopilot sessions. The reviewed
+    context.bedrock.codex.reasoning_effort remains independent and is preserved;
+    review that pair together when changing model families. Explicit --model,
+    GCO_AUTOPILOT_CODEX_MODEL, and GCO_AUTOPILOT_MODEL overrides still win.
+
+    Examples:
+        gco stacks bedrock set-codex-model global.openai.<model-id>
+        gco stacks bedrock set-codex-model global.openai.<model-id> -y
+    """
+    from ..managed_config import ManagedConfigError, set_codex_default_model
+
+    formatter = get_output_formatter(config)
+
+    if not yes:
+        click.confirm(
+            f"Set bedrock.codex_default_model_id to {model_id} in cdk.json?",
+            abort=True,
+        )
+
+    try:
+        report = set_codex_default_model(model_id, config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+
+    if report.changed:
+        formatter.print_success(report.summary())
+        formatter.print_info(
+            "Canonical Codex sessions pick this up at launch; explicit "
+            "--model/GCO_AUTOPILOT_CODEX_MODEL/GCO_AUTOPILOT_MODEL overrides "
+            "still take precedence"
+        )
+    else:
+        formatter.print_info(report.summary())
+
+
+@bedrock_cmd.command("set-codex-reasoning-effort")
+@click.argument(
+    "reasoning_effort",
+    type=click.Choice(["minimal", "low", "medium", "high", "xhigh"], case_sensitive=True),
+)
+@click.option("--config-path", help="Explicit cdk.json to use (default: nearest in cwd/parents)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@pass_config
+def bedrock_set_codex_reasoning_effort(
+    config: Any, reasoning_effort: Any, config_path: Any, yes: Any
+) -> None:
+    """Set context.bedrock.codex.reasoning_effort.
+
+    The effort applies only when Codex uses the canonical default model; any
+    explicit model override omits it. Allowed values are minimal, low, medium,
+    high, and xhigh.
+
+    Examples:
+        gco stacks bedrock set-codex-reasoning-effort high
+        gco stacks bedrock set-codex-reasoning-effort xhigh -y
+    """
+    from ..managed_config import ManagedConfigError, set_codex_reasoning_effort
+
+    formatter = get_output_formatter(config)
+
+    if not yes:
+        click.confirm(
+            f"Set bedrock.codex.reasoning_effort to {reasoning_effort} in cdk.json?",
+            abort=True,
+        )
+
+    try:
+        report = set_codex_reasoning_effort(reasoning_effort, config_path=config_path)
+    except ManagedConfigError as e:
+        formatter.print_error(str(e))
+        sys.exit(1)
+
+    if report.changed:
+        formatter.print_success(report.summary())
+        formatter.print_info(
+            "Canonical Codex sessions pick this up at launch; explicit model "
+            "overrides intentionally omit canonical reasoning"
         )
     else:
         formatter.print_info(report.summary())

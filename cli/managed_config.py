@@ -151,6 +151,7 @@ class ManagedScalarKey:
     description: str
     default: str
     validate_result: Callable[[dict[str, Any], str], None]
+    nested: tuple[str, ...] = ()
 
 
 def _effective_deployment_scalars(document: dict[str, Any]) -> dict[str, str]:
@@ -211,6 +212,33 @@ def _bedrock_model_id_validator(key_id: str) -> Callable[[dict[str, Any], str], 
     return _validate
 
 
+_CODEX_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+
+
+def _codex_reasoning_effort_validator(document: dict[str, Any], candidate: str) -> None:
+    """Mirror the canonical Codex effort/object contract in ``gco.bedrock``."""
+    if candidate not in _CODEX_REASONING_EFFORTS:
+        supported = ", ".join(sorted(_CODEX_REASONING_EFFORTS))
+        raise ValueError("bedrock.codex.reasoning_effort must be one of " + supported)
+
+    bedrock = document.get("context", {}).get("bedrock")
+    if bedrock is None:
+        return
+    if not isinstance(bedrock, dict):
+        raise ValueError("context.bedrock must be a JSON object")
+    codex = bedrock.get("codex")
+    if codex is None:
+        return
+    if not isinstance(codex, dict):
+        raise ValueError("context.bedrock.codex must be a JSON object")
+    unexpected = sorted(set(codex) - {"reasoning_effort"})
+    if unexpected:
+        raise ValueError(
+            "context.bedrock.codex must contain only 'reasoning_effort'; "
+            f"unexpected keys: {', '.join(unexpected)}"
+        )
+
+
 #: The managed-key registry. New knobs register here instead of growing
 #: bespoke read/validate/write code paths.
 REGIONAL_DEPLOYMENT_REGIONS = ManagedListKey(
@@ -264,6 +292,25 @@ CLAUDE_CODE_DEFAULT_MODEL = ManagedScalarKey(
     description="Bedrock model/inference-profile ID gco autopilot hands to Claude Code",
     default="",  # the reader has no fallback: it requires the key when consulted
     validate_result=_bedrock_model_id_validator("bedrock.claude_code_default_model_id"),
+)
+
+CODEX_DEFAULT_MODEL = ManagedScalarKey(
+    key_id="bedrock.codex_default_model_id",
+    container="bedrock",
+    leaf="codex_default_model_id",
+    description="Bedrock model/inference-profile ID gco autopilot hands to Codex",
+    default="",  # the reader has no fallback: it requires the key when consulted
+    validate_result=_bedrock_model_id_validator("bedrock.codex_default_model_id"),
+)
+
+CODEX_REASONING_EFFORT = ManagedScalarKey(
+    key_id="bedrock.codex.reasoning_effort",
+    container="bedrock",
+    nested=("codex",),
+    leaf="reasoning_effort",
+    description="Canonical reasoning effort for the default Codex model",
+    default="",  # the reader has no fallback: it requires the key when consulted
+    validate_result=_codex_reasoning_effort_validator,
 )
 
 
@@ -440,22 +487,52 @@ def managed_list_remove(
     return _apply(key, "remove", value, config_path)
 
 
+def _scalar_container(
+    document: dict[str, Any],
+    key: ManagedScalarKey,
+    *,
+    materialize: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve (and optionally create) a scalar key's nested object path."""
+    context = document["context"]
+    container = context.get(key.container)
+    path_parts = ["context", key.container]
+    if container is None:
+        if not materialize:
+            return None
+        container = {}
+        context[key.container] = container
+    if not isinstance(container, dict):
+        path = ".".join(path_parts)
+        raise ManagedConfigError(f"{path} must be a JSON object, found {type(container).__name__}")
+
+    for segment in key.nested:
+        path_parts.append(segment)
+        child = container.get(segment)
+        if child is None:
+            if not materialize:
+                return None
+            child = {}
+            container[segment] = child
+        if not isinstance(child, dict):
+            path = ".".join(path_parts)
+            raise ManagedConfigError(f"{path} must be a JSON object, found {type(child).__name__}")
+        container = child
+    return container
+
+
 def _current_scalar(document: dict[str, Any], key: ManagedScalarKey) -> str:
     """Return the configured scalar, or the effective default when absent."""
-    container = document["context"].get(key.container)
+    container = _scalar_container(document, key)
     if container is None:
         return key.default
-    if not isinstance(container, dict):
-        raise ManagedConfigError(
-            f"context.{key.container} must be a JSON object, found {type(container).__name__}"
-        )
     value = container.get(key.leaf)
     if value is None:
         return key.default
     if not isinstance(value, str):
+        dotted_path = ".".join(("context", key.container, *key.nested, key.leaf))
         raise ManagedConfigError(
-            f"context.{key.container}.{key.leaf} must be a JSON string, "
-            f"found {type(value).__name__}"
+            f"{dotted_path} must be a JSON string, found {type(value).__name__}"
         )
     return value
 
@@ -469,16 +546,6 @@ def managed_scalar_set(
         document, raw = _load_document(path)
         old = _current_scalar(document, key)
 
-        if value == old:
-            report = ChangeReport(key.key_id, "set", value, False, old, old, path)
-            logger.info(
-                "managed-config no-op: key=%s action=set value=%s path=%s",
-                key.key_id,
-                value,
-                path,
-            )
-            return report
-
         try:
             key.validate_result(document, value)
         except ValueError as exc:
@@ -491,10 +558,22 @@ def managed_scalar_set(
             )
             raise ManagedConfigError(f"refusing to update {key.key_id}: {exc}") from exc
 
+        if value == old:
+            report = ChangeReport(key.key_id, "set", value, False, old, old, path)
+            logger.info(
+                "managed-config no-op: key=%s action=set value=%s path=%s",
+                key.key_id,
+                value,
+                path,
+            )
+            return report
+
         _require_writable(path)
-        # Materialize only the managed leaf; sibling keys (e.g. bedrock.thinking)
-        # and absent sibling scalars keep their current state / reader defaults.
-        container = document["context"].setdefault(key.container, {})
+        # Materialize only the target path; all outer and sibling settings
+        # retain their current state / reader defaults.
+        container = _scalar_container(document, key, materialize=True)
+        if container is None:  # pragma: no cover - materialize guarantees an object
+            raise ManagedConfigError(f"unable to materialize {key.key_id}")
         container[key.leaf] = value
         _write_document(path, document, raw)
 
@@ -574,7 +653,7 @@ def set_deployment_region_role(
 
 
 def get_bedrock_model_status(*, config_path: Path | str | None = None) -> dict[str, Any]:
-    """Return every configured Bedrock model default and its backing path."""
+    """Return every managed Bedrock model/reasoning default and its path."""
     path = _resolve_config_path(config_path)
     document, _ = _load_document(path)
     return {
@@ -584,6 +663,8 @@ def get_bedrock_model_status(*, config_path: Path | str | None = None) -> dict[s
             document, CAPACITY_ADVISOR_DEFAULT_MODEL
         ),
         "claude_code_default_model_id": _current_scalar(document, CLAUDE_CODE_DEFAULT_MODEL),
+        "codex_default_model_id": _current_scalar(document, CODEX_DEFAULT_MODEL),
+        "codex_reasoning_effort": _current_scalar(document, CODEX_REASONING_EFFORT),
     }
 
 
@@ -604,5 +685,23 @@ def set_capacity_advisor_default_model(
 def set_claude_code_default_model(
     model_id: str, *, config_path: Path | str | None = None
 ) -> ChangeReport:
-    """Set ``bedrock.claude_code_default_model_id`` (autopilot session model)."""
+    """Set ``bedrock.claude_code_default_model_id`` (Claude session model)."""
     return managed_scalar_set(CLAUDE_CODE_DEFAULT_MODEL, model_id, config_path=config_path)
+
+
+def set_codex_default_model(
+    model_id: str, *, config_path: Path | str | None = None
+) -> ChangeReport:
+    """Set ``bedrock.codex_default_model_id`` (Codex session model)."""
+    return managed_scalar_set(CODEX_DEFAULT_MODEL, model_id, config_path=config_path)
+
+
+def set_codex_reasoning_effort(
+    reasoning_effort: str, *, config_path: Path | str | None = None
+) -> ChangeReport:
+    """Set ``bedrock.codex.reasoning_effort`` for the canonical Codex model."""
+    return managed_scalar_set(
+        CODEX_REASONING_EFFORT,
+        reasoning_effort,
+        config_path=config_path,
+    )

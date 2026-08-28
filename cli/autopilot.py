@@ -1,39 +1,21 @@
-"""Autopilot: launch a fully configured Claude Code session against GCO.
+"""Autopilot: launch a configured Claude Code or Codex session against GCO.
 
-``gco autopilot`` turns the current terminal into an opinionated
-`Claude Code <https://code.claude.com/docs/en/overview>`_ session that is
-ready to operate GCO:
+``gco autopilot`` defaults to Claude Code for backward compatibility and can
+select Codex with ``--engine codex`` or ``GCO_AUTOPILOT_ENGINE=codex``. Both
+engines use the caller's AWS credentials, GCO's canonical Bedrock defaults,
+the GCO MCP server, and the recommended companion MCP servers. Claude Code
+keeps its generated JSON config plus ``--strict-mcp-config`` behavior. Codex
+uses a generated TOML config and skills inside GCO's isolated
+``~/.gco/autopilot/codex`` home, leaving personal ``~/.codex`` state alone.
 
-* **Amazon Bedrock backend.** The session talks to Bedrock through the
-  caller's AWS credentials (``CLAUDE_CODE_USE_BEDROCK=1``) and defaults to
-  GCO's Claude Code model default — ``cdk.json``
-  ``context.bedrock.claude_code_default_model_id``, resolved through
-  :mod:`gco.bedrock`. The key is deliberately separate from the
-  ``mission_default_model_id`` and ``capacity_advisor_default_model_id``
-  knobs consumed by Mission sampling and the capacity advisor: repointing
-  the interactive agent and repointing advisory Converse calls are
-  independent decisions, and future agent runners (Codex, opencode, ...)
-  get their own sibling keys. Any Claude model or inference profile
-  available on Bedrock can be substituted with ``--model``.
-* **GCO MCP server.** Wired in automatically — from the local checkout when
-  autopilot runs inside one (so uncommitted MCP changes are live), otherwise
-  from the release tag matching the installed ``gco-cli`` version.
-* **Recommended companion MCP servers.** The curated companion list from
-  ``gco_mcp/README.md`` ("Recommended Companion MCP Servers"), generated
-  into a session-scoped MCP config. The config is passed to Claude Code with
-  ``--strict-mcp-config`` so the session is hermetic: exactly these servers,
-  regardless of what personal or project MCP configs exist on the machine.
-
-The Claude Code CLI itself is deliberately **not** baked into the dev
-container. It is installed lazily — ``gco autopilot`` detects a missing
-``claude`` binary and offers to install the exact pinned version below via
-``npm install -g``, keeping the install reproducible and letting the monthly
-dependency scan report drift against the npm ``latest`` dist-tag.
+Neither CLI is baked into the development container. Autopilot detects the
+selected engine's binary and offers to install its exact npm pin lazily.
 
 Scanner contract (``.github/scripts/lib_dependency_scan.sh``):
 
-* ``extract_claude_code_pin`` reads :data:`CLAUDE_CODE_VERSION` from this
-  file with a regex — keep it a single-line, double-quoted assignment.
+* ``extract_claude_code_pin`` and ``extract_codex_pin`` read
+  :data:`CLAUDE_CODE_VERSION` and :data:`CODEX_VERSION` from this file with
+  regexes — keep both as single-line, double-quoted assignments.
 * ``extract_companion_mcp_packages`` pairs the ``registry=`` / ``package=``
   keywords inside each ``CompanionServer(`` block — keep those two fields
   on their own lines when editing the registry below.
@@ -48,9 +30,14 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
-from gco.bedrock import get_default_claude_code_model_id
+from gco.bedrock import (
+    get_default_claude_code_model_id,
+    get_default_codex_model_id,
+    get_default_codex_reasoning_effort,
+)
 
 from . import __version__
 
@@ -62,12 +49,60 @@ CLAUDE_CODE_VERSION = "2.1.235"
 #: npm package that ships the ``claude`` binary.
 CLAUDE_CODE_PACKAGE = "@anthropic-ai/claude-code"
 
+#: Exact Codex CLI release installed by the Codex engine.
+#: Keep this literal assignment scanner-friendly like CLAUDE_CODE_VERSION.
+CODEX_VERSION = "0.150.1"
+
+#: npm package that ships the ``codex`` binary.
+CODEX_PACKAGE = "@openai/codex"
+
+#: Built-in Codex provider that signs Bedrock Runtime requests and supports
+#: geographic/global cross-Region inference profile IDs.
+CODEX_BEDROCK_PROVIDER = "amazon-bedrock-runtime"
+
+#: Parallel npx/uvx startup can include a first-use package download. Codex's
+#: generated config gives every curated MCP server one bounded minute.
+CODEX_MCP_STARTUP_TIMEOUT_SECONDS = 60.0
+
+#: Engine override environment variable; Claude Code remains the compatibility default.
+_ENGINE_ENV = "GCO_AUTOPILOT_ENGINE"
+_CODEX_MODEL_ENV = "GCO_AUTOPILOT_CODEX_MODEL"
+
+
+class AutopilotEngine(StrEnum):
+    """Interactive agent runtimes supported by ``gco autopilot``."""
+
+    CLAUDE_CODE = "claude-code"
+    CODEX = "codex"
+
+
+def resolve_engine(explicit: str | AutopilotEngine | None) -> AutopilotEngine:
+    """Resolve engine flag > environment > backward-compatible Claude default."""
+    if explicit is not None:
+        raw: str | AutopilotEngine = explicit
+    elif _ENGINE_ENV in os.environ:
+        raw = os.environ[_ENGINE_ENV]
+    else:
+        return AutopilotEngine.CLAUDE_CODE
+    if isinstance(raw, AutopilotEngine):
+        return raw
+    candidate = str(raw).strip().lower()
+    try:
+        return AutopilotEngine(candidate)
+    except ValueError as exc:
+        supported = ", ".join(engine.value for engine in AutopilotEngine)
+        raise ValueError(f"Unknown autopilot engine {raw!r}. Choose one of: {supported}.") from exc
+
+
 #: Where the generated session MCP config lands. Regenerated on every
 #: launch, so hand edits do not survive — persistent customization belongs
 #: in your own MCP config (see gco_mcp/README.md).
 _CONFIG_DIR_ENV = "GCO_AUTOPILOT_CONFIG_DIR"
 _DEFAULT_CONFIG_DIR = Path.home() / ".gco" / "autopilot"
 _CONFIG_FILENAME = "mcp.json"
+_CODEX_HOME_DIRNAME = "codex"
+_CODEX_CONFIG_FILENAME = "config.toml"
+_CODEX_SKILLS_DIRNAME = "skills"
 
 #: Model override environment variable (the ``--model`` flag wins over it).
 _MODEL_ENV = "GCO_AUTOPILOT_MODEL"
@@ -363,8 +398,124 @@ def write_mcp_config(config: dict[str, dict[str, dict[str, object]]]) -> Path:
     return path
 
 
+def codex_home() -> Path:
+    """Return GCO's isolated, persistent Codex home directory."""
+    return config_path().parent / _CODEX_HOME_DIRNAME
+
+
+def codex_config_path() -> Path:
+    """Return the generated Codex config path under the isolated home."""
+    return codex_home() / _CODEX_CONFIG_FILENAME
+
+
+def _toml_string(value: str) -> str:
+    """Encode one TOML basic string using JSON's compatible escaping."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _toml_array(values: list[str]) -> str:
+    return "[" + ", ".join(_toml_string(value) for value in values) + "]"
+
+
+def build_codex_config_toml(
+    mcp_config: dict[str, dict[str, dict[str, object]]],
+    *,
+    model: str,
+    region: str,
+    reasoning_effort: str | None,
+) -> str:
+    """Render a complete isolated Codex config with Bedrock and MCP servers.
+
+    ``model_reasoning_effort`` is emitted only for the canonical GCO model.
+    Explicit CLI/environment model overrides must use the selected model's own
+    defaults instead of inheriting a potentially incompatible effort value.
+    """
+    lines = [
+        f"model = {_toml_string(model)}",
+        f"model_provider = {_toml_string(CODEX_BEDROCK_PROVIDER)}",
+    ]
+    if reasoning_effort is not None:
+        lines.append(f"model_reasoning_effort = {_toml_string(reasoning_effort)}")
+    lines.extend(
+        [
+            "check_for_update_on_startup = false",
+            "",
+            f"[model_providers.{CODEX_BEDROCK_PROVIDER}]",
+            'wire_api = "responses"',
+            "",
+            f"[model_providers.{CODEX_BEDROCK_PROVIDER}.aws]",
+            f"region = {_toml_string(region)}",
+        ]
+    )
+    servers = mcp_config["mcpServers"]
+    for name in sorted(servers):
+        entry = servers[name]
+        command = entry.get("command")
+        args = entry.get("args", [])
+        if not isinstance(command, str) or not command:
+            raise ValueError(f"Codex MCP server {name!r} has no command")
+        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+            raise ValueError(f"Codex MCP server {name!r} args must be strings")
+        table_name = _toml_string(name)
+        lines.extend(
+            [
+                "",
+                f"[mcp_servers.{table_name}]",
+                f"command = {_toml_string(command)}",
+                f"args = {_toml_array(args)}",
+                "enabled = true",
+                f"startup_timeout_sec = {CODEX_MCP_STARTUP_TIMEOUT_SECONDS}",
+            ]
+        )
+        environment = entry.get("env")
+        if environment:
+            if not isinstance(environment, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in environment.items()
+            ):
+                raise ValueError(f"Codex MCP server {name!r} env must contain strings")
+            lines.extend(["", f"[mcp_servers.{table_name}.env]"])
+            for key, value in sorted(environment.items()):
+                lines.append(f"{_toml_string(key)} = {_toml_string(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def write_codex_config(content: str) -> Path:
+    """Write the generated Codex configuration inside isolated CODEX_HOME."""
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _selected_model_override(
+    explicit: str | None,
+    env_names: tuple[str, ...],
+) -> tuple[str | None, str | None]:
+    """Return the highest-precedence model override and its user-facing source.
+
+    Presence, not truthiness, selects a source so a blank high-precedence value
+    fails closed instead of silently falling through to another model.
+    """
+    if explicit is not None:
+        raw_value = explicit
+        source = "--model"
+    else:
+        for env_name in env_names:
+            if env_name in os.environ:
+                raw_value = os.environ[env_name]
+                source = env_name
+                break
+        else:
+            return None, None
+    value = raw_value.strip()
+    if not value:
+        raise ValueError(f"{source} must be a non-empty Bedrock model id")
+    return value, source
+
+
 def resolve_model(explicit: str | None) -> tuple[str, list[str]]:
-    """Resolve the Bedrock model id and return it with any advisory warnings.
+    """Resolve the Claude Bedrock model with strict override validation.
 
     Precedence: ``--model`` flag > ``GCO_AUTOPILOT_MODEL`` env > the
     ``cdk.json`` Claude Code default
@@ -375,8 +526,8 @@ def resolve_model(explicit: str | None) -> tuple[str, list[str]]:
     opaque, so an unfamiliar id produces a warning rather than a refusal.
     """
     warnings: list[str] = []
-    model = explicit or os.environ.get(_MODEL_ENV) or get_default_claude_code_model_id()
-    model = model.strip()
+    override, _source = _selected_model_override(explicit, (_MODEL_ENV,))
+    model = override if override is not None else get_default_claude_code_model_id()
     lowered = model.lower()
     if "anthropic" not in lowered and "claude" not in lowered:
         warnings.append(
@@ -386,10 +537,48 @@ def resolve_model(explicit: str | None) -> tuple[str, list[str]]:
     return model, warnings
 
 
+def resolve_codex_model(explicit: str | None) -> tuple[str, list[str]]:
+    """Resolve Codex model: flag > Codex env > generic env > cdk.json."""
+    warnings: list[str] = []
+    override, _source = _selected_model_override(
+        explicit,
+        (_CODEX_MODEL_ENV, _MODEL_ENV),
+    )
+    model = override if override is not None else get_default_codex_model_id()
+    lowered = model.lower()
+    if "openai" not in lowered and "gpt" not in lowered:
+        warnings.append(
+            f"Model id {model!r} does not look like an OpenAI model on Bedrock; "
+            "continuing with the explicit override."
+        )
+    return model, warnings
+
+
+def resolve_codex_reasoning_effort(explicit_model: str | None = None) -> str | None:
+    """Return canonical Codex effort only when no model override was selected."""
+    override, _source = _selected_model_override(
+        explicit_model,
+        (_CODEX_MODEL_ENV, _MODEL_ENV),
+    )
+    if override is not None:
+        return None
+    return get_default_codex_reasoning_effort()
+
+
 def resolve_small_fast_model(explicit: str | None) -> str | None:
-    """Resolve the optional background/fast model (flag > env > unset)."""
-    value = explicit or os.environ.get(_SMALL_FAST_MODEL_ENV)
-    return value.strip() if value and value.strip() else None
+    """Resolve Claude's optional fast model, rejecting configured blank values."""
+    if explicit is not None:
+        raw_value = explicit
+        source = "--small-fast-model"
+    elif _SMALL_FAST_MODEL_ENV in os.environ:
+        raw_value = os.environ[_SMALL_FAST_MODEL_ENV]
+        source = _SMALL_FAST_MODEL_ENV
+    else:
+        return None
+    value = raw_value.strip()
+    if not value:
+        raise ValueError(f"{source} must be a non-empty Bedrock model id")
+    return value
 
 
 def build_claude_env(
@@ -407,6 +596,7 @@ def build_claude_env(
     """
     env = dict(os.environ)
     env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+    env["DISABLE_AUTOUPDATER"] = "1"
     env["ANTHROPIC_MODEL"] = model
     env.setdefault("AWS_REGION", region)
     if small_fast_model:
@@ -414,9 +604,34 @@ def build_claude_env(
     return env
 
 
+def build_codex_env(region: str) -> dict[str, str]:
+    """Return an isolated Codex environment while preserving AWS credentials."""
+    env = dict(os.environ)
+    env.setdefault("AWS_REGION", region)
+    env["CODEX_HOME"] = str(codex_home())
+    return env
+
+
+def effective_aws_region(default_region: str) -> str:
+    """Resolve the AWS SDK region Codex and its generated config should share."""
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or default_region
+
+
 def find_claude_binary() -> str | None:
     """Return the resolved ``claude`` executable path, or ``None``."""
     return shutil.which("claude")
+
+
+def find_codex_binary() -> str | None:
+    """Return the resolved ``codex`` executable path, or ``None``."""
+    return shutil.which("codex")
+
+
+def plugin_paths_requested(cli_plugins: tuple[str, ...]) -> bool:
+    """Return whether CLI or environment requested a Claude Code plugin."""
+    if cli_plugins:
+        return True
+    return any(part.strip() for part in os.environ.get(_PLUGIN_DIRS_ENV, "").split(":"))
 
 
 def resolve_plugin_paths(cli_plugins: tuple[str, ...]) -> list[Path]:
@@ -517,6 +732,23 @@ def stage_imports(
     return plugin_root
 
 
+def stage_codex_skills(skills_dirs: tuple[str, ...]) -> Path | None:
+    """Rebuild GCO's isolated Codex skills directory from validated sources."""
+    destination = codex_home() / _CODEX_SKILLS_DIRNAME
+    shutil.rmtree(destination, ignore_errors=True)
+    if not skills_dirs:
+        return None
+    validate_imports(skills_dirs, ())
+    destination.mkdir(parents=True)
+    for source_raw in skills_dirs:
+        shutil.copytree(
+            Path(source_raw).expanduser(),
+            destination,
+            dirs_exist_ok=True,
+        )
+    return destination
+
+
 def build_plugin_args(plugin_paths: list[Path]) -> tuple[str, ...]:
     """Render plugin paths as claude's repeatable ``--plugin-dir`` flags."""
     args: list[str] = []
@@ -581,6 +813,18 @@ def install_claude_code() -> int:
     return subprocess.call(claude_install_command())  # noqa: S603
 
 
+def codex_install_command() -> list[str]:
+    """Return the exact pinned Codex npm install command."""
+    return ["npm", "install", "-g", f"{CODEX_PACKAGE}@{CODEX_VERSION}"]
+
+
+def install_codex() -> int:
+    """Install the pinned Codex release; return the npm exit code."""
+    if shutil.which("npm") is None:
+        return 127
+    return subprocess.call(codex_install_command())  # noqa: S603
+
+
 def build_launch_argv(
     claude_binary: str,
     mcp_config: Path,
@@ -611,6 +855,78 @@ def build_launch_argv(
     ]
 
 
+def codex_project_root(workspace: Path) -> Path:
+    """Return Codex's normalized project root for a run-scoped trust policy.
+
+    Codex 0.150.1 loads a trusted project's ``.codex/config.toml`` above its
+    user config, even when ``CODEX_HOME`` is isolated. Its Git project identity
+    follows the common Git directory, so linked worktrees resolve to the main
+    checkout. Outside Git, the launch directory itself is the project root.
+    """
+    resolved = workspace.resolve()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=resolved,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except OSError, subprocess.TimeoutExpired:
+        return resolved
+    if result.returncode != 0 or not result.stdout.strip():
+        return resolved
+    return Path(result.stdout.strip()).resolve().parent
+
+
+def build_codex_owned_args(
+    *,
+    model: str,
+    region: str,
+    reasoning_effort: str | None,
+    workspace: Path,
+) -> tuple[str, ...]:
+    """Return session-precedence controls that keep the Codex plan authoritative.
+
+    ``CODEX_HOME`` isolates personal user state, but Codex 0.150.1 otherwise
+    layers trusted project configuration above the generated TOML. Marking the
+    discovered project root untrusted for this launch disables that project
+    layer without persisting trust state. Scalar Bedrock/update controls are
+    repeated at session precedence as defense in depth. Organization-managed
+    policy remains authoritative by Codex design.
+    """
+    project_root = codex_project_root(workspace)
+    assignments = [
+        f"model_provider={_toml_string(CODEX_BEDROCK_PROVIDER)}",
+        (f"model_providers.{CODEX_BEDROCK_PROVIDER}.wire_api={_toml_string('responses')}"),
+        (f"model_providers.{CODEX_BEDROCK_PROVIDER}.aws.region={_toml_string(region)}"),
+        "check_for_update_on_startup=false",
+        (f'projects={{{_toml_string(str(project_root))}={{trust_level="untrusted"}}}}'),
+    ]
+    if reasoning_effort is not None:
+        assignments.insert(
+            1,
+            f"model_reasoning_effort={_toml_string(reasoning_effort)}",
+        )
+
+    args = ["--model", model]
+    for assignment in assignments:
+        args.extend(("-c", assignment))
+    return tuple(args)
+
+
+def build_codex_launch_argv(
+    codex_binary: str,
+    *,
+    root_args: tuple[str, ...] = (),
+    resume_args: tuple[str, ...] = (),
+    extra_args: tuple[str, ...] = (),
+) -> list[str]:
+    """Return Codex argv in native root → resume-selector → passthrough order."""
+    return [codex_binary, *root_args, *resume_args, *extra_args]
+
+
 def exec_claude(argv: list[str], env: dict[str, str]) -> int:
     """Hand the terminal over to Claude Code.
 
@@ -624,3 +940,8 @@ def exec_claude(argv: list[str], env: dict[str, str]) -> int:
         return subprocess.call(argv, env=env)  # noqa: S603
     os.execvpe(argv[0], argv, env)  # noqa: S606
     raise AssertionError("unreachable: execvpe replaces the process on success")
+
+
+def exec_codex(argv: list[str], env: dict[str, str]) -> int:
+    """Hand the terminal over to Codex using the same process semantics."""
+    return exec_claude(argv, env)

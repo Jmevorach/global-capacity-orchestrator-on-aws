@@ -1,15 +1,13 @@
 """Every checked-in Bedrock model default has one source in ``cdk.json``.
 
-Three deliberately independent generation keys live under ``context.bedrock``,
-one per consumer: ``mission_default_model_id`` (Mission sampling),
-``capacity_advisor_default_model_id`` (the capacity advisor), and
-``claude_code_default_model_id`` (the session model ``gco autopilot`` hands to
-Claude Code; future agent runners get their own sibling keys). Each consumer
-resolves its own key through :mod:`gco.bedrock`, canonical reasoning
-translation applies only to the two Converse-path defaults, and the retired
-pre-v6 ``default_model_id`` key fails closed with rename instructions. The
-dependency scanner reads the JSON paths directly, and the configured Mission
-model must have a complete captured scaffolder fixture.
+Four independent interactive/generation model keys live under
+``context.bedrock``: Mission sampling, the capacity advisor, Claude Code, and
+Codex. Each consumer resolves its own key through :mod:`gco.bedrock`; Converse
+reasoning, Claude configuration, and Codex Responses-API reasoning stay in
+separate validation domains. The retired pre-v6 ``default_model_id`` and
+``thinking`` keys fail closed with explicit rename guidance. The dependency
+scanner reads the JSON paths directly, and the configured Mission and Codex
+models must each have a complete captured scaffolder fixture.
 """
 
 from __future__ import annotations
@@ -39,6 +37,9 @@ from gco.bedrock import (  # noqa: E402
     get_default_bedrock_thinking_effort,
     get_default_capacity_advisor_model_id,
     get_default_claude_code_model_id,
+    get_default_codex_configuration,
+    get_default_codex_model_id,
+    get_default_codex_reasoning_effort,
     get_default_mission_model_id,
 )
 from tests._scaffold_replay import (  # noqa: E402
@@ -46,18 +47,22 @@ from tests._scaffold_replay import (  # noqa: E402
     DEFAULT_FIXTURE,
     DEFAULT_FIXTURE_PATH,
     DEFAULT_MODEL_ID,
+    FIXTURES_BY_MODEL,
+    model_fixture_slug,
 )
 
-# Pin the intended defaults independently from the loader so an accidental
-# same-family or lower-tier change is visible in review and CI. The three
-# generation defaults are separate knobs that happen to ship the same profile
-# today; each pin moves on its own.
+# Pin the intended defaults independently from the loader so accidental model
+# or reasoning changes are visible in review and CI. Every consumer moves its
+# own key; equality between today's three Anthropic defaults is incidental.
 _EXPECTED_MISSION_MODEL_ID = "global.anthropic.claude-opus-5"
 _EXPECTED_CAPACITY_ADVISOR_MODEL_ID = "global.anthropic.claude-opus-5"
 _EXPECTED_CLAUDE_CODE_MODEL_ID = "global.anthropic.claude-opus-5"
+_EXPECTED_CODEX_MODEL_ID = "global.openai.gpt-5.6-sol"
+_EXPECTED_CODEX = {"reasoning_effort": "xhigh"}
 _EXPECTED_EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
 _EXPECTED_FIXTURE_NAME = "global_anthropic_claude_opus_5.json"
-_EXPECTED_THINKING = {"effort": "high"}
+_EXPECTED_CODEX_FIXTURE_NAME = "global_openai_gpt_5_6_sol.json"
+_EXPECTED_GENERATION_REASONING = {"effort": "high"}
 _RUNTIME_SOURCE_ROOTS = ("cli", "gco", "gco_mcp", "scripts", ".github/scripts")
 _RUNTIME_SOURCE_SUFFIXES = {".py", ".sh"}
 
@@ -71,7 +76,7 @@ def test_cdk_json_is_the_single_mission_default_source(monkeypatch: Any) -> None
 
     assert configured == _EXPECTED_MISSION_MODEL_ID
     assert configuration.mission_model_id == _EXPECTED_MISSION_MODEL_ID
-    assert configuration.thinking_effort == _EXPECTED_THINKING["effort"]
+    assert configuration.thinking_effort == _EXPECTED_GENERATION_REASONING["effort"]
     assert get_default_bedrock_thinking_effort(PROJECT_ROOT / "cdk.json") == "high"
     assert BedrockSamplingBackend().model_id == configured
     assert BedrockSamplingBackend.from_canonical_default().model_id == configured
@@ -109,6 +114,29 @@ def test_cdk_json_is_the_single_claude_code_default_source(monkeypatch: Any) -> 
     assert configured == _EXPECTED_CLAUDE_CODE_MODEL_ID
     assert resolved_model == configured
     assert warnings == []
+
+
+def test_cdk_json_is_the_single_codex_default_source(monkeypatch: Any) -> None:
+    """Codex model and xhigh effort resolve from their independent mapping."""
+    from cli.autopilot import resolve_codex_model, resolve_codex_reasoning_effort
+
+    monkeypatch.delenv("GCO_AUTOPILOT_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("GCO_AUTOPILOT_MODEL", raising=False)
+
+    configuration = get_default_codex_configuration(PROJECT_ROOT / "cdk.json")
+    resolved_model, warnings = resolve_codex_model(None)
+
+    assert configuration.model_id == _EXPECTED_CODEX_MODEL_ID
+    assert configuration.reasoning_effort == _EXPECTED_CODEX["reasoning_effort"]
+    assert get_default_codex_model_id(PROJECT_ROOT / "cdk.json") == _EXPECTED_CODEX_MODEL_ID
+    assert get_default_codex_reasoning_effort(PROJECT_ROOT / "cdk.json") == "xhigh"
+    assert resolved_model == _EXPECTED_CODEX_MODEL_ID
+    assert resolve_codex_reasoning_effort() == "xhigh"
+    assert warnings == []
+    assert "CodexAutopilotConfiguration" in bedrock_config.__all__
+    assert "get_default_codex_configuration" in bedrock_config.__all__
+    assert "get_default_codex_model_id" in bedrock_config.__all__
+    assert "get_default_codex_reasoning_effort" in bedrock_config.__all__
 
 
 def test_the_single_advisory_surface_is_fully_retired() -> None:
@@ -165,6 +193,7 @@ def test_exact_default_literals_are_absent_from_all_runtime_sources() -> None:
         _EXPECTED_MISSION_MODEL_ID,
         _EXPECTED_CAPACITY_ADVISOR_MODEL_ID,
         _EXPECTED_CLAUDE_CODE_MODEL_ID,
+        _EXPECTED_CODEX_MODEL_ID,
     }
     violations: list[str] = []
     for root_name in _RUNTIME_SOURCE_ROOTS:
@@ -175,6 +204,38 @@ def test_exact_default_literals_are_absent_from_all_runtime_sources() -> None:
             content = path.read_text(encoding="utf-8")
             if any(pin in content for pin in pins):
                 violations.append(relative_path)
+
+    assert violations == []
+
+
+def test_retired_reasoning_key_is_absent_from_current_facing_sources() -> None:
+    """Only migration diagnostics may name the retired configuration path."""
+    forbidden = (
+        "context.bedrock.thinking",
+        "bedrock.thinking",
+        "thinking.effort",
+        '"thinking": {"effort"',
+    )
+    allowed_migration_sources = {
+        "gco/bedrock.py",
+        "tests/README.md",
+        "tests/test_default_bedrock_model_consistency.py",
+    }
+    violations: list[str] = []
+    for root_name in (".github", "cli", "docs", "gco", "gco_mcp", "scripts", "tests"):
+        for path in sorted((PROJECT_ROOT / root_name).rglob("*")):
+            if not path.is_file() or path.suffix not in {".md", ".py", ".sh"}:
+                continue
+            relative = path.relative_to(PROJECT_ROOT)
+            if any(part.startswith(".") and part != ".github" for part in relative.parts):
+                continue
+            relative_path = relative.as_posix()
+            if relative_path in allowed_migration_sources:
+                continue
+            content = path.read_text(encoding="utf-8")
+            for token in forbidden:
+                if token in content:
+                    violations.append(f"{relative_path}: {token}")
 
     assert violations == []
 
@@ -246,12 +307,30 @@ def test_mission_default_has_the_exact_complete_replay_fixture() -> None:
     assert set(CANONICAL_CAPTURE_SLUGS) <= {capture.slug for capture in DEFAULT_FIXTURE.captures}
 
 
+def test_codex_default_has_the_exact_complete_mission_replay_fixture() -> None:
+    """The Codex default remains proved as an explicit Mission override."""
+    fixture = FIXTURES_BY_MODEL[_EXPECTED_CODEX_MODEL_ID]
+    expected_path = (
+        PROJECT_ROOT
+        / "tests"
+        / "fixtures"
+        / "scaffold_responses"
+        / f"{model_fixture_slug(_EXPECTED_CODEX_MODEL_ID)}.json"
+    )
+
+    assert get_default_codex_model_id(PROJECT_ROOT / "cdk.json") == fixture.model_id
+    assert fixture.path == expected_path
+    assert fixture.path.name == _EXPECTED_CODEX_FIXTURE_NAME
+    assert set(CANONICAL_CAPTURE_SLUGS) <= {capture.slug for capture in fixture.captures}
+
+
 @pytest.mark.parametrize(
     "model_id",
     [
         pytest.param(_EXPECTED_MISSION_MODEL_ID, id="mission-default"),
         pytest.param(_EXPECTED_CAPACITY_ADVISOR_MODEL_ID, id="capacity-advisor-default"),
         pytest.param(_EXPECTED_CLAUDE_CODE_MODEL_ID, id="claude-code-default"),
+        pytest.param(_EXPECTED_CODEX_MODEL_ID, id="codex-default"),
     ],
 )
 def test_default_model_is_a_system_defined_inference_profile_id(model_id: str) -> None:
@@ -302,8 +381,10 @@ def test_cdk_json_contains_exactly_the_managed_default_model_keys() -> None:
         "mission_default_model_id": _EXPECTED_MISSION_MODEL_ID,
         "capacity_advisor_default_model_id": _EXPECTED_CAPACITY_ADVISOR_MODEL_ID,
         "claude_code_default_model_id": _EXPECTED_CLAUDE_CODE_MODEL_ID,
+        "codex_default_model_id": _EXPECTED_CODEX_MODEL_ID,
+        "codex": _EXPECTED_CODEX,
         "embedding_model_id": _EXPECTED_EMBEDDING_MODEL_ID,
-        "thinking": _EXPECTED_THINKING,
+        "generation_reasoning": _EXPECTED_GENERATION_REASONING,
     }
 
 
@@ -336,6 +417,22 @@ def test_default_high_thinking_translates_to_native_converse_fields() -> None:
             "output_config": {"effort": "high"},
         },
     }
+
+
+def test_openai_gpt_converse_options_drop_unsupported_temperature() -> None:
+    """Mission can explicitly use the Codex default through Converse.
+
+    GPT-5.6 rejects ``temperature`` at the service boundary, while an explicit
+    output cap remains a supported caller choice and no Claude/Nova reasoning
+    dialect should be attached.
+    """
+    options = build_bedrock_converse_options(
+        _EXPECTED_CODEX_MODEL_ID,
+        inference_config={"maxTokens": 2048, "temperature": 0.2},
+        apply_default_reasoning=False,
+    )
+
+    assert options == {"inferenceConfig": {"maxTokens": 2048}}
 
 
 def test_nova_default_still_translates_to_reasoning_config(tmp_path: Path) -> None:
@@ -497,6 +594,8 @@ def _bedrock_payload(
     mission_model_id: Any = _EXPECTED_MISSION_MODEL_ID,
     capacity_advisor_model_id: Any = _EXPECTED_CAPACITY_ADVISOR_MODEL_ID,
     claude_code_model_id: Any = _EXPECTED_CLAUDE_CODE_MODEL_ID,
+    codex_model_id: Any = _EXPECTED_CODEX_MODEL_ID,
+    codex: Any = _EXPECTED_CODEX,
 ) -> dict[str, Any]:
     return {
         "context": {
@@ -504,7 +603,9 @@ def _bedrock_payload(
                 "mission_default_model_id": mission_model_id,
                 "capacity_advisor_default_model_id": capacity_advisor_model_id,
                 "claude_code_default_model_id": claude_code_model_id,
-                "thinking": dict(_EXPECTED_THINKING),
+                "codex_default_model_id": codex_model_id,
+                "codex": dict(codex) if isinstance(codex, dict) else codex,
+                "generation_reasoning": dict(_EXPECTED_GENERATION_REASONING),
             }
         }
     }
@@ -769,13 +870,13 @@ def test_claude_code_model_payload_trims_valid_identifier() -> None:
     )
 
 
-def test_claude_code_default_survives_a_malformed_generation_thinking_block(
+def test_claude_code_default_survives_malformed_generation_reasoning(
     tmp_path: Path,
 ) -> None:
-    """Autopilot's failure domain excludes the generation reasoning contract."""
+    """Claude model resolution excludes the generation reasoning contract."""
     config_path = tmp_path / "cdk.json"
     payload = _bedrock_payload()
-    payload["context"]["bedrock"]["thinking"] = {"effort": "maximum"}
+    payload["context"]["bedrock"]["generation_reasoning"] = {"effort": "maximum"}
     config_path.write_text(json.dumps(payload), encoding="utf-8")
 
     assert (
@@ -803,23 +904,35 @@ def test_generation_defaults_survive_a_missing_claude_code_key(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
-    ("thinking", "message"),
+    ("generation_reasoning", "message"),
     [
-        (None, "thinking must be an object"),
-        ([], "thinking must be an object"),
-        ({}, "thinking must contain only 'effort'"),
-        ({"effort": "maximum"}, "thinking.effort must be one of high, low, medium"),
-        ({"effort": []}, "thinking.effort must be one of high, low, medium"),
-        ({"effort": {}}, "thinking.effort must be one of high, low, medium"),
+        (None, "generation_reasoning must be an object"),
+        ([], "generation_reasoning must be an object"),
+        ({}, "generation_reasoning must contain only 'effort'"),
+        (
+            {"effort": "maximum"},
+            "generation_reasoning.effort must be one of high, low, medium",
+        ),
+        (
+            {"effort": []},
+            "generation_reasoning.effort must be one of high, low, medium",
+        ),
+        (
+            {"effort": {}},
+            "generation_reasoning.effort must be one of high, low, medium",
+        ),
         (
             {"effort": "high", "budget": 32000},
-            "thinking must contain only 'effort'",
+            "generation_reasoning must contain only 'effort'",
         ),
     ],
 )
-def test_thinking_payload_validation_fails_closed(thinking: Any, message: str) -> None:
+def test_generation_reasoning_payload_validation_fails_closed(
+    generation_reasoning: Any,
+    message: str,
+) -> None:
     payload = _bedrock_payload()
-    payload["context"]["bedrock"]["thinking"] = thinking
+    payload["context"]["bedrock"]["generation_reasoning"] = generation_reasoning
     path = Path("/canonical/cdk.json")
 
     with pytest.raises(bedrock_config.BedrockModelConfigurationError) as exc_info:
@@ -827,6 +940,27 @@ def test_thinking_payload_validation_fails_closed(thinking: Any, message: str) -
 
     assert str(path) in str(exc_info.value)
     assert message in str(exc_info.value)
+
+
+@pytest.mark.parametrize("keep_new_key", [False, True])
+def test_legacy_thinking_key_fails_closed_with_migration_guidance(
+    keep_new_key: bool,
+) -> None:
+    payload = _bedrock_payload()
+    if not keep_new_key:
+        del payload["context"]["bedrock"]["generation_reasoning"]
+    payload["context"]["bedrock"]["thinking"] = {"effort": "high"}
+
+    with pytest.raises(bedrock_config.BedrockModelConfigurationError) as exc_info:
+        bedrock_config._bedrock_configuration_from_payload(
+            payload,
+            Path("/canonical/cdk.json"),
+        )
+
+    message = str(exc_info.value)
+    assert "context.bedrock.thinking" in message
+    assert "Rename 'thinking' to 'generation_reasoning'" in message
+    assert "remove the 'thinking' key" in message
 
 
 @pytest.mark.parametrize("path_kind", ["missing", "directory"])
@@ -894,3 +1028,107 @@ def test_explicit_valid_config_does_not_consult_implicit_path(
     )
 
     assert bedrock_config.get_default_mission_model_id(path) == "explicit.model-v2:0"
+
+
+# ---------------------------------------------------------------------------
+# Codex default validation and failure-domain isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            _bedrock_payload(codex_model_id=None),
+            "codex_default_model_id must be a non-empty string",
+        ),
+        (
+            _bedrock_payload(codex_model_id=42),
+            "codex_default_model_id must be a non-empty string",
+        ),
+        (
+            _bedrock_payload(codex_model_id=""),
+            "codex_default_model_id must be a non-empty string",
+        ),
+        (
+            _bedrock_payload(codex_model_id=" \n"),
+            "codex_default_model_id must be a non-empty string",
+        ),
+        (_bedrock_payload(codex=None), "context.bedrock.codex must be an object"),
+        (_bedrock_payload(codex=[]), "context.bedrock.codex must be an object"),
+        (_bedrock_payload(codex={}), "codex must contain only 'reasoning_effort'"),
+        (
+            _bedrock_payload(codex={"reasoning_effort": "maximum"}),
+            "codex.reasoning_effort must be one of high, low, medium, minimal, xhigh",
+        ),
+        (
+            _bedrock_payload(codex={"reasoning_effort": []}),
+            "codex.reasoning_effort must be one of high, low, medium, minimal, xhigh",
+        ),
+        (
+            _bedrock_payload(codex={"reasoning_effort": "xhigh", "service_tier": "fast"}),
+            "codex must contain only 'reasoning_effort'",
+        ),
+    ],
+)
+def test_codex_payload_validation_fails_closed(payload: Any, message: str) -> None:
+    path = Path("/canonical/cdk.json")
+
+    with pytest.raises(bedrock_config.BedrockModelConfigurationError) as exc_info:
+        bedrock_config._codex_configuration_from_payload(payload, path)
+
+    assert str(path) in str(exc_info.value)
+    assert message in str(exc_info.value)
+
+
+def test_codex_payload_trims_the_model_and_preserves_xhigh() -> None:
+    configuration = bedrock_config._codex_configuration_from_payload(
+        _bedrock_payload(codex_model_id="  global.openai.gpt-5.6-sol\n"),
+        Path("/canonical/cdk.json"),
+    )
+
+    assert configuration.model_id == _EXPECTED_CODEX_MODEL_ID
+    assert configuration.reasoning_effort == "xhigh"
+
+
+def test_codex_defaults_ignore_other_consumers_malformed_configuration(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "cdk.json"
+    payload = _bedrock_payload(claude_code_model_id=None)
+    payload["context"]["bedrock"]["generation_reasoning"] = {"effort": "maximum"}
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert get_default_codex_model_id(config_path) == _EXPECTED_CODEX_MODEL_ID
+    assert get_default_codex_reasoning_effort(config_path) == "xhigh"
+    with pytest.raises(bedrock_config.BedrockModelConfigurationError):
+        get_default_bedrock_configuration(config_path)
+    with pytest.raises(bedrock_config.BedrockModelConfigurationError):
+        get_default_claude_code_model_id(config_path)
+
+
+def test_generation_and_claude_defaults_ignore_malformed_codex_configuration(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "cdk.json"
+    payload = _bedrock_payload(codex={"reasoning_effort": "maximum"})
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert get_default_mission_model_id(config_path) == _EXPECTED_MISSION_MODEL_ID
+    assert get_default_capacity_advisor_model_id(config_path) == _EXPECTED_CAPACITY_ADVISOR_MODEL_ID
+    assert get_default_claude_code_model_id(config_path) == _EXPECTED_CLAUDE_CODE_MODEL_ID
+    with pytest.raises(bedrock_config.BedrockModelConfigurationError):
+        get_default_codex_configuration(config_path)
+
+
+def test_other_defaults_survive_missing_codex_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "cdk.json"
+    payload = _bedrock_payload()
+    del payload["context"]["bedrock"]["codex_default_model_id"]
+    del payload["context"]["bedrock"]["codex"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert get_default_mission_model_id(config_path) == _EXPECTED_MISSION_MODEL_ID
+    assert get_default_claude_code_model_id(config_path) == _EXPECTED_CLAUDE_CODE_MODEL_ID
+    with pytest.raises(bedrock_config.BedrockModelConfigurationError):
+        get_default_codex_configuration(config_path)

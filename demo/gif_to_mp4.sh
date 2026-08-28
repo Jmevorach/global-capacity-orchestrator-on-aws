@@ -21,7 +21,7 @@
 # Usage:
 #   bash demo/gif_to_mp4.sh <input.gif> [output.mp4]
 #
-#   bash demo/gif_to_mp4.sh demo/autopilot.gif
+#   bash demo/gif_to_mp4.sh demo/autopilot-claude-code.gif
 #   bash demo/gif_to_mp4.sh demo/live_demo.gif /tmp/live_demo.mp4
 #
 # Options (via environment variables):

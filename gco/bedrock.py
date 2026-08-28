@@ -14,8 +14,12 @@ _BEDROCK_CONTEXT_KEY = "bedrock"
 _MISSION_MODEL_ID_KEY = "mission_default_model_id"
 _CAPACITY_ADVISOR_MODEL_ID_KEY = "capacity_advisor_default_model_id"
 _CLAUDE_CODE_MODEL_ID_KEY = "claude_code_default_model_id"
+_CODEX_MODEL_ID_KEY = "codex_default_model_id"
+_CODEX_KEY = "codex"
+_CODEX_REASONING_EFFORT_KEY = "reasoning_effort"
 _EMBEDDING_MODEL_ID_KEY = "embedding_model_id"
-_THINKING_KEY = "thinking"
+_GENERATION_REASONING_KEY = "generation_reasoning"
+_LEGACY_THINKING_KEY = "thinking"
 _THINKING_EFFORT_KEY = "effort"
 #: The pre-v6 single "advisory" key that fed BOTH Mission sampling and the
 #: capacity advisor. Fully removed — one knob silently steering two features
@@ -31,6 +35,9 @@ _LEGACY_DEFAULT_MODEL_ID_KEY = "default_model_id"
 # default model become a hard ValidationException the moment the default moves
 # to another family.
 _SUPPORTED_THINKING_EFFORTS = frozenset({"low", "medium", "high"})
+# Codex has an independent Responses-API reasoning dialect. The pinned CLI's
+# Bedrock catalog supports through xhigh; service tier remains provider-owned.
+_SUPPORTED_CODEX_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 _NOVA_2_MODEL_ID_RE = re.compile(r"(?:^|/)(?:[a-z0-9-]+\.)?amazon\.nova-2-[a-z0-9-]+-v\d+:\d+$")
 # Nova 2 rejects these three at ``high`` effort only (lower efforts keep them).
 _NOVA_HIGH_EFFORT_UNSUPPORTED_FIELDS = frozenset({"maxTokens", "temperature", "topP"})
@@ -64,6 +71,10 @@ _CLAUDE_ADAPTIVE_THINKING_MODELS = frozenset(
 # into a cap; GCO's own call sites deliberately set none, so the Converse
 # default — the model's own maximum output length — applies.
 _CLAUDE_UNSUPPORTED_SAMPLING_FIELDS = frozenset({"temperature", "topP", "topK"})
+# OpenAI GPT inference profiles currently reject Converse ``temperature`` even
+# for explicit overrides. Keep the normalization in this shared request builder
+# so Mission, the capacity advisor, and future Converse callers cannot drift.
+_OPENAI_UNSUPPORTED_SAMPLING_FIELDS = frozenset({"temperature"})
 BEDROCK_READ_TIMEOUT_SECONDS = 3600
 _DISTRIBUTION_NAME = "gco-cli"
 _SOURCE_ROOT = Path(__file__).resolve().parent.parent
@@ -74,6 +85,14 @@ _INSTALLED_DATA_PARTS = ("share", "gco", "cdk.json")
 
 class BedrockModelConfigurationError(RuntimeError):
     """A canonical Bedrock model default could not be resolved safely."""
+
+
+@dataclass(frozen=True)
+class CodexAutopilotConfiguration:
+    """Validated Codex session defaults, independent of Converse callers."""
+
+    model_id: str
+    reasoning_effort: str
 
 
 @dataclass(frozen=True)
@@ -193,20 +212,28 @@ def _bedrock_configuration_from_payload(
         bedrock, _CAPACITY_ADVISOR_MODEL_ID_KEY, path
     )
 
-    thinking = bedrock.get(_THINKING_KEY)
-    thinking_path = f"context.{_BEDROCK_CONTEXT_KEY}.{_THINKING_KEY}"
-    if not isinstance(thinking, dict):
-        raise BedrockModelConfigurationError(f"{path}: {thinking_path} must be an object")
-    if set(thinking) != {_THINKING_EFFORT_KEY}:
+    if _LEGACY_THINKING_KEY in bedrock:
         raise BedrockModelConfigurationError(
-            f"{path}: {thinking_path} must contain only {_THINKING_EFFORT_KEY!r}"
+            f"{path}: context.{_BEDROCK_CONTEXT_KEY}.{_LEGACY_THINKING_KEY} is a "
+            "retired generation-reasoning key. Rename "
+            f"{_LEGACY_THINKING_KEY!r} to {_GENERATION_REASONING_KEY!r}, preserve "
+            f"its {_THINKING_EFFORT_KEY!r} value, and remove the "
+            f"{_LEGACY_THINKING_KEY!r} key before retrying."
+        )
+    generation_reasoning = bedrock.get(_GENERATION_REASONING_KEY)
+    reasoning_path = f"context.{_BEDROCK_CONTEXT_KEY}.{_GENERATION_REASONING_KEY}"
+    if not isinstance(generation_reasoning, dict):
+        raise BedrockModelConfigurationError(f"{path}: {reasoning_path} must be an object")
+    if set(generation_reasoning) != {_THINKING_EFFORT_KEY}:
+        raise BedrockModelConfigurationError(
+            f"{path}: {reasoning_path} must contain only {_THINKING_EFFORT_KEY!r}"
         )
 
-    effort = thinking.get(_THINKING_EFFORT_KEY)
+    effort = generation_reasoning.get(_THINKING_EFFORT_KEY)
     if not isinstance(effort, str) or effort not in _SUPPORTED_THINKING_EFFORTS:
         supported = ", ".join(sorted(_SUPPORTED_THINKING_EFFORTS))
         raise BedrockModelConfigurationError(
-            f"{path}: {thinking_path}.{_THINKING_EFFORT_KEY} must be one of {supported}"
+            f"{path}: {reasoning_path}.{_THINKING_EFFORT_KEY} must be one of {supported}"
         )
 
     return BedrockDefaultConfiguration(
@@ -228,6 +255,38 @@ def _claude_code_model_id_from_payload(payload: Any, path: Path) -> str:
             "or run `gco stacks bedrock set-claude-code-model <model-id>`."
         )
     return model_id.strip()
+
+
+def _codex_configuration_from_payload(
+    payload: Any,
+    path: Path,
+) -> CodexAutopilotConfiguration:
+    """Extract and independently validate Codex model and reasoning defaults."""
+    bedrock = _bedrock_block_from_payload(payload, path)
+    model_id = bedrock.get(_CODEX_MODEL_ID_KEY)
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise BedrockModelConfigurationError(
+            f"{path}: context.{_BEDROCK_CONTEXT_KEY}.{_CODEX_MODEL_ID_KEY} "
+            "must be a non-empty string"
+        )
+    codex = bedrock.get(_CODEX_KEY)
+    codex_path = f"context.{_BEDROCK_CONTEXT_KEY}.{_CODEX_KEY}"
+    if not isinstance(codex, dict):
+        raise BedrockModelConfigurationError(f"{path}: {codex_path} must be an object")
+    if set(codex) != {_CODEX_REASONING_EFFORT_KEY}:
+        raise BedrockModelConfigurationError(
+            f"{path}: {codex_path} must contain only {_CODEX_REASONING_EFFORT_KEY!r}"
+        )
+    effort = codex.get(_CODEX_REASONING_EFFORT_KEY)
+    if not isinstance(effort, str) or effort not in _SUPPORTED_CODEX_REASONING_EFFORTS:
+        supported = ", ".join(sorted(_SUPPORTED_CODEX_REASONING_EFFORTS))
+        raise BedrockModelConfigurationError(
+            f"{path}: {codex_path}.{_CODEX_REASONING_EFFORT_KEY} must be one of {supported}"
+        )
+    return CodexAutopilotConfiguration(
+        model_id=model_id.strip(),
+        reasoning_effort=effort,
+    )
 
 
 def _embedding_model_id_from_payload(payload: Any, path: Path) -> str:
@@ -315,7 +374,7 @@ def get_default_embedding_model_id(cdk_json_path: Path | None = None) -> str:
     of the generation-model defaults (``mission_default_model_id`` and
     ``capacity_advisor_default_model_id``): embedding and text generation are
     different model families, and validation is equally independent — a
-    malformed generation ``thinking`` block cannot fail this accessor.
+    malformed generation ``generation_reasoning`` block cannot fail this accessor.
 
     The model's output dimensionality is a one-way door: the vector index is
     created with ``mission_memory.dimensions`` and query vectors must come
@@ -335,13 +394,31 @@ def get_default_claude_code_model_id(cdk_json_path: Path | None = None) -> str:
     and ``capacity_advisor_default_model_id``): repointing an interactive
     agent and repointing advisory Converse calls are separate decisions, and
     future agent runners get their own sibling keys. Validation is equally
-    independent — a malformed generation ``thinking`` block cannot fail this
+    independent — a malformed generation ``generation_reasoning`` block cannot fail this
     accessor, and a missing Claude Code key cannot fail the generation path.
     Path selection and trust boundaries match
     :func:`get_default_bedrock_configuration`.
     """
     payload, path = _canonical_payload(cdk_json_path)
     return _claude_code_model_id_from_payload(payload, path)
+
+
+def get_default_codex_configuration(
+    cdk_json_path: Path | None = None,
+) -> CodexAutopilotConfiguration:
+    """Return independently validated Codex session defaults from ``cdk.json``."""
+    payload, path = _canonical_payload(cdk_json_path)
+    return _codex_configuration_from_payload(payload, path)
+
+
+def get_default_codex_model_id(cdk_json_path: Path | None = None) -> str:
+    """Return the checked-in Codex Bedrock inference-profile default."""
+    return get_default_codex_configuration(cdk_json_path).model_id
+
+
+def get_default_codex_reasoning_effort(cdk_json_path: Path | None = None) -> str:
+    """Return the checked-in Codex Responses API reasoning effort."""
+    return get_default_codex_configuration(cdk_json_path).reasoning_effort
 
 
 def _supports_nova_2_reasoning(model_id: str) -> bool:
@@ -353,6 +430,12 @@ def _supports_claude_adaptive_thinking(model_id: str) -> bool:
     """Return whether the identifier names a Claude line taking adaptive thinking."""
     base = _INFERENCE_PROFILE_GEO_PREFIX_RE.sub("", model_id.rsplit("/", 1)[-1])
     return base in _CLAUDE_ADAPTIVE_THINKING_MODELS
+
+
+def _is_openai_model(model_id: str) -> bool:
+    """Return whether an id names an OpenAI foundation model or profile."""
+    base = _INFERENCE_PROFILE_GEO_PREFIX_RE.sub("", model_id.rsplit("/", 1)[-1])
+    return base.startswith("openai.")
 
 
 def _nova_reasoning_options(
@@ -413,13 +496,13 @@ def build_bedrock_converse_options(
 
     Canonical reasoning preferences apply only when ``model_id`` is one of
     the configured defaults (Mission sampling or capacity advisor). Explicit
-    third-party or other-model overrides retain their caller-provided
-    inference controls and never receive model-specific reasoning fields.
-    Callers that know whether the model was defaulted should pass
-    ``apply_default_reasoning``; an explicit override then remains independent
-    of canonical configuration even when its model ID happens to match a
-    default. With no provenance flag, model-ID equality preserves the
-    compatibility behavior.
+    third-party or other-model overrides retain caller-provided inference
+    controls except fields that the selected provider rejects, and never
+    receive canonical model-specific reasoning fields. Callers that know
+    whether the model was defaulted should pass ``apply_default_reasoning``;
+    an explicit override then remains independent of canonical configuration
+    even when its model ID happens to match a default. With no provenance flag,
+    model-ID equality preserves the compatibility behavior.
 
     Two reasoning dialects are translated, selected from the model id:
 
@@ -428,11 +511,19 @@ def build_bedrock_converse_options(
       ``topK`` are dropped because Claude removed them from Opus 4.7 onward.
     * Nova 2 ``reasoningConfig`` — ``maxReasoningEffort``, with ``maxTokens``,
       ``temperature``, and ``topP`` dropped at ``high`` effort only.
+    * OpenAI GPT — unsupported ``temperature`` is dropped for canonical and
+      explicit models; no Converse reasoning dialect is inferred.
 
-    A default model in neither dialect keeps its caller-supplied inference
-    controls and receives no reasoning fields.
+    A default model in neither reasoning dialect keeps its remaining
+    caller-supplied inference controls and receives no reasoning fields.
     """
     resolved_inference = dict(inference_config or {})
+    if _is_openai_model(model_id):
+        resolved_inference = {
+            key: value
+            for key, value in resolved_inference.items()
+            if key not in _OPENAI_UNSUPPORTED_SAMPLING_FIELDS
+        }
     inference_only = {"inferenceConfig": resolved_inference} if resolved_inference else {}
     if apply_default_reasoning is False:
         return inference_only
@@ -604,12 +695,16 @@ __all__ = [
     "BedrockFTUFormNotAcceptedError",
     "BedrockModelConfigurationError",
     "BedrockResponseTruncatedError",
+    "CodexAutopilotConfiguration",
     "build_bedrock_converse_options",
     "extract_bedrock_converse_text",
     "get_default_bedrock_configuration",
     "get_default_bedrock_thinking_effort",
     "get_default_capacity_advisor_model_id",
     "get_default_claude_code_model_id",
+    "get_default_codex_configuration",
+    "get_default_codex_model_id",
+    "get_default_codex_reasoning_effort",
     "get_default_embedding_model_id",
     "get_default_mission_model_id",
     "is_bedrock_ftu_form_error",

@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import tomllib
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -26,11 +27,20 @@ from click.testing import CliRunner
 from cli.autopilot import (
     CLAUDE_CODE_PACKAGE,
     CLAUDE_CODE_VERSION,
+    CODEX_BEDROCK_PROVIDER,
+    CODEX_MCP_STARTUP_TIMEOUT_SECONDS,
+    CODEX_PACKAGE,
+    CODEX_VERSION,
     COMPANION_MCP_SERVERS,
+    build_codex_owned_args,
 )
 from cli.commands.autopilot_cmd import autopilot
 from cli.config import GCOConfig
-from gco.bedrock import get_default_claude_code_model_id
+from gco.bedrock import (
+    get_default_claude_code_model_id,
+    get_default_codex_model_id,
+    get_default_codex_reasoning_effort,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _AUTOPILOT_SOURCE = _REPO_ROOT / "cli" / "autopilot.py"
@@ -54,9 +64,17 @@ def runner() -> CliRunner:
 @pytest.fixture(autouse=True)
 def _isolated_autopilot_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep tests independent of the developer's shell and home directory."""
-    monkeypatch.delenv("GCO_AUTOPILOT_MODEL", raising=False)
-    monkeypatch.delenv("GCO_AUTOPILOT_SMALL_FAST_MODEL", raising=False)
-    monkeypatch.delenv("AWS_REGION", raising=False)
+    for name in (
+        "GCO_AUTOPILOT_ENGINE",
+        "GCO_AUTOPILOT_MODEL",
+        "GCO_AUTOPILOT_CODEX_MODEL",
+        "GCO_AUTOPILOT_SMALL_FAST_MODEL",
+        "GCO_AUTOPILOT_PLUGIN_DIRS",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "CODEX_HOME",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GCO_AUTOPILOT_CONFIG_DIR", str(tmp_path / "autopilot"))
 
 
@@ -271,6 +289,7 @@ def test_launch_wires_the_bedrock_environment(runner: CliRunner) -> None:
 
     assert result.exit_code == 0
     assert captured["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert captured["DISABLE_AUTOUPDATER"] == "1"
     assert captured["ANTHROPIC_MODEL"] == "global.anthropic.claude-opus-5"
     assert captured["AWS_REGION"] == "us-east-1"
     assert "ANTHROPIC_SMALL_FAST_MODEL" not in captured
@@ -1059,3 +1078,734 @@ def test_registry_source_stays_extractable_by_the_deps_scanner() -> None:
         for companion in COMPANION_MCP_SERVERS
     ]
     assert {registry for _, registry, _ in blocks} <= {"npm", "pypi"}
+
+
+# ---------------------------------------------------------------------------
+# Dual-engine and Codex Autopilot
+# ---------------------------------------------------------------------------
+
+
+def _parse_codex_config(result: Any) -> dict[str, Any]:
+    assert result.exit_code == 0, result.output
+    return tomllib.loads(result.output)
+
+
+def _launch_codex(
+    runner: CliRunner,
+    args: list[str],
+) -> tuple[Any, list[str], dict[str, str]]:
+    argv_seen: list[str] = []
+    env_seen: dict[str, str] = {}
+
+    def fake_exec(argv: list[str], env: dict[str, str]) -> int:
+        argv_seen.extend(argv)
+        env_seen.update(env)
+        return 0
+
+    with (
+        patch("cli.commands.autopilot_cmd.find_codex_binary", return_value="/tmp/bin/codex"),
+        patch("cli.commands.autopilot_cmd.install_codex") as install,
+        patch("cli.commands.autopilot_cmd.exec_codex", side_effect=fake_exec),
+    ):
+        result = _invoke(runner, ["--engine", "codex", *args])
+    install.assert_not_called()
+    return result, argv_seen, env_seen
+
+
+def _expected_codex_argv(
+    *tail: str,
+    model: str | None = None,
+    region: str = "us-east-1",
+    reasoning_effort: str | None = "xhigh",
+) -> list[str]:
+    owned = build_codex_owned_args(
+        model=model or get_default_codex_model_id(),
+        region=region,
+        reasoning_effort=reasoning_effort,
+        workspace=Path.cwd(),
+    )
+    return ["/tmp/bin/codex", *owned, *tail]
+
+
+def test_codex_owned_args_disable_project_config_and_repeat_plan_scalars(
+    tmp_path: Path,
+) -> None:
+    owned = build_codex_owned_args(
+        model="global.openai.gpt-5.6-sol",
+        region="eu-west-1",
+        reasoning_effort="xhigh",
+        workspace=tmp_path,
+    )
+
+    assert owned[:2] == ("--model", "global.openai.gpt-5.6-sol")
+    assert set(owned[2::2]) == {"-c"}
+    assignments = list(owned[3::2])
+    assert 'model_provider="amazon-bedrock-runtime"' in assignments
+    assert 'model_reasoning_effort="xhigh"' in assignments
+    assert 'model_providers.amazon-bedrock-runtime.wire_api="responses"' in assignments
+    assert 'model_providers.amazon-bedrock-runtime.aws.region="eu-west-1"' in assignments
+    assert "check_for_update_on_startup=false" in assignments
+
+    project_assignment = next(item for item in assignments if item.startswith("projects="))
+    project_policy = tomllib.loads(project_assignment)
+    assert project_policy == {"projects": {str(tmp_path.resolve()): {"trust_level": "untrusted"}}}
+
+    no_reasoning = build_codex_owned_args(
+        model="global.example.other-model",
+        region="eu-west-1",
+        reasoning_effort=None,
+        workspace=tmp_path,
+    )
+    assert not any("model_reasoning_effort" in item for item in no_reasoning)
+
+
+def test_help_describes_both_engines_and_engine_passthrough(runner: CliRunner) -> None:
+    result = _invoke(runner, ["--help"])
+
+    assert result.exit_code == 0
+    assert "--engine [claude-code|codex]" in result.output
+    assert "Claude Code remains the default engine" in result.output
+    assert "ENGINE_ARGS" in result.output
+    assert "GCO_AUTOPILOT_CODEX_MODEL" in result.output
+    assert "Claude-only; Codex rejects" in result.output
+
+
+def test_no_engine_selection_explicitly_remains_claude_code(runner: CliRunner) -> None:
+    with (
+        patch(
+            "cli.commands.autopilot_cmd.find_claude_binary",
+            return_value="/tmp/bin/claude",
+        ) as find_claude,
+        patch("cli.commands.autopilot_cmd.find_codex_binary") as find_codex,
+    ):
+        result = _invoke(runner, ["--dry-run"], config=_config(output_format="json"))
+
+    assert result.exit_code == 0
+    plan = json.loads(result.output)
+    assert plan["engine"] == "claude-code"
+    assert plan["model"] == get_default_claude_code_model_id()
+    assert plan["claude_binary"] == "/tmp/bin/claude"
+    assert plan["codex_binary"] is None
+    find_claude.assert_called_once_with()
+    find_codex.assert_not_called()
+
+
+def test_engine_environment_selects_codex(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GCO_AUTOPILOT_ENGINE", "CoDeX")
+
+    config = _parse_codex_config(_invoke(runner, ["--print-config"]))
+
+    assert config["model"] == "global.openai.gpt-5.6-sol"
+
+
+def test_engine_flag_beats_the_environment_and_preserves_claude_json(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GCO_AUTOPILOT_ENGINE", "codex")
+
+    result = _invoke(runner, ["--engine", "claude-code", "--print-config"])
+
+    assert result.exit_code == 0
+    assert "gco" in json.loads(result.output)["mcpServers"]
+
+
+def test_unknown_engine_environment_fails_clearly(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GCO_AUTOPILOT_ENGINE", "not-an-engine")
+
+    result = _invoke(runner, ["--dry-run"])
+
+    assert result.exit_code == 1
+    assert "Unknown autopilot engine" in result.output
+    assert "claude-code, codex" in result.output
+
+
+def test_codex_print_config_matches_the_official_bedrock_runtime_schema(
+    runner: CliRunner,
+) -> None:
+    result = _invoke(runner, ["--engine", "codex", "--print-config"])
+    config = _parse_codex_config(result)
+
+    assert config["model"] == "global.openai.gpt-5.6-sol"
+    assert config["model"] == get_default_codex_model_id()
+    assert config["model_provider"] == "amazon-bedrock-runtime" == CODEX_BEDROCK_PROVIDER
+    assert config["model_reasoning_effort"] == "xhigh"
+    assert config["model_reasoning_effort"] == get_default_codex_reasoning_effort()
+    assert config["check_for_update_on_startup"] is False
+    assert config["model_providers"] == {
+        "amazon-bedrock-runtime": {
+            "wire_api": "responses",
+            "aws": {"region": "us-east-1"},
+        }
+    }
+    expected_servers = {"gco"} | {server.name for server in COMPANION_MCP_SERVERS}
+    assert set(config["mcp_servers"]) == expected_servers
+    assert all(entry["enabled"] is True for entry in config["mcp_servers"].values())
+    assert all(
+        entry["startup_timeout_sec"] == CODEX_MCP_STARTUP_TIMEOUT_SECONDS
+        for entry in config["mcp_servers"].values()
+    )
+    assert "[model_providers.amazon-bedrock-runtime]" in result.output
+    assert "[model_providers.amazon-bedrock-runtime.aws]" in result.output
+    assert "service_tier" not in config
+    assert "service_tier" not in result.output
+    assert "small_fast" not in result.output
+
+
+def test_codex_toml_carries_gco_mcp_flags_without_companions(runner: CliRunner) -> None:
+    result = _invoke(
+        runner,
+        [
+            "--engine",
+            "codex",
+            "--no-companions",
+            "--enable",
+            "mission",
+            "--mcp-env",
+            "GCO_MCP_TOOL_SEARCH=bm25",
+            "--print-config",
+        ],
+    )
+    config = _parse_codex_config(result)
+
+    assert set(config["mcp_servers"]) == {"gco"}
+    assert config["mcp_servers"]["gco"]["env"] == {
+        "GCO_ENABLE_MISSION": "true",
+        "GCO_MCP_TOOL_SEARCH": "bm25",
+    }
+
+
+@pytest.mark.parametrize(
+    ("args", "codex_env", "generic_env", "expected"),
+    [
+        (
+            ["--model", "global.openai.gpt-5.6-terra"],
+            "global.openai.gpt-5.6-luna",
+            "global.openai.gpt-5.5",
+            "global.openai.gpt-5.6-terra",
+        ),
+        (
+            [],
+            "global.openai.gpt-5.6-luna",
+            "global.openai.gpt-5.5",
+            "global.openai.gpt-5.6-luna",
+        ),
+        ([], None, "global.openai.gpt-5.5", "global.openai.gpt-5.5"),
+    ],
+)
+def test_codex_model_override_precedence_omits_canonical_reasoning(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    codex_env: str | None,
+    generic_env: str,
+    expected: str,
+) -> None:
+    if codex_env is not None:
+        monkeypatch.setenv("GCO_AUTOPILOT_CODEX_MODEL", codex_env)
+    monkeypatch.setenv("GCO_AUTOPILOT_MODEL", generic_env)
+
+    result = _invoke(runner, ["--engine", "codex", *args, "--print-config"])
+    config = _parse_codex_config(result)
+
+    assert config["model"] == expected
+    assert "model_reasoning_effort" not in config
+    assert "model_reasoning_effort" not in result.output
+
+
+@pytest.mark.parametrize(
+    "native_args",
+    [
+        ["--model", "global.openai.gpt-5.6-terra"],
+        ["-m", "global.openai.gpt-5.6-terra"],
+        ["--model=global.openai.gpt-5.6-terra"],
+        ["-mglobal.openai.gpt-5.6-terra"],
+        ["-m=global.openai.gpt-5.6-terra"],
+        ["--profile", "alternate"],
+        ["-p", "alternate"],
+        ["--profile=alternate"],
+        ["-palternate"],
+        ["-p=alternate"],
+        ["-c", 'model="global.openai.gpt-5.6-terra"'],
+        ["--config", 'model_provider="other"'],
+        ["--config=model_reasoning_effort=low"],
+        ['-cmodel_providers.amazon-bedrock-runtime.aws.region="eu-west-1"'],
+        ['-c=model="global.openai.gpt-5.6-terra"'],
+        ["-c", '"model_providers".other.aws.region="eu-west-1"'],
+        ["--config", "'profiles' . alternate . model = 'other'"],
+        ["-c", "check_for_update_on_startup=true"],
+        ["-c", 'projects={"/tmp"={trust_level="trusted"}}'],
+        ["-c", 'project_root_markers=[".hostile"]'],
+        ["-c", 'mcp_servers.rogue.command="sh"'],
+        ["-C", "/tmp"],
+        ["-C/tmp"],
+        ["--cd=/tmp"],
+        ["--remote", "https://example.invalid"],
+        ["--remote-auth-token-env=TOKEN"],
+        ["update"],
+        ["--oss"],
+        ["--local-provider", "ollama"],
+    ],
+)
+def test_codex_rejects_native_passthrough_that_overrides_the_bedrock_plan(
+    runner: CliRunner,
+    native_args: list[str],
+) -> None:
+    result = _invoke(
+        runner,
+        ["--engine", "codex", "--dry-run", "--", *native_args],
+    )
+
+    assert result.exit_code == 1
+    assert "Codex passthrough option" in result.output
+    assert "Bedrock" in result.output
+    assert "--model" in result.output or "context.bedrock.codex" in result.output
+
+
+def test_codex_allows_unrelated_native_config_passthrough(runner: CliRunner) -> None:
+    result, argv, _env = _launch_codex(
+        runner,
+        ["--", "-c", 'sandbox_mode="read-only"', "--no-alt-screen"],
+    )
+
+    assert result.exit_code == 0
+    assert argv == _expected_codex_argv(
+        "-c",
+        'sandbox_mode="read-only"',
+        "--no-alt-screen",
+    )
+
+
+def test_codex_allows_recorder_to_narrow_to_required_gco_docs_tools(
+    runner: CliRunner,
+) -> None:
+    native_args = [
+        "-c",
+        "mcp_servers.gco.required=true",
+        "-c",
+        'mcp_servers.gco.enabled_tools=["find_docs","read_resource"]',
+        "-c",
+        'mcp_servers.gco.tools.find_docs.approval_mode="approve"',
+        "-c",
+        'mcp_servers.gco.tools.read_resource.approval_mode="approve"',
+        "--disable",
+        "shell_tool",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "--no-alt-screen",
+    ]
+
+    result, argv, _env = _launch_codex(
+        runner,
+        ["--no-companions", "--", *native_args],
+    )
+
+    assert result.exit_code == 0
+    assert argv == _expected_codex_argv(*native_args)
+
+
+def test_codex_live_recorder_is_docs_only_and_fails_closed_on_prompts() -> None:
+    source = (_REPO_ROOT / "demo" / "record_autopilot.sh").read_text(encoding="utf-8")
+    codex_branch = source.split(
+        'if [ "$DEMO_MODE" = "live" ] && [ "$DEMO_ENGINE" = "codex" ]; then',
+        1,
+    )[1].split('elif [ "$DEMO_MODE" = "live" ]; then', 1)[0]
+
+    for required in (
+        "--engine codex --no-companions --",
+        "mcp_servers.gco.required=true",
+        'mcp_servers.gco.enabled_tools=["find_docs","read_resource"]',
+        'mcp_servers.gco.tools.find_docs.approval_mode="approve"',
+        'mcp_servers.gco.tools.read_resource.approval_mode="approve"',
+        "--disable shell_tool",
+        "--sandbox read-only",
+        "--ask-for-approval never",
+        "--no-alt-screen -- $prompt",
+        "-re {Begin when ready.*\\.} { press_enter }",
+    ):
+        assert required in codex_branch
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex_branch
+    assert "--full-auto" not in codex_branch
+    assert "-re {Begin when ready.*\\.} { press_enter }" in codex_branch
+    assert "timeout { press_enter" not in codex_branch
+    answer_wait = codex_branch.split("# Wait for the explanatory final answer", 1)[1]
+    answer_wait = answer_wait.split("# Leave the complete short answer", 1)[0]
+    assert "press_enter" not in answer_wait
+    assert "submit_retries" not in codex_branch
+    assert "asciinema rec \\\n    --return" in source
+    assert 'doc[1] == "x"' in source
+    assert "valid_exit" in source
+    assert "calledgcofinddocs" in source
+    assert "calledgcoreadresource" in source
+    assert "AWS_SECRET_ACCESS_KEY" in source
+    assert "AWS_SESSION_TOKEN" in source
+
+
+def test_codex_native_separator_stops_override_scanning(runner: CliRunner) -> None:
+    result, argv, _env = _launch_codex(
+        runner,
+        ["--", "--", "--model", "is prompt text after the native separator"],
+    )
+
+    assert result.exit_code == 0
+    assert argv == _expected_codex_argv(
+        "--",
+        "--model",
+        "is prompt text after the native separator",
+    )
+
+
+@pytest.mark.parametrize(
+    ("engine_args", "environment", "source"),
+    [
+        ([], {"GCO_AUTOPILOT_MODEL": " \t"}, "GCO_AUTOPILOT_MODEL"),
+        (
+            ["--engine", "codex"],
+            {
+                "GCO_AUTOPILOT_CODEX_MODEL": "\n ",
+                "GCO_AUTOPILOT_MODEL": "global.openai.gpt-5.5",
+            },
+            "GCO_AUTOPILOT_CODEX_MODEL",
+        ),
+        (["--model", "  "], {}, "--model"),
+        (["--engine", "codex", "--model", "  "], {}, "--model"),
+    ],
+)
+def test_whitespace_model_overrides_fail_closed(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    engine_args: list[str],
+    environment: dict[str, str],
+    source: str,
+) -> None:
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    result = _invoke(runner, [*engine_args, "--dry-run"])
+
+    assert result.exit_code == 1
+    assert source in result.output
+    assert "non-empty Bedrock model id" in result.output
+
+
+@pytest.mark.parametrize(
+    ("aws_region", "aws_default_region", "expected"),
+    [
+        ("eu-west-1", "ap-southeast-2", "eu-west-1"),
+        (None, "ap-southeast-2", "ap-southeast-2"),
+        (None, None, "ca-central-1"),
+    ],
+)
+def test_codex_region_precedence_is_shared_with_the_generated_config(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    aws_region: str | None,
+    aws_default_region: str | None,
+    expected: str,
+) -> None:
+    if aws_region is not None:
+        monkeypatch.setenv("AWS_REGION", aws_region)
+    if aws_default_region is not None:
+        monkeypatch.setenv("AWS_DEFAULT_REGION", aws_default_region)
+
+    result = _invoke(
+        runner,
+        ["--engine", "codex", "--print-config"],
+        config=_config(default_region="ca-central-1"),
+    )
+    config = _parse_codex_config(result)
+
+    assert config["model_providers"]["amazon-bedrock-runtime"]["aws"]["region"] == expected
+
+
+def test_codex_launch_isolated_home_config_skills_and_environment(
+    runner: CliRunner,
+    tmp_path: Path,
+    skills_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = tmp_path / "autopilot" / "codex" / "skills" / "stale-skill"
+    stale.mkdir(parents=True)
+    (stale / "SKILL.md").write_text("stale\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "personal-codex"))
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-central-1")
+
+    result, argv, env = _launch_codex(
+        runner,
+        ["--skills", str(skills_dir), "--", "--full-auto"],
+    )
+
+    assert result.exit_code == 0
+    isolated_home = tmp_path / "autopilot" / "codex"
+    assert env["CODEX_HOME"] == str(isolated_home)
+    assert env["AWS_REGION"] == "eu-central-1"
+    assert argv == _expected_codex_argv(
+        "--full-auto",
+        region="eu-central-1",
+    )
+    assert "--model" in argv
+    assert any('trust_level="untrusted"' in argument for argument in argv)
+    assert "--strict-mcp-config" not in argv
+    assert (isolated_home / "config.toml").is_file()
+    written = tomllib.loads((isolated_home / "config.toml").read_text(encoding="utf-8"))
+    assert written["model_provider"] == "amazon-bedrock-runtime"
+    assert written["model_providers"]["amazon-bedrock-runtime"]["aws"]["region"] == "eu-central-1"
+    assert (isolated_home / "skills" / "capacity-planner" / "SKILL.md").is_file()
+    assert not stale.exists()
+    assert not (tmp_path / "autopilot" / "mcp.json").exists()
+    assert not (tmp_path / "personal-codex").exists()
+
+
+def test_codex_dry_run_is_engine_aware_and_has_no_side_effects(
+    runner: CliRunner,
+    tmp_path: Path,
+    skills_dir: Path,
+) -> None:
+    with (
+        patch("cli.commands.autopilot_cmd.find_codex_binary", return_value=None),
+        patch("cli.commands.autopilot_cmd.install_codex") as install,
+        patch("cli.commands.autopilot_cmd.write_codex_config") as write_config,
+        patch("cli.commands.autopilot_cmd.stage_codex_skills") as stage_skills,
+        patch("cli.commands.autopilot_cmd.exec_codex") as execute,
+    ):
+        result = _invoke(
+            runner,
+            ["--engine", "codex", "--skills", str(skills_dir), "--dry-run"],
+        )
+
+    assert result.exit_code == 0
+    assert "Engine:            Codex" in result.output
+    assert "Reasoning effort:  xhigh" in result.output
+    assert "isolated CODEX_HOME" in result.output
+    assert "copied into isolated CODEX_HOME" in result.output
+    assert f"{CODEX_PACKAGE}@{CODEX_VERSION}" in result.output
+    assert "use --continue or --resume" in result.output
+    install.assert_not_called()
+    write_config.assert_not_called()
+    stage_skills.assert_not_called()
+    execute.assert_not_called()
+    assert not (tmp_path / "autopilot" / "codex").exists()
+
+
+@pytest.mark.parametrize(
+    ("option", "environment", "message"),
+    [
+        (
+            ["--small-fast-model", "us.anthropic.claude-haiku-4-5-v1:0"],
+            {},
+            "supported only by the claude-code engine",
+        ),
+        (
+            [],
+            {"GCO_AUTOPILOT_SMALL_FAST_MODEL": "us.anthropic.claude-haiku-4-5-v1:0"},
+            "GCO_AUTOPILOT_SMALL_FAST_MODEL",
+        ),
+        (
+            ["--agents", "/does/not/need/to/exist"],
+            {},
+            "Claude Code agent files",
+        ),
+        (
+            [],
+            {"GCO_AUTOPILOT_PLUGIN_DIRS": "/does/not/need/to/exist"},
+            "Claude Code plugin inputs",
+        ),
+    ],
+)
+def test_codex_rejects_claude_only_configuration(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    option: list[str],
+    environment: dict[str, str],
+    message: str,
+) -> None:
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    result = _invoke(runner, ["--engine", "codex", *option, "--dry-run"])
+
+    assert result.exit_code == 1
+    assert message in result.output
+
+
+def test_codex_rejects_plugin_flag_before_validating_its_path(runner: CliRunner) -> None:
+    result = _invoke(
+        runner,
+        ["--engine", "codex", "--plugin", "/does/not/need/to/exist", "--dry-run"],
+    )
+
+    assert result.exit_code == 1
+    assert "Claude Code plugin inputs" in result.output
+    assert "Plugin path does not exist" not in result.output
+
+
+def test_codex_lazy_install_uses_the_exact_pin(runner: CliRunner) -> None:
+    exec_argv: list[str] = []
+    with (
+        patch(
+            "cli.commands.autopilot_cmd.find_codex_binary",
+            side_effect=[None, "/tmp/bin/codex"],
+        ),
+        patch("cli.commands.autopilot_cmd.install_codex", return_value=0) as install,
+        patch(
+            "cli.commands.autopilot_cmd.exec_codex",
+            side_effect=_exec_capture(exec_argv),
+        ),
+    ):
+        result = _invoke(runner, ["--engine", "codex", "--yes"])
+
+    assert result.exit_code == 0
+    install.assert_called_once_with()
+    assert exec_argv[0] == "/tmp/bin/codex"
+    assert f"{CODEX_PACKAGE}@{CODEX_VERSION}" in result.output
+
+
+def test_declining_codex_install_names_the_engine_and_exact_command(runner: CliRunner) -> None:
+    with patch("cli.commands.autopilot_cmd.find_codex_binary", return_value=None):
+        result = _invoke(runner, ["--engine", "codex"], input_text="n\n")
+
+    assert result.exit_code == 1
+    assert "Codex is required for this engine" in result.output
+    assert f"npm install -g {CODEX_PACKAGE}@{CODEX_VERSION}" in result.output
+    assert "gco autopilot --engine codex" in result.output
+
+
+@pytest.mark.parametrize(
+    ("return_code", "message"),
+    [(127, "npm was not found"), (2, "exit code 2")],
+)
+def test_codex_install_failures_are_engine_aware(
+    runner: CliRunner,
+    return_code: int,
+    message: str,
+) -> None:
+    with (
+        patch("cli.commands.autopilot_cmd.find_codex_binary", return_value=None),
+        patch("cli.commands.autopilot_cmd.install_codex", return_value=return_code),
+    ):
+        result = _invoke(runner, ["--engine", "codex", "--yes"])
+
+    assert result.exit_code == 1
+    assert message in result.output
+
+
+def test_codex_missing_from_path_after_install_exits_with_guidance(runner: CliRunner) -> None:
+    with (
+        patch("cli.commands.autopilot_cmd.find_codex_binary", return_value=None),
+        patch("cli.commands.autopilot_cmd.install_codex", return_value=0),
+    ):
+        result = _invoke(runner, ["--engine", "codex", "--yes"])
+
+    assert result.exit_code == 1
+    assert "Codex installed but the `codex` binary is not on PATH" in result.output
+
+
+def test_unexecutable_codex_fails_with_exact_reinstall_guidance(runner: CliRunner) -> None:
+    with (
+        patch("cli.commands.autopilot_cmd.find_codex_binary", return_value="/tmp/bin/codex"),
+        patch(
+            "cli.commands.autopilot_cmd.exec_codex",
+            side_effect=OSError(8, "Exec format error"),
+        ),
+    ):
+        result = _invoke(runner, ["--engine", "codex"])
+
+    assert result.exit_code == 1
+    assert "Failed to launch Codex" in result.output
+    assert f"npm install -g {CODEX_PACKAGE}@{CODEX_VERSION}" in result.output
+
+
+def test_unwritable_codex_config_exits_with_the_os_error(runner: CliRunner) -> None:
+    with (
+        patch("cli.commands.autopilot_cmd.find_codex_binary", return_value="/tmp/bin/codex"),
+        patch(
+            "cli.commands.autopilot_cmd.write_codex_config",
+            side_effect=OSError("read-only file system"),
+        ),
+    ):
+        result = _invoke(runner, ["--engine", "codex"])
+
+    assert result.exit_code == 1
+    assert "Failed to prepare the Codex session" in result.output
+    assert "read-only file system" in result.output
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_tail"),
+    [
+        (["--continue"], ["resume", "--last"]),
+        (["--resume"], ["resume"]),
+        (["--resume", "session-123"], ["resume", "session-123"]),
+        (["--", "--full-auto", "fix-it"], ["--full-auto", "fix-it"]),
+        (
+            ["--continue", "--", "--full-auto"],
+            ["resume", "--last", "--full-auto"],
+        ),
+        (
+            ["--continue", "--", "--full-auto", "finish the tests"],
+            ["resume", "--last", "--full-auto", "finish the tests"],
+        ),
+        (
+            [
+                "--resume",
+                "session-123",
+                "--",
+                "--no-alt-screen",
+                "continue here",
+            ],
+            ["resume", "session-123", "--no-alt-screen", "continue here"],
+        ),
+    ],
+)
+def test_codex_resume_and_passthrough_map_to_native_argv(
+    runner: CliRunner,
+    options: list[str],
+    expected_tail: list[str],
+) -> None:
+    result, argv, _env = _launch_codex(runner, options)
+
+    assert result.exit_code == 0
+    assert argv == _expected_codex_argv(*expected_tail)
+    assert "Resume your previous Claude Code session" not in result.output
+
+
+def test_install_codex_uses_only_the_exact_npm_pin() -> None:
+    from cli.autopilot import codex_install_command, install_codex
+
+    assert CODEX_VERSION == "0.150.1"
+    assert codex_install_command() == [
+        "npm",
+        "install",
+        "-g",
+        "@openai/codex@0.150.1",
+    ]
+    with (
+        patch("cli.autopilot.shutil.which", return_value="/usr/bin/npm"),
+        patch("cli.autopilot.subprocess.call", return_value=0) as call,
+    ):
+        assert install_codex() == 0
+    call.assert_called_once_with(codex_install_command())
+
+
+def test_install_codex_reports_127_without_npm() -> None:
+    from cli.autopilot import install_codex
+
+    with patch("cli.autopilot.shutil.which", return_value=None):
+        assert install_codex() == 127
+
+
+def test_codex_pin_source_is_an_exact_scanner_friendly_literal() -> None:
+    source = _AUTOPILOT_SOURCE.read_text(encoding="utf-8")
+
+    pin = re.search(r'^CODEX_VERSION = "([^"]+)"$', source, re.M)
+    assert pin is not None
+    assert pin.group(1) == CODEX_VERSION == "0.150.1"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", CODEX_VERSION)

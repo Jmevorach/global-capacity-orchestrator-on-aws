@@ -32,7 +32,7 @@ capture for that model fails with that code (see
 ``docs/CUSTOMIZATION.md``, Bedrock Model Selection).
 
 The configured default also consumes ``cdk.json``
-``context.bedrock.thinking``. At the stock ``high`` effort each capture
+``context.bedrock.generation_reasoning``. At the stock ``high`` effort each capture
 can use substantially more billed output tokens and take longer;
 Claude models from Opus 4.7 onward additionally reject ``temperature``,
 ``topP``, and ``topK``, which GCO omits for the canonical default.

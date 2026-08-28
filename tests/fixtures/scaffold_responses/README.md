@@ -98,7 +98,7 @@ require the one-time
 [Anthropic first-time-use form](../../../docs/CUSTOMIZATION.md#accepting-the-anthropic-first-time-use-form);
 without it the capture fails with `FTUFormNotFilled`. When the requested id is
 the configured default, the script also applies `cdk.json`
-`context.bedrock.thinking`; the stock `high` effort can materially increase
+`context.bedrock.generation_reasoning`; the stock `high` effort can materially increase
 billed output tokens and latency, and Claude models from Opus 4.7 onward reject
 `temperature`, `topP`, and `topK`, which GCO omits. Failures (denied access, transient errors) are reported per-model and
 never abort the run — every model that does succeed lands in the fixture

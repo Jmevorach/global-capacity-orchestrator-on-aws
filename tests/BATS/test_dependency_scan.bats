@@ -1607,6 +1607,18 @@ with open("cdk.json") as handle:
     [ "$output" = "$expected" ]
 }
 
+@test "extract_default_bedrock_model: reads the Codex leaf from cdk.json" {
+    expected="$(python3 -c '
+import json
+with open("cdk.json") as handle:
+    print(json.load(handle)["context"]["bedrock"]["codex_default_model_id"])
+')"
+    [ -n "$expected" ]
+    run extract_default_bedrock_model "cdk.json" "codex_default_model_id"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$expected" ]
+}
+
 @test "extract_default_bedrock_model: explicit leaf selects the requested key" {
     tmpfile="$(mktemp)"
     cat > "$tmpfile" <<'EOF'
@@ -1644,6 +1656,13 @@ EOF
 @test "bedrock_model_family: Claude Sonnet drops the model version and date" {
     result="$(bedrock_model_family "us.anthropic.claude-sonnet-4-5-20250929-v1:0")"
     [ "$result" = "us.anthropic.claude-sonnet" ]
+}
+
+@test "bedrock_model_family: OpenAI GPT drops a dotted numeric model version" {
+    current="$(bedrock_model_family "global.openai.gpt-5.6-sol")"
+    candidate="$(bedrock_model_family "global.openai.gpt-5.7-sol")"
+    [ "$current" = "global.openai.gpt-sol" ]
+    [ "$candidate" = "$current" ]
 }
 
 @test "bedrock_model_family: different tiers are different families" {
@@ -1714,6 +1733,11 @@ EOF
     [ "$result" = "newer" ]
 }
 
+@test "compare_bedrock_model: GPT 5.6 -> GPT 5.7 is newer" {
+    result="$(compare_bedrock_model "global.openai.gpt-5.6-sol" "global.openai.gpt-5.7-sol")"
+    [ "$result" = "newer" ]
+}
+
 @test "compare_bedrock_model: Opus 5 -> a dated Opus 4.5 profile is older" {
     result="$(compare_bedrock_model "global.anthropic.claude-opus-5" "global.anthropic.claude-opus-4-5-20251101-v1:0")"
     [ "$result" = "older" ]
@@ -1774,6 +1798,28 @@ SHIM
         "global.amazon.nova-2-lite-v1:0" us-east-1
     [ "$status" -eq 0 ]
     [ "$output" = "global.amazon.nova-3-lite-v1:0" ]
+    rm -rf "$tmpdir"
+}
+
+@test "get_latest_bedrock_model: selects GPT 5.7 for the GPT 5.6 Codex default" {
+    tmpdir="$(mktemp -d)"
+    cat > "$tmpdir/aws" <<'SHIM'
+#!/usr/bin/env bash
+cat <<'JSON'
+{"inferenceProfileSummaries":[
+  {"inferenceProfileId":"global.openai.gpt-5.6-sol","status":"ACTIVE"},
+  {"inferenceProfileId":"global.openai.gpt-5.7-sol","status":"ACTIVE"},
+  {"inferenceProfileId":"global.openai.gpt-9.9-terra","status":"ACTIVE"},
+  {"inferenceProfileId":"us.openai.gpt-9.9-sol","status":"ACTIVE"},
+  {"inferenceProfileId":"global.openai.gpt-8.0-sol","status":"LEGACY"}
+]}
+JSON
+SHIM
+    chmod +x "$tmpdir/aws"
+    PATH="$tmpdir:$PATH" run get_latest_bedrock_model \
+        "global.openai.gpt-5.6-sol" us-east-1
+    [ "$status" -eq 0 ]
+    [ "$output" = "global.openai.gpt-5.7-sol" ]
     rm -rf "$tmpdir"
 }
 
@@ -2837,6 +2883,47 @@ EOF
 
 @test "extract_claude_code_pin: empty when file is missing" {
     run extract_claude_code_pin "/nonexistent/cli/autopilot.py"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+# ── extract_codex_pin ───────────────────────────────────────────────────────
+
+@test "extract_codex_pin: reads the pin from cli/autopilot.py" {
+    run extract_codex_pin "cli/autopilot.py"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+@test "extract_codex_pin: parses the constant from a fixture" {
+    run bash -c '
+        source .github/scripts/lib_dependency_scan.sh
+        tmpfile="$(mktemp)"
+        cat > "$tmpfile" <<EOF
+# comment line
+CODEX_VERSION = "8.7.6"
+EOF
+        extract_codex_pin "$tmpfile"
+        rm -f "$tmpfile"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "8.7.6" ]
+}
+
+@test "extract_codex_pin: empty when constant absent" {
+    run bash -c '
+        source .github/scripts/lib_dependency_scan.sh
+        tmpfile="$(mktemp)"
+        echo "no pin constant here" > "$tmpfile"
+        extract_codex_pin "$tmpfile"
+        rm -f "$tmpfile"
+    '
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "extract_codex_pin: empty when file is missing" {
+    run extract_codex_pin "/nonexistent/cli/autopilot.py"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }

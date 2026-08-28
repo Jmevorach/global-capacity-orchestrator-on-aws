@@ -28,22 +28,17 @@ NO_BUILD=0
 AWS_WRITABLE=0
 UNINSTALL=0
 
-# AWS environment variables forwarded into the container, in the bare `-e NAME`
-# form: every runtime (docker, finch/nerdctl, podman) passes such a variable
-# through only when it is set in the caller's environment, so an unset variable
-# never becomes an empty override inside the container. Without this list a
-# mounted ~/.aws was the ONLY credential source that worked — `AWS_PROFILE`,
-# SSO/`assume-role` sessions exported into the shell, static keys, and
-# web-identity/OIDC setups were all silently dropped at the container boundary,
-# which surfaces as "credentials not found" or, worse, as operating against the
-# wrong account than the host shell was pointed at.
+# Host environment variables forwarded into the container in bare `-e NAME`
+# form. Every runtime (Docker, Finch/nerdctl, and Podman) passes a variable only
+# when it is set in the caller's environment, so an unset variable never becomes
+# an empty override. The AWS entries preserve the host credential/Region chain;
+# the GCO_AUTOPILOT entries preserve engine, model, and generated-config choices.
 #
-# Keep this list to variables the SDK and CLI actually read. Values naming a
-# path OUTSIDE ~/.aws (AWS_CONFIG_FILE, AWS_SHARED_CREDENTIALS_FILE,
-# AWS_WEB_IDENTITY_TOKEN_FILE, AWS_CA_BUNDLE) are forwarded because they are
-# frequently set to a path under $HOME/.aws; when they point elsewhere the file
-# is not mounted, and the installer prints that caveat.
-AWS_FORWARDED_ENV=(
+# Values naming files outside ~/.aws are forwarded but require a matching mount.
+# Likewise, GCO_AUTOPILOT_CONFIG_DIR must be a writable path as seen *inside*
+# the container (normally under /root/.gco or /workspace), not an arbitrary host
+# path. Filesystem-bearing plugin paths are intentionally not forwarded.
+FORWARDED_ENV_VARS=(
     AWS_PROFILE
     AWS_DEFAULT_PROFILE
     AWS_REGION
@@ -65,6 +60,11 @@ AWS_FORWARDED_ENV=(
     AWS_MAX_ATTEMPTS
     AWS_EC2_METADATA_DISABLED
     GCO_DEFAULT_REGION
+    GCO_AUTOPILOT_ENGINE
+    GCO_AUTOPILOT_MODEL
+    GCO_AUTOPILOT_CODEX_MODEL
+    GCO_AUTOPILOT_SMALL_FAST_MODEL
+    GCO_AUTOPILOT_CONFIG_DIR
 )
 
 # The dev image is built from Dockerfile.dev at the repository root. Resolve it
@@ -130,6 +130,11 @@ role/web-identity settings, endpoint and retry overrides) only when the calling
 shell has them set. So `AWS_PROFILE=prod gco status`, an exported SSO or
 assume-role session, static keys, and a plain ~/.aws/config all work the same
 way inside the container as they do on the host.
+
+Autopilot controls are also forwarded by name: GCO_AUTOPILOT_ENGINE,
+GCO_AUTOPILOT_MODEL, GCO_AUTOPILOT_CODEX_MODEL,
+GCO_AUTOPILOT_SMALL_FAST_MODEL, and GCO_AUTOPILOT_CONFIG_DIR. Config-directory
+values must name a writable path as seen inside the container.
 EOF
 }
 
@@ -258,29 +263,27 @@ mount_suffix_for_host() {
     fi
 }
 
-# Emit one `-e NAME` flag per forwarded AWS variable (see AWS_FORWARDED_ENV).
-aws_env_args() {
+# Emit one bare `-e NAME` flag per forwarded host variable.
+forwarded_env_args() {
     local name
-    for name in "${AWS_FORWARDED_ENV[@]}"; do
+    for name in "${FORWARDED_ENV_VARS[@]}"; do
         printf -- '-e %s ' "$name"
     done
 }
 
 emit_block() {
-    local rt="$1" socket="$2" image="$3" aws_env="$4" mount_opts="$5" rt_word image_word
+    local rt="$1" socket="$2" image="$3" forwarded_env="$4" mount_opts="$5" rt_word image_word
     rt_word="$(shell_word "$rt")"
     image_word="$(shell_word "$image")"
-    # Three persistence mounts make `gco autopilot` (and anything else that
-    # keeps state under ~/.gco) survive the --rm container lifecycle:
-    #   gco-dev-tools -> /root/.npm-global   named volume; the pinned Claude
-    #                                        Code that autopilot installs on
-    #                                        first use persists across runs
+    # Three persistence mounts make both `gco autopilot` engines (and anything
+    # else that keeps state under ~/.gco) survive the --rm container lifecycle:
+    #   gco-dev-tools -> /root/.npm-global   named volume; pinned Claude Code
+    #                                        and Codex lazy installs persist
     #   ~/.claude     -> /root/.claude       host dir; CLAUDE_CONFIG_DIR keeps
-    #                                        onboarding state and session
-    #                                        transcripts there, so sessions
-    #                                        resume across container runs
-    #   ~/.gco        -> /root/.gco          host dir; GCO CLI config/cache and
-    #                                        the generated autopilot MCP config
+    #                                        Claude onboarding and transcripts
+    #   ~/.gco        -> /root/.gco          host dir; GCO CLI state plus the
+    #                                        generated MCP/Codex configs and
+    #                                        isolated Codex session state
     # The host dirs are pre-created so a root-owned mount point is never
     # created on Linux hosts.
     cat <<EOF
@@ -291,14 +294,14 @@ $MARKER_BEGIN
 # ~/.aws is created (empty is fine) so hosts that authenticate purely through
 # environment variables, an OIDC/web-identity file, or instance metadata still
 # get a valid mount source instead of the runtime materialising a root-owned
-# directory on the host. Credential env vars are forwarded with bare \`-e NAME\`,
-# so each is passed only when the calling shell actually has it set.
+# directory on the host. Forwarded host variables use bare \`-e NAME\`, so
+# each is passed only when the calling shell actually has it set.
 gco() {
     mkdir -p "\$HOME/.aws" "\$HOME/.claude" "\$HOME/.gco"
     if [ -t 0 ] && [ -t 1 ]; then
-        $rt_word run --rm -it -v "\$HOME/.aws:/root/.aws:${mount_opts}" -v "\$HOME/.claude:/root/.claude" -v "\$HOME/.gco:/root/.gco" -v gco-dev-tools:/root/.npm-global -e CLAUDE_CONFIG_DIR=/root/.claude ${aws_env}-v "\$PWD:/workspace" ${socket}-w /workspace $image_word gco "\$@"
+        $rt_word run --rm -it -v "\$HOME/.aws:/root/.aws:${mount_opts}" -v "\$HOME/.claude:/root/.claude" -v "\$HOME/.gco:/root/.gco" -v gco-dev-tools:/root/.npm-global -e CLAUDE_CONFIG_DIR=/root/.claude ${forwarded_env}-v "\$PWD:/workspace" ${socket}-w /workspace $image_word gco "\$@"
     else
-        $rt_word run --rm -i -v "\$HOME/.aws:/root/.aws:${mount_opts}" -v "\$HOME/.claude:/root/.claude" -v "\$HOME/.gco:/root/.gco" -v gco-dev-tools:/root/.npm-global -e CLAUDE_CONFIG_DIR=/root/.claude ${aws_env}-v "\$PWD:/workspace" ${socket}-w /workspace $image_word gco "\$@"
+        $rt_word run --rm -i -v "\$HOME/.aws:/root/.aws:${mount_opts}" -v "\$HOME/.claude:/root/.claude" -v "\$HOME/.gco:/root/.gco" -v gco-dev-tools:/root/.npm-global -e CLAUDE_CONFIG_DIR=/root/.claude ${forwarded_env}-v "\$PWD:/workspace" ${socket}-w /workspace $image_word gco "\$@"
     fi
 }
 $MARKER_END
@@ -397,7 +400,7 @@ else
     aws_mount_opts="ro${mount_suffix}"
 fi
 
-block="$(emit_block "$runtime" "$socket" "$image_ref" "$(aws_env_args)" "$aws_mount_opts")"
+block="$(emit_block "$runtime" "$socket" "$image_ref" "$(forwarded_env_args)" "$aws_mount_opts")"
 
 if [ "$PRINT_ONLY" -eq 1 ]; then
     printf '%s\n' "$block"
@@ -425,6 +428,7 @@ log "  Dev image         : $image_ref"
 log "  Shell profile     : $rc"
 log "  AWS credentials   : ~/.aws mounted $([ "$AWS_WRITABLE" -eq 1 ] && printf 'read-write' || printf 'read-only') + AWS_PROFILE/AWS_REGION/keys/session"
 log "                      forwarded from your shell when set"
+log "  Autopilot env     : engine/model/config controls forwarded when set"
 if [ -n "$mount_suffix" ]; then
     log "  SELinux           : enforcing host detected; bind mounts carry the ',z' shared label"
 fi
