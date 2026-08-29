@@ -62,7 +62,7 @@ Actions run in registry order. Selecting an individual action automatically incl
 | `preflight` | None | Verify the clean Git checkout, exact AWS account, topology profile, enabled Regions, bootstrap stacks, and project ownership boundary |
 | `baseline` | `preflight` | Capture protected CloudFormation and ECR state |
 | `deploy` | `baseline` | Deploy the checked-in GCO topology |
-| `topology` | `deploy` | Verify stacks, EKS, API endpoints, queues, and DynamoDB |
+| `topology` | `deploy` | Verify stacks, EKS, API endpoints, queues, and DynamoDB; require the owned internal ALB to materialize exactly one tagged HTTPS/IP target group for health-monitor, manifest-processor, and inference-proxy, each with HTTPS `/healthz` checks and only port-8443 traffic/health registrations (stale wrong-port draining targets must disappear), recording bounded ELBv2 convergence samples |
 | `policy` | `topology` | `GET /api/v1/policy` reports all three admission layers per Region: the front-door caps, the per-container `LimitRange`, and the namespace `ResourceQuota`. Asserted on the response body, because a Kubernetes read failure degrades to HTTP 200 with a per-namespace `status` and is invisible to a transport-level check. Also requires the project's own ECR hostnames in `trusted_registries`, which CDK appends at synth time. |
 | `api` | `topology` | Run an authenticated API Job through its complete lifecycle |
 | `sqs` | `topology` | Run a direct regional SQS Job through its complete lifecycle |
@@ -72,6 +72,8 @@ Actions run in registry order. Selecting an individual action automatically incl
 | `convergence` | `topology` | Require stable SQS, DLQ, and DynamoDB convergence |
 | `destroy` | `deploy` | Remove all exactly run-owned infrastructure in dependency order |
 | `final-inventory` | `destroy` | Prove target-stack absence, accepted retained resources, and exact protected-baseline preservation |
+
+The `opencost` action keeps production mutating requests single-attempt. In the exclusive disposable validation account only, it retries once after 15 seconds when—and only when—the bridge returns the exact ambiguous `504 Gateway timeout` shape produced after one upstream attempt. Before each non-idempotent POST, the checkpoint records a `started` intent; immediately after every HTTP response, it records bounded outcome metadata, and a validated successful report is then persisted separately. Checkpoint loading rejects duplicate JSON keys and non-object state, and every existing regional report journal is validated before any new report request. Fresh and cached report evidence must identify the expected source Region, deterministic project/account/monitoring-Region bucket, and canonical Region-qualified ad-hoc key. Resume fails closed without another POST for corrupt state, an unresolved `started` intent, or a successful HTTP outcome whose report was not durably validated. A qualifying timeout makes `duplicate_possible=true` permanently sticky because the first backend operation may finish after the bridge deadline and create one additional ad-hoc object; teardown and final inventory still have to account for the run completely.
 
 The `configured` profile accepts the number of regional Regions already in `cdk.json`. `single-region` requires exactly one regional Region. `multi-region` requires at least two. When Job actions are selected, multi-Region validation also requires `api_gateway.regional_api_enabled=true` so observations are attributable to one Region.
 

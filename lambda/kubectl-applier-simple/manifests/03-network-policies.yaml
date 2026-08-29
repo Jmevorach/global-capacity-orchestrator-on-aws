@@ -57,7 +57,7 @@ spec:
             matchLabels:
               ray.io/cluster: ray-cluster
 ---
-# Allow ALB to reach health-monitor
+# Allow ALB HTTPS target traffic to reach health-monitor
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -74,9 +74,9 @@ spec:
   ingress:
     - ports:
         - protocol: TCP
-          port: 8080
+          port: 8443
 ---
-# Allow ALB to reach manifest-processor
+# Allow ALB HTTPS target traffic to reach manifest-processor
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -93,9 +93,9 @@ spec:
   ingress:
     - ports:
         - protocol: TCP
-          port: 8080
+          port: 8443
 ---
-# Allow ALB to reach the dedicated inference proxy
+# Allow ALB HTTPS target traffic to reach the dedicated inference proxy
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -112,7 +112,7 @@ spec:
   ingress:
     - ports:
         - protocol: TCP
-          port: 8080
+          port: 8443
 ---
 # Allow DNS egress in gco-system
 apiVersion: networking.k8s.io/v1

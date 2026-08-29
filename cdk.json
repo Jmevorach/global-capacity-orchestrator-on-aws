@@ -383,7 +383,7 @@
       "kubeflow_trainer": {
         "enabled": true
       },
-      "_comment_cert_manager": "cert-manager — issues and rotates TLS certs for cluster webhooks. Required by kueue and several other charts. Upstream: https://cert-manager.io/docs/.",
+      "_comment_cert_manager": "cert-manager — issues and rotates the ALB-facing GCO API workload certificates and cluster webhook certificates. Enabled by default; disabling the bundled chart requires an existing compatible cert-manager installation or API workloads fail closed without TLS Secrets. Upstream: https://cert-manager.io/docs/.",
       "cert_manager": {
         "enabled": true
       },

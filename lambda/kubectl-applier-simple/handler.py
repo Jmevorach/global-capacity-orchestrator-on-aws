@@ -120,6 +120,14 @@ _QUEUEING_CUSTOM_OBJECTS: dict[str, tuple[str, str, str, bool]] = {
     "LocalQueue": ("kueue.x-k8s.io", "v1beta1", "localqueues", False),
 }
 
+# cert-manager resources that issue the TLS leaves mounted by ALB-facing API
+# workloads. They are ordinary namespaced CRs and are applied before the
+# Gateway resources in the post-Helm phase.
+_CERT_MANAGER_CUSTOM_OBJECTS: dict[str, tuple[str, str, str, bool]] = {
+    "Issuer": ("cert-manager.io", "v1", "issuers", False),
+    "Certificate": ("cert-manager.io", "v1", "certificates", False),
+}
+
 # Services annotated with this marker are validated for exact existence only;
 # a ready EndpointSlice endpoint is not required. Reserved for Services whose
 # backends schedule exclusively onto accelerator nodes that a fresh cluster
@@ -132,6 +140,7 @@ _ALLOW_EMPTY_ENDPOINTS_ANNOTATION = "gco.io/allow-empty-endpoints"
 _SUPPORTED_MANIFEST_KINDS = frozenset(
     {
         "APIService",
+        "Certificate",
         "ClusterRole",
         "ClusterRoleBinding",
         "ClusterTrainingRuntime",
@@ -146,6 +155,7 @@ _SUPPORTED_MANIFEST_KINDS = frozenset(
         "GatewayClass",
         "HTTPRoute",
         "HorizontalPodAutoscaler",
+        "Issuer",
         "Job",
         "Lease",
         "LimitRange",
@@ -1167,9 +1177,15 @@ def apply_manifests(
                             else:
                                 raise
 
-                    elif kind in _GATEWAY_CUSTOM_OBJECTS or kind in _QUEUEING_CUSTOM_OBJECTS:
+                    elif (
+                        kind in _GATEWAY_CUSTOM_OBJECTS
+                        or kind in _QUEUEING_CUSTOM_OBJECTS
+                        or kind in _CERT_MANAGER_CUSTOM_OBJECTS
+                    ):
                         group, version, plural, cluster_scoped = (
-                            _GATEWAY_CUSTOM_OBJECTS.get(kind) or _QUEUEING_CUSTOM_OBJECTS[kind]
+                            _GATEWAY_CUSTOM_OBJECTS.get(kind)
+                            or _QUEUEING_CUSTOM_OBJECTS.get(kind)
+                            or _CERT_MANAGER_CUSTOM_OBJECTS[kind]
                         )
                         try:
                             if cluster_scoped:
@@ -1523,16 +1539,11 @@ def apply_manifests(
             "PruneFailures": ",".join(prune_failures) if prune_failures else "None",
         }
 
-    # Restart deployments in gco-system namespace to pick up new images
-    # This ensures that any updated container images are actually deployed
-    gco_deployments = [
-        "health-monitor",
-        "manifest-processor",
-        "inference-monitor",
-        "inference-proxy",
-    ]
-    logger.info(f"Restarting deployments in gco-system: {gco_deployments}")
-    restart_result = restart_deployments("gco-system", gco_deployments)
+    # GCO Deployments already roll exactly once through their
+    # gco.aws/deployment-timestamp pod-template annotation (and any image patch).
+    # Do not immediately add kubectl.kubernetes.io/restartedAt: a second
+    # back-to-back revision can pin maxUnavailable=0/maxSurge=1 Deployments at
+    # their surge ceiling while the first revision is still converging.
 
     # Restart the EFS CSI controller so it picks up the IRSA role-ARN
     # annotation that the EKS addon update patched onto its service account.
@@ -1584,10 +1595,7 @@ def apply_manifests(
 
     # Combine the restart results for the return payload.
     all_restarted = (
-        restart_result["restarted"]
-        + ks_deploy_restart["restarted"]
-        + ks_ds_restart["restarted"]
-        + cw_ds_restart["restarted"]
+        ks_deploy_restart["restarted"] + ks_ds_restart["restarted"] + cw_ds_restart["restarted"]
     )
 
     return {
@@ -1621,6 +1629,9 @@ def _delete_gateway_resources(cluster_name: str, region: str) -> dict[str, Any]:
         ("HTTPRoute", "gco-routes"),
         ("Gateway", "gco-gateway"),
         ("LoadBalancerConfiguration", "gco-gateway-load-balancer"),
+        ("TargetGroupConfiguration", "gco-health-monitor-target-group"),
+        ("TargetGroupConfiguration", "gco-manifest-processor-target-group"),
+        ("TargetGroupConfiguration", "gco-inference-proxy-target-group"),
         ("TargetGroupConfiguration", "gco-default-target-group"),
         ("GatewayClass", "gco-aws-alb"),
     )
@@ -2004,6 +2015,17 @@ def _resource_readiness_failure(kind: str, resource: dict[str, Any]) -> str | No
             )
         return None
 
+    if kind in {"Certificate", "Issuer"}:
+        generation = metadata.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            return f"invalid metadata.generation ({generation})"
+        return _current_condition_failure(
+            _conditions(status),
+            "Ready",
+            generation,
+            kind,
+        )
+
     if kind in {"NodePool", "EC2NodeClass", "ScaledJob", "ScaledObject"}:
         return _required_condition_failure(status, "Ready")
 
@@ -2080,6 +2102,34 @@ def _service_endpoint_failure(
     return "selector-backed Service has no ready, nonterminating EndpointSlice endpoint"
 
 
+def _certificate_secret_failure(
+    dynamic_client: Any,
+    cache: dict[tuple[str, str], Any],
+    planned_resource: dict[str, Any],
+    live_resource: dict[str, Any],
+) -> str | None:
+    """Require cert-manager's referenced Secret to contain a nonempty TLS keypair."""
+    spec_value = live_resource.get("spec")
+    spec: dict[str, Any] = spec_value if isinstance(spec_value, dict) else {}
+    secret_name = spec.get("secretName")
+    if not isinstance(secret_name, str) or not secret_name:
+        return "Certificate spec.secretName is missing"
+    secret_api = _dynamic_resource(dynamic_client, cache, "v1", "Secret")
+    response = secret_api.get(
+        namespace=planned_resource["namespace"],
+        name=secret_name,
+    )
+    secret = _as_plain_dict(response)
+    data_value = secret.get("data")
+    data: dict[str, Any] = data_value if isinstance(data_value, dict) else {}
+    missing = [
+        key for key in ("tls.crt", "tls.key") if not isinstance(data.get(key), str) or not data[key]
+    ]
+    if missing:
+        return f"Certificate Secret {secret_name!r} has no nonempty {', '.join(missing)}"
+    return None
+
+
 def _manifest_identity_label(resource: dict[str, Any]) -> str:
     return (
         f"{resource['apiVersion']}/{resource['kind']}/"
@@ -2136,6 +2186,13 @@ def validate_manifests(
                     dynamic_client,
                     resource_cache,
                     planned_resource,
+                )
+            if failure is None and planned_resource["kind"] == "Certificate":
+                failure = _certificate_secret_failure(
+                    dynamic_client,
+                    resource_cache,
+                    planned_resource,
+                    live_resource,
                 )
             if failure:
                 add_failure(f"{label}: {failure}")

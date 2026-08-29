@@ -275,6 +275,8 @@ class TestKubernetesManifests:
             "apiregistration.k8s.io/v1",
             "keda.sh/v1alpha1",
             "monitoring.coreos.com/v1",
+            # API workload TLS identities (post-helm-api-workload-certificates.yaml).
+            "cert-manager.io/v1",
             # Kueue default queue topology (post-helm-kueue-default-queues.yaml);
             # keep in lockstep with _QUEUEING_CUSTOM_OBJECTS in the applier.
             "kueue.x-k8s.io/v1beta1",
@@ -479,23 +481,49 @@ class TestKubernetesManifests:
                     "IRSA won't work without it."
                 )
 
-                # Check env vars on containers
+                # Require IRSA only on containers that intentionally mount the
+                # projected token. Supporting sidecars (for example the TLS
+                # proxy) must not inherit AWS credentials they never use.
                 containers = template_spec.get("containers", [])
+                skip_value = (
+                    doc.get("spec", {})
+                    .get("template", {})
+                    .get("metadata", {})
+                    .get("annotations", {})
+                    .get("eks.amazonaws.com/skip-containers", "")
+                )
+                skipped_containers = {
+                    item.strip() for item in skip_value.split(",") if item.strip()
+                }
+                credentialed_containers = 0
                 for container in containers:
                     env_names = {e.get("name") for e in container.get("env", [])}
+                    mount_names = {mount.get("name") for mount in container.get("volumeMounts", [])}
+                    if "aws-iam-token" not in mount_names:
+                        assert container.get("name") in skipped_containers, (
+                            f"Deployment '{name}' container '{container.get('name')}' has no "
+                            "IRSA token mount but is not excluded from EKS credential injection"
+                        )
+                        assert "AWS_ROLE_ARN" not in env_names
+                        assert "AWS_WEB_IDENTITY_TOKEN_FILE" not in env_names
+                        continue
+                    credentialed_containers += 1
                     assert "AWS_ROLE_ARN" in env_names or "TEMPLATE_PLACEHOLDER" in str(
                         container.get("env", [])
                     ), (
                         f"Deployment '{name}' container '{container.get('name')}' "
-                        "missing AWS_ROLE_ARN env var for IRSA"
+                        "mounts the IRSA token but is missing AWS_ROLE_ARN"
                     )
                     assert (
                         "AWS_WEB_IDENTITY_TOKEN_FILE" in env_names
                         or "TEMPLATE_PLACEHOLDER" in str(container.get("env", []))
                     ), (
                         f"Deployment '{name}' container '{container.get('name')}' "
-                        "missing AWS_WEB_IDENTITY_TOKEN_FILE env var for IRSA"
+                        "mounts the IRSA token but is missing AWS_WEB_IDENTITY_TOKEN_FILE"
                     )
+                assert credentialed_containers >= 1, (
+                    f"Deployment '{name}' uses {sa_name} but no container consumes its IRSA token"
+                )
 
         assert gco_deployments_checked >= 4, (
             f"Expected at least 4 GCO deployments with dedicated service accounts, "
@@ -565,39 +593,74 @@ class TestKubernetesManifests:
                 )
 
     def test_sqs_consumer_has_irsa_credentials(self, manifest_files):
-        """Test that the SQS queue processor ScaledJob has IRSA credential config."""
+        """The queue worker has distinct AWS STS and Kubernetes API tokens."""
         for filepath in manifest_files:
             docs = load_yaml_file(filepath, allow_templates=True)
             for doc in docs:
                 if doc.get("kind") != "ScaledJob":
                     continue
 
-                name = doc.get("metadata", {}).get("name", filepath.name)
                 template_spec = (
                     doc.get("spec", {}).get("jobTargetRef", {}).get("template", {}).get("spec", {})
                 )
 
-                # Check service account
-                sa = template_spec.get("serviceAccountName", "")
-                assert sa == "gco-manifest-processor-sa", (
-                    f"ScaledJob '{name}' should use gco-manifest-processor-sa, got '{sa}'"
-                )
+                # The shared service account disables ambient automount. The
+                # worker therefore projects two non-interchangeable tokens:
+                # one with an STS audience for AWS and one with the default
+                # Kubernetes audience for the dynamic client.
+                assert template_spec.get("serviceAccountName") == "gco-manifest-processor-sa"
+                assert template_spec["automountServiceAccountToken"] is False
 
-                # Check for projected token volume
-                volumes = template_spec.get("volumes", [])
-                has_token_volume = False
-                for vol in volumes:
-                    projected = vol.get("projected", {})
-                    for src in projected.get("sources", []):
-                        sat = src.get("serviceAccountToken", {})
-                        if sat.get("audience") == "sts.amazonaws.com":
-                            has_token_volume = True
-                            break
+                containers = template_spec.get("containers", [])
+                worker = next(item for item in containers if item.get("name") == "queue-processor")
+                mounts = {item["name"]: item for item in worker.get("volumeMounts", [])}
+                assert mounts["aws-iam-token"] == {
+                    "name": "aws-iam-token",
+                    "mountPath": "/var/run/secrets/eks.amazonaws.com/serviceaccount",
+                    "readOnly": True,
+                }
+                assert mounts["kubernetes-api-token"] == {
+                    "name": "kubernetes-api-token",
+                    "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                    "readOnly": True,
+                }
 
-                assert has_token_volume, (
-                    f"ScaledJob '{name}' missing projected service-account token volume. "
-                    "IRSA won't work without it."
-                )
+                volumes = {item["name"]: item for item in template_spec.get("volumes", [])}
+                aws_sources = volumes["aws-iam-token"]["projected"]["sources"]
+                assert {
+                    "serviceAccountToken": {
+                        "audience": "sts.amazonaws.com",
+                        "expirationSeconds": 86400,
+                        "path": "token",
+                    }
+                } in aws_sources
+
+                kubernetes_sources = volumes["kubernetes-api-token"]["projected"]["sources"]
+                assert {
+                    "serviceAccountToken": {
+                        "expirationSeconds": 3600,
+                        "path": "token",
+                    }
+                } in kubernetes_sources
+                assert {
+                    "configMap": {
+                        "name": "kube-root-ca.crt",
+                        "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                    }
+                } in kubernetes_sources
+                assert {
+                    "downwardAPI": {
+                        "items": [
+                            {
+                                "path": "namespace",
+                                "fieldRef": {
+                                    "apiVersion": "v1",
+                                    "fieldPath": "metadata.namespace",
+                                },
+                            }
+                        ]
+                    }
+                } in kubernetes_sources
 
     def test_no_hardcoded_aws_regions(self, manifest_files):
         """Test that no manifest has hardcoded AWS region strings in live values.

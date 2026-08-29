@@ -39,6 +39,9 @@ def action_opencost(ctx: RunContext) -> dict[str, Any]:
     regions: dict[str, Any] = {}
     for region in ctx.deployment_regions:
         status = _wait_for_opencost_data(ctx, region)
+        with ctx.state_lock:
+            ctx.checkpoint.state.setdefault("opencost_status", {})[region] = status
+            ctx.persist_callback(ctx.checkpoint)
         report = _generate_validation_report(ctx, region)
         object_evidence = _verify_report_object(ctx, report)
         regions[region] = {

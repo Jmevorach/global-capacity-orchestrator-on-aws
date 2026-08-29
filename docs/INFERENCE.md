@@ -84,7 +84,9 @@ global inference-streaming Lambda (request-bound HMAC) → Global Accelerator (T
    timestamp, and nonce into a short-lived HMAC envelope, then uses strict
    private-root TLS through Global Accelerator to a healthy regional ALB.
    Global Accelerator forwards TCP/443 and never terminates TLS; the ALB
-   forwards HTTP to the dedicated inference proxy after termination.
+   terminates that private-root connection and re-encrypts the target hop to
+   the dedicated inference proxy pod's TLS-only sidecar. The sidecar
+   hot-reloads its projected leaf and forwards the stream over pod loopback.
 6. The inference proxy validates that envelope, checks endpoint state and an
    allowlist of serving paths, then streams the response from a strictly derived
    in-cluster Service name. Mooncake admin, metrics, debug, and documentation
@@ -238,11 +240,17 @@ For each target region, the inference monitor creates:
 
 This endpoint autoscaler is separate from the shared `inference-proxy` data
 plane. Each regional stack installs the managed EKS Metrics Server add-on that
-feeds resource metrics to the proxy's `autoscaling/v2` HPA. The proxy preserves
-a three-pod high-availability floor, scales to ten replicas at 70% CPU or 80%
-memory, and uses a 15-minute scale-down stabilization window. The Deployment's
-`replicas: 3` seeds only initial creation; kubectl-applier update patches omit
-that HPA-owned field so reconciliation cannot reset a live scale decision.
+feeds per-container resource metrics to the proxy's `autoscaling/v2` HPA. The
+shared Deployment preserves a three-pod high-availability floor and scales to
+ten replicas when the application reaches 70% CPU or 80% memory, or when its
+TLS sidecar reaches 70% CPU against a `100m` request. Kubernetes evaluates each
+`ContainerResource` signal independently and uses the largest desired replica
+count, so TLS pressure cannot hide application pressure. TLS memory is not a
+scale signal because established streams remain on their original pod and
+retained Python RSS may not fall when new replicas start. Scale-down retains a
+15-minute stabilization window. The Deployment's `replicas: 3` seeds only
+initial creation; kubectl-applier update patches omit that HPA-owned field so
+reconciliation cannot reset a live scale decision.
 
 Stream shutdown is protected end to end: the ALB target group drains for 900
 seconds, `preStop` removes a terminating pod from readiness before shutdown,
@@ -426,7 +434,8 @@ The `store` and `both` modes enable the shared KV-cache store automatically — 
 
 ```text
 API Gateway (AWS TLS + SigV4) → streaming HMAC proxy → Global Accelerator (TCP/443)
-  → internal ALB (private-root TLS) → authenticated inference proxy (HTTP)
+  → internal ALB (private-root TLS) → pod TLS proxy (re-encrypted HTTPS)
+  → authenticated inference proxy (pod-loopback HTTP)
                                                           │
                                                           ▼
                                                 {name}-proxy Service

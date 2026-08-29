@@ -4688,9 +4688,13 @@ class GCORegionalStack(Stack):
                 result_path="$.manifestValidation",
                 task_timeout=sfn.Timeout.duration(Duration.minutes(15)),
             )
+            # Cold EKS Auto Mode clusters can need more than the original
+            # ~9-minute retry schedule for node capacity, cert-manager Secrets,
+            # PDBs, and EndpointSlices to converge. Validation is read-only;
+            # eight retries sample through ~21 minutes without replaying apply.
             task.add_retry(
                 errors=["States.ALL"],
-                max_attempts=4,
+                max_attempts=8,
                 interval=Duration.minutes(1),
                 backoff_rate=2.0,
                 max_delay=Duration.minutes(3),

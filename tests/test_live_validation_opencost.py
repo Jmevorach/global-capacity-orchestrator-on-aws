@@ -35,6 +35,7 @@ def _context(*, cdk_context: dict | None = None) -> SimpleNamespace:
     checkpoint = SimpleNamespace(state={})
     settings = SimpleNamespace(
         run_id="run-123",
+        expected_account="123456789012",
         poll_interval_seconds=0,
         job_timeout_seconds=30,
     )
@@ -72,10 +73,22 @@ def _report_payload() -> dict:
         "region": "us-east-1",
         "bucket": "gco-live-cost-reports-123456789012-us-east-2",
         "report": {
-            "s3_key": "adhoc/region=us-east-1/date=2026-07-26/allocation-x.parquet",
+            "s3_key": (
+                "adhoc/region=us-east-1/date=2026-07-26/"
+                "allocation-20260726T120000Z-20260726T130000Z-a1b2c3d4.parquet"
+            ),
             "row_count": 4,
             "total_cost": 1.5,
         },
+    }
+
+
+def _completed_report() -> dict:
+    payload = _report_payload()
+    return {
+        "region": payload["region"],
+        "bucket": payload["bucket"],
+        **payload["report"],
     }
 
 
@@ -163,6 +176,37 @@ class TestAdhocReportEvidence:
         assert request["method"] == "POST"
         assert request["path"] == "/api/v1/cost/reports"
 
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("region", "us-west-2", "returned Region"),
+            ("bucket", "wrong-cost-report-bucket", "unexpected bucket"),
+            (
+                "s3_key",
+                (
+                    "adhoc/region=us-west-2/date=2026-07-26/"
+                    "allocation-20260726T120000Z-20260726T130000Z-a1b2c3d4.parquet"
+                ),
+                "unexpected S3 key",
+            ),
+        ],
+        ids=["wrong-region", "wrong-bucket", "wrong-key-region"],
+    )
+    def test_report_provenance_mismatch_fails_validation(self, field, value, message):
+        ctx = _context()
+        payload = _report_payload()
+        target = payload["report"] if field == "s3_key" else payload
+        target[field] = value
+        ctx.aws_client.make_authenticated_request.return_value = _response(201, payload)
+
+        with pytest.raises(RuntimeError, match=message):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_called_once()
+        journal = ctx.checkpoint.state["opencost_report_attempts"]["us-east-1"]
+        assert journal["attempts"][-1]["status_code"] == 201
+        assert journal["completed_report"] is None
+
     def test_zero_row_report_fails_validation(self):
         ctx = _context()
         payload = _report_payload()
@@ -181,6 +225,7 @@ class TestAdhocReportEvidence:
 
         complete = _report_payload()
         complete.pop("bucket")
+        ctx = _context()
         ctx.aws_client.make_authenticated_request.return_value = _response(201, complete)
         with pytest.raises(RuntimeError, match="omitted its bucket"):
             checks_opencost._generate_validation_report(ctx, "us-east-1")
@@ -200,14 +245,22 @@ class TestReportObjectProof:
         s3 = MagicMock()
         s3.head_object.return_value = {"ContentLength": 2048}
         ctx.session.client.return_value = s3
-        evidence = checks_opencost._verify_report_object(
-            ctx, {"bucket": "bucket-x", "s3_key": "adhoc/x.parquet"}
-        )
+        evidence = checks_opencost._verify_report_object(ctx, _completed_report())
         assert evidence == {
-            "bucket": "bucket-x",
-            "key": "adhoc/x.parquet",
+            "bucket": "gco-live-cost-reports-123456789012-us-east-2",
+            "key": (
+                "adhoc/region=us-east-1/date=2026-07-26/"
+                "allocation-20260726T120000Z-20260726T130000Z-a1b2c3d4.parquet"
+            ),
             "size_bytes": 2048,
         }
+        s3.head_object.assert_called_once_with(
+            Bucket="gco-live-cost-reports-123456789012-us-east-2",
+            Key=(
+                "adhoc/region=us-east-1/date=2026-07-26/"
+                "allocation-20260726T120000Z-20260726T130000Z-a1b2c3d4.parquet"
+            ),
+        )
         # The head goes to the monitoring region where the bucket lives.
         assert ctx.session.client.call_args.kwargs["region_name"] == "us-east-2"
 
@@ -217,9 +270,7 @@ class TestReportObjectProof:
         s3.head_object.side_effect = RuntimeError("404 Not Found")
         ctx.session.client.return_value = s3
         with pytest.raises(RuntimeError, match="not readable"):
-            checks_opencost._verify_report_object(
-                ctx, {"bucket": "bucket-x", "s3_key": "adhoc/x.parquet"}
-            )
+            checks_opencost._verify_report_object(ctx, _completed_report())
 
     def test_empty_object_fails_validation(self):
         ctx = _context()
@@ -227,9 +278,7 @@ class TestReportObjectProof:
         s3.head_object.return_value = {"ContentLength": 0}
         ctx.session.client.return_value = s3
         with pytest.raises(RuntimeError, match="empty"):
-            checks_opencost._verify_report_object(
-                ctx, {"bucket": "bucket-x", "s3_key": "adhoc/x.parquet"}
-            )
+            checks_opencost._verify_report_object(ctx, _completed_report())
 
 
 class TestActionEvidence:
@@ -252,7 +301,10 @@ class TestActionEvidence:
         assert region_evidence["report"]["row_count"] == 4
         assert region_evidence["s3_object"]["size_bytes"] == 2048
         assert ctx.checkpoint.state["opencost"] == evidence
-        ctx.persist_callback.assert_called_once()
+        assert ctx.checkpoint.state["opencost_status"]["us-east-1"] == _healthy_status()
+        assert len(ctx.checkpoint.state["opencost_report_attempts"]["us-east-1"]["attempts"]) == 1
+        # Healthy status, intent, HTTP outcome, validated report, final evidence.
+        assert ctx.persist_callback.call_count == 5
 
     def test_unhealthy_region_fails_the_action(self, monkeypatch):
         monkeypatch.setattr(checks_opencost, "_OPENCOST_READY_TIMEOUT_SECONDS", 0)

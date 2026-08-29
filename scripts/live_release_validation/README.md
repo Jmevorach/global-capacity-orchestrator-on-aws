@@ -33,6 +33,7 @@ guide: how the code is organized and where a new check belongs.
 | `protected.py` | The ownership boundary: identity matching that keeps pre-existing account resources untouchable. |
 | `context.py` | Run identity helpers: git SHA/branch, topology profile, Region selection. |
 | `constants.py` | Tags, labels, and tuning constants shared across modules. |
+| `json_utils.py` | Dependency-free strict JSON decoding for security-sensitive checkpoint and response evidence. |
 | `inventory/` | Read-only AWS inventory collection and baseline comparison, split per concern (`stacks`, `ecr`, `scanners`, `project`). |
 | `manifests/` | The Kubernetes Job manifests the job-path actions submit. |
 

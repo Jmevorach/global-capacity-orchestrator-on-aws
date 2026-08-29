@@ -301,7 +301,11 @@ slinky-slurm:
 
 ### cert-manager Compatibility
 
-GCO installs cert-manager v1.20.1. If your cluster already has cert-manager, disable the bundled one:
+GCO installs the cert-manager version pinned in `lambda/helm-installer/charts.yaml`.
+It issues the ALB-facing API workload certificates in addition to scheduler
+webhook certificates. If your cluster already has a compatible cert-manager,
+you may disable the bundled chart, but the external installation must remain
+available or the API workloads fail closed without their TLS Secrets:
 
 ```yaml
 cert-manager:

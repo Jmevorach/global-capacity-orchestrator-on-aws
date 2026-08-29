@@ -90,7 +90,7 @@ Each region contains:
 - Registered with Global Accelerator when the deployment partition is `aws`, and recorded in the global-region SSM registry in every partition
 - Routes `/api/v1/*` and `/inference/*` through authenticated platform services via the shared `HTTPRoute`
 - Ownership is verified by account, region, load-balancer type/scheme, EKS cluster tags, and the exact `gco.aws/gateway` ownership tag before a regional proxy forwards traffic
-- Terminates private-root TLS; the final ALB-to-Kubernetes-pod target-group hop remains HTTP with `/healthz` target-group health checks
+- Terminates private-root TLS, then re-encrypts target traffic to TLS-only proxy sidecars on pod port 8443 with HTTPS `/healthz` target-group checks. Each sidecar hot-reloads its projected leaf and forwards only over pod loopback; ALB does not validate the self-signed workload leaves. HMAC proves trusted-proxy key possession and request integrity on protected paths, while API Gateway IAM authenticates the original caller.
 
 **Regional API Gateway Bridge** (separate stack)
 
@@ -339,7 +339,7 @@ The rule packs run during `cdk synth` and deployment. They are automated control
 - **At Rest**: EBS volumes and EFS encrypted with AWS KMS
 - **Client and AWS API Transit**: AWS-managed TLS protects API Gateway and AWS service API connections; aggregator-to-regional-API calls also require SigV4
 - **Private Backend Transit**: In `aws`, global proxy → Global Accelerator → ALB uses deployment-local private-root TLS; in every partition, regional VPC proxy → ALB uses the same trust and explicit `backend.<project>.gco.internal` SNI/hostname verification. Global Accelerator is Layer 4 and does not terminate TLS.
-- **Post-Termination Hop**: ALB target groups use HTTP to Kubernetes pods after the authenticated TLS listener terminates the connection
+- **Workload Target Transit**: The ALB terminates its private-root client connection and re-encrypts every target hop to cert-manager-backed HTTPS listeners on health-monitor, manifest-processor, and inference-proxy. ALB target TLS encrypts traffic but does not validate the deployment-local self-signed workload certificates and is not mTLS.
 - **Private-Key Boundary**: Only the certificate-manager role can read the customer-managed-KMS-encrypted root secret; backend clients read public SSM trust only
 - **Request Authentication**: HMAC adds integrity, freshness, and replay defense, not encryption
 - **EFS Transit**: TLS-enabled mounts

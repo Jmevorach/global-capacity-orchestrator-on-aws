@@ -112,6 +112,17 @@ first:
 | `/healthz` | `health-monitor` | |
 | `/` (catch-all) | `manifest-processor` | Every other `/api/v1/*` path lands here |
 
+All three ALB-facing Services expose only port 443 and route to a TLS proxy
+sidecar on pod port 8443. The sidecar hot-reloads its cert-manager-projected
+leaf and forwards decrypted traffic only to the application process over pod
+loopback. The ALB re-encrypts each target connection and uses HTTPS
+`/healthz` checks. ALB does not validate the deployment-local self-signed
+workload leaves, so this hop provides confidentiality rather than mTLS.
+Request-bound HMAC proves trusted-proxy key possession and request integrity on
+protected paths; API Gateway IAM remains responsible for original caller
+identity. The exact HMAC exemptions are `/healthz`, `/readyz`, `/metrics`,
+and `/api/v1/health`; `/api/v1/metrics` remains protected.
+
 `/api/v1/status` is the one path both the health monitor and the manifest
 processor implement, and a path prefix cannot be split between two Services. The
 catch-all resolves it to the **manifest processor**, which is the response with
@@ -191,7 +202,11 @@ GCO has two explicit TLS trust domains:
 Every regional ACM leaf represents `backend.<project>.gco.internal`. Backend
 clients connect to dynamic accelerator or ALB DNS names but explicitly send
 that identity with SNI and assert it during certificate verification. ALBs
-terminate TLS and forward HTTP to Kubernetes pods.
+terminate that connection and open a new HTTPS connection to a TLS-only proxy
+sidecar on each selected pod. The sidecar hot-reloads its projected workload
+certificate and forwards decrypted traffic only to the application listener on
+pod loopback. ALB target TLS provides confidentiality but does not validate the
+self-signed workload leaf and is not mTLS.
 
 The root private key exists only in a customer-managed-KMS-encrypted Secrets
 Manager secret readable by the certificate-manager role. Proxy roles read only

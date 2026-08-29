@@ -290,7 +290,7 @@ The generated reference architecture shows the commercial `aws` workload path. O
 4. In commercial `aws`, **Amazon [API Gateway](https://aws.amazon.com/api-gateway/)** is edge-optimized and is the global workload and aggregate entry point. In other partitions it is regional and aggregate-only. Every exposed method enforces **IAM (SigV4) authentication** before integration.
 5. In `aws`, route-specific **[AWS Lambda proxies](./lambda/api-gateway-proxy/)** sign workload requests with a short-lived [HMAC](https://www.okta.com/identity-101/hmac/) envelope derived from a rotating **AWS [Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html)** key; `/api/v1/*` stays buffered while `/inference/*` streams. Other partitions omit these global workload proxies and use equivalent [VPC](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html) [proxies](./lambda/regional-api-proxy/) behind the regional APIs.
 6. In `aws`, **AWS Global Accelerator** routes workload requests over the AWS backbone to a healthy registered Region. Other partitions create no accelerator resources.
-7. A regional internal **AWS [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)** terminates deployment-local private-root TLS from either Global Accelerator (`aws`) or the regional VPC proxy, then sends HTTP to the platform services behind the shared Gateway API `HTTPRoute`.
+7. A regional internal **AWS [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)** terminates deployment-local private-root TLS from either Global Accelerator (`aws`) or the regional VPC proxy, then re-encrypts to TLS-only proxy sidecars on the platform API pods. Each sidecar hot-reloads its projected certificate and forwards decrypted traffic only over pod loopback.
 8. Each region runs an **Amazon EKS Auto Mode cluster** with built-in `system` and `general-purpose` NodePools plus project-managed GPU, inference, EFA, Mooncake EFA, Neuron, and CPU NodePools. Platform services include the [Cost Monitor](./dockerfiles/cost-monitor-dockerfile), [Health Monitor](./dockerfiles/health-monitor-dockerfile), [Manifest Processor](./dockerfiles/manifest-processor-dockerfile), [Queue Processor](./dockerfiles/queue-processor-dockerfile), [Inference Monitor](./dockerfiles/inference-monitor-dockerfile), and dedicated [Inference Proxy](./dockerfiles/inference-proxy-dockerfile).
 
 Below is the reference architecture for a single regional stack.
@@ -301,7 +301,7 @@ Below is the reference architecture for a single regional stack.
 
 ### Regional Architecture workflow
 
-1. An internal **Application Load Balancer** created from the shared `gco-system/gco-gateway` Gateway API resources accepts only HTTPS/443 with a rotating regional ACM leaf, then forwards HTTP to cluster services after TLS termination.
+1. An internal **Application Load Balancer** created from the shared `gco-system/gco-gateway` Gateway API resources accepts only HTTPS/443 with a rotating regional ACM leaf, then re-encrypts target traffic to cert-manager-backed HTTPS listeners on the cluster API services. ALB target TLS provides confidentiality; HMAC proves trusted-proxy key possession and request integrity on protected paths, while API Gateway IAM authenticates the original caller.
 2. The **Amazon EKS Auto Mode cluster** is the heart of the regional stack, hosting platform services and user workloads with a private API endpoint by default.
 3. **NodePools** provision capacity on demand: built-in `system` and `general-purpose`, plus [`gpu-x86-pool`](./lambda/kubectl-applier-simple/manifests/40-nodepool-gpu-x86.yaml), [`gpu-arm-pool`](./lambda/kubectl-applier-simple/manifests/41-nodepool-gpu-arm.yaml), [`gpu-inference-pool`](./lambda/kubectl-applier-simple/manifests/42-nodepool-inference.yaml), [`gpu-efa-pool`](./lambda/kubectl-applier-simple/manifests/43-nodepool-efa.yaml), [`mooncake-efa-pool`](./lambda/kubectl-applier-simple/manifests/46-nodepool-mooncake-efa.yaml), [`neuron-pool`](./lambda/kubectl-applier-simple/manifests/44-nodepool-neuron.yaml), and [`cpu-general-pool`](./lambda/kubectl-applier-simple/manifests/45-nodepool-cpu-general.yaml).
 4. **Workloads and platform services** run across [namespaces](./lambda/kubectl-applier-simple/manifests/00-namespaces.yaml): `gco-system` ([Health Monitor](./gco/services/health_monitor.py), [Manifest Processor](./gco/services/manifest_processor.py), [Queue Processor](./gco/services/queue_processor.py), [Inference Monitor](./gco/services/inference_monitor.py), [Inference Proxy](./gco/services/inference_api.py)) and `gco-jobs` / `gco-inference` (training and batch jobs, inference endpoints, and job DAG pipelines).
@@ -330,11 +330,12 @@ Six complementary controls protect backend requests:
 Commercial `aws` request flow:
 User → API Gateway (AWS TLS + SigV4) → Lambda (HMAC)
   → Global Accelerator (TCP/443 pass-through) → internal ALB (private-root TLS)
-  → AuthenticationMiddleware (HTTP after ALB termination)
+  → pod TLS proxy (re-encrypted HTTPS) → AuthenticationMiddleware (pod loopback)
 
 Other partitions:
 User → Regional API Gateway (AWS TLS + SigV4) → VPC Lambda (HMAC)
-  → internal ALB (private-root TLS) → AuthenticationMiddleware
+  → internal ALB (private-root TLS)
+  → pod TLS proxy (re-encrypted HTTPS) → AuthenticationMiddleware (pod loopback)
 ```
 
 Every Region's API bridge is required for aggregator fan-out. [Direct regional
@@ -684,7 +685,7 @@ GCO implements defense-in-depth across five layers (see [Security Model](#securi
 - Data at rest: S3 (KMS), EFS (KMS), EBS (KMS), DynamoDB (AWS-managed), and Secrets Manager (KMS)
 - Client-to-global/regional API traffic uses AWS-managed TLS and IAM SigV4. Cross-region aggregation also uses AWS-managed TLS plus SigV4 from the aggregator to each regional API bridge.
 - The normal global proxy → Global Accelerator → ALB path and each regional VPC proxy → ALB path use authenticated private-root TLS on TCP/HTTPS 443. Global Accelerator is a Layer 4 pass-through and does not terminate TLS.
-- Every ALB leaf is issued for `backend.<project>.gco.internal`; clients send that identity through SNI and assert it while connecting to dynamic accelerator or ALB DNS names. ALB → Kubernetes pod traffic remains HTTP after ALB termination.
+- Every ALB leaf is issued for `backend.<project>.gco.internal`; clients send that identity through SNI and assert it while connecting to dynamic accelerator or ALB DNS names. The ALB then re-encrypts to TLS-only pod proxy sidecars on port 8443; decrypted bytes travel only over pod loopback to the application process.
 - The root private key exists only in a customer-managed-KMS-encrypted Secrets Manager secret readable by the certificate-manager role. Proxy roles read only the public SSM trust bundle; rotating leaves are reimported into stable regional ACM ARNs.
 - The request-bound HMAC envelope adds integrity, freshness, and replay defense; it is not encryption and is independent of TLS confidentiality and server authentication.
 - EFS mount encryption in transit is enabled by the deployed storage configuration.

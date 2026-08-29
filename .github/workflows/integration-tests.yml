@@ -1410,6 +1410,24 @@ jobs:
           kubectl apply -f lambda/kubectl-applier-simple/manifests/01-serviceaccounts.yaml
           kubectl apply -f lambda/kubectl-applier-simple/manifests/02-rbac.yaml
           kubectl apply -f lambda/kubectl-applier-simple/manifests/05-priority-classes.yaml
+      - name: Seed API workload TLS Secrets for Kind
+        # Production creates these Secrets through the post-Helm cert-manager
+        # Certificates. This raw-manifest Kind job deliberately does not install
+        # Helm add-ons, so provide an equivalent short-lived ECDSA keypair before
+        # applying the required pod volumes. The real TLS proxy still parses,
+        # serves, and probes this certificate end to end.
+        run: |
+          set -euo pipefail
+          key="${RUNNER_TEMP}/gco-ci-tls.key"
+          cert="${RUNNER_TEMP}/gco-ci-tls.crt"
+          openssl ecparam -name prime256v1 -genkey -noout -out "${key}"
+          openssl req -new -x509 -sha256 -key "${key}" -out "${cert}" \
+            -days 1 -subj "/CN=gco-ci"
+          for secret in health-monitor-tls manifest-processor-tls inference-proxy-tls; do
+            kubectl -n gco-system create secret tls "${secret}" \
+              --cert="${cert}" --key="${key}" --dry-run=client -o yaml \
+              | kubectl apply -f -
+          done
       - name: Apply NetworkPolicies (Calico-enforced)
         # The whole point of the Calico CNI install is that kindnet silently
         # accepts NetworkPolicy but does not enforce it. Apply the policies
@@ -1469,12 +1487,19 @@ jobs:
           kubectl -n gco-system get deploy inference-proxy
           kubectl -n gco-system get deploy cost-monitor
           kubectl -n gco-system get service cost-monitor
-          # The shared streaming proxy scales independently while retaining its
-          # three-pod HA floor. Exact readback guards against partial file apply.
+          # The shared inference Deployment scales as one unit while retaining
+          # its three-pod HA floor. Exact readback guards against partial apply
+          # and proves both the application and TLS sidecar supply HPA signals.
           kubectl -n gco-system get hpa inference-proxy-hpa
           test "$(kubectl -n gco-system get hpa inference-proxy-hpa -o jsonpath='{.spec.minReplicas}')" = "3"
           test "$(kubectl -n gco-system get hpa inference-proxy-hpa -o jsonpath='{.spec.maxReplicas}')" = "10"
           test "$(kubectl -n gco-system get hpa inference-proxy-hpa -o jsonpath='{.spec.scaleTargetRef.name}')" = "inference-proxy"
+          metric_template='{range .spec.metrics[*]}'
+          metric_template+='{.containerResource.container}:{.containerResource.name}:'
+          metric_template+='{.containerResource.target.averageUtilization}{"\n"}{end}'
+          metrics="$(kubectl -n gco-system get hpa inference-proxy-hpa -o "jsonpath=$metric_template")"
+          expected_metrics=$'inference-proxy:cpu:70\ninference-proxy:memory:80\napi-tls-proxy:cpu:70'
+          test "$metrics" = "$expected_metrics"
           # At least one pod got scheduled for each — confirms the apiserver
           # admitted the PodSpec and the scheduler found the nodes.
           for _ in $(seq 1 30); do
@@ -1499,22 +1524,50 @@ jobs:
           kubectl -n gco-system get pods -o wide
           kubectl -n gco-system describe deploy health-monitor manifest-processor inference-monitor inference-proxy cost-monitor
           exit 1
-      - name: Verify inference proxy HPA is actively computing replicas
-        # Admission/readback alone does not prove autoscaling works. Wait for
-        # Metrics Server samples and require the controller's ScalingActive
-        # condition for the real autoscaling/v2 resource.
+      - name: Wait for inference proxy TLS rollout
+        # HPA resource metrics do not exist until kubelet has started the
+        # containers. The prior gate already proved every other deployment
+        # created pods; scale those non-target fixtures down to release the
+        # single Kind node's CPU for all three HPA-owned inference replicas.
+        # Then require the TLS sidecar and loopback application to pass their
+        # independent startup/readiness probes before polling HPA state.
         run: |
           set -euo pipefail
+          kubectl -n gco-system scale \
+            deployment/health-monitor \
+            deployment/manifest-processor \
+            deployment/inference-monitor \
+            deployment/cost-monitor \
+            --replicas=0
+          kubectl -n gco-system rollout status deployment/inference-proxy --timeout=3m
+      - name: Verify inference proxy HPA is actively computing replicas
+        # Admission/readback alone does not prove autoscaling works. Wait for
+        # Metrics Server samples, aggregate ScalingActive, and a numeric live
+        # utilization value for every application and TLS sidecar signal.
+        run: |
+          set -euo pipefail
+          expected_metrics=$'api-tls-proxy:cpu\ninference-proxy:cpu\ninference-proxy:memory'
+          status_template='{range .status.currentMetrics[*]}'
+          status_template+='{.containerResource.container}:{.containerResource.name}:'
+          status_template+='{.containerResource.current.averageUtilization}{"\n"}{end}'
+          current_metrics=""
           for _ in $(seq 1 90); do
             active="$(kubectl -n gco-system get hpa inference-proxy-hpa \
               -o jsonpath='{.status.conditions[?(@.type=="ScalingActive")].status}')"
-            if [ "$active" = "True" ]; then
+            current_metrics="$(
+              kubectl -n gco-system get hpa inference-proxy-hpa \
+                -o "jsonpath=$status_template" \
+                | awk -F: '$3 ~ /^[0-9]+$/ { print $1 ":" $2 }' \
+                | sort
+            )"
+            if [ "$active" = "True" ] && [ "$current_metrics" = "$expected_metrics" ]; then
               kubectl -n gco-system get hpa inference-proxy-hpa
               exit 0
             fi
             sleep 2
           done
-          echo "::error::inference-proxy-hpa never reported ScalingActive=True"
+          echo "::error::inference-proxy-hpa did not compute all three container metrics"
+          printf 'Current numeric metrics:\n%s\n' "$current_metrics"
           kubectl -n gco-system describe hpa inference-proxy-hpa || true
           kubectl top nodes || true
           kubectl -n gco-system top pods -l app=inference-proxy || true

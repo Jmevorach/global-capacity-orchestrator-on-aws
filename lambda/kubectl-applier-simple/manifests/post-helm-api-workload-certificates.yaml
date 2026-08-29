@@ -1,0 +1,112 @@
+# TLS identities for the three ALB-facing GCO API workloads.
+#
+# These certificates encrypt the ALB target hop. Application Load Balancers do
+# not validate target certificates or present a client certificate, so the
+# request-bound HMAC envelope proves trusted-proxy key possession and request
+# integrity on protected paths. Original caller identity remains API Gateway
+# IAM's responsibility. Only /healthz, /readyz, /metrics, and /api/v1/health
+# bypass HMAC; /api/v1/metrics remains protected.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: gco-api-selfsigned
+  namespace: gco-system
+  labels:
+    app: gco
+    project: gco
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: health-monitor-tls
+  namespace: gco-system
+  labels:
+    app: health-monitor
+    project: gco
+spec:
+  secretName: health-monitor-tls
+  duration: 2160h
+  renewBefore: 720h
+  revisionHistoryLimit: 1
+  privateKey:
+    algorithm: ECDSA
+    encoding: PKCS8
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  dnsNames:
+    - health-monitor
+    - health-monitor.gco-system
+    - health-monitor.gco-system.svc
+    - health-monitor.gco-system.svc.cluster.local
+  issuerRef:
+    name: gco-api-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: manifest-processor-tls
+  namespace: gco-system
+  labels:
+    app: manifest-processor
+    project: gco
+spec:
+  secretName: manifest-processor-tls
+  duration: 2160h
+  renewBefore: 720h
+  revisionHistoryLimit: 1
+  privateKey:
+    algorithm: ECDSA
+    encoding: PKCS8
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  dnsNames:
+    - manifest-processor
+    - manifest-processor.gco-system
+    - manifest-processor.gco-system.svc
+    - manifest-processor.gco-system.svc.cluster.local
+  issuerRef:
+    name: gco-api-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: inference-proxy-tls
+  namespace: gco-system
+  labels:
+    app: inference-proxy
+    project: gco
+spec:
+  secretName: inference-proxy-tls
+  duration: 2160h
+  renewBefore: 720h
+  revisionHistoryLimit: 1
+  privateKey:
+    algorithm: ECDSA
+    encoding: PKCS8
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  dnsNames:
+    - inference-proxy
+    - inference-proxy.gco-system
+    - inference-proxy.gco-system.svc
+    - inference-proxy.gco-system.svc.cluster.local
+  issuerRef:
+    name: gco-api-selfsigned
+    kind: Issuer
+    group: cert-manager.io

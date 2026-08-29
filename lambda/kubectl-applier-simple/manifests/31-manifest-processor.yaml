@@ -28,10 +28,12 @@ spec:
         project: gco
       annotations:
         gco.aws/deployment-timestamp: "{{DEPLOYMENT_TIMESTAMP}}"
+        eks.amazonaws.com/skip-containers: "api-tls-proxy"
     spec:
       serviceAccountName: gco-manifest-processor-sa
       priorityClassName: gco-platform-critical
-      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 75
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -78,10 +80,14 @@ spec:
               drop:
                 - ALL
           ports:
-            - name: http
-              containerPort: 8080
+            - name: app-http
+              containerPort: 9000
               protocol: TCP
           env:
+            - name: HOST
+              value: "127.0.0.1"
+            - name: PORT
+              value: "9000"
             - name: CLUSTER_NAME
               value: "{{CLUSTER_NAME}}"
             - name: REGION
@@ -191,24 +197,21 @@ spec:
               cpu: 1000m
               memory: 2Gi
           startupProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            exec:
+              command: ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=3).read()"]
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 12
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            exec:
+              command: ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=3).read()"]
             initialDelaySeconds: 0
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http
+            exec:
+              command: ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/readyz', timeout=3).read()"]
             initialDelaySeconds: 0
             periodSeconds: 5
             timeoutSeconds: 3
@@ -225,9 +228,75 @@ spec:
             - name: aws-iam-token
               mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
               readOnly: true
+            - name: kubernetes-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+        - name: api-tls-proxy
+          image: {{MANIFEST_PROCESSOR_IMAGE}}
+          imagePullPolicy: Always
+          command: ["python", "-m", "gco.services.tls_proxy"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          env:
+            - name: GCO_TLS_CERT_FILE
+              value: /var/run/gco/tls/tls.crt
+            - name: GCO_TLS_KEY_FILE
+              value: /var/run/gco/tls/tls.key
+            - name: TLS_PROXY_UPSTREAM_PORT
+              value: "9000"
+            - name: GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+              value: "50"
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          startupProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Keep the TLS acceptor open while endpoint removal reaches ALB.
+                command: ["python", "-c", "import time; time.sleep(10)"]
+          volumeMounts:
+            - name: api-tls
+              mountPath: /var/run/gco/tls
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: api-tls
+          secret:
+            secretName: manifest-processor-tls
+            defaultMode: 288
         - name: aws-iam-token
           projected:
             defaultMode: 420
@@ -236,6 +305,24 @@ spec:
                   audience: sts.amazonaws.com
                   expirationSeconds: 86400
                   path: token
+        - name: kubernetes-api-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -262,9 +349,9 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 80
-      targetPort: http
+    - port: 443
+      targetPort: https
       protocol: TCP
-      name: http
+      name: https
   selector:
     app: manifest-processor

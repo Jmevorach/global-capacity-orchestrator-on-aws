@@ -1086,6 +1086,8 @@ Disable optional charts you do not use to reduce system-node overhead and deploy
 >
 > Chart installation is **deliberately decoupled from the CloudFormation deploy**. When `gco stacks deploy-all` reports the regional stack as `CREATE_COMPLETE`, that means the install has been *kicked off* — not that every chart is ready. The charts are then installed one at a time by a Step Functions state machine in the background, and full convergence can take **10–30+ minutes** depending on how many charts are enabled and how fast their images pull (some third-party images come from `docker.io` and can be slow, e.g. Volcano).
 >
+> After post-Helm apply, exhaustive manifest validation is read-only and retries snapshots on a bounded 1/2/3-minute backoff schedule through roughly 21 minutes. This gives cold cert-manager Secret issuance, EKS Auto Mode node provisioning, PDBs, and EndpointSlices time to converge without replaying any Kubernetes mutations. Persistent readiness, schema, or access failures still fail the exact background execution with object-level evidence.
+>
 > This is intentional: a slow or failing chart must **never** roll back and destroy the freshly-created EKS cluster. Each chart installs independently — one slow or broken chart does not block the rest.
 >
 > Monitor convergence and inspect per-chart results at any time:
@@ -2295,7 +2297,7 @@ opted-in user follows the same first hop:
 Aggregator or authorized direct user
   → Regional API Gateway (AWS-managed TLS + IAM SigV4)
   → VPC Lambda (request-bound HMAC)
-  → Internal ALB (private-root TLS) → EKS pod (HTTP)
+  → Internal ALB (private-root TLS) → EKS pod (re-encrypted HTTPS)
 ```
 
 The Lambda resolves the current ALB from

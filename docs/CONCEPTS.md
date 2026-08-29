@@ -322,7 +322,7 @@ deployment-local private-root TLS through the Layer 4 accelerator to the ALB:
 
 ```text
 User → Global API Gateway → HMAC-signing Lambda → Global Accelerator (TCP/443)
-  → Internal Regional ALB (private-root TLS) → EKS pod (HTTP)
+  → Internal Regional ALB (private-root TLS) → EKS pod (re-encrypted HTTPS)
 ```
 
 Outside `aws`, this global workload route is not created; the global API is regional and aggregate-only, and workload traffic uses the regional mode below.
@@ -349,7 +349,7 @@ can reach its private ALB. Aggregator fan-out uses AWS-managed TLS and [SigV4](h
 
 ```text
 Aggregator → Regional API Gateway → HMAC-signing VPC Lambda
-  → Internal Regional ALB (private-root TLS) → EKS pod (HTTP)
+  → Internal Regional ALB (private-root TLS) → EKS pod (re-encrypted HTTPS)
 ```
 
 The bridge resource policy always admits the exact aggregator role. In the
@@ -360,7 +360,7 @@ is enabled automatically because Global Accelerator is omitted:
 
 ```text
 User (optional in `aws`; required ingress elsewhere) → Regional API Gateway → HMAC-signing VPC Lambda
-  → Internal Regional ALB (private-root TLS) → EKS pod (HTTP)
+  → Internal Regional ALB (private-root TLS) → EKS pod (re-encrypted HTTPS)
 ```
 
 **Pros:**
@@ -413,8 +413,8 @@ Here's what happens when you submit a job:
 4. In `aws`, private-root TLS traverses Global Accelerator to a healthy regional ALB; elsewhere, a regional VPC proxy connects directly
    └─► Global Accelerator forwards TCP/443 without termination when present
 
-5. The ALB terminates TLS and forwards HTTP to the service
-   └─► Backend middleware verifies freshness, integrity, and nonce replay
+5. The ALB terminates the private-root connection and re-encrypts the target hop to a TLS-only proxy sidecar on pod port 8443
+   └─► The sidecar hot-reloads its projected leaf, forwards only over pod loopback, and backend HMAC verifies trusted-proxy key possession, freshness, request integrity, and nonce replay
 
 6. Manifest Processor pod processes the job
    └─► Validates YAML, applies to Kubernetes

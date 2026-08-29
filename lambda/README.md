@@ -53,7 +53,7 @@ Do not install the root CDK/diagram/markdown packages into this directory; keepi
 
 ```text
 API Gateway → api-gateway-proxy (HMAC) → Global Accelerator (TCP/443 pass-through)
-  → regional ALB (private-root TLS) → EKS pod (HTTP)
+  → regional ALB (private-root TLS) → EKS pod (re-encrypted HTTPS)
                                       ↓
                          AuthenticationMiddleware
                          (validates exact request)

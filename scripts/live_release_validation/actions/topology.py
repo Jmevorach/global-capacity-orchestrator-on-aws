@@ -1,10 +1,11 @@
-"""topology: verify stacks, EKS, API endpoints, queues, and DynamoDB."""
+"""topology: verify stacks, EKS, HTTPS ALB targets, APIs, queues, and DynamoDB."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
+from ..checks.alb_tls import _alb_https_target_evidence
 from ..checks.topology import (
     _bounded_topology_evidence,
     _converge_region_addons,
@@ -112,6 +113,15 @@ def action_topology(ctx: RunContext) -> dict[str, Any]:
             ),
         }
 
+    alb_https_targets = {
+        region: _alb_https_target_evidence(
+            ctx,
+            region=region,
+            cluster_name=f"{ctx.config.project_name}-{region}",
+        )
+        for region in ctx.deployment_regions
+    }
+
     global_endpoint = ctx.aws_client.get_api_endpoint(force_refresh=True)
     global_url = str(getattr(global_endpoint, "url", "") or "")
     if not global_url:
@@ -188,6 +198,7 @@ def action_topology(ctx: RunContext) -> dict[str, Any]:
         "stacks": stack_details,
         "clusters": clusters,
         "convergence": convergence,
+        "alb_https_targets": alb_https_targets,
         "health_samples": health_samples,
         "metrics_samples": metrics_samples,
         "global_api": global_api,

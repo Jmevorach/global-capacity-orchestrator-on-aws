@@ -25,6 +25,7 @@ metadata:
     project: gco
   annotations:
     eks.amazonaws.com/role-arn: "{{HEALTH_MONITOR_ROLE_ARN}}"
+automountServiceAccountToken: false
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -36,6 +37,7 @@ metadata:
     project: gco
   annotations:
     eks.amazonaws.com/role-arn: "{{MANIFEST_PROCESSOR_ROLE_ARN}}"
+automountServiceAccountToken: false
 ---
 apiVersion: v1
 kind: ServiceAccount

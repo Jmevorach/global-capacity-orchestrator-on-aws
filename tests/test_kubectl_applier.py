@@ -536,6 +536,52 @@ class TestLegacyRemovedResources:
         assert post_helm["PrunedCount"] == 0
 
 
+class TestCertManagerCRDs:
+    """Issuer and Certificate resources are applied after cert-manager installs its CRDs."""
+
+    @pytest.mark.parametrize(
+        ("kind", "plural"),
+        (("Issuer", "issuers"), ("Certificate", "certificates")),
+    )
+    def test_tls_resource_applied_as_namespaced_custom_object(
+        self,
+        handler_module,
+        tmp_path,
+        kind: str,
+        plural: str,
+    ):
+        (tmp_path / f"post-helm-{plural}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "cert-manager.io/v1",
+                    "kind": kind,
+                    "metadata": {"name": f"test-{plural}", "namespace": "gco-system"},
+                    "spec": {"selfSigned": {}} if kind == "Issuer" else {"secretName": "tls"},
+                }
+            )
+        )
+
+        with (
+            patch.object(handler_module, "configure_k8s_client"),
+            patch("handler.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = MagicMock()
+            mock_client.AppsV1Api.return_value = MagicMock()
+            mock_client.RbacAuthorizationV1Api.return_value = MagicMock()
+            mock_client.NetworkingV1Api.return_value = MagicMock()
+            mock_custom = MagicMock()
+            mock_client.CustomObjectsApi.return_value = mock_custom
+
+            result = handler_module.apply_manifests(
+                "c", "us-east-1", str(tmp_path), {}, post_helm=True
+            )
+
+        assert result["AppliedCount"] == 1
+        assert result["FailedCount"] == 0
+        args = mock_custom.create_namespaced_custom_object.call_args.args
+        assert args[:4] == ("cert-manager.io", "v1", "gco-system", plural)
+
+
 class TestPrometheusOperatorCRDs:
     """ServiceMonitor / PodMonitor are applied as monitoring.coreos.com objects.
 
@@ -1308,9 +1354,10 @@ class TestMainPassRestartsAddonControllers:
     installs.
     """
 
-    def test_main_pass_restarts_efs_and_fsx_controllers(self, handler_module, tmp_path):
-        """efs-csi-controller and fsx-csi-controller are restarted in kube-system."""
-        # Minimal manifest so apply_manifests completes.
+    def test_main_pass_avoids_duplicate_gco_rollout_and_restarts_csi_controllers(
+        self, handler_module, tmp_path
+    ):
+        """GCO rolls via manifest annotation; CSI controllers still restart for IRSA."""
         (tmp_path / "00-ns.yaml").write_text(
             yaml.dump({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "demo"}})
         )
@@ -1334,16 +1381,10 @@ class TestMainPassRestartsAddonControllers:
                 "test-cluster", "us-east-1", str(tmp_path), {}, post_helm=False
             )
 
-        # Collect every (namespace, names) pair restart_deployments was
-        # called with. We don't care about argument order between gco-system
-        # and kube-system — we only care both restarts happened.
         deploy_calls = {
             (call.args[0], tuple(call.args[1])) for call in mock_restart_deploy.call_args_list
         }
-        assert (
-            "gco-system",
-            ("health-monitor", "manifest-processor", "inference-monitor", "inference-proxy"),
-        ) in deploy_calls
+        assert not any(namespace == "gco-system" for namespace, _names in deploy_calls)
         assert ("kube-system", ("efs-csi-controller", "fsx-csi-controller")) in deploy_calls
 
     def test_main_pass_restarts_csi_and_cloudwatch_daemonsets(self, handler_module, tmp_path):
@@ -1525,7 +1566,7 @@ class TestGatewayResourceDeletion:
     def test_deletes_routes_first_and_gateway_class_last_waiting_for_absence(self, handler_module):
         custom_api = MagicMock()
         custom_api.get_namespaced_custom_object.side_effect = [
-            self._not_found(handler_module) for _ in range(4)
+            self._not_found(handler_module) for _ in range(7)
         ]
         custom_api.get_cluster_custom_object.side_effect = self._not_found(handler_module)
         delete_options = MagicMock()
@@ -1540,24 +1581,24 @@ class TestGatewayResourceDeletion:
         configure.assert_called_once_with("gco-us-east-1", "us-east-1")
         assert result == {
             "status": "deleted",
-            "DeletedCount": 5,
+            "DeletedCount": 8,
             "Deleted": [
                 "HTTPRoute/gco-system/gco-routes",
                 "Gateway/gco-system/gco-gateway",
                 "LoadBalancerConfiguration/gco-system/gco-gateway-load-balancer",
+                "TargetGroupConfiguration/gco-system/gco-health-monitor-target-group",
+                "TargetGroupConfiguration/gco-system/gco-manifest-processor-target-group",
+                "TargetGroupConfiguration/gco-system/gco-inference-proxy-target-group",
                 "TargetGroupConfiguration/gco-system/gco-default-target-group",
                 "GatewayClass/gco-aws-alb",
             ],
         }
+        expected_namespaced_calls = [
+            "delete_namespaced_custom_object",
+            "get_namespaced_custom_object",
+        ] * 7
         assert [entry[0] for entry in custom_api.mock_calls] == [
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
-            "delete_namespaced_custom_object",
-            "get_namespaced_custom_object",
+            *expected_namespaced_calls,
             "delete_cluster_custom_object",
             "get_cluster_custom_object",
         ]
@@ -1580,7 +1621,7 @@ class TestGatewayResourceDeletion:
     def test_already_absent_resources_are_idempotent(self, handler_module):
         custom_api = MagicMock()
         custom_api.delete_namespaced_custom_object.side_effect = [
-            self._not_found(handler_module) for _ in range(4)
+            self._not_found(handler_module) for _ in range(7)
         ]
         custom_api.delete_cluster_custom_object.side_effect = self._not_found(handler_module)
 
@@ -1591,7 +1632,7 @@ class TestGatewayResourceDeletion:
         ):
             result = handler_module._delete_gateway_resources("cluster", "us-east-1")
 
-        assert result["DeletedCount"] == 5
+        assert result["DeletedCount"] == 8
         assert all(item.endswith(":already-absent") for item in result["Deleted"])
         custom_api.get_namespaced_custom_object.assert_not_called()
         custom_api.get_cluster_custom_object.assert_not_called()
@@ -1618,7 +1659,7 @@ class TestGatewayResourceDeletion:
         sleep.assert_not_called()
 
     def test_task_action_dispatches_and_records_gateway_teardown(self, handler_module):
-        deleted = {"status": "deleted", "DeletedCount": 5, "Deleted": ["five objects"]}
+        deleted = {"status": "deleted", "DeletedCount": 8, "Deleted": ["eight objects"]}
         with (
             patch.object(
                 handler_module, "_delete_gateway_resources", return_value=deleted
@@ -1635,7 +1676,7 @@ class TestGatewayResourceDeletion:
 
         assert result is deleted
         delete_gateway.assert_called_once_with("gco-us-east-1", "us-east-1")
-        record.assert_called_once_with("gateway-teardown", "deleted", "deleted=5")
+        record.assert_called_once_with("gateway-teardown", "deleted", "deleted=8")
 
 
 class TestHorizontalPodAutoscalerApply:
@@ -1835,17 +1876,27 @@ class TestInferenceProxyAutoscalingManifest:
         assert hpa["spec"]["maxReplicas"] == 10
         assert hpa["spec"]["metrics"] == [
             {
-                "type": "Resource",
-                "resource": {
+                "type": "ContainerResource",
+                "containerResource": {
                     "name": "cpu",
+                    "container": "inference-proxy",
                     "target": {"type": "Utilization", "averageUtilization": 70},
                 },
             },
             {
-                "type": "Resource",
-                "resource": {
+                "type": "ContainerResource",
+                "containerResource": {
                     "name": "memory",
+                    "container": "inference-proxy",
                     "target": {"type": "Utilization", "averageUtilization": 80},
+                },
+            },
+            {
+                "type": "ContainerResource",
+                "containerResource": {
+                    "name": "cpu",
+                    "container": "api-tls-proxy",
+                    "target": {"type": "Utilization", "averageUtilization": 70},
                 },
             },
         ]
@@ -1867,6 +1918,11 @@ class TestInferenceProxyAutoscalingManifest:
             "-c",
             "import time; time.sleep(10)",
         ]
+        containers = {container["name"]: container for container in pod_spec["containers"]}
+        assert (
+            containers["api-tls-proxy"]["lifecycle"]["preStop"]
+            == containers["inference-proxy"]["lifecycle"]["preStop"]
+        )
         assert pdb["spec"]["minAvailable"] == 2
         assert pdb["spec"]["selector"]["matchLabels"] == {"app": "inference-proxy"}
 
@@ -2037,14 +2093,20 @@ class TestAuthoritativeManifestPlanner:
         dispatched = set(re.findall(r'(?:el)?if kind == "([A-Za-z0-9]+)"', source))
         for group in re.findall(r"(?:el)?if kind in \(([^)]*)\)", source):
             dispatched.update(re.findall(r'"([A-Za-z0-9]+)"', group))
-        # Table-driven branches: `elif kind in _GATEWAY_CUSTOM_OBJECTS or
-        # kind in _QUEUEING_CUSTOM_OBJECTS`. Require the branch to exist so
-        # the maps' keys genuinely reach the apply loop.
-        assert re.search(
-            r"kind in _GATEWAY_CUSTOM_OBJECTS or kind in _QUEUEING_CUSTOM_OBJECTS", source
-        ), "table-driven custom-object dispatch branch disappeared; update this test"
+        # Table-driven branches use the three custom-object maps. Require each
+        # map name to appear in the dispatch condition so adding a map cannot
+        # leave its kinds admitted by planning but unreachable at apply time.
+        for map_name in (
+            "_GATEWAY_CUSTOM_OBJECTS",
+            "_QUEUEING_CUSTOM_OBJECTS",
+            "_CERT_MANAGER_CUSTOM_OBJECTS",
+        ):
+            assert f"kind in {map_name}" in source, (
+                f"table-driven custom-object dispatch omitted {map_name}; update the apply loop"
+            )
         dispatched.update(handler_module._GATEWAY_CUSTOM_OBJECTS)
         dispatched.update(handler_module._QUEUEING_CUSTOM_OBJECTS)
+        dispatched.update(handler_module._CERT_MANAGER_CUSTOM_OBJECTS)
 
         supported = set(handler_module._SUPPORTED_MANIFEST_KINDS)
         assert supported - dispatched == set(), (
@@ -2454,6 +2516,57 @@ class TestManifestReadinessValidation:
             call.kwargs["kind"] for call in dynamic_client.resources.get.call_args_list
         }
         assert "Deployment" not in discovered_kinds
+
+    @pytest.mark.parametrize("kind", ["Issuer", "Certificate"])
+    def test_cert_manager_resource_requires_current_ready_condition(self, handler_module, kind):
+        pending = {"metadata": {"generation": 2}, "status": {"conditions": []}}
+        stale = {
+            "metadata": {"generation": 2},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]
+            },
+        }
+        ready = {
+            "metadata": {"generation": 2},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 2}]
+            },
+        }
+
+        assert handler_module._resource_readiness_failure(kind, pending) == (
+            f"{kind} condition Ready is missing"
+        )
+        stale_failure = handler_module._resource_readiness_failure(kind, stale)
+        assert stale_failure is not None
+        assert "is stale" in stale_failure
+        assert handler_module._resource_readiness_failure(kind, ready) is None
+
+    def test_certificate_readiness_requires_a_nonempty_generated_secret(self, handler_module):
+        dynamic_client = MagicMock()
+        secret_api = MagicMock()
+        dynamic_client.resources.get.return_value = secret_api
+        planned = {"namespace": "gco-system"}
+        certificate = {"spec": {"secretName": "api-tls"}}
+
+        secret_api.get.return_value = {"data": {"tls.crt": "", "tls.key": "a2V5"}}
+        failure = handler_module._certificate_secret_failure(
+            dynamic_client,
+            {},
+            planned,
+            certificate,
+        )
+        assert failure == "Certificate Secret 'api-tls' has no nonempty tls.crt"
+
+        secret_api.get.return_value = {"data": {"tls.crt": "Y2VydA==", "tls.key": "a2V5"}}
+        assert (
+            handler_module._certificate_secret_failure(
+                dynamic_client,
+                {},
+                planned,
+                certificate,
+            )
+            is None
+        )
 
     @pytest.mark.parametrize(
         "resource",
