@@ -725,7 +725,7 @@ def test_install_state_machine_retries_and_continues_per_chart(feature_stack):
     assert manifest_validation["ResultPath"] == "$.manifestValidation"
     assert manifest_validation["TimeoutSeconds"] == 900
     assert "Catch" not in manifest_validation
-    _assert_retry(manifest_validation, attempts=4, interval=60, max_delay=180)
+    _assert_retry(manifest_validation, attempts=8, interval=60, max_delay=180)
     manifest_json = json.dumps(manifest_validation, sort_keys=True)
     assert "validate_manifests" in manifest_json
     assert "$.ImageReplacements" in manifest_json
