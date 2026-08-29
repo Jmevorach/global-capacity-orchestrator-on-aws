@@ -144,6 +144,7 @@ _STRUCTURAL_STUBS: dict[str, str] = {
 # fails the schema's `type: integer` check.
 _INTEGER_PLACEHOLDER_TOKENS: frozenset[str] = frozenset(
     {
+        "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}",
         "{{QP_POLLING_INTERVAL}}",
         "{{QP_SUCCESSFUL_JOBS_HISTORY}}",
         "{{QP_FAILED_JOBS_HISTORY}}",
@@ -158,6 +159,7 @@ _INTEGER_PLACEHOLDER_TOKENS: frozenset[str] = frozenset(
 # the position is quoted or bare.
 _QUANTITY_PLACEHOLDER_TOKENS: frozenset[str] = frozenset(
     {
+        "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}",
         "{{QUOTA_MAX_CPU}}",
         "{{QUOTA_MAX_MEMORY}}",
         "{{QUOTA_MAX_GPU}}",

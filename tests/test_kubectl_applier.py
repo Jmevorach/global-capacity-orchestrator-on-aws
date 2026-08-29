@@ -1846,9 +1846,14 @@ class TestInferenceProxyAutoscalingManifest:
             / "manifests"
             / "33-inference-proxy.yaml"
         )
-        content = manifest_path.read_text().replace(
-            "{{INFERENCE_PROXY_IMAGE}}",
-            "example.invalid/inference-proxy:test",
+        content = (
+            manifest_path.read_text()
+            .replace(
+                "{{INFERENCE_PROXY_IMAGE}}",
+                "example.invalid/inference-proxy:test",
+            )
+            .replace("{{INFERENCE_PROXY_TLS_CPU_REQUEST}}", "100m")
+            .replace("{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}", "70")
         )
         documents = list(yaml.safe_load_all(content))
         deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
@@ -1900,13 +1905,23 @@ class TestInferenceProxyAutoscalingManifest:
                 },
             },
         ]
-        assert hpa["spec"]["behavior"]["scaleDown"] == {
-            "stabilizationWindowSeconds": 900,
-            "selectPolicy": "Min",
-            "policies": [
-                {"type": "Percent", "value": 25, "periodSeconds": 60},
-                {"type": "Pods", "value": 1, "periodSeconds": 60},
-            ],
+        assert hpa["spec"]["behavior"] == {
+            "scaleUp": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [
+                    {"type": "Percent", "value": 100, "periodSeconds": 60},
+                    {"type": "Pods", "value": 4, "periodSeconds": 60},
+                ],
+            },
+            "scaleDown": {
+                "stabilizationWindowSeconds": 900,
+                "selectPolicy": "Min",
+                "policies": [
+                    {"type": "Percent", "value": 25, "periodSeconds": 60},
+                    {"type": "Pods", "value": 1, "periodSeconds": 60},
+                ],
+            },
         }
         pod_spec = deployment["spec"]["template"]["spec"]
         assert pod_spec["terminationGracePeriodSeconds"] == 930
@@ -1919,12 +1934,51 @@ class TestInferenceProxyAutoscalingManifest:
             "import time; time.sleep(10)",
         ]
         containers = {container["name"]: container for container in pod_spec["containers"]}
+        assert containers["inference-proxy"]["resources"] == {
+            "requests": {"cpu": "250m", "memory": "256Mi"},
+            "limits": {"cpu": "1000m", "memory": "1Gi"},
+        }
+        assert containers["api-tls-proxy"]["resources"] == {
+            "requests": {"cpu": "100m", "memory": "128Mi"},
+            "limits": {"cpu": "250m", "memory": "256Mi"},
+        }
         assert (
             containers["api-tls-proxy"]["lifecycle"]["preStop"]
             == containers["inference-proxy"]["lifecycle"]["preStop"]
         )
         assert pdb["spec"]["minAvailable"] == 2
         assert pdb["spec"]["selector"]["matchLabels"] == {"app": "inference-proxy"}
+
+    @pytest.mark.parametrize(
+        "missing_token",
+        [
+            "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}",
+            "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}",
+        ],
+    )
+    def test_missing_tls_autoscaling_replacement_skips_complete_manifest(
+        self, handler_module, tmp_path, missing_token
+    ):
+        """One unresolved required token gates every document in the file."""
+        source = (
+            Path(__file__).parent.parent
+            / "lambda"
+            / "kubectl-applier-simple"
+            / "manifests"
+            / "33-inference-proxy.yaml"
+        ).read_text(encoding="utf-8")
+        (tmp_path / "33-inference-proxy.yaml").write_text(source, encoding="utf-8")
+        token_re = re.compile(r"\{\{[A-Z0-9_]+\}\}")
+        replacements = dict.fromkeys(token_re.findall(source), "test-value")
+        replacements["{{INFERENCE_PROXY_TLS_CPU_REQUEST}}"] = "100m"
+        replacements["{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}"] = "70"
+        del replacements[missing_token]
+
+        plan = handler_module.plan_manifests(str(tmp_path), replacements)
+
+        assert plan["phases"]["base"] == []
+        assert plan["skipped"]["base"] == ["33-inference-proxy.yaml:unreplaced-placeholders"]
+        assert plan["featureGates"]["base"] == [missing_token]
 
     def test_gateway_target_group_deregistration_covers_stream_drain(self):
         """ALB draining lasts at least as long as Uvicorn's maximum stream drain."""
@@ -2039,7 +2093,13 @@ class TestAuthoritativeManifestPlanner:
             Path(__file__).parent.parent / "lambda" / "kubectl-applier-simple" / "manifests"
         )
         token_re = re.compile(r"\{\{[A-Za-z0-9_]+\}\}")
-        quantity_tokens = {"{{QUOTA_MAX_CPU}}", "{{QUOTA_MAX_MEMORY}}", "{{QUOTA_MAX_GPU}}"}
+        quantity_tokens = {
+            "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}",
+            "{{QUOTA_MAX_CPU}}",
+            "{{QUOTA_MAX_MEMORY}}",
+            "{{QUOTA_MAX_GPU}}",
+        }
+        integer_tokens = {"{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}"}
         integer_prefixes = ("{{QP_", "{{LIMIT_", "{{QUOTA_MAX_PODS}}")
         replacements: dict[str, str] = {
             "{{VPC_ENDPOINT_CIDR_BLOCKS}}": '- ipBlock:\n            cidr: "10.0.0.0/16"',
@@ -2048,7 +2108,11 @@ class TestAuthoritativeManifestPlanner:
             for token in token_re.findall(manifest.read_text(encoding="utf-8")):
                 if token in replacements:
                     continue
-                if token in quantity_tokens or token.startswith(integer_prefixes):
+                if (
+                    token in quantity_tokens
+                    or token in integer_tokens
+                    or token.startswith(integer_prefixes)
+                ):
                     replacements[token] = "1"
                 else:
                     replacements[token] = "stub-value"

@@ -199,6 +199,12 @@ class MockConfigLoader:
             },
         }
 
+    def get_inference_proxy_config(self):
+        return {
+            "tls_proxy_cpu_request_millicores": 100,
+            "tls_proxy_cpu_target_utilization_percentage": 70,
+        }
+
     def get_api_gateway_config(self):
         return {
             "throttle_rate_limit": 1000,
@@ -1004,6 +1010,10 @@ class TestConfigIntegration:
         assert config.get_global_accelerator_config() is not None
         assert config.get_alb_config() is not None
         assert config.get_manifest_processor_config() is not None
+        assert config.get_inference_proxy_config() == {
+            "tls_proxy_cpu_request_millicores": 100,
+            "tls_proxy_cpu_target_utilization_percentage": 70,
+        }
         assert config.get_api_gateway_config() is not None
         assert config.get_backend_tls_config() is not None
 

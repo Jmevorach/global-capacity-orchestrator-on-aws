@@ -1470,6 +1470,8 @@ jobs:
             sed -e "s|{{${key}}}|${image}|g" \
                 -e "s|{{DEPLOYMENT_TIMESTAMP}}|$(date +%s)|g" \
                 -e 's|{{INFERENCE_PROXY_MAX_REQUEST_BODY_BYTES}}|1048576|g' \
+                -e 's|{{INFERENCE_PROXY_TLS_CPU_REQUEST}}|100m|g' \
+                -e 's|{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}|70|g' \
                 -e 's|{{COST_REPORT_INTERVAL_MINUTES}}|60|g' \
                 -e 's|{{COST_MONITORING_ENABLED}}|true|g' \
                 -e "s|{{[A-Z_]*}}|ci-stub|g" \
@@ -1494,6 +1496,11 @@ jobs:
           test "$(kubectl -n gco-system get hpa inference-proxy-hpa -o jsonpath='{.spec.minReplicas}')" = "3"
           test "$(kubectl -n gco-system get hpa inference-proxy-hpa -o jsonpath='{.spec.maxReplicas}')" = "10"
           test "$(kubectl -n gco-system get hpa inference-proxy-hpa -o jsonpath='{.spec.scaleTargetRef.name}')" = "inference-proxy"
+          tls_cpu_request="$(
+            kubectl -n gco-system get deployment inference-proxy \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="api-tls-proxy")].resources.requests.cpu}'
+          )"
+          test "$tls_cpu_request" = "100m"
           metric_template='{range .spec.metrics[*]}'
           metric_template+='{.containerResource.container}:{.containerResource.name}:'
           metric_template+='{.containerResource.target.averageUtilization}{"\n"}{end}'

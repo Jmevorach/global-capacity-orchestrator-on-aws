@@ -150,6 +150,13 @@ class TestRenderPlaceholders:
             out = validator.render_placeholders(f"field: {token}")
             assert out == "field: 1", f"{token} did not render to a bare integer"
 
+    def test_all_quantity_tokens_render_as_strings_when_quoted(self) -> None:
+        for token in validator._QUANTITY_PLACEHOLDER_TOKENS:
+            out = validator.render_placeholders(f'field: "{token}"')
+            assert yaml.safe_load(out)["field"] == "1", (
+                f"{token} did not render to a quoted Kubernetes quantity"
+            )
+
     def test_structural_cidr_token_becomes_ipblock_sequence(self) -> None:
         # {{VPC_ENDPOINT_CIDR_BLOCKS}} sits at the head of a YAML sequence, so
         # the stub must be a real list item, not a scalar.
@@ -171,6 +178,7 @@ class TestRenderPlaceholders:
             "03-network-policies.yaml",  # the structural VPC CIDR placeholder
             "30-health-monitor.yaml",  # bare image: placeholder + quoted values
             "31-manifest-processor.yaml",  # REST policy env wiring
+            "33-inference-proxy.yaml",  # quoted Quantity + bare integer HPA target
             "post-helm-sqs-consumer.yaml",  # the bare integer placeholders
             "04-resource-quotas.yaml",  # quoted-string placeholders only
         ],
@@ -184,6 +192,29 @@ class TestRenderPlaceholders:
         assert "{{" not in rendered
         docs = list(yaml.safe_load_all(rendered))
         assert any(doc for doc in docs), "rendered manifest produced no YAML documents"
+
+    def test_inference_tls_cpu_placeholders_render_with_kubernetes_types(self) -> None:
+        raw = (MANIFESTS_DIR / "33-inference-proxy.yaml").read_text(encoding="utf-8")
+        documents = list(yaml.safe_load_all(validator.render_placeholders(raw)))
+        deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
+        hpa = next(doc for doc in documents if doc["kind"] == "HorizontalPodAutoscaler")
+
+        containers = {
+            container["name"]: container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+        }
+        request = containers["api-tls-proxy"]["resources"]["requests"]["cpu"]
+        tls_metric = next(
+            metric
+            for metric in hpa["spec"]["metrics"]
+            if metric["containerResource"]["container"] == "api-tls-proxy"
+        )
+        target = tls_metric["containerResource"]["target"]["averageUtilization"]
+
+        assert request == "1"
+        assert type(request) is str
+        assert target == 1
+        assert type(target) is int
 
     def test_manifest_processor_security_policy_env_is_fully_wired(self) -> None:
         raw = (MANIFESTS_DIR / "31-manifest-processor.yaml").read_text(encoding="utf-8")

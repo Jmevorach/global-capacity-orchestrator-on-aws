@@ -39,8 +39,25 @@ _API_WORKLOADS = {
 
 def _documents(filename: str) -> list[dict]:
     text = (_MANIFEST_DIR / filename).read_text(encoding="utf-8")
-    rendered = re.sub(r"\{\{[A-Z0-9_]+\}\}", "test-value", text)
+    rendered = text.replace("{{INFERENCE_PROXY_TLS_CPU_REQUEST}}", "100m").replace(
+        "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}", "70"
+    )
+    rendered = re.sub(r"\{\{[A-Z0-9_]+\}\}", "test-value", rendered)
     return [document for document in yaml.safe_load_all(rendered) if document]
+
+
+def test_inference_tls_autoscaling_tokens_are_scoped_to_inference_proxy() -> None:
+    """Health and manifest TLS resource profiles remain fixed and untokenized."""
+    tokens = (
+        "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}",
+        "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}",
+    )
+    inference_manifest = (_MANIFEST_DIR / "33-inference-proxy.yaml").read_text(encoding="utf-8")
+    assert all(inference_manifest.count(token) == 1 for token in tokens)
+
+    for filename in ("30-health-monitor.yaml", "31-manifest-processor.yaml"):
+        manifest = (_MANIFEST_DIR / filename).read_text(encoding="utf-8")
+        assert all(token not in manifest for token in tokens)
 
 
 def _proxy_config(tmp_path: Path) -> ProxyConfig:

@@ -12,6 +12,7 @@ Configuration Sections:
 - resource_thresholds: CPU/memory/GPU utilization thresholds
 - global_accelerator: Global Accelerator settings
 - alb_config: Application Load Balancer health check settings
+- inference_proxy: Shared inference TLS proxy CPU request and HPA target
 - manifest_processor: Manifest validation and resource limits
 - api_gateway: Throttling and logging configuration
 - tags: Common tags applied to all resources
@@ -142,6 +143,9 @@ class ConfigLoader:
 
         # Validate deployment-local backend TLS rotation policy
         self._validate_backend_tls_config()
+
+        # Validate inference proxy TLS sidecar autoscaling settings
+        self._validate_inference_proxy_config()
 
         # Validate ALB config
         self._validate_alb_config()
@@ -432,6 +436,21 @@ class ConfigLoader:
                 "backend_tls.root_activation_delay_hours must exceed the maximum stale trust "
                 "cache window so every proxy can observe a pending root before leaf rollover"
             )
+
+    def _validate_inference_proxy_config(self) -> None:
+        """Validate the inference TLS proxy CPU request and HPA target."""
+        config = self.get_inference_proxy_config()
+        ranges = {
+            "tls_proxy_cpu_request_millicores": (1, 250),
+            "tls_proxy_cpu_target_utilization_percentage": (1, 100),
+        }
+        for field, (minimum, maximum) in ranges.items():
+            value = config[field]
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ConfigValidationError(
+                    f"inference_proxy.{field} must be an integer between "
+                    f"{minimum} and {maximum}, got {value!r}"
+                )
 
     def _validate_alb_config(self) -> None:
         """Validate ALB configuration"""
@@ -1237,6 +1256,36 @@ class ConfigLoader:
         configured = self.app.node.try_get_context("backend_tls") or {}
         if not isinstance(configured, dict):
             raise ConfigValidationError("backend_tls must be a mapping")
+        return {**defaults, **configured}
+
+    def get_inference_proxy_config(self) -> dict[str, int]:
+        """Return merged inference TLS proxy autoscaling settings.
+
+        Omission is backward compatible and returns the shipped defaults. AWS
+        CDK normalizes a top-level JSON ``null`` context value to omission, so
+        ``None`` follows the same default-preserving contract.
+        """
+        defaults = {
+            "tls_proxy_cpu_request_millicores": 100,
+            "tls_proxy_cpu_target_utilization_percentage": 70,
+        }
+        configured = self.app.node.try_get_context("inference_proxy")
+        if configured is None:
+            return dict(defaults)
+        if not isinstance(configured, dict):
+            raise ConfigValidationError(
+                "inference_proxy must be an object, got "
+                f"{type(configured).__name__}: {configured!r}"
+            )
+
+        unknown = sorted(str(key) for key in configured if key not in defaults)
+        if unknown:
+            unknown_paths = ", ".join(f"inference_proxy.{key}" for key in unknown)
+            allowed_paths = ", ".join(f"inference_proxy.{key}" for key in sorted(defaults))
+            raise ConfigValidationError(
+                f"inference_proxy contains unknown key(s): {unknown_paths}; "
+                f"allowed keys: {allowed_paths}"
+            )
         return {**defaults, **configured}
 
     def get_alb_config(self) -> dict[str, Any]:

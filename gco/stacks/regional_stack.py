@@ -3320,8 +3320,10 @@ class GCORegionalStack(Stack):
         # shared job_validation_policy section because both the REST
         # manifest_processor and the SQS queue_processor read them. Service-
         # specific knobs (replicas, validation_enabled, max_request_body_bytes,
-        # etc.) stay under manifest_processor.
+        # etc.) stay under manifest_processor. Inference TLS proxy CPU and HPA
+        # settings live in their own optional block.
         mp_config = self.config.get_manifest_processor_config()
+        inference_proxy_config = self.config.get_inference_proxy_config()
         job_policy = self.node.try_get_context("job_validation_policy") or {}
         job_quotas = _validated_manifest_caps(
             job_policy.get("resource_quotas", {}),
@@ -3463,6 +3465,14 @@ class GCORegionalStack(Stack):
             # but retain a service-specific placeholder for future tuning.
             "{{INFERENCE_PROXY_MAX_REQUEST_BODY_BYTES}}": str(
                 mp_config.get("max_request_body_bytes", 1_048_576)
+            ),
+            # The replacement map is string-only. Manifest quoting renders the
+            # request as a Quantity string and the HPA target as a YAML integer.
+            "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}": (
+                f"{inference_proxy_config['tls_proxy_cpu_request_millicores']}m"
+            ),
+            "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}": str(
+                inference_proxy_config["tls_proxy_cpu_target_utilization_percentage"]
             ),
             # Regional worker for the DynamoDB-backed global queue. Multiple API
             # replicas are safe because JobStore claims are conditional and

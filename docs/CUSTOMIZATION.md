@@ -692,6 +692,31 @@ Configure in `cdk.json`:
 
 Before the threshold, the monitor records the start of the outage. After the threshold, it logs that the authenticated inference proxy will return 503 until the model recovers. When a replica becomes ready, the timer is cleared. Reconciliation never creates endpoint-specific public routes.
 
+#### Inference Proxy TLS Autoscaling
+
+Configure the shared inference data plane's `api-tls-proxy` CPU request and
+HPA target in `cdk.json`:
+
+```json
+"inference_proxy": {
+  "tls_proxy_cpu_request_millicores": 100,
+  "tls_proxy_cpu_target_utilization_percentage": 70
+}
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `tls_proxy_cpu_request_millicores` | `100` | Exact integer from 1 through 250. CDK renders it as a Kubernetes CPU quantity such as `100m`; this request is the TLS sidecar HPA utilization denominator |
+| `tls_proxy_cpu_target_utilization_percentage` | `70` | Exact integer from 1 through 100 used only by the `api-tls-proxy` CPU `ContainerResource` HPA signal |
+
+The section is optional. Omission and JSON `null` use both defaults because AWS
+CDK normalizes top-level `null` context values to omission; partial objects retain
+the other default. Unknown keys, non-object non-null sections, booleans, floats,
+strings, and out-of-range values fail configuration validation. Redeploy the
+regional stack after changing a value. This tuning does not change the inference
+application CPU or memory, the TLS proxy CPU limit or memory profile, HPA replica
+bounds or behavior, the PodDisruptionBudget, or stream-drain settings.
+
 #### ALB Architecture
 
 GCO uses one internal application ALB per region, created by the AWS Load Balancer Controller from the `gco-system/gco-gateway` Gateway API resources. The shared `HTTPRoute` sends health and control-plane traffic to their platform services and `/inference/*` to the dedicated inference proxy. The proxy authenticates and validates an inference route before streaming from the selected endpoint's ClusterIP Service, so endpoint Deployments and Services do not create public or endpoint-specific routes.
