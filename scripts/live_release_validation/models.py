@@ -45,6 +45,16 @@ def to_jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject ambiguous object keys at every level of a persisted checkpoint."""
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _REPORT_FILENAMES = frozenset(
@@ -431,14 +441,24 @@ class RunCheckpoint:
     @classmethod
     def from_path(cls, path: Path) -> RunCheckpoint:
         try:
-            raw = json.loads(_read_private_text(path))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            checkpoint_text = _read_private_text(path)
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"Unable to read checkpoint {path}: {exc}") from exc
+        try:
+            raw = json.loads(
+                checkpoint_text,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+        except ValueError as exc:
             raise ValueError(f"Unable to read checkpoint {path}: {exc}") from exc
         if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
             raise ValueError(f"Checkpoint {path} does not use supported schema {SCHEMA_VERSION}")
         results_raw = raw.get("action_results") or {}
         if not isinstance(results_raw, dict):
             raise ValueError(f"Checkpoint {path} has invalid action_results")
+        state_raw = raw.get("state", {})
+        if not isinstance(state_raw, dict):
+            raise ValueError(f"Checkpoint {path} state must be an object")
         return cls(
             identity=dict(raw.get("identity") or {}),
             created_at=str(raw.get("created_at") or utc_now()),
@@ -452,7 +472,7 @@ class RunCheckpoint:
             deployment_attempted=bool(raw.get("deployment_attempted", False)),
             destroyed=bool(raw.get("destroyed", False)),
             baseline=dict(raw["baseline"]) if isinstance(raw.get("baseline"), dict) else None,
-            state=dict(raw.get("state") or {}),
+            state=dict(state_raw),
             schema_version=SCHEMA_VERSION,
         )
 

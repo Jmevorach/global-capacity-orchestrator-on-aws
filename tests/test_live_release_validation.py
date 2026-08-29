@@ -34,9 +34,11 @@ from scripts.live_release_validation.actions import central_queue as actions_cen
 from scripts.live_release_validation.actions import deploy as actions_deploy
 from scripts.live_release_validation.actions import destroy as actions_destroy
 from scripts.live_release_validation.actions import final_inventory as actions_final_inventory
+from scripts.live_release_validation.actions import opencost as actions_opencost
 from scripts.live_release_validation.actions import topology as actions_topology
 from scripts.live_release_validation.checks import central_queue as checks_central_queue
 from scripts.live_release_validation.checks import jobs as checks_jobs
+from scripts.live_release_validation.checks import opencost as checks_opencost
 from scripts.live_release_validation.checks import topology as checks_topology
 from scripts.live_release_validation.cleanup import ecr as cleanup_ecr
 from scripts.live_release_validation.cleanup import log_groups as cleanup_log_groups
@@ -4120,6 +4122,85 @@ class TestFinalInventoryReconciliation:
 
 
 class TestCheckpointPersistence:
+    def test_checkpoint_round_trip_preserves_object_state(self, tmp_path: Path) -> None:
+        from scripts.live_release_validation import models
+
+        path = tmp_path / "report" / "checkpoint.json"
+        checkpoint = models.RunCheckpoint(
+            identity={"run_id": "run-123"},
+            state={"nested": {"value": 1}},
+        )
+        models.atomic_write_json(path, checkpoint.to_dict())
+
+        loaded = models.RunCheckpoint.from_path(path)
+
+        assert loaded.identity == {"run_id": "run-123"}
+        assert loaded.state == {"nested": {"value": 1}}
+
+    def test_checkpoint_without_state_keeps_compatible_empty_default(self, tmp_path: Path) -> None:
+        from scripts.live_release_validation import models
+
+        path = tmp_path / "report" / "checkpoint.json"
+        models.atomic_write_json(
+            path,
+            {"schema_version": models.SCHEMA_VERSION, "identity": {}},
+        )
+
+        assert models.RunCheckpoint.from_path(path).state == {}
+
+    @pytest.mark.parametrize(
+        "state",
+        [None, False, 0, "", [], [["key", "value"]]],
+        ids=["null", "false", "zero", "string", "empty-list", "pair-list"],
+    )
+    def test_checkpoint_rejects_present_nonobject_state(
+        self,
+        tmp_path: Path,
+        state,
+    ) -> None:
+        from scripts.live_release_validation import models
+
+        path = tmp_path / "report" / "checkpoint.json"
+        models.atomic_write_json(
+            path,
+            {
+                "schema_version": models.SCHEMA_VERSION,
+                "identity": {},
+                "state": state,
+            },
+        )
+
+        with pytest.raises(ValueError, match="state must be an object"):
+            models.RunCheckpoint.from_path(path)
+
+    @pytest.mark.parametrize(
+        ("raw_json", "duplicate_key"),
+        [
+            (
+                '{"schema_version":2,"state":{},"state":{"value":1}}',
+                "state",
+            ),
+            (
+                '{"schema_version":2,"state":{"attempt":false,"attempt":1}}',
+                "attempt",
+            ),
+        ],
+        ids=["root", "nested"],
+    )
+    def test_checkpoint_rejects_duplicate_json_keys(
+        self,
+        tmp_path: Path,
+        raw_json: str,
+        duplicate_key: str,
+    ) -> None:
+        from scripts.live_release_validation import models
+
+        path = tmp_path / "report" / "checkpoint.json"
+        models.atomic_write_text(path, raw_json)
+
+        with pytest.raises(ValueError, match=rf"duplicate JSON key: {duplicate_key}"):
+            models.RunCheckpoint.from_path(path)
+
     @pytest.mark.skipif(os.name == "nt", reason="POSIX permission model only")
     def test_repeated_atomic_checkpoint_replacements_stay_owner_only(
         self,
@@ -5182,3 +5263,597 @@ class TestActionBaselineCheckpointPurity:
             result = actions_baseline.action_baseline(ctx)
         capture.assert_not_called()
         assert result["reused_checkpoint_baseline"] is True
+
+
+class TestOpenCostLiveValidationRetry:
+    """The disposable-account report check retries only the exact ambiguous 504."""
+
+    @staticmethod
+    def _success_response():
+        return _response(
+            201,
+            {
+                "region": "us-east-1",
+                "bucket": "gco-live-cost-reports-123456789012-us-east-1",
+                "report": {
+                    "s3_key": (
+                        "adhoc/region=us-east-1/date=2026-08-29/"
+                        "allocation-20260829T000000Z-20260829T010000Z-a1b2c3d4.parquet"
+                    ),
+                    "row_count": 3,
+                    "total_cost": 1.25,
+                },
+            },
+        )
+
+    @staticmethod
+    def _bridge_timeout_response():
+        payload = {
+            "error": "Gateway timeout",
+            "message": "Upstream failed after 1 attempt(s)",
+        }
+        return _response(504, payload, text=json.dumps(payload))
+
+    def test_exact_bridge_timeout_retries_once_and_records_duplicate_risk(self):
+        ctx = _context()
+        ctx.aws_client.make_authenticated_request.side_effect = [
+            self._bridge_timeout_response(),
+            self._success_response(),
+        ]
+
+        with patch.object(checks_opencost.time, "sleep") as sleep:
+            result = checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        assert result["duplicate_possible"] is True
+        assert [item["status_code"] for item in result["request_attempts"]] == [504, 201]
+        assert result["request_attempts"][0]["retry_scheduled"] is True
+        assert result["request_attempts"][1]["retry_scheduled"] is False
+        sleep.assert_called_once_with(checks_opencost._REPORT_RETRY_DELAY_SECONDS)
+        assert ctx.aws_client.make_authenticated_request.call_count == 2
+        checkpointed = ctx.checkpoint.state["opencost_report_attempts"]["us-east-1"]
+        assert checkpointed["duplicate_possible"] is True
+        assert len(checkpointed["attempts"]) == 2
+        # Intent, first response, second intent, second response, validated report.
+        assert ctx.persist_callback.call_count == 5
+
+    def test_resume_consumes_only_remaining_attempt_and_keeps_ambiguity(self):
+        timeout_payload = {
+            "error": "Gateway timeout",
+            "message": "Upstream failed after 1 attempt(s)",
+        }
+        ctx = _context(
+            state={
+                "opencost_report_attempts": {
+                    "us-east-1": {
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "state": "completed",
+                                "started_at": "2026-08-29T00:00:00+00:00",
+                                "ended_at": "2026-08-29T00:00:30+00:00",
+                                "status_code": 504,
+                                "exact_bridge_timeout": True,
+                                "response_text": json.dumps(timeout_payload),
+                                "retry_scheduled": True,
+                            }
+                        ],
+                        "duplicate_possible": True,
+                        "completed_report": None,
+                    }
+                }
+            }
+        )
+        ctx.aws_client.make_authenticated_request.return_value = self._success_response()
+
+        with patch.object(checks_opencost.time, "sleep") as sleep:
+            result = checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_called_once()
+        sleep.assert_called_once_with(checks_opencost._REPORT_RETRY_DELAY_SECONDS)
+        assert result["duplicate_possible"] is True
+        assert [item["attempt"] for item in result["request_attempts"]] == [1, 2]
+        checkpointed = ctx.checkpoint.state["opencost_report_attempts"]["us-east-1"]
+        assert checkpointed["duplicate_possible"] is True
+        assert checkpointed["completed_report"]["row_count"] == 3
+
+    def test_resume_reuses_completed_report_without_another_post(self):
+        ctx = _context(
+            state={
+                "opencost_report_attempts": {
+                    "us-east-1": {
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "state": "completed",
+                                "started_at": "2026-08-29T00:00:00+00:00",
+                                "ended_at": "2026-08-29T00:00:01+00:00",
+                                "status_code": 201,
+                                "exact_bridge_timeout": False,
+                                "response_text": "",
+                                "retry_scheduled": False,
+                            }
+                        ],
+                        "duplicate_possible": False,
+                        "completed_report": {
+                            "region": "us-east-1",
+                            "bucket": "gco-live-cost-reports-123456789012-us-east-1",
+                            "s3_key": (
+                                "adhoc/region=us-east-1/date=2026-08-29/"
+                                "allocation-20260829T000000Z-20260829T010000Z-deadbeef.parquet"
+                            ),
+                            "row_count": 2,
+                        },
+                    }
+                }
+            }
+        )
+
+        result = checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+        assert result["s3_key"].endswith("deadbeef.parquet")
+        assert result["request_attempts"][0]["attempt"] == 1
+
+    @pytest.mark.parametrize(
+        ("completed_report", "message"),
+        [
+            (
+                {
+                    "region": "us-east-1",
+                    "s3_key": (
+                        "adhoc/region=us-east-1/date=2026-08-29/"
+                        "allocation-20260829T000000Z-20260829T010000Z-deadbeef.parquet"
+                    ),
+                    "row_count": 2,
+                },
+                "omitted its bucket",
+            ),
+            (
+                {
+                    "region": "us-east-1",
+                    "bucket": "gco-live-cost-reports-123456789012-us-east-1",
+                    "row_count": 2,
+                },
+                "omitted its S3 key",
+            ),
+            (
+                {
+                    "region": "us-east-1",
+                    "bucket": "gco-live-cost-reports-123456789012-us-east-1",
+                    "s3_key": (
+                        "adhoc/region=us-east-1/date=2026-08-29/"
+                        "allocation-20260829T000000Z-20260829T010000Z-deadbeef.parquet"
+                    ),
+                    "row_count": 0,
+                },
+                "zero allocation rows",
+            ),
+            (
+                {
+                    "region": "us-west-2",
+                    "bucket": "gco-live-cost-reports-123456789012-us-east-1",
+                    "s3_key": (
+                        "adhoc/region=us-west-2/date=2026-08-29/"
+                        "allocation-20260829T000000Z-20260829T010000Z-deadbeef.parquet"
+                    ),
+                    "row_count": 2,
+                },
+                "returned Region",
+            ),
+            (
+                {
+                    "region": "us-east-1",
+                    "bucket": "wrong-cost-reports-bucket",
+                    "s3_key": (
+                        "adhoc/region=us-east-1/date=2026-08-29/"
+                        "allocation-20260829T000000Z-20260829T010000Z-deadbeef.parquet"
+                    ),
+                    "row_count": 2,
+                },
+                "unexpected bucket",
+            ),
+            (
+                {
+                    "region": "us-east-1",
+                    "bucket": "gco-live-cost-reports-123456789012-us-east-1",
+                    "s3_key": (
+                        "adhoc/region=us-west-2/date=2026-08-29/"
+                        "allocation-20260829T000000Z-20260829T010000Z-deadbeef.parquet"
+                    ),
+                    "row_count": 2,
+                },
+                "unexpected S3 key",
+            ),
+        ],
+        ids=[
+            "missing-bucket",
+            "missing-key",
+            "zero-rows",
+            "wrong-region",
+            "wrong-bucket",
+            "wrong-key-region",
+        ],
+    )
+    def test_resume_rejects_invalid_completed_report(self, completed_report, message):
+        ctx = _context(
+            state={
+                "opencost_report_attempts": {
+                    "us-east-1": {
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "state": "completed",
+                                "started_at": "2026-08-29T00:00:00+00:00",
+                                "ended_at": "2026-08-29T00:00:01+00:00",
+                                "status_code": 201,
+                                "exact_bridge_timeout": False,
+                                "response_text": "",
+                                "retry_scheduled": False,
+                            }
+                        ],
+                        "duplicate_possible": False,
+                        "completed_report": completed_report,
+                    }
+                }
+            }
+        )
+
+        with pytest.raises(RuntimeError, match=message):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    def test_resume_blocks_an_unresolved_inflight_post(self):
+        ctx = _context(
+            state={
+                "opencost_report_attempts": {
+                    "us-east-1": {
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "state": "started",
+                                "started_at": "2026-08-29T00:00:00+00:00",
+                            }
+                        ],
+                        "duplicate_possible": False,
+                        "completed_report": None,
+                    }
+                }
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="ambiguous in-flight outcome"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "journal",
+        [
+            None,
+            {
+                "attempts": [],
+                "duplicate_possible": False,
+                "completed_report": None,
+            },
+            {
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "state": "completed",
+                        "started_at": "2026-08-29T00:00:00+00:00",
+                        "ended_at": "2026-08-29T00:00:30+00:00",
+                        "exact_bridge_timeout": True,
+                        "retry_scheduled": True,
+                    }
+                ],
+                "duplicate_possible": True,
+                "completed_report": None,
+            },
+            {
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "state": "completed",
+                        "started_at": "2026-08-29T00:00:00+00:00",
+                        "ended_at": "2026-08-29T00:00:30+00:00",
+                        "status_code": 503,
+                        "exact_bridge_timeout": True,
+                        "response_text": "service unavailable",
+                        "retry_scheduled": True,
+                    }
+                ],
+                "duplicate_possible": True,
+                "completed_report": None,
+            },
+            {
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "state": "completed",
+                        "started_at": "2026-08-29T00:00:00+00:00",
+                        "ended_at": "2026-08-29T00:00:30+00:00",
+                        "status_code": 504,
+                        "exact_bridge_timeout": True,
+                        "response_text": json.dumps(
+                            {
+                                "error": "Gateway timeout",
+                                "message": "Upstream failed after 1 attempt(s)",
+                            }
+                        ),
+                        "retry_scheduled": True,
+                    }
+                ],
+                "duplicate_possible": False,
+                "completed_report": None,
+            },
+            {
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "state": "completed",
+                        "started_at": "2026-08-29T00:00:00+00:00",
+                        "ended_at": "2026-08-29T00:00:01+00:00",
+                        "status_code": 503,
+                        "exact_bridge_timeout": False,
+                        "response_text": "service unavailable",
+                        "retry_scheduled": False,
+                    },
+                    {
+                        "attempt": 2,
+                        "state": "started",
+                        "started_at": "2026-08-29T00:00:02+00:00",
+                    },
+                ],
+                "duplicate_possible": False,
+                "completed_report": None,
+            },
+        ],
+        ids=[
+            "null-region-history",
+            "explicit-empty-history",
+            "retry-flags-without-response",
+            "timeout-flag-with-non-timeout-response",
+            "nonsticky-duplicate-flag",
+            "second-attempt-without-timeout-ancestry",
+        ],
+    )
+    def test_corrupt_retry_journal_fails_closed(self, journal):
+        ctx = _context(state={"opencost_report_attempts": {"us-east-1": journal}})
+
+        with pytest.raises(RuntimeError, match="OpenCost .*checkpoint"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    @pytest.mark.parametrize("root", [None, {}], ids=["null", "empty"])
+    def test_present_invalid_journal_root_fails_closed(self, root):
+        ctx = _context(state={"opencost_report_attempts": root})
+
+        with pytest.raises(RuntimeError, match="checkpoint root is malformed"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    def test_malformed_sibling_journal_blocks_fresh_region_post(self):
+        ctx = _context(state={"opencost_report_attempts": {"us-west-2": None}})
+        ctx.deployment_regions = ("us-east-1", "us-west-2")
+
+        with pytest.raises(RuntimeError, match="us-west-2.*malformed"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    def test_valid_sibling_journal_allows_fresh_region_post(self):
+        sibling = {
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "state": "completed",
+                    "started_at": "2026-08-29T00:00:00+00:00",
+                    "ended_at": "2026-08-29T00:00:01+00:00",
+                    "status_code": 503,
+                    "exact_bridge_timeout": False,
+                    "response_text": "service unavailable",
+                    "retry_scheduled": False,
+                }
+            ],
+            "duplicate_possible": False,
+            "completed_report": None,
+        }
+        ctx = _context(state={"opencost_report_attempts": {"us-west-2": sibling}})
+        ctx.deployment_regions = ("us-east-1", "us-west-2")
+        ctx.aws_client.make_authenticated_request.return_value = self._success_response()
+
+        result = checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_called_once()
+        assert result["region"] == "us-east-1"
+        assert set(ctx.checkpoint.state["opencost_report_attempts"]) == {
+            "us-east-1",
+            "us-west-2",
+        }
+
+    def test_unknown_sibling_region_blocks_fresh_region_post(self):
+        ctx = _context(state={"opencost_report_attempts": {"moon-1": None}})
+
+        with pytest.raises(RuntimeError, match="unexpected Region 'moon-1'"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    @pytest.mark.parametrize("attempt_number", [True, 1.0], ids=["boolean", "float"])
+    def test_non_integer_attempt_number_cannot_authorize_retry(self, attempt_number):
+        timeout = self._bridge_timeout_response()
+        journal = {
+            "attempts": [
+                {
+                    "attempt": attempt_number,
+                    "state": "completed",
+                    "started_at": "2026-08-29T00:00:00+00:00",
+                    "ended_at": "2026-08-29T00:00:30+00:00",
+                    "status_code": 504,
+                    "exact_bridge_timeout": True,
+                    "response_text": timeout.text,
+                    "retry_scheduled": True,
+                }
+            ],
+            "duplicate_possible": True,
+            "completed_report": None,
+        }
+        ctx = _context(state={"opencost_report_attempts": {"us-east-1": journal}})
+
+        with pytest.raises(RuntimeError, match="invalid ordering"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    def test_duplicate_key_timeout_journal_cannot_authorize_retry(self):
+        duplicate_key_body = (
+            '{"error":"not-a-timeout","error":"Gateway timeout",'
+            '"message":"Upstream failed after 1 attempt(s)"}'
+        )
+        journal = {
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "state": "completed",
+                    "started_at": "2026-08-29T00:00:00+00:00",
+                    "ended_at": "2026-08-29T00:00:30+00:00",
+                    "status_code": 504,
+                    "exact_bridge_timeout": True,
+                    "response_text": duplicate_key_body,
+                    "retry_scheduled": True,
+                }
+            ],
+            "duplicate_possible": True,
+            "completed_report": None,
+        }
+        ctx = _context(state={"opencost_report_attempts": {"us-east-1": journal}})
+
+        with pytest.raises(RuntimeError, match="invalid timeout evidence"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            _response(503, {"error": "Service unavailable"}, text="unavailable"),
+            _response(504, {"error": "Gateway timeout"}, text="missing exact message"),
+            _response(
+                504,
+                {
+                    "error": "Gateway timeout",
+                    "message": "Upstream failed after 1 attempt(s)",
+                    "request_id": "unexpected-extra-field",
+                },
+                text="superset timeout body",
+            ),
+            _response(
+                504,
+                {
+                    "error": "Gateway timeout",
+                    "message": "Upstream failed after 1 attempt(s)",
+                },
+                text=(
+                    '{"error":"not-a-timeout","error":"Gateway timeout",'
+                    '"message":"Upstream failed after 1 attempt(s)"}'
+                ),
+            ),
+            _response(422, {"detail": "invalid window"}, text="invalid window"),
+        ],
+        ids=[
+            "service-unavailable",
+            "nonexact-504",
+            "superset-504",
+            "duplicate-key-504",
+            "invalid-request",
+        ],
+    )
+    def test_other_failures_are_not_replayed(self, response):
+        ctx = _context()
+        ctx.aws_client.make_authenticated_request.return_value = response
+
+        with (
+            patch.object(checks_opencost.time, "sleep") as sleep,
+            pytest.raises(RuntimeError, match="Ad-hoc cost report"),
+        ):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        ctx.aws_client.make_authenticated_request.assert_called_once()
+        sleep.assert_not_called()
+        checkpointed = ctx.checkpoint.state["opencost_report_attempts"]["us-east-1"]
+        assert checkpointed["duplicate_possible"] is False
+        assert len(checkpointed["attempts"]) == 1
+
+    def test_second_exact_timeout_fails_with_both_attempts_checkpointed(self):
+        ctx = _context()
+        ctx.aws_client.make_authenticated_request.side_effect = [
+            self._bridge_timeout_response(),
+            self._bridge_timeout_response(),
+        ]
+
+        with (
+            patch.object(checks_opencost.time, "sleep") as sleep,
+            pytest.raises(RuntimeError, match="504.*Gateway timeout"),
+        ):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        sleep.assert_called_once_with(checks_opencost._REPORT_RETRY_DELAY_SECONDS)
+        checkpointed = ctx.checkpoint.state["opencost_report_attempts"]["us-east-1"]
+        assert checkpointed["duplicate_possible"] is True
+        assert [item["status_code"] for item in checkpointed["attempts"]] == [504, 504]
+
+    def test_first_attempt_success_is_not_marked_ambiguous(self):
+        ctx = _context()
+        ctx.aws_client.make_authenticated_request.return_value = self._success_response()
+
+        with patch.object(checks_opencost.time, "sleep") as sleep:
+            result = checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        assert result["duplicate_possible"] is False
+        assert [item["status_code"] for item in result["request_attempts"]] == [201]
+        sleep.assert_not_called()
+
+    def test_malformed_success_is_checkpointed_and_never_replayed(self):
+        ctx = _context()
+        malformed = _response(201, text="not-json")
+        malformed.json.side_effect = ValueError("invalid JSON")
+        ctx.aws_client.make_authenticated_request.return_value = malformed
+
+        with pytest.raises(RuntimeError, match="returned invalid JSON"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+
+        checkpointed = ctx.checkpoint.state["opencost_report_attempts"]["us-east-1"]
+        assert checkpointed["attempts"][-1]["state"] == "completed"
+        assert checkpointed["attempts"][-1]["status_code"] == 201
+        assert checkpointed["completed_report"] is None
+        assert ctx.persist_callback.call_count == 2
+
+        ctx.aws_client.make_authenticated_request.reset_mock()
+        with pytest.raises(RuntimeError, match="successful HTTP outcome.*no validated report"):
+            checks_opencost._generate_validation_report(ctx, "us-east-1")
+        ctx.aws_client.make_authenticated_request.assert_not_called()
+
+    def test_action_checkpoints_healthy_status_before_report_generation(self):
+        ctx = _context()
+        status = {
+            "opencost_healthy": True,
+            "opencost_returning_data": True,
+            "allocation_names": ["gco-system"],
+        }
+        with (
+            patch.object(actions_opencost, "_cost_monitoring_configured", return_value=True),
+            patch.object(actions_opencost, "_wait_for_opencost_data", return_value=status),
+            patch.object(
+                actions_opencost,
+                "_generate_validation_report",
+                side_effect=RuntimeError("report failed"),
+            ),
+            pytest.raises(RuntimeError, match="report failed"),
+        ):
+            actions_opencost.action_opencost(ctx)
+
+        assert ctx.checkpoint.state["opencost_status"]["us-east-1"] is status
+        ctx.persist_callback.assert_called_once_with(ctx.checkpoint)
