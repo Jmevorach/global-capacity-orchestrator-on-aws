@@ -17,6 +17,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Literal, TextIO, cast
 
+from .json_utils import loads_without_duplicate_keys
+
 SCHEMA_VERSION = 2
 ActionStatus = Literal["passed", "failed", "skipped"]
 
@@ -43,16 +45,6 @@ def to_jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Reject ambiguous object keys at every level of a persisted checkpoint."""
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON key: {key}")
-        value[key] = item
-    return value
 
 
 _PRIVATE_DIRECTORY_MODE = 0o700
@@ -445,10 +437,7 @@ class RunCheckpoint:
         except (OSError, UnicodeError) as exc:
             raise ValueError(f"Unable to read checkpoint {path}: {exc}") from exc
         try:
-            raw = json.loads(
-                checkpoint_text,
-                object_pairs_hook=_reject_duplicate_json_keys,
-            )
+            raw = loads_without_duplicate_keys(checkpoint_text)
         except ValueError as exc:
             raise ValueError(f"Unable to read checkpoint {path}: {exc}") from exc
         if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:

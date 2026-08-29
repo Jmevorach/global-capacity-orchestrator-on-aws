@@ -11,7 +11,6 @@ answer with non-empty allocations.
 
 from __future__ import annotations
 
-import json
 import re
 import time
 from typing import Any
@@ -20,6 +19,7 @@ from gco.stacks.constants import COST_REPORT_ADHOC_PREFIX, cost_report_bucket_na
 
 from ..checks.jobs import _response_json
 from ..context import _job_transport_region
+from ..json_utils import loads_without_duplicate_keys
 from ..models import RunContext, utc_now
 
 #: Ceiling for the OpenCost data-readiness poll. A fresh deploy needs
@@ -61,24 +61,11 @@ def _is_exact_bridge_timeout_payload(payload: Any) -> bool:
     return isinstance(payload, dict) and payload == _EXACT_BRIDGE_TIMEOUT_BODY
 
 
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in payload:
-            raise ValueError(f"duplicate JSON key: {key}")
-        payload[key] = value
-    return payload
-
-
-def _parse_json_without_duplicate_keys(value: str) -> Any:
-    return json.loads(value, object_pairs_hook=_reject_duplicate_json_keys)
-
-
 def _is_exact_bridge_timeout(response: Any) -> bool:
     if response.status_code != 504:
         return False
     try:
-        payload = _parse_json_without_duplicate_keys(response.text)
+        payload = loads_without_duplicate_keys(response.text)
     except TypeError, ValueError:
         return False
     return _is_exact_bridge_timeout_payload(payload)
@@ -88,7 +75,7 @@ def _is_exact_bridge_timeout_evidence(status_code: int, response_text: str) -> b
     if status_code != 504:
         return False
     try:
-        payload = _parse_json_without_duplicate_keys(response_text)
+        payload = loads_without_duplicate_keys(response_text)
     except TypeError, ValueError:
         return False
     return _is_exact_bridge_timeout_payload(payload)
