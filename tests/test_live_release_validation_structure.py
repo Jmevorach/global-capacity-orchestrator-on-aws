@@ -70,6 +70,7 @@ ROOT_LAYER_MODULES = {
     "constants",
     "context",
     "inventory",
+    "json_utils",
     "models",
     "protected",
 }
