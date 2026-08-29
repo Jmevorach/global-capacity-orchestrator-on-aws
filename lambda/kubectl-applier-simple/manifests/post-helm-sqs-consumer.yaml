@@ -55,6 +55,9 @@ spec:
           project: gco
       spec:
         # Uses the manifest-processor SA (dedicated IRSA role for SQS + K8s access)
+        # Keep ambient Kubernetes credentials disabled. The worker receives
+        # only the two explicitly projected tokens below.
+        automountServiceAccountToken: false
         serviceAccountName: gco-manifest-processor-sa
         priorityClassName: gco-platform-critical
         securityContext:
@@ -139,6 +142,12 @@ spec:
           - name: aws-iam-token
             mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
             readOnly: true
+          # The service account disables ambient token automount. Project a
+          # separate Kubernetes-audience token at the standard client path;
+          # the STS-audience token above cannot authenticate to kube-apiserver.
+          - name: kubernetes-api-token
+            mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+            readOnly: true
         volumes:
         - name: tmp
           emptyDir: {}
@@ -150,6 +159,24 @@ spec:
                   audience: sts.amazonaws.com
                   expirationSeconds: 86400
                   path: token
+        - name: kubernetes-api-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
         restartPolicy: Never
 
   # KEDA scaling configuration
