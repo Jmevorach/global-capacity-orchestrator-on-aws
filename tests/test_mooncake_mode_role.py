@@ -47,6 +47,20 @@ class _RecordingK8s:
             raise ApiException(status=404, reason="Not Found")
         return self.deployments[key]
 
+    def delete_namespaced_deployment(self, name, namespace, **_kwargs):
+        key = (namespace, name)
+        if key not in self.deployments:
+            raise ApiException(status=404, reason="Not Found")
+        return self.deployments.pop(key)
+
+    def patch_namespaced_deployment(self, name, namespace, body=None, **_kwargs):
+        key = (namespace, name)
+        if key not in self.deployments:
+            raise ApiException(status=404, reason="Not Found")
+        if hasattr(body, "spec"):
+            self.deployments[key] = body
+        return self.deployments[key]
+
     def create_namespaced_deployment(self, namespace, body, **_kwargs):
         self.deployments[(namespace, body.metadata.name)] = body
 
@@ -123,7 +137,15 @@ def _reconcile_workers(mode: str, prefill: int, decode: int, protocol: str):
     spec = _build_spec(mode, prefill, decode, protocol)
     endpoint = {"name": "endpoint", "spec": spec}
 
-    asyncio.run(monitor._reconcile_mooncake("endpoint", "gco-inference", spec, endpoint))
+    with (
+        patch("gco.services.inference_monitor.client.AutoscalingV2Api") as hpa_api,
+        patch("gco.services.inference_monitor.client.CustomObjectsApi") as custom_api,
+    ):
+        hpa_api.return_value.read_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(
+            status=404
+        )
+        custom_api.return_value.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        asyncio.run(monitor._reconcile_mooncake("endpoint", "gco-inference", spec, endpoint))
 
     created = {name for (_ns, name) in fake.deployments}
     return created, fake.deployments
@@ -238,7 +260,15 @@ def test_role_pods_use_spec_bootstrap_base_port_override() -> None:
             "transfer": {"protocol": "rdma", "bootstrap_base_port": 9100},
         },
     }
-    asyncio.run(monitor._reconcile_mooncake("endpoint", "gco-inference", spec, {"spec": spec}))
+    with (
+        patch("gco.services.inference_monitor.client.AutoscalingV2Api") as hpa_api,
+        patch("gco.services.inference_monitor.client.CustomObjectsApi") as custom_api,
+    ):
+        hpa_api.return_value.read_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(
+            status=404
+        )
+        custom_api.return_value.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        asyncio.run(monitor._reconcile_mooncake("endpoint", "gco-inference", spec, {"spec": spec}))
 
     dep = fake.deployments[("gco-inference", "endpoint-prefill")]
     env = _container_env(dep)
