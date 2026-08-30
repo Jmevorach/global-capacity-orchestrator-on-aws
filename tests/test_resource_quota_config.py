@@ -253,9 +253,9 @@ class TestResourceQuotaErrorMessages:
 # changes along with them) never rolled out.
 #
 # This test enumerates every {{...}} placeholder in every manifest YAML
-# and asserts that the CDK stack's regional_stack.py source file contains
-# a matching string literal. If a placeholder is added to a manifest, CDK
-# must be updated to provide it.
+# and asserts that a production replacement source contains a matching string
+# literal. Most replacements live in regional_stack.py; dependency-light pure
+# renderers may own their tokens in a leaf module imported by that stack.
 
 
 class TestManifestTemplatePlaceholderCoverage:
@@ -263,7 +263,10 @@ class TestManifestTemplatePlaceholderCoverage:
     corresponding replacement string literal in the CDK stack source."""
 
     MANIFEST_DIR = Path("lambda/kubectl-applier-simple/manifests")
-    CDK_STACK = Path("gco/stacks/regional_stack.py")
+    REPLACEMENT_SOURCES = (
+        Path("gco/stacks/regional_stack.py"),
+        Path("gco/inference_proxy_config.py"),
+    )
 
     # Placeholders that are intentionally only provided for specific
     # features (FSx, Valkey, Mooncake store, etc.) and may be absent when
@@ -297,24 +300,24 @@ class TestManifestTemplatePlaceholderCoverage:
                 yield yaml_path.name, match.group(1)
 
     def test_every_placeholder_has_cdk_replacement(self):
-        """For every {{NAME}} placeholder used in a manifest, the CDK stack
-        source must contain either {{NAME}} (as a dict key) somewhere, or
-        NAME must be in OPTIONAL_PLACEHOLDERS."""
-        cdk_src = self.CDK_STACK.read_text()
+        """Every required manifest token has a production replacement literal."""
+        replacement_src = "\n".join(
+            path.read_text(encoding="utf-8") for path in self.REPLACEMENT_SOURCES
+        )
 
         missing = set()
         for filename, placeholder in self._iter_placeholders():
             if placeholder in self.OPTIONAL_PLACEHOLDERS:
                 continue
             needle = "{{" + placeholder + "}}"
-            if needle not in cdk_src:
+            if needle not in replacement_src:
                 missing.add((filename, placeholder))
 
         assert not missing, (
             "The following kubectl-applier manifest placeholders have no "
-            "matching replacement in gco/stacks/regional_stack.py. Any manifest "
-            "containing these placeholders will be SKIPPED at deploy time by "
-            "the kubectl-applier Lambda, leaving the associated Deployment/"
+            "matching replacement in the reviewed production replacement "
+            "sources. Any manifest containing these placeholders will be "
+            "SKIPPED at deploy time by the kubectl-applier Lambda, leaving the "
             "resource stale. Either add the replacement to the CDK stack or "
             "add the placeholder to OPTIONAL_PLACEHOLDERS in this test if "
             "it's intentionally feature-gated:\n  "
