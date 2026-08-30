@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import subprocess
 import time
 from collections.abc import Callable
 from typing import Any, cast
 
 from .inference_common import ManagedInferenceValidationError
+
+_TUNNEL_HEARTBEAT_INTERVAL_SECONDS = 240.0
 
 
 class InferenceRuntimeMixin:
@@ -38,6 +41,60 @@ class InferenceRuntimeMixin:
         raise NotImplementedError
 
     _kubectl_json: Callable[..., Any | None]
+    kubectl: Callable[..., tuple[int, str, str]]
+
+    def keep_cluster_tunnel_alive(
+        self,
+        record: dict[str, Any],
+        last_heartbeat: float,
+        *,
+        deadline: float | None = None,
+    ) -> float:
+        """Send bounded Kubernetes traffic before SSM's idle-session timeout."""
+        now = time.monotonic()
+        if now - last_heartbeat < _TUNNEL_HEARTBEAT_INTERVAL_SECONDS:
+            return last_heartbeat
+        process_timeout = 8.0
+        if deadline is not None:
+            remaining = deadline - now
+            if remaining <= 0:
+                raise ManagedInferenceValidationError(
+                    "managed inference tunnel heartbeat deadline expired"
+                )
+            process_timeout = min(process_timeout, remaining)
+        observation: dict[str, Any] = {"started_at_monotonic": now}
+        try:
+            returncode, stdout, stderr = self.kubectl(
+                "--request-timeout=5s",
+                "get",
+                "--raw=/readyz",
+                timeout=process_timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            observation.update(
+                {
+                    "healthy": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        else:
+            observation.update(
+                {
+                    "healthy": returncode == 0 and stdout.strip() == "ok",
+                    "returncode": returncode,
+                    "stderr": stderr[-1000:],
+                }
+            )
+        history = record.setdefault("tunnel_heartbeats", [])
+        if not isinstance(history, list):
+            raise ManagedInferenceValidationError("managed tunnel heartbeat history is invalid")
+        history.append(observation)
+        self._persist()
+        if observation["healthy"] is not True:
+            raise ManagedInferenceValidationError(
+                "managed inference Kubernetes tunnel heartbeat failed"
+            )
+        return time.monotonic()
 
     def wait_for_ddb_running(self, plan: Any, record: dict[str, Any]) -> None:
         """Require this run's exact DDB record and running regional observation."""

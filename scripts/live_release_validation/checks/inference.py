@@ -710,11 +710,13 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         if not isinstance(attempts, list):
             raise ManagedInferenceValidationError("managed backend probe history is invalid")
         deadline = time.monotonic() + self.settings.readiness_timeout_seconds
+        heartbeat_at = time.monotonic()
         while True:
             if time.monotonic() >= deadline:
                 raise ManagedInferenceValidationError(
                     "managed health did not converge before timeout"
                 )
+            heartbeat_at = self.keep_cluster_tunnel_alive(record, heartbeat_at, deadline=deadline)
             item = self._strong_get(record)
             if item is None or not self._is_owned(item):
                 raise ManagedInferenceValidationError("managed ownership changed during health")
@@ -731,7 +733,6 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                 raise ManagedInferenceValidationError(
                     "managed endpoint stopped running during health"
                 )
-
             attempt: dict[str, Any] = {
                 "attempt": len(attempts) + 1,
                 "started_at_monotonic": time.monotonic(),
@@ -938,8 +939,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
             or isinstance(record.get("invoke_journal"), dict)
         ):
             return
-        # Persisted booleans are not authority. Re-prove strong DDB and complete
-        # Kubernetes absence before closing the old incarnation.
+        # Re-prove strong DDB and Kubernetes absence before closing the old incarnation.
         evidence = self.prove_absence(record)
         if evidence.get("stable_absence_observations") != 2:
             raise ManagedInferenceValidationError(
@@ -957,6 +957,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                 "absence_evidence": evidence,
                 "commands": record.get("commands", []),
                 "backend_probe_attempts": record.get("backend_probe_attempts", []),
+                "tunnel_heartbeats": record.get("tunnel_heartbeats", []),
                 "cleanup_attempts": record.get("cleanup_attempts", []),
                 "failures": record.get("failures", []),
             }
@@ -979,6 +980,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         for key in (
             "backend_probe_evidence",
             "backend_probe_attempts",
+            "tunnel_heartbeats",
             "invoke_evidence",
             "invoke_journal",
             "hpa_stability_observations",
@@ -1001,18 +1003,16 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
             and record["invoke_evidence"].get("generated_text_non_empty") is True
         )
         if record.get("validation_steps_complete") is True or invocation_finished:
-            # A crash can land after invoke or after cleanup but before execute()
-            # flips validation_complete. Never recreate or reinvoke in either
-            # window; the caller's finally only needs to finish/prove cleanup.
+            # A crash after invoke or cleanup must never recreate or reinvoke;
+            # the caller's finally only needs to finish/prove cleanup.
             record["validation_steps_complete"] = True
             record["phase"] = "validation-complete-resume"
             self._persist()
             return False
         journal = record.get("invoke_journal")
         if isinstance(journal, dict) and not isinstance(record.get("invoke_evidence"), dict):
-            # The invocation intent is a one-way boundary. A durable success is
-            # parsed into evidence without another request; any other persisted
-            # state fails closed and the caller's finally performs cleanup.
+            # Invocation intent is one-way: recover durable success without a request;
+            # any other persisted state fails closed for cleanup.
             self.invoke(plan, record)
             record["validation_steps_complete"] = True
             self._persist()

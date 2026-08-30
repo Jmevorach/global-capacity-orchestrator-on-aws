@@ -1715,6 +1715,47 @@ class TestWireContractAndHpaDeadline:
 
 
 class TestBackendProbeContracts:
+    def test_cluster_tunnel_heartbeat_is_bounded_and_rate_limited(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+        def kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            calls.append((args, kwargs))
+            return 0, "ok\n", ""
+
+        runner, _, records, _ = _lifecycle(tmp_path, kubectl=kubectl)
+        clock = SimpleNamespace(now=300.0)
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: float(clock.now))
+
+        heartbeat = runner.keep_cluster_tunnel_alive(records[0], 0.0, deadline=304.0)
+        clock.now = 301.0
+        assert runner.keep_cluster_tunnel_alive(records[0], heartbeat) == heartbeat
+
+        assert heartbeat == 300.0
+        assert calls == [(("--request-timeout=5s", "get", "--raw=/readyz"), {"timeout": 4.0})]
+        assert records[0]["tunnel_heartbeats"] == [
+            {
+                "started_at_monotonic": 300.0,
+                "healthy": True,
+                "returncode": 0,
+                "stderr": "",
+            }
+        ]
+
+    def test_cluster_tunnel_heartbeat_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, _, records, _ = _lifecycle(
+            tmp_path,
+            kubectl=lambda *args, **kwargs: (1, "", "connection refused"),
+        )
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: 300.0)
+
+        with pytest.raises(ManagedInferenceValidationError, match="heartbeat failed"):
+            runner.keep_cluster_tunnel_alive(records[0], 0.0)
+        assert records[0]["tunnel_heartbeats"][0]["healthy"] is False
+
     def test_vllm_requires_healthy_response_and_configured_model(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2040,6 +2081,7 @@ class TestIncarnationRotation:
                 "http_status": 502,
             }
         ]
+        heartbeats = [{"started_at_monotonic": 240.0, "healthy": True}]
         record.update(
             {
                 "lifecycle_id": LIFECYCLE_ID,
@@ -2047,6 +2089,7 @@ class TestIncarnationRotation:
                 "cleanup_phase": "absent",
                 "absence_proven": True,
                 "backend_probe_attempts": probe_attempts,
+                "tunnel_heartbeats": heartbeats,
             }
         )
         evidence = {
@@ -2070,11 +2113,13 @@ class TestIncarnationRotation:
                 "absence_evidence": evidence,
                 "commands": [],
                 "backend_probe_attempts": probe_attempts,
+                "tunnel_heartbeats": heartbeats,
                 "cleanup_attempts": [],
                 "failures": [],
             }
         ]
         assert "backend_probe_attempts" not in record
+        assert "tunnel_heartbeats" not in record
 
     def test_closed_lifecycle_is_never_readopted_and_new_lifecycle_binds(
         self, tmp_path: Path

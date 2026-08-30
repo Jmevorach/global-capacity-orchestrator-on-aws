@@ -51,6 +51,6 @@ Both modes require HTTPS/443 with a public root bundle loaded from SSM, TLS 1.2 
 
 Retries apply only to `GET` and `HEAD` for 429/502/503/504 or retryable transport failures. `POST` is attempted exactly once and is never replayed. Locally generated failures are bounded JSON messages and do not expose secret, certificate, registry, or backend details.
 
-The selected upstream status and end-to-end headers are attached with `awslambda.HttpResponseStream.from`, then the upstream body is piped with backpressure. The Lambda runtime owns the streaming metadata prelude and transfer framing; the handler does not construct framing bytes. A downstream disconnect aborts and destroys the upstream request/response.
+The handler writes API Gateway's response metadata JSON and required eight-null-byte delimiter as one bounded prefix, then pipes the upstream body with backpressure. The prefix is emitted even when the upstream body is empty, and locally generated errors await stream completion before the handler returns. A downstream disconnect aborts and destroys the upstream request/response.
 
 Both edge/global and regional modes can stream for the Lambda invocation's full remaining budget (up to the 15-minute Lambda/API Gateway integration limit, with one second reserved for response handling). Edge/global mode retains a 30-second **idle** timeout, while regional mode uses a 5-minute idle timeout; each timeout resets while response bytes continue to arrive.

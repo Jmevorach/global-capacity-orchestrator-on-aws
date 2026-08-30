@@ -570,7 +570,6 @@ test("forwardRequest maps terminal transport failures without unsafe retries", a
 });
 
 test("stream finalization fails safely before and after metadata framing", async () => {
-  const originalFrom = globalThis.awslambda.HttpResponseStream.from;
   const metadataFailure = {
     response: Readable.from(["never-written"]),
     cleanupCalls: 0,
@@ -582,30 +581,21 @@ test("stream finalization fails safely before and after metadata framing", async
       this.destroyCalls += 1;
     },
   };
-  globalThis.awslambda.HttpResponseStream.from = () => {
-    throw new Error("framing failed");
-  };
-  try {
-    await assert.rejects(
-      __test.streamFinalResponse(
-        metadataFailure,
-        new CollectingWritable(),
-        { started: false },
-        new AbortController().signal,
-      ),
-      (error) => error instanceof __test.PublicError && error.statusCode === 500,
-    );
-    assert.equal(metadataFailure.cleanupCalls, 1);
-    assert.equal(metadataFailure.destroyCalls, 1);
-
-    await __test.sendJsonError(
-      new CollectingWritable(),
-      500,
-      "Internal server error",
-    );
-  } finally {
-    globalThis.awslambda.HttpResponseStream.from = originalFrom;
-  }
+  await assert.rejects(
+    __test.streamFinalResponse(
+      metadataFailure,
+      {
+        write() {
+          throw new Error("framing failed");
+        },
+      },
+      { started: false },
+      new AbortController().signal,
+    ),
+    (error) => error instanceof __test.PublicError && error.statusCode === 500,
+  );
+  assert.equal(metadataFailure.cleanupCalls, 1);
+  assert.equal(metadataFailure.destroyCalls, 1);
 
   const streamFailure = {
     response: new Readable({
@@ -639,7 +629,7 @@ test("streamingHandler completes global and regional streaming requests", async 
   const globalDependencies = baseDependencies({
     async forwardRequest(args) {
       globalCapture.args = args;
-      const output = globalThis.awslambda.HttpResponseStream.from(
+      const output = __test.beginStreamingResponse(
         args.responseStream,
         { statusCode: 200, headers: { "content-type": "text/plain" } },
       );
@@ -696,7 +686,7 @@ test("streamingHandler completes global and regional streaming requests", async 
       },
       async forwardRequest(args) {
         regionalCapture.args = args;
-        const output = globalThis.awslambda.HttpResponseStream.from(
+        const output = __test.beginStreamingResponse(
           args.responseStream,
           { statusCode: 201, headers: {} },
         );
@@ -739,7 +729,7 @@ test("streamingHandler forwards a body between 8 KiB and 1 MiB intact", async ()
     baseDependencies({
       async forwardRequest(args) {
         forwardedBody = args.bodyBuffer;
-        const output = globalThis.awslambda.HttpResponseStream.from(
+        const output = __test.beginStreamingResponse(
           args.responseStream,
           { statusCode: 200, headers: {} },
         );

@@ -269,7 +269,6 @@ def start_api_tunnel(
         ) from exc
 
     deadline = time.monotonic() + ready_wait_seconds
-    last_error = "listener was not probed"
     try:
         while True:
             if detail := exited_api_tunnel_detail(proc):
