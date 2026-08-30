@@ -19,11 +19,11 @@ import boto3
 import urllib3
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``get_backend_http_pool`` -> ``diagrams/code_diagrams/lambda/tls-shared/backend_tls.get_backend_http_pool.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/tls-shared/backend_tls.get_backend_http_pool.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

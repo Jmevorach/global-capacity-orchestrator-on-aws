@@ -25,11 +25,11 @@ import shutil
 import subprocess
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``detect_container_runtime`` -> ``diagrams/code_diagrams/cli/_container_runtime.detect_container_runtime.html``
 #     (PNG: ``diagrams/code_diagrams/cli/_container_runtime.detect_container_runtime.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

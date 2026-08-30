@@ -2,7 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
         <title>Mission script AST validator (parse-time allowlist enforcement)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,27 +206,27 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op5935=>operation: 'Parse and validate a Mission script source string.\n\n    On success, the function returns ``None`` and the caller may pass\n    ``script`` to the sandbox runtime layer. On any disallowed\n    construct, raises :class:`ScriptRejected` carrying ``reason``,\n    ``failing_node``, ``lineno``, and ``col_offset``. The script is\n    *never* executed by this function; it only walks the AST.\n\n    ``allowlist`` is the per-session list of MCP tool names the script\n    may call. Each name becomes a visible bare-Name and a permitted\n    call target. Names not in the allowlist (and not in the safe\n    builtin / exception / mission set) are rejected at every Name\n    lookup.\n    '
-cond5938=>operation: raise ScriptRejected('not_a_string', message='script source must be a str') if  not isinstance(script, str)
-op5951=>operation: parsed = ast.parse(script, mode='exec')
-cond5948=>condition: exception raised?
-cond5953=>condition: except SyntaxError as exc
-op5957=>operation: rejection = ScriptRejected('syntax_error', message=f'could not parse script: {exc.msg}')
-op5959=>operation: rejection.lineno = exc.lineno
-op5961=>operation: rejection.col_offset = exc.offset
-sub5963=>subroutine: raise rejection from exc
-sub5968=>subroutine: _ScriptValidator(allowlist).visit(parsed)
+        <div><textarea id="code" style="width: 100%;" rows="11">op6090=>operation: 'Parse and validate a Mission script source string.\n\n    On success, the function returns ``None`` and the caller may pass\n    ``script`` to the sandbox runtime layer. On any disallowed\n    construct, raises :class:`ScriptRejected` carrying ``reason``,\n    ``failing_node``, ``lineno``, and ``col_offset``. The script is\n    *never* executed by this function; it only walks the AST.\n\n    ``allowlist`` is the per-session list of MCP tool names the script\n    may call. Each name becomes a visible bare-Name and a permitted\n    call target. Names not in the allowlist (and not in the safe\n    builtin / exception / mission set) are rejected at every Name\n    lookup.\n    '
+cond6093=>operation: raise ScriptRejected('not_a_string', message='script source must be a str') if  not isinstance(script, str)
+op6106=>operation: parsed = ast.parse(script, mode='exec')
+cond6103=>condition: exception raised?
+cond6108=>condition: except SyntaxError as exc
+op6112=>operation: rejection = ScriptRejected('syntax_error', message=f'could not parse script: {exc.msg}')
+op6114=>operation: rejection.lineno = exc.lineno
+op6116=>operation: rejection.col_offset = exc.offset
+sub6118=>subroutine: raise rejection from exc
+sub6123=>subroutine: _ScriptValidator(allowlist).visit(parsed)
 
-op5935->cond5938
-cond5938->op5951
-op5951->cond5948
-cond5948(yes)->cond5953
-cond5953(yes)->op5957
-op5957->op5959
-op5959->op5961
-op5961->sub5963
-cond5953(no)->sub5968
-cond5948(no)->sub5968
+op6090->cond6093
+cond6093->op6106
+op6106->cond6103
+cond6103(yes)->cond6108
+cond6108(yes)->op6112
+op6112->op6114
+op6114->op6116
+op6116->sub6118
+cond6108(no)->sub6123
+cond6103(no)->sub6123
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -236,10 +236,10 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
           </p>
           <div id="canvas"></div>
         </div>

@@ -49,7 +49,7 @@ from ._image_uri import (
 from .config import GCOConfig, _load_cdk_json, get_config
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``ImageManager.build`` -> ``diagrams/code_diagrams/cli/images.ImageManager_build.html``
 #     (PNG: ``diagrams/code_diagrams/cli/images.ImageManager_build.png``)
@@ -57,7 +57,7 @@ from .config import GCOConfig, _load_cdk_json, get_config
 #     (PNG: ``diagrams/code_diagrams/cli/images.ImageManager_push.png``)
 #   * ``ImageManager.cleanup`` -> ``diagrams/code_diagrams/cli/images.ImageManager_cleanup.html``
 #     (PNG: ``diagrams/code_diagrams/cli/images.ImageManager_cleanup.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

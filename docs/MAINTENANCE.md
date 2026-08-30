@@ -24,6 +24,7 @@ review decisions.
 - [Routine dependency bumps](#routine-dependency-bumps)
 - [Refreshing the Bedrock default model](#refreshing-the-bedrock-default-model)
 - [Maintaining the MCP server](#maintaining-the-mcp-server)
+  - [Repository inventory symmetry](#repository-inventory-symmetry)
 - [Dependency management policy](#dependency-management-policy)
 - [Testing and CI hygiene](#testing-and-ci-hygiene)
 - [Release and deployment](#release-and-deployment)
@@ -463,12 +464,12 @@ the repo or CI fails — most of this is "when you add X, register it in Y":
 
 | When you… | Update | Guard |
 |-----------|--------|-------|
-| Add a `docs/*.md` guide | `DOC_METADATA` in `gco_mcp/resources/docs.py` (keep `topics` from the existing small vocabulary; every `related` entry must reference a real key) | `tests/test_mcp_docs_index.py` |
+| Add a `docs/*.md` guide | `DOC_METADATA` in `gco_mcp/resources/docs.py` and the human index in `docs/README.md` (keep `topics` from the existing small vocabulary; every `related` entry must reference a real key) | `tests/test_mcp_docs_index.py`, `tests/test_documentation_consistency.py` |
 | Add an `examples/*.yaml` manifest | `EXAMPLE_METADATA` in `gco_mcp/resources/docs.py` | `find_examples` discovery |
 | Add a package README meant for agents | `PACKAGE_DOC_METADATA` in `gco_mcp/resources/docs.py` | `tests/test_mcp_docs_index.py` |
 | Add a normative root document | The root Markdown file, `ROOT_DOC_METADATA`, a static `docs://gco/{name}` resource, and `docs_index()` in `gco_mcp/resources/docs.py` | `tests/test_mcp_docs_index.py`, `tests/test_mcp_server.py`, `tests/test_mcp_integration.py` |
 | Add or rename an MCP tool | the Tool Reference table (and the per-module count) in `gco_mcp/tools/README.md` | `tests/test_docs_coverage.py` |
-| Gate a tool behind a feature flag | `gco_mcp/feature_flags.py`, and document the flag in `gco_mcp/README.md` | — |
+| Gate a tool behind a feature flag | `gco_mcp/feature_flags.py`, `gco_mcp/resources/self.py`, and the exact tool inventory in `gco_mcp/README.md` | `tests/test_mcp_gating_consistency.py` |
 
 Notes:
 
@@ -481,6 +482,18 @@ Notes:
 - This guide is itself registered in `DOC_METADATA`, so `find_docs` surfaces it
   to agents — the same step every new guide needs.
 
+### Repository inventory symmetry
+
+Human indexes are executable contracts, not best-effort lists:
+
+| When you… | Update together | Guard |
+|-----------|-----------------|-------|
+| Add/remove a top-level guide | `docs/*.md`, `docs/README.md`, and MCP metadata when agent-facing | `tests/test_documentation_consistency.py`, `tests/test_mcp_docs_index.py` |
+| Add/remove a CLI command module | `cli/commands/*_cmd.py`, `cli/main.py`, `docs/CLI.md` TOC, and `cli/README.md` | `tests/test_documentation_consistency.py` |
+| Add/remove a workflow | `.github/workflows/*.yml`, `.github/CI.md`, `.github/workflows/README.md`, `CONTRIBUTING.md`, and the wiki summary | `tests/test_documentation_consistency.py` |
+| Add/remove a production image group | `pyproject.toml` `image-*`, its one matching Dockerfile, and `CONTRIBUTING.md` | `tests/test_documentation_consistency.py` |
+| Change MCP tool counts | `README.md`, `QUICKSTART.md`, `gco_mcp/README.md`, and `gco_mcp/tools/README.md` | `tests/test_mcp_tool_count_docs.py` |
+
 ## Dependency management policy
 
 GCO pins **every** direct dependency to an exact version and commits a fully
@@ -488,9 +501,9 @@ resolved lockfile, so a clean checkout installs the same graph CI ran.
 
 ### What is pinned, and where
 
-- Direct Python deps and their extras (`cdk`, `diagrams`, `inference-monitor`,
-  `mcp`, `lint`, `typecheck`, `test`, `security`, `dev`) — exact `==` pins in
-  `pyproject.toml`.
+- Direct Python deps and their extras (`cdk`, `diagrams`, `mcp`, `lint`,
+  `typecheck`, `test`, `security`, `dev`, and the six production `image-*`
+  groups) — exact `==` pins in `pyproject.toml`.
 - The Python build backend — an exact `==` pin in `pyproject.toml`
   `[build-system] requires` (setuptools). pip resolves it inside build
   isolation, so it never appears in the runtime environment or the lock;
@@ -644,8 +657,11 @@ There is no auto-retry wrapper — a flake is treated as a bug, not hidden.
   `requirements-lock.txt`; the mypy jobs key `.mypy_cache` on
   `hashFiles('pyproject.toml', 'requirements-lock.txt')`. Both invalidate
   automatically when dependencies change — don't hand-clear them.
-- **Runners and tools:** jobs run on `ubuntu-latest` with actions pinned by
-  major version (bumped by Dependabot). Hand-installed CI tools — Trivy (the
+- **Runners and tools:** jobs run on GitHub-hosted runners. Every third-party
+  action is pinned to an immutable 40-character commit SHA with its exact
+  `# vX.Y.Z` tag as the maintenance comment; Dependabot updates both halves.
+  Local `./.github/actions/*` references resolve inside the checked-out commit
+  and therefore need no external SHA. Hand-installed CI tools — Trivy (the
   `install-trivy` action's `version` default), Helm and kubectl (derived at
   runtime from the `lambda/helm-installer/Dockerfile` pins), and the kind node
   image (`KIND_NODE_IMAGE` in `integration-tests.yml`) — are tracked by the
@@ -813,16 +829,24 @@ surfaces version drift as a single rolling issue.
 
 ### Keep the diagrams current
 
-`diagrams/infra_diagrams/` (per-stack CDK views) and `diagrams/code_diagrams/`
-(per-function flowcharts) regenerate via their `generate.py` scripts. Refresh
-them when architecture or a charted handler changes so the visual docs don't
-rot. One code-diagram generation uses one UTC timestamp across HTML metadata
-and visible content, PNG pixels, the generated README, and every source marker.
-Normal runs intentionally record their wall-clock invocation time and can
-produce metadata-only changes even when source code is unchanged. Set a fixed
-integer `SOURCE_DATE_EPOCH` when byte-reproducible output is required. Never
-hand-edit an individual artifact's timestamp — regenerate the complete target
-catalogue.
+`diagrams/generate.py` is the canonical driver for the per-stack CDK views and
+per-function code flowcharts. Refresh both catalogues whenever architecture or
+a charted flow changes, then run the read-only contract:
+
+```bash
+SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+python diagrams/generate.py --check
+```
+
+Use `--code-only` or `--infra-only` only when the other catalogue is known to be
+unchanged. Canonical code generation records one fixed UTC timestamp across
+HTML metadata and visible content, PNG pixels, the generated README, and source
+markers. The fixed epoch prevents timestamp-only churn; it does not guarantee
+byte-identical Graphviz/Chromium output across platforms. The structural check
+requires exact artifact/index/marker symmetry, and
+`tests/test_diagram_artifact_contract.py` verifies every committed PNG with
+Pillow. Never hand-edit generated marker blocks, indexes, artifacts, or
+timestamps.
 
 ## Onboarding for maintainers
 

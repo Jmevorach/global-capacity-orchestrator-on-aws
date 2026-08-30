@@ -27,9 +27,11 @@ Six primary workflows run on every push and pull request:
 - **Inference streaming proxy** — native Node.js tests for the production
   streaming Lambda with their own coverage thresholds.
 
-Satellite workflows handle releases, weekly CVE re-scans, a monthly
-dependency-drift scan that manages its own rolling issue, and the Pages
-deployment that publishes this site.
+Eight satellite workflows cover the two-stage release path, weekly CVE
+re-scans, the monthly dependency-drift issue, Pages publication, the pinned
+Mooncake image contract, pull-request type labelling, and real-Grafana
+dashboard provisioning. See the CI reference for their exact triggers and
+permissions.
 
 ## The coverage gate
 

@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
+        <title>Capacity snapshot poller (Region truth, pooled scores, bounded retries, writes)</title>
+        <style type="text/css">
+          .end-element { fill : #FFCCFF; }
+        </style>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/raphael/2.3.0/raphael.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/flowchart/1.17.1/flowchart.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.1/js/bootstrap.bundle.min.js"></script>
+        <!-- <script src="../release/flowchart.min.js"></script> -->
+        <script>
+
+            window.onload = function () {
+                var btn = document.getElementById("run"),
+                    cd = document.getElementById("code"),
+                    chart;
+
+                (btn.onclick = function () {
+                    var code = cd.value;
+
+                    if (chart) {
+                      chart.clean();
+                    }
+
+                    chart = flowchart.parse(code);
+                    chart.drawSVG('canvas', {
+                      'x': 0,
+                      'y': 0,
+                      'line-width': 3,
+                      //'maxWidth': 15,//ensures the flowcharts fits within a certain width
+                      'line-length': 50,
+                      'text-margin': 10,
+                      'font-size': 14,
+                      'font': 'normal',
+                      'font-family': 'Helvetica',
+                      'font-weight': 'normal',
+                      'font-color': 'black',
+                      'line-color': 'black',
+                      'element-color': 'black',
+                      'fill': 'white',
+                      'yes-text': 'yes',
+                      'no-text': 'no',
+                      'arrow-end': 'block',
+                      'scale': 1,
+                      'symbols': {
+                        'start': {
+                          'font-size': 14,
+                          'font-color': 'yellow',
+                          'element-color': 'blue',
+                          'fill': 'green',
+                          'class': 'start-element'
+                        },
+                        'inputoutput': {
+                          'font-color': 'black',
+                          'element-color': 'black',
+                          'fill': 'bisque'
+                        },
+                        'operation': {
+                          'font-color': 'black',
+                          'element-color': 'black',
+                          'fill': 'linen'
+                        },
+                        'subroutine': {
+                          'font-color': 'black',
+                          'element-color': 'blue',
+                          'fill': 'lightgreen'
+                        },
+                        'condition': {
+                          'font-color': 'red',
+                          'element-color': 'black',
+                          'fill': 'yellow'
+                        },
+                        'end':{
+                          'font-size': 20,
+                          'class': 'end-element'
+                        }
+                      },
+                      'flowstate' : {
+                        //'past' : { 'fill' : '#CCCCCC', 'font-size' : 12},
+                        //'current' : {'fill' : 'yellow', 'font-color' : 'red', 'font-weight' : 'bold'},
+                        //'future' : { 'fill' : '#FFFF99'},
+                        'request' : { 'fill' : 'blue'},
+                        'invalid': {'fill' : '#444444'},
+                        'approved' : { 'fill' : '#58C4A3', 'font-size' : 12, 'yes-text' : 'APPROVED', 'no-text' : 'n/a' },
+                        'rejected' : { 'fill' : '#C45879', 'font-size' : 12, 'yes-text' : 'n/a', 'no-text' : 'REJECTED' }
+                      }
+                    });
+                    //create base64 encoding of SVG to generate download link for title(without html or htm).SVG
+                    var currentCanvasDIV = document.getElementById('canvas')
+                    var currentDrawSVG = currentCanvasDIV.innerHTML.replaceAll('ë','e');
+
+                    const OUTsvgBASE64 = btoa(currentDrawSVG)
+                    doctitle = document.title.replace('.html','');
+                    doctitle = doctitle.replace('.htm','');
+
+
+                    var currentCanvasDIV = document.getElementById('canvas')
+                    var currentDrawSVG = currentCanvasDIV.innerHTML.replaceAll('ë','e');
+                    svgSource = currentDrawSVG
+                    svgXML = currentDrawSVG;
+                    // Use SVG Height and Width from the SVG XML to set canvas size
+                    svgXMLsubstringHeight = svgXML.substring(svgXML.indexOf('height='), svgXML.indexOf('version='));
+                    svgXMLsubstringWidth = svgXML.substring(svgXML.indexOf('width='), svgXML.indexOf('xmlns='));
+                    HeightValue = svgXMLsubstringHeight.substring(svgXMLsubstringHeight.indexOf('"')+1,svgXMLsubstringHeight.lastIndexOf('"'));
+                    WidthValue = svgXMLsubstringWidth.substring(svgXMLsubstringWidth.indexOf('"')+1,svgXMLsubstringWidth.lastIndexOf('"'));
+                    HeightValueInt = Math.round(HeightValue)
+                    WidthValueInt = Math.round(WidthValue)
+                    // setup input for base64SvgToBase64Png
+                    let svgSrc = "data:image/svg+xml;base64,"+OUTsvgBASE64;
+                    var pngBase
+                    imageUtil.base64SvgToBase64Png(svgSrc, WidthValueInt, HeightValueInt).then(pngSrc => {
+                    pngBase = pngSrc
+                    // output download link for base64 PNG converted on download from base64
+                    var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
+                    document.getElementById("pngbase64").innerHTML=pngOutHtml;
+                    });
+                    // output download link for base64 SVG converted on download from base64
+                    var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
+                        document.getElementById("svgbase64").innerHTML=svgOutHtml;
+                    })();
+
+                            };
+
+
+// derived from https://stackoverflow.com/a/64800570
+// we need to use web browser canvas to generate a image. In this case png
+let imageUtil = {};
+/**
+ * converts a base64 encoded data url SVG image to a PNG image
+ * @param originalBase64 data url of svg image
+ * @param width target width in pixel of PNG image
+ * @param secondTry used internally to prevent endless recursion
+ * @return {Promise<unknown>} resolves to png data url of the image
+ */
+imageUtil.base64SvgToBase64Png = function (originalBase64, width, height, secondTry) {
+    return new Promise(resolve => {
+        let img = document.createElement('img');
+        img.onload = function () {
+            if (!secondTry && (img.naturalWidth === 0 || img.naturalHeight === 0)) {
+                let svgDoc = base64ToSvgDocument(originalBase64);
+                let fixedDoc = fixSvgDocumentFF(svgDoc);
+                return imageUtil.base64SvgToBase64Png(svgDocumentToBase64(fixedDoc), width, height, true).then(result => {
+                    resolve(result);
+                });
+            }
+            //document.body.appendChild(img);
+            let canvas2 = document.createElement("canvas");
+            //document.body.removeChild(img);
+            canvas2.width = width;
+            canvas2.height = height;
+            let ctx = canvas2.getContext("2d");
+            ctx.drawImage(img, 0, 0, canvas2.width, canvas2.height);
+            try {
+                let data = canvas2.toDataURL('image/png');
+                resolve(data);
+            } catch (e) {
+                resolve(null);
+            }
+        };
+        img.src = originalBase64;
+    });
+}
+
+//needed because Firefox doesn't correctly handle SVG with size = 0, see https://bugzilla.mozilla.org/show_bug.cgi?id=700533
+function fixSvgDocumentFF(svgDocument) {
+    try {
+        let widthInt = parseInt(svgDocument.documentElement.width.baseVal.value) || 500;
+        let heightInt = parseInt(svgDocument.documentElement.height.baseVal.value) || 500;
+        svgDocument.documentElement.width.baseVal.newValueSpecifiedUnits(SVGLength.SVG_LENGTHTYPE_PX, widthInt);
+        svgDocument.documentElement.height.baseVal.newValueSpecifiedUnits(SVGLength.SVG_LENGTHTYPE_PX, heightInt);
+        return svgDocument;
+    } catch (e) {
+        return svgDocument;
+    }
+}
+
+function svgDocumentToBase64(svgDocument) {
+    try {
+        let base64EncodedSVG = btoa(new XMLSerializer().serializeToString(svgDocument));
+        return 'data:image/svg+xml;base64,' + base64EncodedSVG;
+    } catch (e) {
+        return null;
+    }
+}
+
+function base64ToSvgDocument(base64) {
+    let svg = atob(base64.substring(base64.indexOf('base64,') + 7));
+    svg = svg.substring(svg.indexOf('<svg'));
+    let parser = new DOMParser();
+    return parser.parseFromString(svg, "image/svg+xml");
+}
+        </script>
+
+        <script>
+            function HelpText() {
+              var x = document.getElementById("HelpTextBlock");
+              if (x.style.display === "none") {
+                x.style.display = "block";
+              } else {
+                x.style.display = "none";
+              }
+            }
+        </script>
+    </head>
+    <body>
+        <div><textarea id="code" style="width: 100%;" rows="11">op7613=>operation: 'Snapshot capacity signals for every watched (instance_type, region) pair.'
+op7615=>operation: table_name = os.environ.get('CAPACITY_HISTORY_TABLE_NAME')
+cond7618=>operation: raise ValueError('CAPACITY_HISTORY_TABLE_NAME environment variable is required') if  not table_name
+op7628=>operation: instance_types = _split_csv(os.environ.get('WATCH_INSTANCE_TYPES'))
+op7630=>operation: configured_regions = _split_csv(os.environ.get('ENABLED_REGIONS'))
+op7632=>operation: retention_days = int(os.environ.get('CAPACITY_HISTORY_RETENTION_DAYS', str(DEFAULT_RETENTION_DAYS)))
+op7634=>operation: block_duration_hours = int(os.environ.get('CAPACITY_BLOCK_DURATION_HOURS', str(DEFAULT_BLOCK_DURATION_HOURS)))
+op7636=>operation: long_block_duration_hours = int(os.environ.get('CAPACITY_BLOCK_LONG_DURATION_HOURS', str(DEFAULT_LONG_BLOCK_DURATION_HOURS)))
+op7638=>operation: target_capacities = _parse_target_capacities(os.environ.get('SPOT_SCORE_TARGET_CAPACITIES'))
+op7640=>operation: pools = _parse_instance_pools(os.environ.get('INSTANCE_POOLS'))
+cond7643=>operation: logger.warning('WATCH_INSTANCE_TYPES is empty; nothing to poll') if  not instance_types
+cond7654=>operation: logger.warning('ENABLED_REGIONS is empty; nothing to poll') if  not configured_regions
+op7664=>operation: table = boto3.resource('dynamodb').Table(table_name)
+op7666=>operation: now = datetime.now(UTC)
+op7668=>operation: written = 0
+op7670=>operation: errors = 0
+op7672=>operation: regions: list[str] = []
+op7674=>operation: regions_skipped_not_enabled: list[str] = []
+op7676=>operation: regions_enablement_unknown: list[str] = []
+cond7679=>condition: for region in configured_regions
+op7683=>operation: enablement = _region_enablement_status(region)
+cond7686=>condition: if enablement == 'not-enabled'
+sub7690=>subroutine: regions_skipped_not_enabled.append(region)
+sub7692=>subroutine: continue
+sub7697=>subroutine: regions.append(region)
+cond7700=>operation: regions_enablement_unknown.append(region) if  enablement == 'unknown'
+op7712=>operation: watched = set(instance_types)
+op7714=>operation: relevant_pools = tuple(((name, members) for name, members in pools if watched.intersection(members)))
+op7716=>operation: unpooled_watch_types = sorted((itype for itype in watched if _pool_for_instance_type(pools, itype) is None))
+cond7719=>operation: logger.info('%d watched instance type(s) belong to no instance pool and get no placement score (price and Capacity Block metrics are still recorded): %s', len(unpooled_watch_types), unpooled_watch_types) if  unpooled_watch_types
+op7729=>operation: sps_client = boto3.client('ec2')
+op7731=>operation: scores, sps_counters = _collect_spot_placement_scores(sps_client, relevant_pools, target_capacities, regions)
+op7733=>operation: long_probe_enabled = long_block_duration_hours > 0
+cond7736=>condition: for region in regions
+op7740=>operation: ec2 = boto3.client('ec2', region_name=region)
+cond7743=>condition: for instance_type in instance_types
+op7748=>operation: pool = _pool_for_instance_type(pools, instance_type)
+spot_scores: dict[str, int] = {}
+spot_pool: str | None = None
+if pool is not None:
+    pool_name, _members = pool
+    spot_pool = pool_name
+    for capacity, field in target_capacities:
+        value = scores.get((pool_name, region, capacity))
+        if value is not None:
+            spot_scores[field] = value
+spot_price, az_count = _spot_price_summary(ec2, instance_type)
+blocks_available, blocks_total = _capacity_block_summary(ec2, instance_type, block_duration_hours)
+long_available: int | None = None
+long_total: int | None = None
+if long_probe_enabled:
+    if long_block_duration_hours == block_duration_hours:
+        long_available, long_total = (blocks_available, blocks_total)
+    else:
+        long_available, long_total = _capacity_block_summary(ec2, instance_type, long_block_duration_hours)
+item = _build_item(instance_type, region, now, retention_days, spot_scores, spot_pool, spot_price, az_count, blocks_available, blocks_total, long_available, long_total)
+table.put_item(Item=item)
+written += 1
+cond7747=>condition: exception raised?
+cond7750=>condition: except Exception as exc
+op7754=>operation: errors += 1
+sub7756=>subroutine: logger.exception('failed to record %s/%s: %s', instance_type, region, exc)
+op7765=>operation: summary: dict[str, Any] = {'written': written, 'errors': errors, 'timestamp': now.isoformat(), 'regions_polled': regions, 'regions_skipped_not_enabled': regions_skipped_not_enabled, 'regions_enablement_unknown': regions_enablement_unknown, 'sps': {**sps_counters, 'pools': len(relevant_pools), 'target_capacities': [capacity for capacity, _field in target_capacities], 'unpooled_watch_types': len(unpooled_watch_types)}}
+sub7767=>subroutine: logger.info('capacity poll complete: written=%d errors=%d sps_requests=%d sps_received=%d/%d sps_missing=%d config_limit_refusals=%d regions_skipped=%d regions_enablement_unknown=%d', written, errors, summary['sps']['requests_issued'], summary['sps']['combinations_received'], summary['sps']['combinations_expected'], summary['sps']['combinations_missing_after_retry'], summary['sps']['config_limit_refusals'], len(regions_skipped_not_enabled), len(regions_enablement_unknown))
+io7772=>inputoutput: output: summary
+e7770=>end: end function return
+
+op7613->op7615
+op7615->cond7618
+cond7618->op7628
+op7628->op7630
+op7630->op7632
+op7632->op7634
+op7634->op7636
+op7636->op7638
+op7638->op7640
+op7640->cond7643
+cond7643->cond7654
+cond7654->op7664
+op7664->op7666
+op7666->op7668
+op7668->op7670
+op7670->op7672
+op7672->op7674
+op7674->op7676
+op7676->cond7679
+cond7679(yes)->op7683
+op7683->cond7686
+cond7686(yes)->sub7690
+sub7690->sub7692
+cond7686(no)->sub7697
+sub7697->cond7700
+cond7700->cond7679
+cond7679(no)->op7712
+op7712->op7714
+op7714->op7716
+op7716->cond7719
+cond7719->op7729
+op7729->op7731
+op7731->op7733
+op7733->cond7736
+cond7736(yes)->op7740
+op7740->cond7743
+cond7743(yes)->op7748
+op7748->cond7747
+cond7747(yes)->cond7750
+cond7750(yes)->op7754
+op7754->sub7756
+sub7756->cond7743
+cond7750(no)->cond7743
+cond7747(no)->cond7743
+cond7743(no)->cond7736
+cond7736(no)->op7765
+op7765->sub7767
+sub7767->io7772
+io7772->e7770
+</textarea></div>
+        <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
+        <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
+... and the other symbols too... like sub1(right)<br/>
+You can also tweak the <b>diagram.drawSVG('diagram', {});</b> script in this file for more changes<br/>
+This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on github</a> and <a href="http://flowchart.js.org">http://flowchart.js.org</a> more documentation can be found over there.
+</div><br/><div id="svgbase64"></div>
+        <div id="pngbase64"></div>
+
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
+          </p>
+          <div id="canvas"></div>
+        </div>
+    </body>
+</html>

@@ -2,7 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
         <title>MCP audit_logged decorator (sync + async dispatch, Context capture)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,70 +206,70 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op4953=>operation: 'Decorator that emits structured JSON audit entries for tool invocations.\n\n    Dispatches on ``inspect.iscoroutinefunction(func)``: async tools get an\n    async wrapper that ``await``s the call, sync tools keep the existing\n    sync path. Both wrappers share ``_build_audit_entry``.\n    '
-cond4956=>condition: if inspect.iscoroutinefunction(func)
-st4961=>start: start async_wrapper
-io4963=>inputoutput: input:
-op4966=>operation: start = time.time()
-op4968=>operation: sanitized_args = _sanitize_arguments(kwargs)
-op4971=>operation: result = await func(*args, **kwargs)
+        <div><textarea id="code" style="width: 100%;" rows="11">op5108=>operation: 'Decorator that emits structured JSON audit entries for tool invocations.\n\n    Dispatches on ``inspect.iscoroutinefunction(func)``: async tools get an\n    async wrapper that ``await``s the call, sync tools keep the existing\n    sync path. Both wrappers share ``_build_audit_entry``.\n    '
+cond5111=>condition: if inspect.iscoroutinefunction(func)
+st5116=>start: start async_wrapper
+io5118=>inputoutput: input:
+op5121=>operation: start = time.time()
+op5123=>operation: sanitized_args = _sanitize_arguments(kwargs)
+op5126=>operation: result = await func(*args, **kwargs)
 duration_ms = (time.time() - start) * 1000
 audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'success', duration_ms, None, result)))
 return result
-cond4970=>condition: exception raised?
-cond4973=>condition: except Exception as e
-op4977=>operation: duration_ms = (time.time() - start) * 1000
-sub4979=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
-sub4981=>subroutine: raise
-e4986=>end: end async_wrapper
-io4992=>inputoutput: output: async_wrapper
-e4990=>end: end function return
-st4999=>start: start sync_wrapper
-io5001=>inputoutput: input:
-op5004=>operation: start = time.time()
-op5006=>operation: sanitized_args = _sanitize_arguments(kwargs)
-op5009=>operation: result = func(*args, **kwargs)
+cond5125=>condition: exception raised?
+cond5128=>condition: except Exception as e
+op5132=>operation: duration_ms = (time.time() - start) * 1000
+sub5134=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
+sub5136=>subroutine: raise
+e5141=>end: end async_wrapper
+io5147=>inputoutput: output: async_wrapper
+e5145=>end: end function return
+st5154=>start: start sync_wrapper
+io5156=>inputoutput: input:
+op5159=>operation: start = time.time()
+op5161=>operation: sanitized_args = _sanitize_arguments(kwargs)
+op5164=>operation: result = func(*args, **kwargs)
 duration_ms = (time.time() - start) * 1000
 audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'success', duration_ms, None, result)))
 return result
-cond5008=>condition: exception raised?
-cond5011=>condition: except Exception as e
-op5015=>operation: duration_ms = (time.time() - start) * 1000
-sub5017=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
-sub5019=>subroutine: raise
-e5024=>end: end sync_wrapper
-io5030=>inputoutput: output: sync_wrapper
-e5028=>end: end function return
+cond5163=>condition: exception raised?
+cond5166=>condition: except Exception as e
+op5170=>operation: duration_ms = (time.time() - start) * 1000
+sub5172=>subroutine: audit_logger.info(json.dumps(_build_audit_entry(func.__name__, sanitized_args, 'error', duration_ms, str(e), None)))
+sub5174=>subroutine: raise
+e5179=>end: end sync_wrapper
+io5185=>inputoutput: output: sync_wrapper
+e5183=>end: end function return
 
-op4953->cond4956
-cond4956(yes)->st4961
-st4961->io4963
-io4963->op4966
-op4966->op4968
-op4968->op4971
-op4971->cond4970
-cond4970(yes)->cond4973
-cond4973(yes)->op4977
-op4977->sub4979
-sub4979->sub4981
-cond4973(no)->e4986
-e4986->io4992
-io4992->e4990
-cond4970(no)->e4986
-cond4956(no)->st4999
-st4999->io5001
-io5001->op5004
-op5004->op5006
-op5006->op5009
-op5009->cond5008
-cond5008(yes)->cond5011
-cond5011(yes)->op5015
-op5015->sub5017
-sub5017->sub5019
-cond5011(no)->e5024
-e5024->io5030
-io5030->e5028
-cond5008(no)->e5024
+op5108->cond5111
+cond5111(yes)->st5116
+st5116->io5118
+io5118->op5121
+op5121->op5123
+op5123->op5126
+op5126->cond5125
+cond5125(yes)->cond5128
+cond5128(yes)->op5132
+op5132->sub5134
+sub5134->sub5136
+cond5128(no)->e5141
+e5141->io5147
+io5147->e5145
+cond5125(no)->e5141
+cond5111(no)->st5154
+st5154->io5156
+io5156->op5159
+op5159->op5161
+op5161->op5164
+op5164->cond5163
+cond5163(yes)->cond5166
+cond5166(yes)->op5170
+op5170->sub5172
+sub5172->sub5174
+cond5166(no)->e5179
+e5179->io5185
+io5185->e5183
+cond5163(no)->e5179
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -279,10 +279,10 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
           </p>
           <div id="canvas"></div>
         </div>

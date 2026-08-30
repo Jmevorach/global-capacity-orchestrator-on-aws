@@ -28,7 +28,9 @@ covered by the pyflowchart import in the renderer's unit tests below.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -73,11 +75,13 @@ Target = targets_mod.Target
 TARGETS = targets_mod.TARGETS
 _output_stem_for = renderer_mod._output_stem_for
 _render_one = renderer_mod._render_one
+_screenshot_scale = renderer_mod._screenshot_scale
 RenderedTarget = renderer_mod.RenderedTarget
 SENTINEL = source_marker_mod.SENTINEL
 upsert_markers = source_marker_mod.upsert_markers
 strip_markers_from = source_marker_mod.strip_markers_from
 strip_all_markers = source_marker_mod.strip_all_markers
+_ruff_format = source_marker_mod._ruff_format
 render_readme = readme_mod.render_readme
 generation_timestamp_utc = timestamp_mod.generation_timestamp_utc
 
@@ -125,6 +129,39 @@ class TestTargetsCatalogue:
                 "plain identifiers and dotted ``Class.method`` paths."
             )
 
+    def test_every_selector_resolves_to_a_function_or_method(self) -> None:
+        missing: list[str] = []
+        for target in TARGETS:
+            tree = ast.parse((ROOT / target.source).read_text(encoding="utf-8"))
+            parts = target.function.split(".")
+            nodes: list[ast.stmt] = tree.body
+            for index, part in enumerate(parts):
+                match = next(
+                    (
+                        node
+                        for node in nodes
+                        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+                        and node.name == part
+                    ),
+                    None,
+                )
+                if match is None or (
+                    index < len(parts) - 1 and not isinstance(match, ast.ClassDef)
+                ):
+                    missing.append(f"{target.source}:{target.function}")
+                    break
+                nodes = match.body if isinstance(match, ast.ClassDef) else []
+        assert not missing, f"diagram selectors do not resolve: {missing}"
+
+    def test_targets_and_output_stems_are_unique(self) -> None:
+        identities = [(target.source, target.function) for target in TARGETS]
+        stems = [
+            _output_stem_for(target, output_dir=ROOT / "diagrams" / "code_diagrams")
+            for target in TARGETS
+        ]
+        assert len(identities) == len(set(identities)), "duplicate diagram target"
+        assert len(stems) == len(set(stems)), "diagram targets collide on an output stem"
+
 
 # ---------------------------------------------------------------------------
 # Renderer path math
@@ -160,6 +197,20 @@ class TestOutputStemFor:
         stem = _output_stem_for(t, output_dir=tmp_path)
         html_path = stem.parent / f"{stem.name}.html"
         assert html_path.name == "handler.lambda_handler.html"
+
+
+class TestScreenshotScale:
+    def test_small_diagram_is_not_resized(self) -> None:
+        assert _screenshot_scale(2_000, 1_000) == 1.0
+
+    def test_area_cap_applies_even_below_legacy_dimension_threshold(self) -> None:
+        scale = _screenshot_scale(14_000, 14_000)
+        assert 0 < scale < 1
+        assert (14_000 * scale) * (14_000 * scale) <= 20_000_000
+
+    def test_dimension_cap_applies_to_extremely_wide_diagrams(self) -> None:
+        scale = _screenshot_scale(20_000, 1_000)
+        assert 20_000 * scale <= 8_000
 
 
 class TestGenerationTimestamp:
@@ -256,8 +307,22 @@ def _make_rendered(
 
 
 class TestUpsertMarkers:
-    """Insert once, then run again — the second pass must replace (not
-    duplicate) the marker block."""
+    """Insert once, then run again — the second pass must replace (not duplicate)."""
+
+    def test_ruff_format_failure_is_not_reported_as_generation_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "example.py"
+        source.write_text("def example():\n    return True\n", encoding="utf-8")
+        monkeypatch.setattr(
+            source_marker_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                subprocess.CalledProcessError(2, args[0])
+            ),
+        )
+        with pytest.raises(subprocess.CalledProcessError):
+            _ruff_format([source], project_root=tmp_path)
 
     def _write_source(self, path: Path, body: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -560,13 +625,13 @@ class TestSyncSharedLambdaCopies:
     checked-in copies one header behind — the exact drift
     ``tests/test_lambda_shared_sources.py`` rejects. These tests build a fake
     project tree so they exercise the sync against the real
-    ``cli.stacks.LAMBDA_SHARED_SOURCE_TARGETS`` map without touching the
+    ``gco.lambda_shared_sources.LAMBDA_SHARED_SOURCE_TARGETS`` map without touching the
     checkout.
     """
 
     @staticmethod
     def _tree(tmp_path: Path) -> Path:
-        from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS
+        from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
         for source_rel, target_rels in LAMBDA_SHARED_SOURCE_TARGETS.items():
             source = tmp_path / source_rel
@@ -579,7 +644,7 @@ class TestSyncSharedLambdaCopies:
         return tmp_path
 
     def test_drifted_copies_are_rewritten_to_canonical_bytes(self, tmp_path: Path) -> None:
-        from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS
+        from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
         root = self._tree(tmp_path)
         _sync_shared_lambda_copies(root)
@@ -589,7 +654,7 @@ class TestSyncSharedLambdaCopies:
                 assert (root / target_rel).read_bytes() == expected, target_rel
 
     def test_identical_copies_are_left_untouched(self, tmp_path: Path) -> None:
-        from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS
+        from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
         root = self._tree(tmp_path)
         _sync_shared_lambda_copies(root)

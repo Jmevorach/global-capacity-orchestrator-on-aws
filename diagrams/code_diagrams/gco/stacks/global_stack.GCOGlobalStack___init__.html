@@ -2,7 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
         <title>Global stack constructor (Global Accelerator, SSM, DynamoDB)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,72 +206,76 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">sub2586=>subroutine: super().__init__(scope, construct_id, **kwargs)
-op2588=>operation: self.config = config
-op2590=>operation: self.regional_endpoints: dict[str, str] = {}
-op2592=>operation: self.endpoint_groups: dict[str, ga.EndpointGroup] = {}
-op2594=>operation: supports_global_accelerator = getattr(config, 'supports_global_accelerator', None)
-op2596=>operation: self.global_accelerator_enabled = bool(supports_global_accelerator()) if callable(supports_global_accelerator) else True
-op2598=>operation: ga_config = self.config.get_global_accelerator_config()
-op2600=>operation: self.accelerator_name = ga_config.get('name') or f'{self.config.get_project_name()}-accelerator'
-sub2602=>subroutine: self._create_dynamodb_tables()
-sub2604=>subroutine: self._create_model_bucket()
-sub2606=>subroutine: self._create_cluster_shared_kms_key()
-sub2608=>subroutine: self._create_cluster_shared_bucket()
-sub2610=>subroutine: self._publish_cluster_shared_bucket_ssm_params()
-sub2612=>subroutine: self._create_backup_plan()
-op2614=>operation: self.images_config = _parse_images_config(self.node.try_get_context('images'))
-sub2616=>subroutine: self._create_image_replication_rule()
-sub2618=>subroutine: self._create_image_lookup_lambda()
-cond2621=>operation: self._create_capacity_poller() if  self.config.get_capacity_history_enabled()
-cond2632=>operation: self._create_mission_memory() if  self.config.get_mission_memory_enabled()
-cond2643=>condition: if self.config.get_vector_store_enabled()
-sub2647=>subroutine: self._create_vector_store()
-sub2649=>subroutine: self._create_vector_ingest()
-op2654=>operation: self.accelerator: ga.Accelerator | None = None
-op2656=>operation: self.listener: ga.Listener | None = None
-op2658=>operation: self.accelerator_id: str | None = None
-cond2661=>condition: if self.global_accelerator_enabled
-op2665=>operation: self.accelerator = ga.Accelerator(self, 'GCOAccelerator', accelerator_name=self.accelerator_name, enabled=True)
-op2667=>operation: self.accelerator_id = Fn.select(1, Fn.split('/', self.accelerator.accelerator_arn))
-op2669=>operation: self.listener = self.accelerator.add_listener('GCOListener', port_ranges=[ga.PortRange(from_port=443, to_port=443)], protocol=ga.ConnectionProtocol.TCP, client_affinity=self._resolve_client_affinity(ga_config))
-cond2672=>operation: self._create_endpoint_group(region) while  region in self.config.get_regions()
-sub2681=>subroutine: self._create_outputs()
-sub2686=>subroutine: self._apply_nag_suppressions()
+        <div><textarea id="code" style="width: 100%;" rows="11">sub2664=>subroutine: super().__init__(scope, construct_id, **kwargs)
+op2666=>operation: self.config = config
+op2668=>operation: self.regional_endpoints: dict[str, str] = {}
+op2670=>operation: self.endpoint_groups: dict[str, ga.EndpointGroup] = {}
+op2672=>operation: supports_global_accelerator = getattr(config, 'supports_global_accelerator', None)
+op2674=>operation: self.global_accelerator_enabled = bool(supports_global_accelerator()) if callable(supports_global_accelerator) else True
+op2676=>operation: ga_config = self.config.get_global_accelerator_config()
+op2678=>operation: self.accelerator_name = ga_config.get('name') or f'{self.config.get_project_name()}-accelerator'
+sub2680=>subroutine: self._create_dynamodb_tables()
+sub2682=>subroutine: self._create_model_bucket()
+sub2684=>subroutine: self._create_cluster_shared_kms_key()
+sub2686=>subroutine: self._create_cluster_shared_bucket()
+sub2688=>subroutine: self._publish_cluster_shared_bucket_ssm_params()
+sub2690=>subroutine: self._create_backup_plan()
+op2692=>operation: self.images_config = _parse_images_config(self.node.try_get_context('images'))
+sub2694=>subroutine: self._create_image_replication_rule()
+sub2696=>subroutine: self._create_image_lookup_lambda()
+cond2699=>operation: self._create_capacity_poller() if  self.config.get_capacity_history_enabled()
+cond2710=>operation: self._create_mission_memory() if  self.config.get_mission_memory_enabled()
+cond2721=>condition: if self.config.get_vector_store_enabled()
+sub2725=>subroutine: self._create_vector_store()
+sub2727=>subroutine: self._create_vector_ingest()
+op2732=>operation: self.accelerator: ga.Accelerator | None = None
+op2734=>operation: self.listener: ga.Listener | None = None
+op2736=>operation: self.accelerator_id: str | None = None
+cond2739=>condition: if self.global_accelerator_enabled
+op2743=>operation: self.accelerator = ga.Accelerator(self, 'GCOAccelerator', accelerator_name=self.accelerator_name, enabled=True)
+op2745=>operation: self.accelerator_id = Fn.select(1, Fn.split('/', self.accelerator.accelerator_arn))
+op2747=>operation: self.listener = self.accelerator.add_listener('GCOListener', port_ranges=[ga.PortRange(from_port=443, to_port=443)], protocol=ga.ConnectionProtocol.TCP, client_affinity=self._resolve_client_affinity(ga_config))
+cond2750=>operation: self._create_endpoint_group(region) while  region in self.config.get_regions()
+sub2759=>subroutine: self._create_outputs()
+op2761=>operation: traffic_dial_config = ga_config.get('traffic_dial') or {}
+cond2764=>operation: self._create_traffic_dial_controller(ga_config) if  bool(traffic_dial_config.get('enabled', False))
+sub2777=>subroutine: self._apply_nag_suppressions()
 
-sub2586->op2588
-op2588->op2590
-op2590->op2592
-op2592->op2594
-op2594->op2596
-op2596->op2598
-op2598->op2600
-op2600->sub2602
-sub2602->sub2604
-sub2604->sub2606
-sub2606->sub2608
-sub2608->sub2610
-sub2610->sub2612
-sub2612->op2614
-op2614->sub2616
-sub2616->sub2618
-sub2618->cond2621
-cond2621->cond2632
-cond2632->cond2643
-cond2643(yes)->sub2647
-sub2647->sub2649
-sub2649->op2654
-op2654->op2656
-op2656->op2658
-op2658->cond2661
-cond2661(yes)->op2665
-op2665->op2667
-op2667->op2669
-op2669->cond2672
-cond2672->sub2681
-sub2681->sub2686
-cond2661(no)->sub2686
-cond2643(no)->op2654
+sub2664->op2666
+op2666->op2668
+op2668->op2670
+op2670->op2672
+op2672->op2674
+op2674->op2676
+op2676->op2678
+op2678->sub2680
+sub2680->sub2682
+sub2682->sub2684
+sub2684->sub2686
+sub2686->sub2688
+sub2688->sub2690
+sub2690->op2692
+op2692->sub2694
+sub2694->sub2696
+sub2696->cond2699
+cond2699->cond2710
+cond2710->cond2721
+cond2721(yes)->sub2725
+sub2725->sub2727
+sub2727->op2732
+op2732->op2734
+op2734->op2736
+op2736->cond2739
+cond2739(yes)->op2743
+op2743->op2745
+op2745->op2747
+op2747->cond2750
+cond2750->sub2759
+sub2759->op2761
+op2761->cond2764
+cond2764->sub2777
+cond2739(no)->sub2777
+cond2721(no)->op2732
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -281,10 +285,10 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
           </p>
           <div id="canvas"></div>
         </div>

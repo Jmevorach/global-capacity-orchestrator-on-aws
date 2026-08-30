@@ -51,6 +51,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-30T12:00:00Z
+# Flowchart(s) generated from this file:
+#   * ``SwarmRunner.run_to_completion`` -> ``diagrams/code_diagrams/gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.html``
+#     (PNG: ``diagrams/code_diagrams/gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
+
 # Match the package's path-injection pattern (see _engine_factory.py):
 # gco_mcp/ modules import each other with gco_mcp/ itself on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

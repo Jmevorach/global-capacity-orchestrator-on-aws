@@ -17,13 +17,13 @@ from .aws_client import get_aws_client
 from .config import GCOConfig, get_config
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``InferenceManager.deploy`` -> ``diagrams/code_diagrams/cli/inference.InferenceManager_deploy.html``
 #     (PNG: ``diagrams/code_diagrams/cli/inference.InferenceManager_deploy.png``)
 #   * ``InferenceManager.canary_deploy`` -> ``diagrams/code_diagrams/cli/inference.InferenceManager_canary_deploy.html``
 #     (PNG: ``diagrams/code_diagrams/cli/inference.InferenceManager_canary_deploy.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

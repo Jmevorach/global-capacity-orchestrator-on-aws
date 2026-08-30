@@ -80,7 +80,7 @@ def _ruff_format(paths: list[Path], *, project_root: Path) -> None:
     subprocess.run(  # noqa: S603 — args are fully-known paths we just generated
         [sys.executable, "-m", "ruff", "format", "--quiet", *rels],
         cwd=str(project_root),
-        check=False,
+        check=True,
     )
 
 
@@ -203,7 +203,8 @@ def _format_block(
             png_rel = result.png_path.relative_to(project_root)
             lines.append(f"#     (PNG: ``{png_rel}``)")
     lines.append(
-        "# Regenerate with ``python diagrams/code_diagrams/generate.py``.",
+        "# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> "
+        "python diagrams/generate.py --code-only``.",
     )
     lines.append(f"# <{SENTINEL}> END")
     # Trailing "" plus the final "\n" from ``join`` ensures the block

@@ -236,6 +236,17 @@ def _require_pyflowchart() -> None:
         )
 
 
+def _screenshot_scale(width: float, height: float) -> float:
+    """Bound Chromium screenshots by both dimension and total pixel area."""
+    max_css_dimension = 8_000
+    max_css_area = 20_000_000
+    return min(
+        1.0,
+        max_css_dimension / max(width, height),
+        (max_css_area / (width * height)) ** 0.5,
+    )
+
+
 class _PlaywrightRenderer:
     """Thin wrapper that keeps a single Playwright browser alive.
 
@@ -283,13 +294,8 @@ class _PlaywrightRenderer:
             # the SVG viewport itself. The viewBox preserves all chart content.
             # The area cap also avoids allocating several hundred megapixels
             # for unusually wide-and-tall control-flow charts.
-            if box is not None and max(box["width"], box["height"]) > 15_000:
-                max_css_dimension = 8_000
-                max_css_area = 25_000_000
-                factor = min(
-                    max_css_dimension / max(box["width"], box["height"]),
-                    (max_css_area / (box["width"] * box["height"])) ** 0.5,
-                )
+            factor = _screenshot_scale(box["width"], box["height"]) if box is not None else 1.0
+            if factor < 1.0:
                 locator.evaluate(
                     """(svg, size) => {
                         if (!svg.hasAttribute('viewBox')) {

@@ -46,8 +46,8 @@ spec:
   jobTargetRef:
     parallelism: 1                  # One worker per pod
     completions: 1                  # Process one message batch and exit
-    backoffLimit: 2                 # Retry within the pod up to 2 times before marking failed
-    activeDeadlineSeconds: 300      # Kill the pod if it runs longer than 5 minutes
+    backoffLimit: 2                 # Allow at most 2 Job-level retries via replacement Pods
+    activeDeadlineSeconds: 300      # Bound the complete Job lifetime, including every retry
     template:
       metadata:
         labels:

@@ -27,11 +27,11 @@ import boto3
 from botocore.exceptions import ClientError
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``handler`` -> ``diagrams/code_diagrams/lambda/analytics-cleanup/handler.handler.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/analytics-cleanup/handler.handler.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

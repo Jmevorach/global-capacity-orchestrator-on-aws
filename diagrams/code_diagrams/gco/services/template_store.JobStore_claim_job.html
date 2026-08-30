@@ -2,7 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
         <title>Global queue fenced claim (conditional write + monotonic generation)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,43 +206,43 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op3632=>operation: 'Claim a queued job with a unique token and monotonic fencing generation.'
-op3634=>operation: item = self._get_raw_job(job_id)
-cond3637=>condition: if item is None or item.get('status') != JobStatus.QUEUED.value or item.get('target_region') != target_region
-io3644=>inputoutput: output: None
-e3642=>end: end function return
-op3650=>operation: now = _utc_now_iso()
-op3652=>operation: lease_expires_at = _claim_lease_expiry_iso(self.claim_lease_seconds)
-op3654=>operation: claim_token = uuid.uuid4().hex
-op3656=>operation: generation = int(item.get('claim_generation', 0)) + 1
-op3658=>operation: history = self._history_with(item, status=JobStatus.CLAIMED.value, timestamp=now, message=f'Claimed by {claimed_by}')
-op3661=>operation: response = self._table.update_item(Key={'job_id': job_id}, UpdateExpression='SET #status = :claimed, region_status = :region_status, claimed_by = :claimed_by, claim_token = :claim_token, claim_generation = :generation, claimed_at = :now, updated_at = :now, lease_expires_at = :lease_expires_at, work_sort = :work_sort, status_history = :history', ConditionExpression='attribute_exists(job_id) AND #status = :queued AND target_region = :target_region AND updated_at = :expected_updated_at', ExpressionAttributeNames={'#status': 'status'}, ExpressionAttributeValues={':claimed': JobStatus.CLAIMED.value, ':queued': JobStatus.QUEUED.value, ':region_status': self._region_status(target_region, JobStatus.CLAIMED.value), ':target_region': target_region, ':claimed_by': claimed_by, ':claim_token': claim_token, ':generation': generation, ':now': now, ':expected_updated_at': item.get('updated_at'), ':lease_expires_at': lease_expires_at, ':work_sort': lease_expires_at, ':history': history}, ReturnValues='ALL_NEW')
+        <div><textarea id="code" style="width: 100%;" rows="11">op3723=>operation: 'Claim a queued job with a unique token and monotonic fencing generation.'
+op3725=>operation: item = self._get_raw_job(job_id)
+cond3728=>condition: if item is None or item.get('status') != JobStatus.QUEUED.value or item.get('target_region') != target_region
+io3735=>inputoutput: output: None
+e3733=>end: end function return
+op3741=>operation: now = _utc_now_iso()
+op3743=>operation: lease_expires_at = _claim_lease_expiry_iso(self.claim_lease_seconds)
+op3745=>operation: claim_token = uuid.uuid4().hex
+op3747=>operation: generation = int(item.get('claim_generation', 0)) + 1
+op3749=>operation: history = self._history_with(item, status=JobStatus.CLAIMED.value, timestamp=now, message=f'Claimed by {claimed_by}')
+op3752=>operation: response = self._table.update_item(Key={'job_id': job_id}, UpdateExpression='SET #status = :claimed, region_status = :region_status, claimed_by = :claimed_by, claim_token = :claim_token, claim_generation = :generation, claimed_at = :now, updated_at = :now, lease_expires_at = :lease_expires_at, work_sort = :work_sort, status_history = :history', ConditionExpression='attribute_exists(job_id) AND #status = :queued AND target_region = :target_region AND updated_at = :expected_updated_at', ExpressionAttributeNames={'#status': 'status'}, ExpressionAttributeValues={':claimed': JobStatus.CLAIMED.value, ':queued': JobStatus.QUEUED.value, ':region_status': self._region_status(target_region, JobStatus.CLAIMED.value), ':target_region': target_region, ':claimed_by': claimed_by, ':claim_token': claim_token, ':generation': generation, ':now': now, ':expected_updated_at': item.get('updated_at'), ':lease_expires_at': lease_expires_at, ':work_sort': lease_expires_at, ':history': history}, ReturnValues='ALL_NEW')
 return self._parse_job_item(response.get('Attributes', {}), include_internal=True)
-cond3660=>condition: exception raised?
-cond3663=>condition: except ClientError as error
-cond3668=>condition: if self._is_conditional_failure(error)
-io3675=>inputoutput: output: None
-e3673=>end: end function return
-sub3681=>subroutine: logger.error('Failed to claim job %s: %s', job_id, error)
-sub3683=>subroutine: raise
+cond3751=>condition: exception raised?
+cond3754=>condition: except ClientError as error
+cond3759=>condition: if self._is_conditional_failure(error)
+io3766=>inputoutput: output: None
+e3764=>end: end function return
+sub3772=>subroutine: logger.error('Failed to claim job %s: %s', job_id, error)
+sub3774=>subroutine: raise
 
-op3632->op3634
-op3634->cond3637
-cond3637(yes)->io3644
-io3644->e3642
-cond3637(no)->op3650
-op3650->op3652
-op3652->op3654
-op3654->op3656
-op3656->op3658
-op3658->op3661
-op3661->cond3660
-cond3660(yes)->cond3663
-cond3663(yes)->cond3668
-cond3668(yes)->io3675
-io3675->e3673
-cond3668(no)->sub3681
-sub3681->sub3683
+op3723->op3725
+op3725->cond3728
+cond3728(yes)->io3735
+io3735->e3733
+cond3728(no)->op3741
+op3741->op3743
+op3743->op3745
+op3745->op3747
+op3747->op3749
+op3749->op3752
+op3752->cond3751
+cond3751(yes)->cond3754
+cond3754(yes)->cond3759
+cond3759(yes)->io3766
+io3766->e3764
+cond3759(no)->sub3772
+sub3772->sub3774
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -252,10 +252,10 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
           </p>
           <div id="canvas"></div>
         </div>

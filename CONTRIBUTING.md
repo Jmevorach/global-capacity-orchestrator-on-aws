@@ -176,8 +176,9 @@ GCO uses exact-pinned Python dependencies in `pyproject.toml` with a committed t
 | Image: inference proxy | Docker reads `[image-inference-proxy]` | Direct runtime roots for `gco.services.inference_api` |
 | Image: inference monitor | Docker reads `[image-inference-monitor]` | Direct runtime roots for the inference reconciler |
 | Image: queue processor | Docker reads `[image-queue-processor]` | Direct runtime roots for the SQS worker |
+| Image: cost monitor | Docker reads `[image-cost-monitor]` | Direct runtime roots for the cost API and report pipeline |
 
-CDK dependencies are in a separate `[cdk]` extras group so operators who only use the CLI don't need to install the full CDK toolchain. The five `image-*` groups are build metadata and the single source of direct dependency pins for production service images: each Dockerfile extracts only its own group with `tomllib`, constrains it with `requirements-lock.txt`, and deletes the generated requirements file in the same layer. Do not add per-image requirements files or install `.[image-*]` inside production images, because either approach introduces extra dependencies or another synchronization surface.
+CDK dependencies are in a separate `[cdk]` extras group so operators who only use the CLI don't need to install the full CDK toolchain. The six `image-*` groups are build metadata and the single source of direct dependency pins for production service images: each Dockerfile extracts only its own group with `tomllib`, constrains it with `requirements-lock.txt`, and deletes the generated requirements file in the same layer. Do not add per-image requirements files or install `.[image-*]` inside production images, because either approach introduces extra dependencies or another synchronization surface.
 
 #### Node.js Dependency Graphs
 
@@ -215,7 +216,7 @@ docker run --rm -v "$(pwd):/workspace" -w /workspace gco-dev bash -c '
 '
 ```
 
-The `pip install "pip==25.0.1"` step works around `pip-tools==7.6.0` importing
+The `pip install "pip==25.0.1"` step works around `pip-tools==7.6.1` importing
 pip internals (`pip._internal.utils.compat.stdlib_pkgs`) that newer pip — as
 shipped in the current `python:3.14-slim` base image — has removed. The
 downgrade lives only inside the throwaway container; upgrading `pip-tools`
@@ -476,30 +477,33 @@ See the [Example Job Validation guide](docs/EXAMPLE_VALIDATION.md) for the full 
 
 ### CI/CD Pipeline
 
-The project uses GitHub Actions for automated testing. Every push and pull request runs six primary workflows in parallel, plus four satellite workflows triggered by a successful test run, a schedule, or a manual dispatch.
+The project uses GitHub Actions for automated testing. Every push and pull request runs six primary workflows in parallel. Eight satellite workflows cover release publication, scheduled scans, Pages, and feature-specific contracts; some satellites also run on push or pull request.
 
 #### Primary workflows (run on every push + PR)
 
 | Workflow file | README row | Purpose |
 |---------------|------------|---------|
-| `.github/workflows/unit-tests.yml` | Unit Tests | pytest with coverage, explicit offline accelerator catalog/NodePool validation, BATS, CLI smoke, CDK synth + config matrix, lockfile freshness, fresh install, workload import checks |
-| `.github/workflows/floci-tests.yml` | Floci Tests | Emulated-AWS layer (opt-in via `GCO_FLOCI_ENDPOINT`; see `docs/FLOCI_TESTING.md`): wire-level integration tests and the live-validation preflight+baseline E2E against a digest-pinned Floci emulator, zero AWS credentials |
-| `.github/workflows/integration-tests.yml` | Integration Tests | Per-Dockerfile build + functional container tests (boot, probes, auth fail-closed, SIGTERM), kind cluster E2E (with Calico for NetworkPolicy enforcement), K8s manifest schema, Lambda import validation, cross-module pytest, MCP server pytest |
-| `.github/workflows/security.yml` | Security | bandit, pip-audit, npm audit for every owned graph, trivy (filesystem + per-image), trufflehog, gitleaks, semgrep, checkov, KICS, and CodeQL for Python + JavaScript |
-| `.github/workflows/inference-streaming-proxy.yml` | — (no badge) | Native Node.js 24 tests for the streaming Lambda with 93% line/function/branch gates |
-| `.github/workflows/lint.yml` | Linting | actionlint, hadolint, markdownlint, mypy (strict/stacks/lambda), ruff (format + check, imports included), strict ShellCheck at `style` severity over every tracked `*.sh` path, yamllint |
-| `.github/workflows/mooncake-image.yml` | — (no badge) | Mooncake vLLM image contract: runs the real upstream image GCO defaults to (`cli/images.py::_DISAGGREGATED_DEFAULT_IMAGE`) and asserts the PD proxy starts under `python3` + serves `/healthz`, the rendered store config is accepted by the image's loader, and the connector names GCO emits are registered — so an image-version bump is validated by CI |
+| `.github/workflows/unit-tests.yml` | Unit Tests | Three dynamically balanced pytest shards with combined coverage, accelerator policy, BATS, CLI/autopilot smoke, CDK synth/config/nag, lockfile freshness, and workload imports |
+| `.github/workflows/floci-tests.yml` | Floci Tests | Credential-free wire-level and live-validation harness contracts against the pinned Floci emulator |
+| `.github/workflows/integration-tests.yml` | Integration Tests | Container, dev-image, kind, manifest, Lambda, and MCP integration contracts |
+| `.github/workflows/security.yml` | Security | Python/npm/container/IaC/secret scans and Python+JavaScript CodeQL |
+| `.github/workflows/inference-streaming-proxy.yml` | — (no badge) | Native Node.js 24 streaming-Lambda tests with 93% line/function/branch gates |
+| `.github/workflows/lint.yml` | Linting | actionlint, hadolint, markdownlint, strict MkDocs, mypy, Ruff, ShellCheck, and yamllint |
 
-Each workflow file has a comment header documenting triggers and per-job purpose — that is the single source of truth. Every job uses `category:tool:test_name` display names (e.g., `unit:pytest:core`, `security:trivy:container-scan`) and `category-tool-test_name` job IDs.
+Each workflow file has a comment header documenting triggers and per-job purpose. Every job uses `category:tool:test_name` display names (for example, `unit:pytest:core`) and `category-tool-test_name` job IDs.
 
 #### Satellite workflows
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `.github/workflows/release.yml` | Manual (`workflow_dispatch`) | Bump version, tag, and create a GitHub Release with auto-generated notes |
-| `.github/workflows/deps-scan.yml` | `cron: 0 9 1 * *` (monthly) | Check pinned versions plus deterministic NodePool/watch-list policy and live EC2 accelerator-catalog drift; update one rolling issue when drift is detected |
-| `.github/workflows/cve-scan.yml` | `cron: 0 9 * * 1` (weekly) | Re-run Trivy against current CVE databases |
-| `.github/workflows/pages.yml` | Successful `Unit Tests` push run on the default branch (`workflow_run`) | Download that run's coverage artifact and publish the HTML report plus coverage badge to GitHub Pages |
+| `.github/workflows/release.yml` | Manual | Stage 1: open the version-bump PR and dispatch its gating workflows |
+| `.github/workflows/release-publish.yml` | `main` VERSION push + manual | Stage 2: verify the merged release commit, then create the immutable tag and GitHub Release |
+| `.github/workflows/deps-scan.yml` | Monthly + manual | Check pinned versions and live accelerator-catalog drift; maintain one rolling issue |
+| `.github/workflows/cve-scan.yml` | Weekly + manual | Re-run Trivy against current CVE databases |
+| `.github/workflows/pages.yml` | Successful Unit Tests run on `main` | Publish the strict MkDocs site, coverage report, and badge JSON |
+| `.github/workflows/mooncake-image.yml` | `main`, PR, manual | Validate the pinned upstream Mooncake image contract |
+| `.github/workflows/pr-type-label.yml` | PR opened/edited/reopened/ready | Sync the declared type-of-change checkbox to its release-note label |
+| `.github/workflows/grafana-dashboards.yml` | Paths-filtered `main`/PR + manual | Provision curated dashboards into the real Grafana image resolved from the pinned chart |
 
 #### Published coverage report and badge
 
@@ -598,6 +602,7 @@ gco stacks destroy-all -y
 - `TENETS.md`: Normative north star and prioritized project decision guidance
 - `README.md`: Overview and quick start
 - `QUICKSTART.md`: Step-by-step setup guide
+- `docs/README.md`: Comprehensive top-level guide index
 - `docs/ARCHITECTURE.md`: Technical architecture
 - `docs/CLI.md`: CLI reference
 - `docs/API.md`: REST API reference
@@ -609,6 +614,18 @@ gco stacks destroy-all -y
 - `wiki/` + `mkdocs.yml`: The orientation wiki published to GitHub Pages (see
   [Developing the wiki](#developing-the-wiki))
 - `CONTRIBUTING.md`: This file
+
+Repository inventories move in pairs and are guarded by tests. When adding or
+removing a top-level `docs/*.md` guide, CLI command module, workflow, production
+`image-*` dependency group/Dockerfile, or count-bearing MCP document, update its
+human index in the same change. Run `tests/test_documentation_consistency.py`,
+`tests/test_mcp_tool_count_docs.py`, and `tests/test_mcp_gating_consistency.py`
+before pushing. Generated diagrams use the canonical aggregate command:
+
+```bash
+SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+python diagrams/generate.py --check
+```
 
 ### Developing the wiki
 

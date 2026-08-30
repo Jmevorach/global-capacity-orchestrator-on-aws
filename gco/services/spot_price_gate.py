@@ -25,6 +25,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-30T12:00:00Z
+# Flowchart(s) generated from this file:
+#   * ``SpotPriceGate.evaluate`` -> ``diagrams/code_diagrams/gco/services/spot_price_gate.SpotPriceGate_evaluate.html``
+#     (PNG: ``diagrams/code_diagrams/gco/services/spot_price_gate.SpotPriceGate_evaluate.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
+
 logger = logging.getLogger(__name__)
 
 #: EC2 instance type shape (``g5.xlarge``, ``p6-b200.48xlarge``, ``trn2.3xlarge``).

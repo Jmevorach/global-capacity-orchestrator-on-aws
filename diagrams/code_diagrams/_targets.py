@@ -46,12 +46,13 @@ class Target:
 # section so review diffs stay local.
 TARGETS: list[Target] = [
     # --- Top-level CDK app entry point -----------------------------------
-    # ``app.py::main`` has real control flow (per-region loop, analytics
-    # sub-toggle gating) so its flowchart is informative. CDK Stack
-    # ``__init__`` methods are mostly linear wiring sequences and we
-    # chart only the ones that carry real branches (e.g. the
-    # ``_create_execution_role_and_grants`` helper on the analytics
-    # stack, which has hyperpod/canvas branches).
+    # ``app.py::main`` has real control flow (per-region loop and analytics
+    # gating), so its flowchart is informative. The catalog intentionally
+    # selects externally triggered orchestration and policy boundaries with
+    # branching, retries, fencing, partial failure, or cross-service decisions;
+    # thin wrappers and repetitive adapters stay in close-to-code docs/tests.
+    # Stack constructors are the deliberate exception because they are the
+    # most useful onboarding map from one deployable stack to its helper graph.
     Target(
         source="app.py",
         function="main",
@@ -265,8 +266,8 @@ TARGETS: list[Target] = [
     ),
     Target(
         source="gco/services/inference_monitor.py",
-        function="InferenceMonitor._reconcile_endpoint",
-        title="Inference endpoint desired-state reconciliation",
+        function="InferenceMonitor._reconcile_endpoint_authorized",
+        title="Inference endpoint authorized desired-state reconciliation",
     ),
     Target(
         source="lambda/helm-installer/teardown_provider.py",
@@ -416,5 +417,56 @@ TARGETS: list[Target] = [
         source="lambda/vector-ingest/handler.py",
         function="lambda_handler",
         title="Vector-store corpus ingest (S3 notification -> chunk, embed, write items)",
+    ),
+    # --- pre-v7 high-value orchestration and policy boundaries -----------
+    Target(
+        source="lambda/capacity-poller/handler.py",
+        function="lambda_handler",
+        title="Capacity snapshot poller (Region truth, pooled scores, bounded retries, writes)",
+    ),
+    Target(
+        source="lambda/helm-orchestrator/handler.py",
+        function="on_event",
+        title="Helm convergence orchestrator (start/adopt, replay identity, rollback fencing)",
+    ),
+    Target(
+        source="lambda/traffic-dial-controller/handler.py",
+        function="lambda_handler",
+        title="Traffic dial controller (health evidence, step limits, last-Region safety)",
+    ),
+    Target(
+        source="gco/services/spot_price_gate.py",
+        function="SpotPriceGate.evaluate",
+        title="Spot price gate (unknown/malformed/above-cap dispatch policy)",
+    ),
+    Target(
+        source="cli/commands/autopilot_cmd.py",
+        function="_plan",
+        title="Autopilot launch planner (engine, model, MCP, imports, resume)",
+    ),
+    Target(
+        source="gco_mcp/mission/swarm_runner.py",
+        function="SwarmRunner.run_to_completion",
+        title="Swarm runner lifecycle (fleet guard, respawn, settlement, cascade shutdown)",
+    ),
+    Target(
+        source="gco/services/request_size_middleware.py",
+        function="RequestSizeLimitMiddleware.__call__",
+        title="Request-size trust boundary (declared/streamed limits and exact replay)",
+    ),
+    Target(
+        source="gco/services/webhook_dispatcher.py",
+        function="WebhookDispatcher._deliver_webhook",
+        title="Webhook delivery boundary (DNS pinning, HMAC, retries, redacted accounting)",
+    ),
+    Target(
+        source="gco/services/mooncake_pd_proxy.py",
+        function="_dispatch",
+        title="Mooncake prefill/decode dispatch (admin gate, KV handoff, streaming decode)",
+    ),
+    Target(
+        source="gco/services/health_monitor.py",
+        function="HealthMonitor.get_health_status",
+        title="Health status policy (thresholds, violations, collection failure)",
     ),
 ]

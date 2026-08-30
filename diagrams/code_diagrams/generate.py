@@ -52,6 +52,7 @@ from diagrams.code_diagrams._source_marker import (  # noqa: E402
 )
 from diagrams.code_diagrams._targets import TARGETS, Target  # noqa: E402
 from diagrams.code_diagrams._timestamp import generation_timestamp_utc  # noqa: E402
+from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS  # noqa: E402
 
 
 def main() -> None:
@@ -79,6 +80,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--require-png",
+        action="store_true",
+        help="Fail a canonical run if any selected PNG could not be rendered.",
+    )
+    parser.add_argument(
         "--skip-marker",
         action="store_true",
         help="Don't insert ``# Flowchart:`` markers into source files.",
@@ -96,6 +102,8 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.require_png and args.skip_png:
+        parser.error("--require-png cannot be combined with --skip-png")
 
     project_root = Path(__file__).resolve().parent.parent.parent
     output_dir = Path(__file__).resolve().parent
@@ -127,9 +135,20 @@ def main() -> None:
         render_png=not args.skip_png,
         generated_at=generated_at,
     )
+    if args.require_png:
+        missing_pngs = [
+            result.target.source + ":" + result.target.function
+            for result in results
+            if result.png_path is None
+        ]
+        if missing_pngs:
+            sys.exit(f"Canonical generation requires every PNG; missing: {missing_pngs}")
 
     if not args.skip_marker:
         if full_catalog:
+            # Reconcile the whole owned marker set: stripping first removes
+            # markers from retired targets before current targets are reinserted.
+            strip_all_markers(project_root)
             upsert_markers(results, project_root=project_root)
             _sync_shared_lambda_copies(project_root)
         else:
@@ -162,8 +181,6 @@ def _sync_shared_lambda_copies(project_root: Path) -> None:
     re-syncs at deploy time). Reuse the deploy path's own map so the two
     sync points can never disagree about what a copy is.
     """
-    from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS  # noqa: PLC0415 — heavy import, CLI-only
-
     synced = 0
     for source_rel, target_rels in LAMBDA_SHARED_SOURCE_TARGETS.items():
         source = project_root / source_rel

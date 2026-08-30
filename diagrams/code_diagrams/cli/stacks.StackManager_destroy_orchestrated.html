@@ -2,7 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
         <title>gco stacks destroy-all — orchestrated multi-stack destroy</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,7 +206,7 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op1655=>operation: 'Destroy stacks in dependency order with optional exact-ARN authority.'
+        <div><textarea id="code" style="width: 100%;" rows="11">op1655=>operation: "Destroy stacks in dependency order with optional exact-ARN authority.\n\n        ``retain_volumes`` reports the destroyed clusters' orphaned CSI volumes\n        instead of deleting them; see ``_cleanup_cluster_volumes``.\n        "
 op1657=>operation: app_stacks = self.list_stacks()
 op1659=>operation: strict_identity = expected_stack_ids is not None
 cond1662=>condition: if strict_identity
@@ -255,10 +255,11 @@ op1875=>operation: implicit_log_groups: dict[str, dict[str, Any]] = {}
 cond1878=>operation: implicit_log_groups = self._collect_implicit_log_groups(stacks) if  not strict_identity
 st1889=>start: start finish
 io1891=>inputoutput: input: overall
-op1894=>operation: 'Funnel every exit through the implicit log-group sweep.\n\n            Called at each return point so a partially failed teardown\n            still cleans up the stacks that DID delete. New exit paths\n            must return through here as well.\n            '
+op1894=>operation: 'Funnel every exit through the teardown sweeps.\n\n            Called at each return point so a partially failed teardown\n            still cleans up the stacks that DID delete (implicit log\n            groups), while the success-only sweeps (runtime traffic-dial\n            parameters) run exactly when everything is gone. New exit\n            paths must return through here as well.\n            '
 cond1897=>operation: record_cleanup('implicit-log-groups', self._cleanup_implicit_log_groups(implicit_log_groups, successful)) if  implicit_log_groups
-io1910=>inputoutput: output: (overall, successful, failed)
-e1908=>end: end function return
+cond1908=>operation: record_cleanup('traffic-dial-parameters', self._cleanup_traffic_dial_parameters()) if  overall
+io1921=>inputoutput: output: (overall, successful, failed)
+e1919=>end: end function return
 
 op1655->op1657
 op1657->op1659
@@ -311,8 +312,9 @@ cond1878->st1889
 st1889->io1891
 io1891->op1894
 op1894->cond1897
-cond1897->io1910
-io1910->e1908
+cond1897->cond1908
+cond1908->io1921
+io1921->e1919
 cond1788(no)->op1801
 cond1756(no)->op1781
 cond1711(no)->op1753
@@ -326,10 +328,10 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
           </p>
           <div id="canvas"></div>
         </div>

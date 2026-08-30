@@ -10,13 +10,14 @@ run's clean-worktree preflight (observed live: the release-validation harness
 left five modified files behind on an otherwise green run).
 
 This module enforces the sync at commit time instead of deploy time. The map
-of canonical sources to copies is ``cli.stacks.LAMBDA_SHARED_SOURCE_TARGETS``
-— the same one the deploy path consumes — so the test cannot drift from the
-code. On failure, re-run the sync (any of):
+of canonical sources to copies is
+``gco.lambda_shared_sources.LAMBDA_SHARED_SOURCE_TARGETS`` — the same one the
+deploy path consumes — so the test cannot drift from the code. On failure,
+re-run the sync (any of):
 
     gco stacks deploy ... (runs it implicitly), or
     python -c "from pathlib import Path; from shutil import copy2;
-               from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS as M;
+               from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS as M;
                [copy2(s, t) for s, ts in M.items() for t in ts]"
 
 and commit the result.
@@ -28,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS
+from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 

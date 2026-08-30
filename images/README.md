@@ -11,11 +11,19 @@ Screenshots and visual assets for GCO (Global Capacity Orchestrator on AWS) docu
 
 ## Reference Architecture Diagrams
 
-These curated reference views complement the generated infrastructure diagrams and preserve the platform story at three levels:
+These curated reference views complement the generated infrastructure diagrams
+and preserve the platform story at three levels. They are retained rendered
+artifacts: **their editable source is not present in this repository**, and no
+in-repository generator is claimed for them. Do not substitute the generated
+CDK views or invent a draw.io/PowerPoint/SVG provenance when refreshing them.
 
-- [Part 1 — Multi-region reference architecture](gco_ref_architecture_part1.png)
-- [Part 2 — Regional EKS architecture](gco_ref_architecture_part2.png)
-- [Part 3 — Security controls and request flow](gco_ref_architecture_part3.png)
+| Asset | View | Provenance / update path |
+|-------|------|--------------------------|
+| [gco_ref_architecture_part1.png](gco_ref_architecture_part1.png) | Multi-region reference architecture | Curated rendered PNG; editable source unavailable in this repository |
+| [gco_ref_architecture_part2.png](gco_ref_architecture_part2.png) | Regional EKS architecture | Curated rendered PNG; editable source unavailable in this repository |
+| [gco_ref_architecture_part3.png](gco_ref_architecture_part3.png) | Security controls and request flow | Curated rendered PNG; editable source unavailable in this repository |
+| [`diagrams/infra_diagrams/`](../diagrams/infra_diagrams/README.md) | CDK-derived stack and aggregate topology | Reproducible structure via `python diagrams/generate.py --infra-only` |
+| [`diagrams/code_diagrams/`](../diagrams/code_diagrams/README.md) | Per-function control flow | Regenerate with a fixed `SOURCE_DATE_EPOCH` through `diagrams/generate.py` |
 
 ## MCP Server Screenshots
 

@@ -11,20 +11,20 @@ CI/CD workflow definitions that run on every push, pull request, or on a schedul
 
 ## Primary Workflows
 
-Run on every push to `main` and every pull request.
+Six primary workflows run on every push to `main` and every pull request.
 
 | File | Badge | Description |
 |------|-------|-------------|
-| `unit-tests.yml` | Unit Tests | pytest with coverage (90% enforced floor; ~92% Python target), explicit offline accelerator catalog/NodePool/watch-list validation, BATS shell tests, [CDK](https://docs.aws.amazon.com/cdk/v2/guide/home.html) synth, config matrix, cdk-nag compliance, lockfile freshness, CLI smoke, autopilot smoke (both-engine dry-run/config validation + exact pinned Claude Code and Codex installs) |
+| `unit-tests.yml` | Unit Tests | three dynamically balanced pytest shards with one stable combined-coverage gate (90% floor), explicit offline accelerator catalog/NodePool/watch-list validation, BATS shell tests, [CDK](https://docs.aws.amazon.com/cdk/v2/guide/home.html) synth, config matrix, cdk-nag compliance, locked Linux installs, lockfile freshness, CLI smoke, and autopilot smoke |
 | `inference-streaming-proxy.yml` | — | Native Node.js 24 tests for the inference streaming [Lambda](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) with 93% line/function/branch gates |
 | `floci-tests.yml` | Floci Tests | Emulated-AWS layer ([Floci](https://github.com/floci-io/floci), digest-pinned service container, zero AWS credentials): production stores/queues/secrets/S3/CloudFormation code issuing real SDK requests against the emulator, plus the live-validation harness E2E through `gco release validate --emulator-endpoint` (verified emulator opt-in, full preflight incl. `cdk list` over the real cloud assembly, baseline capture, negative account-mismatch proof). See `docs/FLOCI_TESTING.md` |
-| `integration-tests.yml` | Integration Tests | Dockerfile builds + functional container tests (pod-equivalent boot, HTTP probe/auth contracts, SIGTERM shutdown, moto-SQS queue-processor exit codes), dev-container smoke (pinned toolchain incl. uv/uvx + both engine plans/configs + persisted Codex lazy install), kind cluster E2E with Calico and Metrics Server (4 service deployments, inference-proxy HPA `ScalingActive`, RBAC enforcement, NetworkPolicy blocking, ResourceQuota, PDB validation), K8s manifest validation, Lambda import checks, MCP server tests |
+| `integration-tests.yml` | Integration Tests | Dockerfile builds + functional container tests (pod-equivalent boot, HTTP probe/auth contracts, SIGTERM shutdown, moto-SQS queue-processor exit codes), dev-container smoke (pinned toolchain incl. uv/uvx + both engine plans/configs + persisted Codex lazy install), kind cluster E2E with Calico and Metrics Server (5 service deployments, inference-proxy HPA `ScalingActive`, RBAC enforcement, NetworkPolicy blocking, ResourceQuota, PDB validation), K8s manifest validation, Lambda import checks, MCP server tests |
 | `security.yml` | Security | bandit, pip-audit, npm audit across every owned graph, trivy (filesystem + container), trufflehog, gitleaks, semgrep, checkov, KICS, CodeQL (Python + JavaScript) |
 | `lint.yml` | Linting | actionlint, hadolint, markdownlint, mypy (strict + stacks + lambda), ruff (format + check, imports included), strict ShellCheck at `style` severity over every tracked `*.sh` path, yamllint |
 
 ## Satellite Workflows
 
-Workflows outside the four badged gates above. Most are schedule- or dispatch-driven; `mooncake-image.yml` also runs on push and PR but is a narrow, feature-specific contract test rather than a headline gate.
+Eight workflows sit outside the four badged gates above. Most are schedule- or dispatch-driven; `mooncake-image.yml` also runs on push and PR but is a narrow, feature-specific contract test rather than a headline gate.
 
 | File | Trigger | Description |
 |------|---------|-------------|
@@ -54,4 +54,4 @@ failing the scheduled workflow.
 2. Set `permissions:` to the minimum required (default: `contents: read`)
 3. Add `concurrency` with `cancel-in-progress: true` for PR workflows
 4. Set `timeout-minutes` on every job
-5. Document the workflow in `../.github/CI.md`
+5. Document the workflow in `../CI.md`

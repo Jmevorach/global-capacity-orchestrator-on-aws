@@ -41,11 +41,11 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``lambda_handler`` -> ``diagrams/code_diagrams/lambda/cross-region-aggregator/handler.lambda_handler.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/cross-region-aggregator/handler.lambda_handler.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 
@@ -235,6 +235,15 @@ def query_region(
         }
 
 
+def _job_metadata_text(job: dict[str, Any], key: str) -> str:
+    """Return a string metadata field for total, deterministic ordering."""
+    metadata = job.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    value = metadata.get(key)
+    return value if isinstance(value, str) else ""
+
+
 def aggregate_jobs(
     namespace: str | None = None,
     status: str | None = None,
@@ -290,9 +299,20 @@ def aggregate_jobs(
                 _LOGGER.exception("Unexpected aggregate-jobs failure for %s", region)
                 errors.append({"region": region, "error": "Regional request failed"})
 
-    # Sort by creation time descending
+    # Canonicalize presentation independently of thread completion order.
+    region_summaries.sort(key=lambda item: item["region"])
+    errors.sort(key=lambda item: item["region"])
     all_jobs.sort(
-        key=lambda j: j.get("metadata", {}).get("creationTimestamp", ""),
+        key=lambda job: (
+            str(job.get("_source_region") or ""),
+            _job_metadata_text(job, "namespace"),
+            _job_metadata_text(job, "name"),
+            _job_metadata_text(job, "uid"),
+        )
+    )
+    # Stable second pass keeps the tie-breakers ascending within each timestamp.
+    all_jobs.sort(
+        key=lambda job: _job_metadata_text(job, "creationTimestamp"),
         reverse=True,
     )
 
@@ -350,6 +370,8 @@ def aggregate_metrics() -> dict[str, Any]:
                 _LOGGER.exception("Unexpected aggregate-metrics failure for %s", region)
                 errors.append({"region": region, "error": "Regional request failed"})
 
+    region_metrics.sort(key=lambda item: item["region"])
+    errors.sort(key=lambda item: item["region"])
     return {
         "regions_queried": len(endpoints),
         "regions_successful": len(region_metrics),
@@ -401,6 +423,7 @@ def aggregate_health() -> dict[str, Any]:
                     }
                 )
 
+    region_health.sort(key=lambda item: item["region"])
     healthy_count = sum(1 for r in region_health if r["status"] == "healthy")
     overall_status = "healthy" if healthy_count == len(endpoints) else "degraded"
     if healthy_count == 0:
@@ -477,6 +500,8 @@ def bulk_delete_jobs(
                 _LOGGER.exception("Unexpected bulk-delete failure for %s", region)
                 errors.append({"region": region, "error": "Regional request failed"})
 
+    region_results.sort(key=lambda item: item["region"])
+    errors.sort(key=lambda item: item["region"])
     return {
         "dry_run": dry_run,
         "total_matched": total_matched,

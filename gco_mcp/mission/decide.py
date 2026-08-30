@@ -79,11 +79,11 @@ from .checkpoints import should_evaluate_now
 from .types import IterationRecord, SessionState, VerdictLabel, VerdictReason
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``decide_verdict`` -> ``diagrams/code_diagrams/gco_mcp/mission/decide.decide_verdict.html``
 #     (PNG: ``diagrams/code_diagrams/gco_mcp/mission/decide.decide_verdict.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

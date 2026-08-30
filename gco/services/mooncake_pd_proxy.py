@@ -49,6 +49,15 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-30T12:00:00Z
+# Flowchart(s) generated from this file:
+#   * ``_dispatch`` -> ``diagrams/code_diagrams/gco/services/mooncake_pd_proxy._dispatch.html``
+#     (PNG: ``diagrams/code_diagrams/gco/services/mooncake_pd_proxy._dispatch.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s [mooncake-pd-proxy] %(message)s"
 )

@@ -40,6 +40,7 @@ An MCP (Model Context Protocol) server that exposes the Global Capacity Orchestr
   - [Examples Discovery](#examples-discovery)
   - [Docs Discovery](#docs-discovery)
   - [Mission (Goal-Directed Loop)](#mission-goal-directed-loop)
+  - [Swarm (Supervisor of Missions)](#swarm-supervisor-of-missions)
   - [Task Observability](#task-observability)
   - [Live State](#live-state)
 - [Available Resources](#available-resources)
@@ -467,7 +468,7 @@ A handful of GCO MCP tools can incur AWS charges, mutate live infrastructure, de
 | `GCO_ENABLE_INFRASTRUCTURE_DEPLOY` | `false` | `deploy_stack`, `deploy_all`, `bootstrap_cdk`, `addons_install` | Creates or updates [CloudFormation](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/Welcome.html) stacks or starts Helm add-on re-convergence. A full `deploy_all` runs 30-60 minutes wall-clock and can provision EKS clusters, NodePools, and storage that incur ongoing charges. |
 | `GCO_ENABLE_INFRASTRUCTURE_DESTROY` | `false` | `destroy_stack`, `destroy_all` | Tears down CloudFormation stacks. Cancellation mid-flight can leave partial state behind that has to be cleaned up by hand. |
 | `GCO_ENABLE_DESTRUCTIVE_OPERATIONS` | `false` | `delete_job`, `delete_inference`, `delete_template`, `delete_webhook`, `delete_model`, `delete_nodepool`, `analytics_user_remove`, `monitoring_user_remove`, `cancel_queue_job`, `cancel_reservation`, `images_cleanup`, `images_prune`, `images_delete_tag`, `images_delete_repo`, `task_prune` | Delete operations are irreversible — once data, jobs, models, images, capacity reservations, or local task history are removed they can't be recovered without a backup. |
-| `GCO_ENABLE_MISSION` | `false` | `mission_start`, `mission_status`, `mission_iterate`, `mission_checkpoint`, `mission_complete`, `mission_abort`, `mission_resume`, `mission_history`, `mission_list` | Runs an autonomous goal-directed loop that can call any tool in its allowlist. Gated to prevent unattended autonomous execution. |
+| `GCO_ENABLE_MISSION` | `false` | `mission_start`, `mission_status`, `mission_iterate`, `mission_checkpoint`, `mission_complete`, `mission_abort`, `mission_resume`, `mission_history`, `mission_list`, `mission_memory_search` | Runs an autonomous goal-directed loop that can call any tool in its allowlist. Gated to prevent unattended autonomous execution. |
 | `GCO_ENABLE_SWARM` | `false` | `swarm_start`, `swarm_iterate`, `swarm_status`, `swarm_abort`, `swarm_list`, `swarm_plan` | One orchestrator Mission session spawning and supervising concurrent child Mission sessions under hard rails (fleet cap, pooled iteration budget, finite child budgets). Gated because loop-spawning-loops multiplies the blast radius of whatever other flags are enabled. Recommended together with `GCO_ENABLE_MISSION` so children are inspectable via `mission_status`. See [`docs/SWARM.md`](../docs/SWARM.md). |
 | `GCO_ENABLE_LOCAL_METRICS` | `false` | `metrics_from_local_file` | Reads a metric file from the MCP host beneath `GCO_METRICS_LOCAL_ROOT`; disabled by default to prevent unintended host-file access. |
 | `GCO_ENABLE_LOCAL_STORAGE_SYNC` | `false` | `sync_storage_bucket` | Reads from or writes to the MCP host and can upload objects to S3. A large or unintended sync can consume local disk or [S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html) storage and network capacity, so the operator must opt in and confine local paths with `GCO_STORAGE_LOCAL_ROOT`. |
@@ -955,7 +956,7 @@ Read-only metric-reader tools that surface a single training-style scalar (loss,
 
 ### Mission (Goal-Directed Loop)
 
-All nine Mission tools are gated behind `GCO_ENABLE_MISSION` — the loop can call any tool in its allowlist, so it is off by default to prevent unattended autonomous execution. See [`gco_mcp/mission/README.md`](mission/README.md) and [`docs/MISSION.md`](../docs/MISSION.md).
+All ten Mission tools are gated behind `GCO_ENABLE_MISSION` — the loop can call any tool in its allowlist, so it is off by default to prevent unattended autonomous execution. See [`gco_mcp/mission/README.md`](mission/README.md) and [`docs/MISSION.md`](../docs/MISSION.md).
 
 | Tool | Description | Risk Tier | Gated By |
 |------|-------------|-----------|----------|
@@ -968,6 +969,7 @@ All nine Mission tools are gated behind `GCO_ENABLE_MISSION` — the loop can ca
 | `mission_resume` | Resume a previously paused or interrupted mission | low-risk | `GCO_ENABLE_MISSION` |
 | `mission_history` | List the iteration history of a mission session | safe | `GCO_ENABLE_MISSION` |
 | `mission_list` | List known mission sessions | safe | `GCO_ENABLE_MISSION` |
+| `mission_memory_search` | Search durable cross-session Mission memory for semantically related prior findings | safe | `GCO_ENABLE_MISSION` |
 
 ### Swarm (Supervisor of Missions)
 

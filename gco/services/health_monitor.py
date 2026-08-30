@@ -37,6 +37,15 @@ from kubernetes.client.rest import ApiException
 from gco.models import HealthStatus, RequestedResources, ResourceThresholds, ResourceUtilization
 from gco.services.structured_logging import configure_structured_logging
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-30T12:00:00Z
+# Flowchart(s) generated from this file:
+#   * ``HealthMonitor.get_health_status`` -> ``diagrams/code_diagrams/gco/services/health_monitor.HealthMonitor_get_health_status.html``
+#     (PNG: ``diagrams/code_diagrams/gco/services/health_monitor.HealthMonitor_get_health_status.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )

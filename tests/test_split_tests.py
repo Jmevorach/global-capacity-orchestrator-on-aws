@@ -144,6 +144,41 @@ def test_workflow_shard_matrix_is_a_contiguous_range(workflow: dict[str, Any]) -
     )
 
 
+def test_workflow_uses_three_nonempty_shards(workflow: dict[str, Any]) -> None:
+    """The pre-v7 matrix has exactly three dynamic cells."""
+    job = _shard_job(workflow)
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"]["shard"] == [1, 2, 3]
+
+
+def test_shard_one_owns_whole_repository_policy_checks(workflow: dict[str, Any]) -> None:
+    """The accelerator policy runs once, independently of pytest sharding."""
+    step = next(
+        item
+        for item in _shard_job(workflow)["steps"]
+        if item.get("name") == "Validate accelerator catalog and NodePools"
+    )
+    assert step["if"] == "matrix.shard == 1"
+
+
+def test_shard_artifacts_are_dynamic_and_aggregate_uses_a_glob(
+    workflow: dict[str, Any],
+) -> None:
+    """Adding a matrix cell must require no artifact-name edits."""
+    shard_steps = _shard_job(workflow)["steps"]
+    upload = next(item for item in shard_steps if item.get("name") == "Upload shard coverage data")
+    assert upload["with"]["name"] == "pytest-coverage-shard-${{ matrix.shard }}"
+    assert "coverage-data-shard-${{ matrix.shard }}" in upload["with"]["path"]
+    assert "report-shard-${{ matrix.shard }}.xml" in upload["with"]["path"]
+
+    aggregate_steps = workflow["jobs"]["unit-pytest-core"]["steps"]
+    download = next(
+        item for item in aggregate_steps if item.get("name") == "Download shard coverage data"
+    )
+    assert download["with"]["pattern"] == "pytest-coverage-shard-*"
+    assert download["with"]["merge-multiple"] is True
+
+
 def test_workflow_derives_shard_total_from_the_matrix(workflow: dict[str, Any]) -> None:
     """``--of`` must come from ``strategy.job-total``, never a second literal.
 

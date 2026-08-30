@@ -2,7 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
         <title>Global queue lifecycle transition (lease, status, and Kubernetes UID fencing)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,135 +206,135 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op3690=>operation: 'Apply one fenced compare-and-set lifecycle transition.\n\n        ``None`` means another actor won the race or the caller lost its lease.\n        Terminal records are immutable because the transition matrix has no\n        outgoing terminal edges.\n        '
-op3692=>operation: expected = expected_status.value if isinstance(expected_status, JobStatus) else expected_status
-op3694=>operation: destination = status.value if isinstance(status, JobStatus) else status
-cond3697=>operation: raise ValueError(f'Invalid job transition: {expected} -> {destination}') if  destination not in _ALLOWED_JOB_TRANSITIONS.get(expected, frozenset())
-cond3708=>condition: if workload_not_created is not None
-cond3713=>operation: raise ValueError('workload_not_created proof must be exactly true') if  workload_not_created is not True
-cond3724=>operation: raise ValueError('workload_not_created proof is valid only from the applying state') if  expected != JobStatus.APPLYING.value
-cond3735=>operation: raise ValueError('workload_not_created proof is valid only for failed jobs') if  destination != JobStatus.FAILED.value
-cond3746=>operation: raise ValueError('workload_not_created proof cannot accompany Kubernetes identity') if  any((k8s_job_name, k8s_job_namespace, k8s_job_uid))
-op3759=>operation: item = self._get_raw_job(job_id)
-cond3762=>condition: if item is None or item.get('status') != expected or item.get('target_region') != target_region
-io3769=>inputoutput: output: None
-e3767=>end: end function return
-cond3776=>operation: raise ValueError('workload_not_created proof requires a record without Kubernetes identity') if  workload_not_created is True and any((attribute in item for attribute in ('k8s_job_name', 'k8s_job_namespace', 'k8s_job_uid')))
-op3786=>operation: claim_is_required = expected in {JobStatus.CLAIMED.value, JobStatus.APPLYING.value}
-cond3789=>condition: if claim_is_required
-cond3794=>operation: raise ValueError(f'Transition from {expected} requires complete claim fencing') if  claimed_by is None or claim_token is None or claim_generation is None
-cond3805=>condition: if item.get('claimed_by') != claimed_by or item.get('claim_token') != claim_token or int(item.get('claim_generation', -1)) != claim_generation
-io3812=>inputoutput: output: None
-e3810=>end: end function return
-cond3822=>condition: if expected_k8s_uid is not None and str(item.get('k8s_job_uid') or '') != str(expected_k8s_uid)
-io3829=>inputoutput: output: None
-e3827=>end: end function return
-op3835=>operation: now = _utc_now_iso()
-op3837=>operation: priority_sort = str(item.get('priority_sort') or self._priority_sort_key(self._legacy_priority(item), str(item.get('submitted_at') or item.get('updated_at') or now), job_id))
-op3839=>operation: work_sort = str(item.get('lease_expires_at') or priority_sort) if destination in {JobStatus.CLAIMED.value, JobStatus.APPLYING.value} else priority_sort
-op3841=>operation: update_parts = ['#status = :destination', 'region_status = :region_status', 'priority_sort = :priority_sort', 'work_sort = :work_sort', 'updated_at = :now', 'status_history = :history']
-op3843=>operation: remove_parts: list[str] = []
-op3845=>operation: values: dict[str, Any] = {':destination': destination, ':expected': expected, ':region_status': self._region_status(target_region, destination), ':priority_sort': priority_sort, ':work_sort': work_sort, ':target_region': target_region, ':now': now, ':expected_updated_at': item.get('updated_at'), ':history': self._history_with(item, status=destination, timestamp=now, message=message, error=error)}
-op3847=>operation: conditions = ['attribute_exists(job_id)', '#status = :expected', 'target_region = :target_region', 'updated_at = :expected_updated_at']
-cond3850=>condition: if claim_is_required
-sub3854=>subroutine: conditions.extend(['claimed_by = :claimed_by', 'claim_token = :claim_token', 'claim_generation = :generation', 'lease_expires_at > :now'])
-sub3856=>subroutine: values.update({':claimed_by': claimed_by, ':claim_token': claim_token, ':generation': claim_generation})
-cond3862=>condition: if expected_k8s_uid is not None
-sub3866=>subroutine: conditions.append('k8s_job_uid = :expected_k8s_uid')
-op3868=>operation: values[':expected_k8s_uid'] = expected_k8s_uid
-cond3874=>condition: if workload_not_created is True
-sub3878=>subroutine: update_parts.append('workload_not_created = :workload_not_created')
-op3880=>operation: values[':workload_not_created'] = True
-sub3882=>subroutine: conditions.extend(['attribute_not_exists(workload_not_created)', 'attribute_not_exists(k8s_job_name)', 'attribute_not_exists(k8s_job_namespace)', 'attribute_not_exists(k8s_job_uid)'])
-cond3888=>condition: for attribute, value, placeholder in (('k8s_job_name', k8s_job_name, ':k8s_job_name'), ('k8s_job_namespace', k8s_job_namespace, ':k8s_job_namespace'), ('k8s_job_uid', k8s_job_uid, ':k8s_job_uid'))
-cond3893=>condition: if value
-sub3897=>subroutine: update_parts.append(f'{attribute} = {placeholder}')
-op3899=>operation: values[placeholder] = value
-cond3907=>condition: if error
-sub3911=>subroutine: update_parts.append('error_message = :error')
-op3913=>operation: values[':error'] = error
-cond3930=>operation: update_parts.append('completed_at = :now') if  destination in _TERMINAL_JOB_STATUSES
-cond3941=>operation: remove_parts.extend(['claimed_by', 'claim_token', 'lease_expires_at']) if  destination not in {JobStatus.CLAIMED.value, JobStatus.APPLYING.value}
-op3951=>operation: update_expression = 'SET ' + ', '.join(update_parts)
-cond3954=>operation: update_expression += ' REMOVE ' + ', '.join(dict.fromkeys(remove_parts)) if  remove_parts
-op3965=>operation: response = self._table.update_item(Key={'job_id': job_id}, UpdateExpression=update_expression, ConditionExpression=' AND '.join(conditions), ExpressionAttributeNames={'#status': 'status'}, ExpressionAttributeValues=values, ReturnValues='ALL_NEW')
+        <div><textarea id="code" style="width: 100%;" rows="11">op3781=>operation: 'Apply one fenced compare-and-set lifecycle transition.\n\n        ``None`` means another actor won the race or the caller lost its lease.\n        Terminal records are immutable because the transition matrix has no\n        outgoing terminal edges.\n        '
+op3783=>operation: expected = expected_status.value if isinstance(expected_status, JobStatus) else expected_status
+op3785=>operation: destination = status.value if isinstance(status, JobStatus) else status
+cond3788=>operation: raise ValueError(f'Invalid job transition: {expected} -> {destination}') if  destination not in _ALLOWED_JOB_TRANSITIONS.get(expected, frozenset())
+cond3799=>condition: if workload_not_created is not None
+cond3804=>operation: raise ValueError('workload_not_created proof must be exactly true') if  workload_not_created is not True
+cond3815=>operation: raise ValueError('workload_not_created proof is valid only from the applying state') if  expected != JobStatus.APPLYING.value
+cond3826=>operation: raise ValueError('workload_not_created proof is valid only for failed jobs') if  destination != JobStatus.FAILED.value
+cond3837=>operation: raise ValueError('workload_not_created proof cannot accompany Kubernetes identity') if  any((k8s_job_name, k8s_job_namespace, k8s_job_uid))
+op3850=>operation: item = self._get_raw_job(job_id)
+cond3853=>condition: if item is None or item.get('status') != expected or item.get('target_region') != target_region
+io3860=>inputoutput: output: None
+e3858=>end: end function return
+cond3867=>operation: raise ValueError('workload_not_created proof requires a record without Kubernetes identity') if  workload_not_created is True and any((attribute in item for attribute in ('k8s_job_name', 'k8s_job_namespace', 'k8s_job_uid')))
+op3877=>operation: claim_is_required = expected in {JobStatus.CLAIMED.value, JobStatus.APPLYING.value}
+cond3880=>condition: if claim_is_required
+cond3885=>operation: raise ValueError(f'Transition from {expected} requires complete claim fencing') if  claimed_by is None or claim_token is None or claim_generation is None
+cond3896=>condition: if item.get('claimed_by') != claimed_by or item.get('claim_token') != claim_token or int(item.get('claim_generation', -1)) != claim_generation
+io3903=>inputoutput: output: None
+e3901=>end: end function return
+cond3913=>condition: if expected_k8s_uid is not None and str(item.get('k8s_job_uid') or '') != str(expected_k8s_uid)
+io3920=>inputoutput: output: None
+e3918=>end: end function return
+op3926=>operation: now = _utc_now_iso()
+op3928=>operation: priority_sort = str(item.get('priority_sort') or self._priority_sort_key(self._legacy_priority(item), str(item.get('submitted_at') or item.get('updated_at') or now), job_id))
+op3930=>operation: work_sort = str(item.get('lease_expires_at') or priority_sort) if destination in {JobStatus.CLAIMED.value, JobStatus.APPLYING.value} else priority_sort
+op3932=>operation: update_parts = ['#status = :destination', 'region_status = :region_status', 'priority_sort = :priority_sort', 'work_sort = :work_sort', 'updated_at = :now', 'status_history = :history']
+op3934=>operation: remove_parts: list[str] = []
+op3936=>operation: values: dict[str, Any] = {':destination': destination, ':expected': expected, ':region_status': self._region_status(target_region, destination), ':priority_sort': priority_sort, ':work_sort': work_sort, ':target_region': target_region, ':now': now, ':expected_updated_at': item.get('updated_at'), ':history': self._history_with(item, status=destination, timestamp=now, message=message, error=error)}
+op3938=>operation: conditions = ['attribute_exists(job_id)', '#status = :expected', 'target_region = :target_region', 'updated_at = :expected_updated_at']
+cond3941=>condition: if claim_is_required
+sub3945=>subroutine: conditions.extend(['claimed_by = :claimed_by', 'claim_token = :claim_token', 'claim_generation = :generation', 'lease_expires_at > :now'])
+sub3947=>subroutine: values.update({':claimed_by': claimed_by, ':claim_token': claim_token, ':generation': claim_generation})
+cond3953=>condition: if expected_k8s_uid is not None
+sub3957=>subroutine: conditions.append('k8s_job_uid = :expected_k8s_uid')
+op3959=>operation: values[':expected_k8s_uid'] = expected_k8s_uid
+cond3965=>condition: if workload_not_created is True
+sub3969=>subroutine: update_parts.append('workload_not_created = :workload_not_created')
+op3971=>operation: values[':workload_not_created'] = True
+sub3973=>subroutine: conditions.extend(['attribute_not_exists(workload_not_created)', 'attribute_not_exists(k8s_job_name)', 'attribute_not_exists(k8s_job_namespace)', 'attribute_not_exists(k8s_job_uid)'])
+cond3979=>condition: for attribute, value, placeholder in (('k8s_job_name', k8s_job_name, ':k8s_job_name'), ('k8s_job_namespace', k8s_job_namespace, ':k8s_job_namespace'), ('k8s_job_uid', k8s_job_uid, ':k8s_job_uid'))
+cond3984=>condition: if value
+sub3988=>subroutine: update_parts.append(f'{attribute} = {placeholder}')
+op3990=>operation: values[placeholder] = value
+cond3998=>condition: if error
+sub4002=>subroutine: update_parts.append('error_message = :error')
+op4004=>operation: values[':error'] = error
+cond4021=>operation: update_parts.append('completed_at = :now') if  destination in _TERMINAL_JOB_STATUSES
+cond4032=>operation: remove_parts.extend(['claimed_by', 'claim_token', 'lease_expires_at']) if  destination not in {JobStatus.CLAIMED.value, JobStatus.APPLYING.value}
+op4042=>operation: update_expression = 'SET ' + ', '.join(update_parts)
+cond4045=>operation: update_expression += ' REMOVE ' + ', '.join(dict.fromkeys(remove_parts)) if  remove_parts
+op4056=>operation: response = self._table.update_item(Key={'job_id': job_id}, UpdateExpression=update_expression, ConditionExpression=' AND '.join(conditions), ExpressionAttributeNames={'#status': 'status'}, ExpressionAttributeValues=values, ReturnValues='ALL_NEW')
 return self._parse_job_item(response.get('Attributes', {}))
-cond3964=>condition: exception raised?
-cond3967=>condition: except ClientError as transition_error
-cond3972=>condition: if self._is_conditional_failure(transition_error)
-io3979=>inputoutput: output: None
-e3977=>end: end function return
-sub3985=>subroutine: logger.error('Failed to transition job %s: %s', job_id, transition_error)
-sub3987=>subroutine: raise
-cond3918=>operation: remove_parts.append('error_message') if  destination != JobStatus.FAILED.value
+cond4055=>condition: exception raised?
+cond4058=>condition: except ClientError as transition_error
+cond4063=>condition: if self._is_conditional_failure(transition_error)
+io4070=>inputoutput: output: None
+e4068=>end: end function return
+sub4076=>subroutine: logger.error('Failed to transition job %s: %s', job_id, transition_error)
+sub4078=>subroutine: raise
+cond4009=>operation: remove_parts.append('error_message') if  destination != JobStatus.FAILED.value
 
-op3690->op3692
-op3692->op3694
-op3694->cond3697
-cond3697->cond3708
-cond3708(yes)->cond3713
-cond3713->cond3724
-cond3724->cond3735
-cond3735->cond3746
-cond3746->op3759
-op3759->cond3762
-cond3762(yes)->io3769
-io3769->e3767
-cond3762(no)->cond3776
-cond3776->op3786
-op3786->cond3789
-cond3789(yes)->cond3794
-cond3794->cond3805
-cond3805(yes)->io3812
-io3812->e3810
-cond3805(no)->cond3822
-cond3822(yes)->io3829
-io3829->e3827
-cond3822(no)->op3835
-op3835->op3837
-op3837->op3839
-op3839->op3841
-op3841->op3843
-op3843->op3845
-op3845->op3847
-op3847->cond3850
-cond3850(yes)->sub3854
-sub3854->sub3856
-sub3856->cond3862
-cond3862(yes)->sub3866
-sub3866->op3868
-op3868->cond3874
-cond3874(yes)->sub3878
-sub3878->op3880
-op3880->sub3882
-sub3882->cond3888
-cond3888(yes)->cond3893
-cond3893(yes)->sub3897
-sub3897->op3899
-op3899->cond3888
-cond3893(no)->cond3888
-cond3888(no)->cond3907
-cond3907(yes)->sub3911
-sub3911->op3913
-op3913->cond3930
-cond3930->cond3941
-cond3941->op3951
-op3951->cond3954
-cond3954->op3965
-op3965->cond3964
-cond3964(yes)->cond3967
-cond3967(yes)->cond3972
-cond3972(yes)->io3979
-io3979->e3977
-cond3972(no)->sub3985
-sub3985->sub3987
-cond3907(no)->cond3918
-cond3918->cond3930
-cond3874(no)->cond3888
-cond3862(no)->cond3874
-cond3850(no)->cond3862
-cond3789(no)->cond3822
-cond3708(no)->op3759
+op3781->op3783
+op3783->op3785
+op3785->cond3788
+cond3788->cond3799
+cond3799(yes)->cond3804
+cond3804->cond3815
+cond3815->cond3826
+cond3826->cond3837
+cond3837->op3850
+op3850->cond3853
+cond3853(yes)->io3860
+io3860->e3858
+cond3853(no)->cond3867
+cond3867->op3877
+op3877->cond3880
+cond3880(yes)->cond3885
+cond3885->cond3896
+cond3896(yes)->io3903
+io3903->e3901
+cond3896(no)->cond3913
+cond3913(yes)->io3920
+io3920->e3918
+cond3913(no)->op3926
+op3926->op3928
+op3928->op3930
+op3930->op3932
+op3932->op3934
+op3934->op3936
+op3936->op3938
+op3938->cond3941
+cond3941(yes)->sub3945
+sub3945->sub3947
+sub3947->cond3953
+cond3953(yes)->sub3957
+sub3957->op3959
+op3959->cond3965
+cond3965(yes)->sub3969
+sub3969->op3971
+op3971->sub3973
+sub3973->cond3979
+cond3979(yes)->cond3984
+cond3984(yes)->sub3988
+sub3988->op3990
+op3990->cond3979
+cond3984(no)->cond3979
+cond3979(no)->cond3998
+cond3998(yes)->sub4002
+sub4002->op4004
+op4004->cond4021
+cond4021->cond4032
+cond4032->op4042
+op4042->cond4045
+cond4045->op4056
+op4056->cond4055
+cond4055(yes)->cond4058
+cond4058(yes)->cond4063
+cond4063(yes)->io4070
+io4070->e4068
+cond4063(no)->sub4076
+sub4076->sub4078
+cond3998(no)->cond4009
+cond4009->cond4021
+cond3965(no)->cond3979
+cond3953(no)->cond3965
+cond3941(no)->cond3953
+cond3880(no)->cond3913
+cond3799(no)->op3850
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -344,10 +344,10 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
           </p>
           <div id="canvas"></div>
         </div>

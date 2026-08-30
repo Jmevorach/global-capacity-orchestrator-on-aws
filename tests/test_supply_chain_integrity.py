@@ -26,6 +26,41 @@ def _workflow_step(relative_path: str, step_name: str) -> str:
     return match.group(0)
 
 
+def test_required_linux_unit_jobs_install_the_committed_lock() -> None:
+    """Required Linux test/CDK jobs must execute the graph that keys their cache."""
+    workflow = yaml.safe_load(_read(".github/workflows/unit-tests.yml"))
+    locked_jobs = {
+        "unit-pytest-core-shard",
+        "unit-cdk-synth",
+        "unit-cdk-config-matrix",
+        "unit-cdk-project-name-scoping",
+        "unit-cdk-nag-compliance",
+    }
+    for job_id in locked_jobs:
+        job = workflow["jobs"][job_id]
+        commands = "\n".join(step.get("run", "") for step in job["steps"] if isinstance(step, dict))
+        assert "pip install -r requirements-lock.txt" in commands, job_id
+        assert "pip install -e . --no-deps" in commands, job_id
+
+    # This job intentionally proves that project metadata resolves from scratch.
+    fresh_commands = "\n".join(
+        step.get("run", "")
+        for step in workflow["jobs"]["unit-fresh-install"]["steps"]
+        if isinstance(step, dict)
+    )
+    assert 'pip install -e ".[cdk]"' in fresh_commands
+    assert "pip install -r requirements-lock.txt" not in fresh_commands
+
+
+def test_lockfile_check_uses_its_pinned_resolver_toolchain() -> None:
+    step = _workflow_step(
+        ".github/workflows/unit-tests.yml", "Install the locked pip-tools version"
+    )
+    assert 'python -m pip install "pip==25.0.1"' in step
+    assert "grep -E '^pip-tools==' requirements-lock.txt" in step
+    assert "pip install pip-tools" not in step
+
+
 @pytest.mark.parametrize(
     ("relative_path", "version", "sha256"),
     [

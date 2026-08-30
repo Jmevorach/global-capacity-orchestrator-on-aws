@@ -31,11 +31,11 @@ import feature_flags
 from version import get_project_version
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``audit_logged`` -> ``diagrams/code_diagrams/gco_mcp/audit.audit_logged.html``
 #     (PNG: ``diagrams/code_diagrams/gco_mcp/audit.audit_logged.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

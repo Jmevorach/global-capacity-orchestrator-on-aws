@@ -471,9 +471,9 @@ class TestLambdaHandler:
         ec2 = _fake_ec2()
 
         def probe(**kwargs):
-            if kwargs.get("RegionNames") == ["eu-bad-1"]:
-                raise Exception("AuthFailure: not opted in")
-            return {"Regions": [{"RegionName": kwargs["RegionNames"][0]}]}
+            region = kwargs["RegionNames"][0]
+            status = "not-opted-in" if region == "eu-bad-1" else "opted-in"
+            return {"Regions": [{"RegionName": region, "OptInStatus": status}]}
 
         ec2.describe_regions.side_effect = probe
         with patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)):
@@ -481,6 +481,7 @@ class TestLambdaHandler:
 
         assert result["regions_polled"] == ["us-east-1"]
         assert result["regions_skipped_not_enabled"] == ["eu-bad-1"]
+        assert result["regions_enablement_unknown"] == []
         # No snapshot was written for the skipped region and SPS never
         # requested it.
         written_pks = [c.kwargs["Item"]["pk"] for c in mock_table.put_item.call_args_list]
@@ -510,8 +511,50 @@ class TestLambdaHandler:
 
         assert result["regions_polled"] == ["us-east-1"]
         assert result["regions_skipped_not_enabled"] == []
+        assert result["regions_enablement_unknown"] == ["us-east-1"]
         assert result["written"] == 1
         assert any("ec2:DescribeRegions" in record.message for record in caplog.records)
+
+    def test_transient_probe_failure_is_unknown_and_still_polled(
+        self, handler, monkeypatch, caplog
+    ):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+
+        class _Throttled(Exception):
+            response = {"Error": {"Code": "ThrottlingException"}}
+
+        ec2.describe_regions.side_effect = _Throttled("retry later")
+        with (
+            caplog.at_level("WARNING"),
+            patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)),
+        ):
+            result = handler.lambda_handler({}, None)
+
+        assert result["regions_polled"] == ["us-east-1"]
+        assert result["regions_skipped_not_enabled"] == []
+        assert result["regions_enablement_unknown"] == ["us-east-1"]
+        assert result["written"] == 1
+        assert any("ThrottlingException" in record.message for record in caplog.records)
+
+    def test_missing_opt_in_status_is_unknown_and_still_polled(self, handler, monkeypatch, caplog):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+        ec2.describe_regions.return_value = {"Regions": [{"RegionName": "us-east-1"}]}
+
+        with (
+            caplog.at_level("WARNING"),
+            patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)),
+        ):
+            result = handler.lambda_handler({}, None)
+
+        assert result["regions_polled"] == ["us-east-1"]
+        assert result["regions_skipped_not_enabled"] == []
+        assert result["regions_enablement_unknown"] == ["us-east-1"]
+        assert result["written"] == 1
+        assert any("unknown OptInStatus None" in record.message for record in caplog.records)
 
     def test_structured_summary_reports_sps_counters(self, handler, monkeypatch):
         _set_env(monkeypatch)

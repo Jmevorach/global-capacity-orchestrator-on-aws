@@ -14,10 +14,15 @@ lightweight WebhookStore cache used to keep DynamoDB reads off the
 hot loop.
 """
 
+import asyncio
 import hashlib
 import hmac
 import ipaddress
+import shutil
 import socket
+import ssl
+import subprocess
+import textwrap
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -307,8 +312,8 @@ class TestWebhookDispatcher:
 
         with (
             patch(
-                "gco.services.webhook_dispatcher.validate_webhook_url",
-                return_value=(True, None),
+                "gco.services.webhook_dispatcher.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.20", 443))],
             ),
             patch("httpx.AsyncClient") as mock_client_class,
         ):
@@ -447,8 +452,8 @@ class TestWebhookDispatcher:
         # ever touched.
         with (
             patch(
-                "gco.services.webhook_dispatcher.validate_webhook_url",
-                return_value=(True, None),
+                "gco.services.webhook_dispatcher.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.20", 443))],
             ),
             patch("httpx.AsyncClient") as mock_client_class,
         ):
@@ -753,7 +758,7 @@ class TestDeliverWebhookEdgeCases:
         payload = {"event": "job.started"}
 
         # Mock DNS resolution to return a public IP so URL validation passes
-        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.1", 443))]
+        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.1", 443))]
         with (
             patch("gco.services.webhook_dispatcher.socket.getaddrinfo", return_value=fake_addrinfo),
             patch("httpx.AsyncClient") as mock_cls,
@@ -765,7 +770,7 @@ class TestDeliverWebhookEdgeCases:
             result = await dispatcher._deliver_webhook(webhook, payload)
 
         assert result.success is False
-        assert "Connection refused" in result.error
+        assert result.error == "ConnectError"
         assert result.attempts == 2
         assert dispatcher._deliveries_failed == 1
         assert dispatcher._deliveries_total == 1
@@ -811,6 +816,326 @@ class TestDeliverWebhookEdgeCases:
 
         assert result.success is True
         assert result.attempts == 2
+
+    @pytest.mark.asyncio
+    async def test_delivery_connects_only_to_validated_address_with_original_sni(
+        self, dispatcher, caplog
+    ):
+        secret = "path-and-query-secret"
+        webhook = {
+            "id": "wh-pinned",
+            "url": f"https://hooks.example/{secret}?token={secret}",
+            "secret": None,
+        }
+        resolver = MagicMock(
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.10", 443))]
+        )
+        with (
+            patch("gco.services.webhook_dispatcher.socket.getaddrinfo", resolver),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            client = AsyncMock()
+            client.post.return_value = MagicMock(status_code=204)
+            mock_cls.return_value.__aenter__.return_value = client
+            result = await dispatcher._deliver_webhook(webhook, {"event": "job.completed"})
+
+        assert result.success is True
+        resolver.assert_called_once_with("hooks.example", 443, proto=socket.IPPROTO_TCP)
+        call = client.post.call_args
+        assert call.args[0] == f"https://93.184.216.10:443/{secret}?token={secret}"
+        assert call.kwargs["headers"]["Host"] == "hooks.example"
+        assert call.kwargs["extensions"] == {"sni_hostname": "hooks.example"}
+        assert secret not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_logs_redact_url_response_and_transport_secrets(self, dispatcher, caplog):
+        secret = "reusable-webhook-secret"
+        webhook = {
+            "id": "wh-redacted",
+            "url": f"https://hooks.example/{secret}?token={secret}",
+            "secret": None,
+        }
+        address = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.11", 443))]
+        with (
+            patch("gco.services.webhook_dispatcher.socket.getaddrinfo", return_value=address),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            client = AsyncMock()
+            client.post.side_effect = [
+                MagicMock(status_code=503, text=f"remote {secret}"),
+                httpx.ConnectError(f"transport {secret}"),
+            ]
+            mock_cls.return_value.__aenter__.return_value = client
+            result = await dispatcher._deliver_webhook(webhook, {"event": "job.failed"})
+
+        assert result.success is False
+        assert secret not in caplog.text
+        assert "wh-redacted" in caplog.text
+        assert result.error == "ConnectError"
+
+    @pytest.mark.asyncio
+    async def test_pre_http_failures_are_counted_once(self, dispatcher, caplog):
+        webhook = {"id": "wh-invalid", "url": "https://127.0.0.1/hook", "secret": None}
+        result = await dispatcher._deliver_webhook(webhook, {"event": "job.started"})
+        assert result.attempts == 0
+        assert dispatcher.get_metrics()["deliveries_total"] == 1
+        assert dispatcher.get_metrics()["deliveries_failed"] == 1
+
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.12", 443))]
+        with patch(
+            "gco.services.webhook_dispatcher.socket.getaddrinfo",
+            side_effect=RuntimeError("resolver-secret"),
+        ):
+            result = await dispatcher._deliver_webhook(
+                {"id": "wh-resolver", "url": "https://hooks.example/hook", "secret": None},
+                {"event": "job.started"},
+            )
+        assert result.error == "Delivery failure: RuntimeError"
+
+        with patch("gco.services.webhook_dispatcher.socket.getaddrinfo", return_value=public):
+            result = await dispatcher._deliver_webhook(
+                {"id": "wh-json", "url": "https://hooks.example/hook", "secret": None},
+                {"event": "job.started", "invalid": object()},
+            )
+        assert result.error == "Delivery failure: TypeError"
+
+        with (
+            patch("gco.services.webhook_dispatcher.socket.getaddrinfo", return_value=public),
+            patch.object(
+                dispatcher,
+                "_sign_payload",
+                side_effect=RuntimeError("signing-secret"),
+            ),
+        ):
+            result = await dispatcher._deliver_webhook(
+                {"id": "wh-sign", "url": "https://hooks.example/hook", "secret": "key"},
+                {"event": "job.started"},
+            )
+        assert result.error == "Delivery failure: RuntimeError"
+
+        with (
+            patch("gco.services.webhook_dispatcher.socket.getaddrinfo", return_value=public),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.return_value.__aenter__.side_effect = RuntimeError("setup-secret")
+            result = await dispatcher._deliver_webhook(
+                {"id": "wh-client", "url": "https://hooks.example/hook", "secret": None},
+                {"event": "job.started"},
+            )
+        assert result.success is False
+        assert result.error == "Delivery failure: RuntimeError"
+        assert dispatcher.get_metrics()["deliveries_total"] == 5
+        assert dispatcher.get_metrics()["deliveries_failed"] == 5
+        assert dispatcher.get_metrics()["deliveries_success"] == 0
+        log_text = caplog.text
+        assert "resolver-secret" not in log_text
+        assert "signing-secret" not in log_text
+        assert "setup-secret" not in log_text
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_propagated_and_accounted(self, dispatcher):
+        entered_post = asyncio.Event()
+
+        async def blocked_post(*_args, **_kwargs):
+            entered_post.set()
+            await asyncio.Event().wait()
+
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.12", 443))]
+        with (
+            patch("gco.services.webhook_dispatcher.socket.getaddrinfo", return_value=public),
+            patch("httpx.AsyncClient") as mock_cls,
+        ):
+            client = AsyncMock()
+            client.post.side_effect = blocked_post
+            mock_cls.return_value.__aenter__.return_value = client
+            task = asyncio.create_task(
+                dispatcher._deliver_webhook(
+                    {"id": "wh-cancel", "url": "https://hooks.example/hook"},
+                    {"event": "job.started"},
+                )
+            )
+            await entered_post.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        metrics = dispatcher.get_metrics()
+        assert metrics["deliveries_total"] == 1
+        assert metrics["deliveries_success"] == 0
+        assert metrics["deliveries_failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_client_teardown_is_only_failure(self, dispatcher):
+        entered_exit = asyncio.Event()
+
+        class BlockingExitClient:
+            async def __aenter__(self):
+                return self
+
+            async def post(self, *_args, **_kwargs):
+                return MagicMock(status_code=204)
+
+            async def __aexit__(self, *_args):
+                entered_exit.set()
+                await asyncio.Event().wait()
+
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.12", 443))]
+        with (
+            patch("gco.services.webhook_dispatcher.socket.getaddrinfo", return_value=public),
+            patch(
+                "gco.services.webhook_dispatcher.httpx.AsyncClient",
+                return_value=BlockingExitClient(),
+            ),
+        ):
+            task = asyncio.create_task(
+                dispatcher._deliver_webhook(
+                    {"id": "wh-exit-cancel", "url": "https://hooks.example/hook"},
+                    {"event": "job.completed"},
+                )
+            )
+            await entered_exit.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        metrics = dispatcher.get_metrics()
+        assert metrics["deliveries_total"] == 1
+        assert metrics["deliveries_success"] == 0
+        assert metrics["deliveries_failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_real_tls_transport_preserves_sni_host_and_rotates_addresses(
+        self, dispatcher, tmp_path
+    ):
+        openssl = shutil.which("openssl")
+        assert openssl is not None, "openssl is required for the local TLS contract"
+        config_path = tmp_path / "openssl.cnf"
+        cert_path = tmp_path / "cert.pem"
+        key_path = tmp_path / "key.pem"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                [req]
+                prompt = no
+                distinguished_name = dn
+                x509_extensions = v3_req
+
+                [dn]
+                CN = hooks.example
+
+                [v3_req]
+                subjectAltName = DNS:hooks.example
+                basicConstraints = critical,CA:TRUE
+                keyUsage = critical,digitalSignature,keyEncipherment,keyCertSign
+                extendedKeyUsage = serverAuth
+                """
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                openssl,
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-nodes",
+                "-days",
+                "1",
+                "-keyout",
+                str(key_path),
+                "-out",
+                str(cert_path),
+                "-config",
+                str(config_path),
+                "-extensions",
+                "v3_req",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(cert_path, key_path)
+        seen_sni: list[str | None] = []
+        server_context.set_servername_callback(
+            lambda _connection, server_name, _context: seen_sni.append(server_name)
+        )
+        requests: list[str] = []
+
+        def handler(status: int):
+            async def receive(reader, writer):
+                request = await reader.readuntil(b"\r\n\r\n")
+                requests.append(request.decode("ascii"))
+                reason = "OK" if status == 200 else "Service Unavailable"
+                body = b"ok"
+                writer.write(
+                    f"HTTP/1.1 {status} {reason}\r\n".encode()
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            return receive
+
+        first = await asyncio.start_server(handler(503), "127.0.0.1", 0, ssl=server_context)
+        port = first.sockets[0].getsockname()[1]
+        second = await asyncio.start_server(handler(200), "::1", port, ssl=server_context)
+        client_context = ssl.create_default_context(cafile=str(cert_path))
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(**kwargs):
+            return real_async_client(
+                **kwargs,
+                verify=client_context,
+                trust_env=False,
+            )
+
+        answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+        ]
+        try:
+            with (
+                patch(
+                    "gco.services.webhook_dispatcher.socket.getaddrinfo",
+                    return_value=answers,
+                ),
+                patch(
+                    "gco.services.webhook_dispatcher._globally_routable_unicast",
+                    side_effect=ipaddress.ip_address,
+                ),
+                patch(
+                    "gco.services.webhook_dispatcher.httpx.AsyncClient",
+                    side_effect=client_factory,
+                ),
+            ):
+                result = await dispatcher._deliver_webhook(
+                    {
+                        "id": "wh-tls",
+                        "url": f"https://hooks.example:{port}/hook?token=secret",
+                    },
+                    {"event": "job.completed"},
+                )
+        finally:
+            first.close()
+            second.close()
+            await first.wait_closed()
+            await second.wait_closed()
+
+        assert result.success is True
+        assert result.attempts == 2
+        assert seen_sni == ["hooks.example", "hooks.example"]
+        assert len(requests) == 2
+        assert all(
+            request.startswith("POST /hook?token=secret HTTP/1.1\r\n") for request in requests
+        )
+        assert all(f"Host: hooks.example:{port}\r\n" in request for request in requests)
 
 
 class TestDispatchEventEdgeCases:
@@ -859,18 +1184,26 @@ class TestDispatchEventEdgeCases:
         assert results == []
 
     @pytest.mark.asyncio
-    async def test_dispatch_handles_gather_exception(self, dispatcher, mock_webhook_store):
-        """When a delivery task raises an exception, it's filtered out."""
+    async def test_dispatch_handles_gather_exception(self, dispatcher, mock_webhook_store, caplog):
+        """Escaped delivery exceptions become sanitized, accounted failures."""
         mock_webhook_store.get_webhooks_for_event.return_value = [
             {"id": "wh-1", "url": "https://example.com/hook", "namespace": None},
         ]
         job = self._make_job()
 
-        with patch.object(dispatcher, "_deliver_webhook", side_effect=RuntimeError("boom")):
+        with patch.object(
+            dispatcher,
+            "_deliver_webhook",
+            side_effect=RuntimeError("delivery-secret"),
+        ):
             results = await dispatcher._dispatch_event(WebhookEvent.JOB_COMPLETED, job)
 
-        # The exception is caught; no WebhookDeliveryResult returned
-        assert results == []
+        assert len(results) == 1
+        assert results[0].success is False
+        assert results[0].error == "Delivery failure: RuntimeError"
+        assert dispatcher.get_metrics()["deliveries_total"] == 1
+        assert dispatcher.get_metrics()["deliveries_failed"] == 1
+        assert "delivery-secret" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_dispatch_deduplicates_webhooks(self, dispatcher, mock_webhook_store):
@@ -1424,7 +1757,20 @@ _blocked_ipv6 = st.one_of(*[_ip_from_network(n) for n in _blocked_ipv6_networks]
 # Strategy: any blocked IP (v4 or v6)
 _blocked_ip = st.one_of(_blocked_ipv4, _blocked_ipv6)
 
-# Strategy: public IPv4 addresses that are NOT in any blocked range
+
+def _is_globally_routable_unicast(ip: str) -> bool:
+    address = ipaddress.ip_address(ip)
+    return bool(
+        address.is_global
+        and not address.is_multicast
+        and not address.is_unspecified
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_reserved
+    )
+
+
+# Strategy: globally routable public-unicast IPv4 addresses.
 _public_ipv4 = (
     st.tuples(
         st.integers(min_value=1, max_value=223),
@@ -1433,7 +1779,7 @@ _public_ipv4 = (
         st.integers(min_value=1, max_value=254),
     )
     .map(lambda t: f"{t[0]}.{t[1]}.{t[2]}.{t[3]}")
-    .filter(lambda ip: not any(ipaddress.ip_address(ip) in net for net in BLOCKED_NETWORKS))
+    .filter(_is_globally_routable_unicast)
 )
 
 
@@ -1566,7 +1912,7 @@ class TestWebhookUrlValidationEdgeCases:
     def test_empty_allowlist_allows_any_domain(self):
         """An empty allowlist does not restrict domains."""
         url = "https://any-domain.example.com/hook"
-        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.50", 443))]
+        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.50", 443))]
         with patch(
             "gco.services.webhook_dispatcher.socket.getaddrinfo",
             return_value=fake_addrinfo,
@@ -1578,7 +1924,7 @@ class TestWebhookUrlValidationEdgeCases:
     def test_none_allowlist_allows_any_domain(self):
         """A None allowlist does not restrict domains."""
         url = "https://any-domain.example.com/hook"
-        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.50", 443))]
+        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.50", 443))]
         with patch(
             "gco.services.webhook_dispatcher.socket.getaddrinfo",
             return_value=fake_addrinfo,
@@ -1592,7 +1938,7 @@ class TestWebhookUrlValidationEdgeCases:
     def test_non_standard_port_public_ip_accepted(self):
         """HTTPS URL with a non-standard port and public IP is accepted."""
         url = "https://webhooks.example.com:8443/hook"
-        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.10", 8443))]
+        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.10", 8443))]
         with patch(
             "gco.services.webhook_dispatcher.socket.getaddrinfo",
             return_value=fake_addrinfo,
@@ -1674,29 +2020,18 @@ class TestWebhookUrlValidationEdgeCases:
     # --- URL with credentials / userinfo ---
 
     def test_url_with_userinfo_public_ip(self):
-        """URL with userinfo (user:pass@host) still validates the host correctly."""
+        """Reusable credentials in webhook URLs are rejected before DNS."""
         url = "https://admin:secret@webhooks.example.com/hook"
-        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.20", 443))]
-        with patch(
-            "gco.services.webhook_dispatcher.socket.getaddrinfo",
-            return_value=fake_addrinfo,
-        ):
-            is_valid, error = validate_webhook_url(url)
-        # The hostname is correctly extracted by urlparse; public IP passes
-        assert is_valid is True
-        assert error is None
+        is_valid, error = validate_webhook_url(url)
+        assert is_valid is False
+        assert "userinfo" in error
 
     def test_url_with_userinfo_private_ip(self):
-        """URL with userinfo resolving to private IP is still rejected."""
+        """Userinfo is rejected before hostname resolution or network policy."""
         url = "https://user:pass@internal.corp/hook"
-        fake_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.1", 443))]
-        with patch(
-            "gco.services.webhook_dispatcher.socket.getaddrinfo",
-            return_value=fake_addrinfo,
-        ):
-            is_valid, error = validate_webhook_url(url)
+        is_valid, error = validate_webhook_url(url)
         assert is_valid is False
-        assert "blocked" in error.lower()
+        assert "userinfo" in error
 
     # --- Missing hostname ---
 
@@ -1713,7 +2048,7 @@ class TestWebhookUrlValidationEdgeCases:
         """If any resolved IP is blocked, the URL is rejected."""
         url = "https://dual-stack.example.com/hook"
         fake_addrinfo = [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.10", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.10", 443)),
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 443)),
         ]
         with patch(
@@ -1723,3 +2058,44 @@ class TestWebhookUrlValidationEdgeCases:
             is_valid, error = validate_webhook_url(url)
         assert is_valid is False
         assert "blocked" in error.lower()
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "0.0.0.0",
+            "100.64.0.1",
+            "192.0.2.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ],
+    )
+    def test_non_global_or_non_unicast_addresses_rejected(self, address):
+        """Special-use and mapped-private addresses fail the public-unicast policy."""
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        sockaddr = (address, 443, 0, 0) if family == socket.AF_INET6 else (address, 443)
+        with patch(
+            "gco.services.webhook_dispatcher.socket.getaddrinfo",
+            return_value=[(family, socket.SOCK_STREAM, 6, "", sockaddr)],
+        ):
+            is_valid, error = validate_webhook_url("https://special.example/hook")
+        assert is_valid is False
+        assert "globally routable unicast" in error
+
+    @pytest.mark.parametrize(
+        "address",
+        ["2001:4860:4860::8888", "::ffff:8.8.8.8"],
+    )
+    def test_global_ipv6_and_mapped_public_ipv4_are_accepted(self, address):
+        family = socket.AF_INET6
+        with patch(
+            "gco.services.webhook_dispatcher.socket.getaddrinfo",
+            return_value=[(family, socket.SOCK_STREAM, 6, "", (address, 443, 0, 0))],
+        ):
+            is_valid, error = validate_webhook_url("https://public-v6.example/hook")
+        assert is_valid is True
+        assert error is None

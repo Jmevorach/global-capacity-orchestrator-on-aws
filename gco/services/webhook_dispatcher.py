@@ -40,7 +40,7 @@ Environment Variables:
     CLUSTER_NAME: Name of the EKS cluster
     REGION: AWS region of the cluster
     WEBHOOK_TIMEOUT: HTTP timeout for webhook calls (default: 30)
-    WEBHOOK_MAX_RETRIES: Maximum retry attempts (default: 3)
+    WEBHOOK_MAX_RETRIES: Maximum total delivery attempts (default: 3)
     WEBHOOK_RETRY_DELAY: Initial retry delay in seconds (default: 5)
     WEBHOOKS_TABLE_NAME: DynamoDB table for webhooks
 """
@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import httpx
 from kubernetes import client, config
@@ -69,6 +69,15 @@ from kubernetes.client.rest import ApiException
 from kubernetes.watch import Watch
 
 from gco.services.template_store import WebhookStore, get_webhook_store
+
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-30T12:00:00Z
+# Flowchart(s) generated from this file:
+#   * ``WebhookDispatcher._deliver_webhook`` -> ``diagrams/code_diagrams/gco/services/webhook_dispatcher.WebhookDispatcher__deliver_webhook.html``
+#     (PNG: ``diagrams/code_diagrams/gco/services/webhook_dispatcher.WebhookDispatcher__deliver_webhook.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -88,55 +97,124 @@ BLOCKED_NETWORKS = [
 ]
 
 
-def validate_webhook_url(
-    url: str, allowed_domains: list[str] | None = None
-) -> tuple[bool, str | None]:
-    """Validate a webhook URL for SSRF prevention.
+@dataclass(frozen=True)
+class _ValidatedWebhookTarget:
+    """One DNS-validated destination whose transport cannot resolve again."""
 
-    Checks:
-    - HTTPS-only scheme
-    - Domain allowlist (if configured)
-    - DNS resolution with IP validation against blocked private networks
+    original_url: str
+    parsed: ParseResult
+    hostname: str
+    port: int
+    addresses: tuple[str, ...]
 
-    Args:
-        url: The webhook URL to validate.
-        allowed_domains: Optional list of allowed domains. If non-empty,
-            only URLs targeting these domains are permitted.
+    @property
+    def log_identity(self) -> str:
+        """Return an operator-useful identity without path/query credentials."""
+        return f"host={self.hostname} port={self.port}"
 
-    Returns:
-        A tuple of (is_valid, error_message). error_message is None when valid.
+    @property
+    def host_header(self) -> str:
+        return self.parsed.netloc
+
+    def pinned_url(self, attempt: int) -> str:
+        address = self.addresses[(attempt - 1) % len(self.addresses)]
+        host = f"[{address}]" if ":" in address else address
+        return self.parsed._replace(netloc=f"{host}:{self.port}").geturl()
+
+
+def _globally_routable_unicast(
+    value: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Return a canonical public-unicast address, including mapped IPv4.
+
+    ``is_global`` intentionally does not exclude multicast in ``ipaddress``.
+    Normalize IPv4-mapped IPv6 first, then require a globally routable,
+    non-multicast unicast address so loopback, private, link-local, shared,
+    documentation, reserved, unspecified, and multicast destinations all fail
+    closed.
     """
-    parsed = urlparse(url)
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if (
+        not address.is_global
+        or address.is_multicast
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+    ):
+        return None
+    return address
 
-    # Scheme check
+
+def _resolve_webhook_target(
+    url: str,
+    allowed_domains: list[str] | None = None,
+) -> tuple[_ValidatedWebhookTarget | None, str | None]:
+    """Resolve and approve every address before any outbound connection."""
+    parsed = urlparse(url)
     if parsed.scheme != "https":
-        return False, "Only HTTPS webhook URLs are allowed"
+        return None, "Only HTTPS webhook URLs are allowed"
+    if parsed.username is not None or parsed.password is not None:
+        return None, "Webhook URLs must not contain userinfo credentials"
 
     hostname = parsed.hostname
     if not hostname:
-        return False, "Webhook URL must include a valid hostname"
+        return None, "Webhook URL must include a valid hostname"
+    normalized_hostname = hostname.rstrip(".").lower()
+    normalized_allowed = {value.rstrip(".").lower() for value in allowed_domains or []}
+    if normalized_allowed and normalized_hostname not in normalized_allowed:
+        return None, f"Domain '{hostname}' not in allowed domains list"
 
-    # Domain allowlist (if configured and non-empty)
-    if allowed_domains and hostname not in allowed_domains:
-        return False, f"Domain '{hostname}' not in allowed domains list"
-
-    # DNS resolution + IP validation
-    port = parsed.port or 443
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None, "Webhook URL contains an invalid port"
     try:
         resolved = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror:
-        return False, f"DNS resolution failed for {hostname}"
-
+        return None, f"DNS resolution failed for {hostname}"
     if not resolved:
-        return False, f"DNS resolution returned no results for {hostname}"
+        return None, f"DNS resolution returned no results for {hostname}"
 
-    for _family, _type, _proto, _canonname, sockaddr in resolved:
-        ip = ipaddress.ip_address(sockaddr[0])
-        for network in BLOCKED_NETWORKS:
-            if ip in network:
-                return False, (f"Resolved IP {ip} is in blocked network {network}")
+    addresses: set[str] = set()
+    for family, _type, _proto, _canonname, sockaddr in resolved:
+        if family not in {socket.AF_INET, socket.AF_INET6}:
+            return None, "DNS resolution returned an unsupported address family"
+        raw_address = sockaddr[0]
+        if not isinstance(raw_address, str):
+            return None, "DNS resolution returned a non-text IP address"
+        address = _globally_routable_unicast(raw_address)
+        if address is None:
+            return None, (
+                f"Resolved IP {raw_address} is blocked because it is not globally routable unicast"
+            )
+        addresses.add(str(address))
+    if not addresses:
+        return None, f"DNS resolution returned no usable addresses for {hostname}"
 
-    return True, None
+    return (
+        _ValidatedWebhookTarget(
+            original_url=url,
+            parsed=parsed,
+            hostname=hostname,
+            port=port,
+            addresses=tuple(sorted(addresses)),
+        ),
+        None,
+    )
+
+
+def validate_webhook_url(
+    url: str, allowed_domains: list[str] | None = None
+) -> tuple[bool, str | None]:
+    """Validate HTTPS, allowlist, DNS, and blocked-network constraints."""
+    target, error = _resolve_webhook_target(url, allowed_domains)
+    return target is not None, error
 
 
 class WebhookEvent(StrEnum):
@@ -209,7 +287,7 @@ class WebhookDispatcher:
             region: AWS region
             webhook_store: DynamoDB webhook store (uses singleton if None)
             timeout: HTTP timeout for webhook calls in seconds
-            max_retries: Maximum retry attempts for failed deliveries
+            max_retries: Maximum total delivery attempts (initial request included)
             retry_delay: Initial retry delay in seconds (doubles each retry)
             namespaces: Namespaces to watch (None = all non-system namespaces)
             allowed_domains: Optional list of allowed webhook domains for SSRF prevention
@@ -334,112 +412,149 @@ class WebhookDispatcher:
         webhook: dict[str, Any],
         payload: dict[str, Any],
     ) -> WebhookDeliveryResult:
-        """Deliver a webhook with retry logic."""
-        webhook_id = webhook["id"]
-        url = webhook["url"]
+        """Deliver one logical webhook with bounded, address-pinned attempts."""
+        raw_webhook_id = webhook.get("id")
+        webhook_id = raw_webhook_id if isinstance(raw_webhook_id, str) else "<unknown>"
+        raw_url = webhook.get("url")
+        url = raw_url if isinstance(raw_url, str) else ""
+        raw_event = payload.get("event")
+        event = raw_event if isinstance(raw_event, str) else "unknown"
         secret = webhook.get("secret")
-        event = payload["event"]
+        start_time = datetime.now(UTC)
+        self._deliveries_total += 1
 
-        # SSRF prevention: validate URL before making any HTTP request
-        is_valid, error = validate_webhook_url(url, self.allowed_domains or None)
-        if not is_valid:
-            logger.warning(f"Webhook URL validation failed: {webhook_id} -> {url}: {error}")
-            return WebhookDeliveryResult(
-                webhook_id=webhook_id,
-                url=url,
-                event=event,
-                success=False,
-                error=f"URL validation failed: {error}",
-                attempts=0,
-                duration_ms=0.0,
-            )
-
-        payload_json = json.dumps(payload)
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": f"GCO-Webhook/{self.cluster_id}",
-            "X-GCO-Event": event,
-            "X-GCO-Cluster": self.cluster_id,
-            "X-GCO-Region": self.region,
-        }
-
-        if secret:
-            headers["X-GCO-Signature"] = self._sign_payload(payload_json, secret)
-
+        target: _ValidatedWebhookTarget | None = None
         attempts = 0
         last_error: str | None = None
         last_status_code: int | None = None
-        start_time = datetime.now(UTC)
+        successful_status_code: int | None = None
+        validation_error: str | None = None
+        try:
+            if not isinstance(raw_url, str):
+                validation_error = "Webhook URL must be a string"
+            else:
+                target, validation_error = _resolve_webhook_target(
+                    raw_url, self.allowed_domains or None
+                )
+            if target is None:
+                last_error = f"URL validation failed: {validation_error}"
+                logger.warning(
+                    "Webhook URL validation failed: webhook_id=%s error=%s",
+                    webhook_id,
+                    validation_error,
+                )
+            else:
+                payload_json = json.dumps(payload)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Host": target.host_header,
+                    "User-Agent": f"GCO-Webhook/{self.cluster_id}",
+                    "X-GCO-Event": event,
+                    "X-GCO-Cluster": self.cluster_id,
+                    "X-GCO-Region": self.region,
+                }
+                if secret:
+                    headers["X-GCO-Signature"] = self._sign_payload(payload_json, secret)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            while attempts < self.max_retries:
-                attempts += 1
-                try:
-                    response = await client.post(
-                        url,
-                        content=payload_json,
-                        headers=headers,
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    while attempts < self.max_retries:
+                        attempts += 1
+                        try:
+                            response = await client.post(
+                                target.pinned_url(attempts),
+                                content=payload_json,
+                                headers=headers,
+                                extensions={"sni_hostname": target.hostname},
+                            )
+                            last_status_code = response.status_code
+                            if 200 <= response.status_code < 300:
+                                successful_status_code = response.status_code
+                                break
+
+                            last_error = f"HTTP {response.status_code}"
+                            if response.status_code >= 500:
+                                logger.warning(
+                                    "Webhook attempt failed: webhook_id=%s %s status=%s attempt=%s",
+                                    webhook_id,
+                                    target.log_identity,
+                                    response.status_code,
+                                    attempts,
+                                )
+                                if attempts < self.max_retries:
+                                    await asyncio.sleep(self.retry_delay * (2 ** (attempts - 1)))
+                                continue
+                            break  # Caller errors are terminal and must not be replayed.
+
+                        except httpx.TimeoutException:
+                            last_error = "Request timed out"
+                            logger.warning(
+                                "Webhook attempt timed out: webhook_id=%s %s attempt=%s",
+                                webhook_id,
+                                target.log_identity,
+                                attempts,
+                            )
+                            if attempts < self.max_retries:
+                                await asyncio.sleep(self.retry_delay * (2 ** (attempts - 1)))
+                        except httpx.RequestError as exc:
+                            last_error = type(exc).__name__
+                            logger.warning(
+                                "Webhook transport failed: webhook_id=%s %s "
+                                "error_type=%s attempt=%s",
+                                webhook_id,
+                                target.log_identity,
+                                type(exc).__name__,
+                                attempts,
+                            )
+                            if attempts < self.max_retries:
+                                await asyncio.sleep(self.retry_delay * (2 ** (attempts - 1)))
+
+                # Exiting AsyncClient may itself await and be cancelled. Commit
+                # success only after teardown completes so one delivery has
+                # exactly one terminal metric classification.
+                if successful_status_code is not None:
+                    duration = (datetime.now(UTC) - start_time).total_seconds() * 1000
+                    logger.info(
+                        "Webhook delivered: webhook_id=%s %s status=%s attempts=%s",
+                        webhook_id,
+                        target.log_identity,
+                        successful_status_code,
+                        attempts,
                     )
-                    last_status_code = response.status_code
-
-                    if 200 <= response.status_code < 300:
-                        duration = (datetime.now(UTC) - start_time).total_seconds() * 1000
-                        logger.info(
-                            f"Webhook delivered successfully: {webhook_id} -> {url} "
-                            f"(status={response.status_code}, attempts={attempts})"
-                        )
-                        self._deliveries_success += 1
-                        self._deliveries_total += 1
-                        return WebhookDeliveryResult(
-                            webhook_id=webhook_id,
-                            url=url,
-                            event=event,
-                            success=True,
-                            status_code=response.status_code,
-                            attempts=attempts,
-                            duration_ms=duration,
-                        )
-
-                    # Non-2xx response - retry for 5xx errors
-                    last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-                    if response.status_code >= 500:
-                        logger.warning(
-                            f"Webhook delivery failed (attempt {attempts}): "
-                            f"{webhook_id} -> {url}: {last_error}"
-                        )
-                        if attempts < self.max_retries:
-                            delay = self.retry_delay * (2 ** (attempts - 1))
-                            await asyncio.sleep(delay)
-                        continue
-                    # 4xx errors - don't retry
-                    break
-
-                except httpx.TimeoutException:
-                    last_error = "Request timed out"
-                    logger.warning(
-                        f"Webhook delivery timed out (attempt {attempts}): {webhook_id} -> {url}"
+                    self._deliveries_success += 1
+                    return WebhookDeliveryResult(
+                        webhook_id=webhook_id,
+                        url=url,
+                        event=event,
+                        success=True,
+                        status_code=successful_status_code,
+                        attempts=attempts,
+                        duration_ms=duration,
                     )
-                    if attempts < self.max_retries:
-                        delay = self.retry_delay * (2 ** (attempts - 1))
-                        await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            # Cancellation is a terminal outcome for this logical delivery.
+            # Preserve task cancellation while keeping total == success + failed.
+            self._deliveries_failed += 1
+            logger.info("Webhook delivery cancelled: webhook_id=%s", webhook_id)
+            raise
+        except Exception as exc:  # noqa: BLE001 — sanitize the logical delivery boundary
+            last_error = f"Delivery failure: {type(exc).__name__}"
+            logger.error(
+                "Webhook delivery raised: webhook_id=%s error_type=%s",
+                webhook_id,
+                type(exc).__name__,
+            )
 
-                except httpx.RequestError as e:
-                    last_error = str(e)
-                    logger.warning(
-                        f"Webhook delivery error (attempt {attempts}): {webhook_id} -> {url}: {e}"
-                    )
-                    if attempts < self.max_retries:
-                        delay = self.retry_delay * (2 ** (attempts - 1))
-                        await asyncio.sleep(delay)
-
-        # All retries exhausted
         duration = (datetime.now(UTC) - start_time).total_seconds() * 1000
+        log_identity = target.log_identity if target is not None else "target=unvalidated"
         logger.error(
-            f"Webhook delivery failed after {attempts} attempts: "
-            f"{webhook_id} -> {url}: {last_error}"
+            "Webhook delivery failed: webhook_id=%s %s attempts=%s status=%s error=%s",
+            webhook_id,
+            log_identity,
+            attempts,
+            last_status_code,
+            last_error,
         )
         self._deliveries_failed += 1
-        self._deliveries_total += 1
         return WebhookDeliveryResult(
             webhook_id=webhook_id,
             url=url,
@@ -473,8 +588,12 @@ class WebhookDispatcher:
 
             webhooks = list(all_webhooks.values())
 
-        except Exception as e:
-            logger.error(f"Failed to get webhooks for event {event.value}: {e}")
+        except Exception as exc:
+            logger.error(
+                "Failed to get webhooks for event %s: error_type=%s",
+                event.value,
+                type(exc).__name__,
+            )
             return []
 
         if not webhooks:
@@ -486,17 +605,42 @@ class WebhookDispatcher:
             f"(job={job.metadata.name}, namespace={namespace})"
         )
 
-        # Dispatch all webhooks concurrently
+        # Dispatch all webhooks concurrently. _deliver_webhook owns normal
+        # exception conversion; this boundary protects accounting and redaction
+        # if a future regression (or an injected implementation) escapes it.
         tasks = [self._deliver_webhook(webhook, payload) for webhook in webhooks]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Filter out exceptions and return results
-        delivery_results = []
-        for result in results:
+        delivery_results: list[WebhookDeliveryResult] = []
+        for webhook, result in zip(webhooks, results, strict=True):
             if isinstance(result, WebhookDeliveryResult):
                 delivery_results.append(result)
-            elif isinstance(result, Exception):
-                logger.error(f"Webhook delivery raised exception: {result}")
+                continue
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                raw_webhook_id = webhook.get("id")
+                webhook_id = raw_webhook_id if isinstance(raw_webhook_id, str) else "<unknown>"
+                raw_url = webhook.get("url")
+                url = raw_url if isinstance(raw_url, str) else ""
+                logger.error(
+                    "Webhook delivery escaped boundary: webhook_id=%s error_type=%s",
+                    webhook_id,
+                    type(result).__name__,
+                )
+                self._deliveries_total += 1
+                self._deliveries_failed += 1
+                delivery_results.append(
+                    WebhookDeliveryResult(
+                        webhook_id=webhook_id,
+                        url=url,
+                        event=event.value,
+                        success=False,
+                        error=f"Delivery failure: {type(result).__name__}",
+                        attempts=0,
+                        duration_ms=0.0,
+                    )
+                )
 
         return delivery_results
 

@@ -1,7 +1,7 @@
 """Mission goal-directed iteration loop tools.
 
 The whole module body is gated by :data:`feature_flags.FLAG_MISSION` so
-the nine ``mission_*`` tool decorators only fire when
+the ten ``mission_*`` tool decorators only fire when
 ``GCO_ENABLE_MISSION=true``. With the flag unset, this module imports
 cleanly and FastMCP never sees the tools.
 

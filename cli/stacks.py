@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypedDict
 
 from botocore.exceptions import ClientError
 
+from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 from gco.stacks.constants import (
     known_cloudformation_regions,
     validated_deployment_partition,
@@ -69,7 +70,7 @@ from gco.stacks.constants import (
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-30T12:00:00Z
 # Flowchart(s) generated from this file:
 #   * ``StackManager.deploy_orchestrated`` -> ``diagrams/code_diagrams/cli/stacks.StackManager_deploy_orchestrated.html``
 #     (PNG: ``diagrams/code_diagrams/cli/stacks.StackManager_deploy_orchestrated.png``)
@@ -77,7 +78,7 @@ from gco.stacks.constants import (
 #     (PNG: ``diagrams/code_diagrams/cli/stacks.StackManager_destroy_orchestrated.png``)
 #   * ``StackManager._mirror_images_if_enabled`` -> ``diagrams/code_diagrams/cli/stacks.StackManager__mirror_images_if_enabled.html``
 #     (PNG: ``diagrams/code_diagrams/cli/stacks.StackManager__mirror_images_if_enabled.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 
@@ -130,24 +131,8 @@ _CLOUDFORMATION_DELETE_HEARTBEAT_SECONDS = 60.0
 _BOOTSTRAP_HEALTHY_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE"})
 _LIVE_VALIDATION_PROVIDER_LOG_CONTEXT = "gco_live_validation_retain_provider_log_groups"
 
-# Canonical shared Lambda sources and the checked-in copies that must mirror
-# them, as POSIX paths relative to the project root. This is the single map
-# behind StackManager._sync_lambda_sources (deploy-time enforcement) and
-# tests/test_lambda_shared_sources.py (commit-time enforcement): the copies
-# exist so each Lambda's build directory is self-contained, and they must stay
-# byte-identical to their canonical source or a deploy rewrites tracked files
-# and dirties the worktree mid-run.
-LAMBDA_SHARED_SOURCE_TARGETS: dict[str, tuple[str, ...]] = {
-    "lambda/proxy-shared/proxy_utils.py": (
-        "lambda/api-gateway-proxy/proxy_utils.py",
-        "lambda/regional-api-proxy/proxy_utils.py",
-    ),
-    "lambda/tls-shared/backend_tls.py": (
-        "lambda/proxy-shared/backend_tls.py",
-        "lambda/api-gateway-proxy/backend_tls.py",
-        "lambda/regional-api-proxy/backend_tls.py",
-    ),
-}
+# LAMBDA_SHARED_SOURCE_TARGETS is imported from the dependency-light inventory
+# shared by deploy packaging, diagram reconciliation, and commit-time guards.
 StackAuthorizationCallback = Callable[[str, str, str], None]
 CleanupOutcomeCallback = Callable[[str, dict[str, Any]], None]
 ChangeSetPreparedCallback = Callable[[str, str, str, str, str], None]
@@ -1255,9 +1240,9 @@ class StackManager:
         Checked-in copies keep raw CDK evaluation deterministic. Deploy updates
         those copies before generated assets are checked, and never mutates a
         generated final build tree in place. The source->targets mapping lives
-        in the module-level ``LAMBDA_SHARED_SOURCE_TARGETS`` so
-        ``tests/test_lambda_shared_sources.py`` can hold the checked-in copies
-        byte-identical to their canonical sources without restating the map.
+        in ``gco.lambda_shared_sources`` so deploy packaging, diagram
+        reconciliation, and commit-time identity tests consume one
+        dependency-light inventory.
         """
         if getattr(self, "_lambda_sources_synced", False):
             return

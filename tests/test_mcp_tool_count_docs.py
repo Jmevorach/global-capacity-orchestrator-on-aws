@@ -3,7 +3,7 @@
 The registered tool inventory is pinned by ``test_mcp_server.py`` (exact count +
 name set) and every tool name is documented by ``test_docs_coverage.py``. But
 the *human-readable* headline counts — "N tools by default (up to M with all
-flags enabled)" — live in three prose files and had silently drifted (README
+flags enabled)" — live in four prose files and had silently drifted (README
 headlines said 98/130 while the server actually registered 109/144) because
 nothing checked them against reality.
 
@@ -41,6 +41,7 @@ _CEILING_PATTERNS = (
 
 _DOC_FILES = (
     PROJECT_ROOT / "README.md",
+    PROJECT_ROOT / "QUICKSTART.md",
     PROJECT_ROOT / "gco_mcp" / "README.md",
     PROJECT_ROOT / "gco_mcp" / "tools" / "README.md",
 )
@@ -95,17 +96,19 @@ def test_docs_tool_counts_match_registry() -> None:
     ceiling_hits: list[tuple[Path, int]] = []
     for path in _DOC_FILES:
         assert path.exists(), f"expected doc file missing: {path}"
-        default_hits.extend((path, n) for n in _scan(path, _DEFAULT_PATTERNS))
-        ceiling_hits.extend((path, n) for n in _scan(path, _CEILING_PATTERNS))
+        path_default = _scan(path, _DEFAULT_PATTERNS)
+        path_ceiling = _scan(path, _CEILING_PATTERNS)
+        relative = path.relative_to(PROJECT_ROOT)
+        assert path_default, f"{relative} no longer quotes the default MCP tool count"
+        assert path_ceiling, f"{relative} no longer quotes the all-flags MCP tool ceiling"
+        default_hits.extend((path, n) for n in path_default)
+        ceiling_hits.extend((path, n) for n in path_ceiling)
 
-    # Floor: if a phrasing change stops the regexes from matching, fail loudly
-    # rather than passing on zero comparisons.
-    assert len(default_hits) >= 3, (
-        f"expected to find the default count quoted in the docs, found {default_hits}"
-    )
-    assert len(ceiling_hits) >= 3, (
-        f"expected to find the ceiling count quoted in the docs, found {ceiling_hits}"
-    )
+    # Every expected file must contribute at least one match. Per-file checks
+    # above prevent duplicate wording in one document from hiding another
+    # document that silently dropped its count.
+    assert len(default_hits) >= len(_DOC_FILES)
+    assert len(ceiling_hits) >= len(_DOC_FILES)
 
     wrong_default = [(str(p.relative_to(PROJECT_ROOT)), n) for p, n in default_hits if n != default]
     wrong_ceiling = [(str(p.relative_to(PROJECT_ROOT)), n) for p, n in ceiling_hits if n != ceiling]

@@ -36,19 +36,25 @@ Playwright is available) a rendered PNG.
 
 ## Regeneration
 
-```bash
-# All targets
-python diagrams/code_diagrams/generate.py
+Use the aggregate driver for canonical committed output:
 
-# A single target
+```bash
+# Full code + infrastructure catalogues at the reviewed timestamp
+SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+
+# Read-only artifact/index/marker/PNG contract
+python diagrams/generate.py --check
+
+# One catalogue only
+SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py --code-only
+python diagrams/generate.py --infra-only
+
+# A single target for local diagnosis
 python diagrams/code_diagrams/generate.py \\
     --target lambda/analytics-presigned-url/handler.py:lambda_handler
 
 # HTML only (skip Playwright and remove older PNGs for selected targets)
 python diagrams/code_diagrams/generate.py --skip-png
-
-# Make every HTML + PNG artifact byte-reproducible by fixing its timestamp
-SOURCE_DATE_EPOCH=1784203200 python diagrams/code_diagrams/generate.py
 
 # Don't insert/refresh the ``# Flowchart:`` markers in source files
 python diagrams/code_diagrams/generate.py --skip-marker
@@ -72,13 +78,15 @@ pip install -e '.[diagrams]'
 playwright install chromium
 ```
 
-Without Playwright's browser, the generator still writes HTML and removes any
-older PNG for the selected targets so mixed generation times are impossible.
-Every full run records one UTC timestamp in the HTML, PNG, catalogue, and source
-marker. Without ``SOURCE_DATE_EPOCH``, a normal run intentionally records its
-wall-clock invocation time and can change committed metadata even when source
-code is unchanged. Set ``SOURCE_DATE_EPOCH`` to fixed integer Unix seconds when
-byte-reproducible output is required.
+Without Playwright's browser, direct code-generator runs still write HTML and
+remove any older PNG for the selected targets so mixed generation times are
+impossible. Canonical aggregate generation requires ``SOURCE_DATE_EPOCH`` and
+records that one UTC timestamp in HTML, PNG pixels, the catalogue, and source
+markers. Fixing the timestamp prevents metadata-only churn; it does not promise
+byte-identical Chromium or Graphviz rasterization across toolchain versions or
+platforms. ``python diagrams/generate.py --check`` enforces structural
+contracts; ``tests/test_diagram_artifact_contract.py`` also verifies every PNG
+with Pillow.
 
 ## Flowchart index
 

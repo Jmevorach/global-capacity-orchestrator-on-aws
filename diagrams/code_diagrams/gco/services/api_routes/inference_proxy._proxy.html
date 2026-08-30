@@ -2,7 +2,7 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
         <title>Managed inference reverse proxy (path allowlist, bounded I/O, streaming cleanup)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,48 +206,48 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op4327=>operation: 'Forward one authenticated request to a managed in-cluster endpoint.'
-cond4330=>operation: raise HTTPException(status_code=400, detail='Invalid inference path') if  any((part in {'.', '..'} for part in upstream_path.split('/')))
-op4340=>operation: service_name, namespace, configured_health_path = await _resolve_upstream(endpoint_name)
-op4342=>operation: upstream_path = _validate_upstream_path(upstream_path, request.method, configured_health_path)
-op4344=>operation: encoded_suffix = quote(upstream_path, safe='/:@-._~')
-op4346=>operation: upstream_path_value = f'/{encoded_suffix}' if encoded_suffix else '/'
-op4348=>operation: upstream_url = f'http://{service_name}.{namespace}.svc.cluster.local{upstream_path_value}'
-op4350=>operation: body = await request.body()
-op4352=>operation: timeout = httpx.Timeout(connect=_bounded_timeout('INFERENCE_PROXY_CONNECT_TIMEOUT_SECONDS', 5.0, 0.1, 30.0), read=_bounded_timeout('INFERENCE_PROXY_READ_TIMEOUT_SECONDS', 300.0, 1.0, 900.0), write=_bounded_timeout('INFERENCE_PROXY_WRITE_TIMEOUT_SECONDS', 30.0, 1.0, 300.0), pool=_bounded_timeout('INFERENCE_PROXY_POOL_TIMEOUT_SECONDS', 5.0, 0.1, 30.0))
-op4354=>operation: client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False)
-op4357=>operation: upstream_request = client.build_request(request.method, upstream_url, params=list(request.query_params.multi_items()), headers=_request_headers(request), content=body)
+        <div><textarea id="code" style="width: 100%;" rows="11">op4418=>operation: 'Forward one authenticated request to a managed in-cluster endpoint.'
+cond4421=>operation: raise HTTPException(status_code=400, detail='Invalid inference path') if  any((part in {'.', '..'} for part in upstream_path.split('/')))
+op4431=>operation: service_name, namespace, configured_health_path = await _resolve_upstream(endpoint_name)
+op4433=>operation: upstream_path = _validate_upstream_path(upstream_path, request.method, configured_health_path)
+op4435=>operation: encoded_suffix = quote(upstream_path, safe='/:@-._~')
+op4437=>operation: upstream_path_value = f'/{encoded_suffix}' if encoded_suffix else '/'
+op4439=>operation: upstream_url = f'http://{service_name}.{namespace}.svc.cluster.local{upstream_path_value}'
+op4441=>operation: body = await request.body()
+op4443=>operation: timeout = httpx.Timeout(connect=_bounded_timeout('INFERENCE_PROXY_CONNECT_TIMEOUT_SECONDS', 5.0, 0.1, 30.0), read=_bounded_timeout('INFERENCE_PROXY_READ_TIMEOUT_SECONDS', 300.0, 1.0, 900.0), write=_bounded_timeout('INFERENCE_PROXY_WRITE_TIMEOUT_SECONDS', 30.0, 1.0, 300.0), pool=_bounded_timeout('INFERENCE_PROXY_POOL_TIMEOUT_SECONDS', 5.0, 0.1, 30.0))
+op4445=>operation: client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False)
+op4448=>operation: upstream_request = client.build_request(request.method, upstream_url, params=list(request.query_params.multi_items()), headers=_request_headers(request), content=body)
 response = await client.send(upstream_request, stream=True)
-cond4356=>condition: exception raised?
-cond4359=>condition: except httpx.TimeoutException as exc
-op4363=>operation: await client.aclose()
-sub4365=>subroutine: raise HTTPException(status_code=504, detail='Inference endpoint timed out') from exc
-cond4367=>condition: except httpx.HTTPError as exc
-op4371=>operation: await client.aclose()
-sub4373=>subroutine: raise HTTPException(status_code=502, detail='Inference endpoint is unavailable') from exc
-io4381=>inputoutput: output: StreamingResponse(_stream_response(response, client), status_code=response.status_code, headers=_response_headers(response), media_type=None)
-e4379=>end: end function return
+cond4447=>condition: exception raised?
+cond4450=>condition: except httpx.TimeoutException as exc
+op4454=>operation: await client.aclose()
+sub4456=>subroutine: raise HTTPException(status_code=504, detail='Inference endpoint timed out') from exc
+cond4458=>condition: except httpx.HTTPError as exc
+op4462=>operation: await client.aclose()
+sub4464=>subroutine: raise HTTPException(status_code=502, detail='Inference endpoint is unavailable') from exc
+io4472=>inputoutput: output: StreamingResponse(_stream_response(response, client), status_code=response.status_code, headers=_response_headers(response), media_type=None)
+e4470=>end: end function return
 
-op4327->cond4330
-cond4330->op4340
-op4340->op4342
-op4342->op4344
-op4344->op4346
-op4346->op4348
-op4348->op4350
-op4350->op4352
-op4352->op4354
-op4354->op4357
-op4357->cond4356
-cond4356(yes)->cond4359
-cond4359(yes)->op4363
-op4363->sub4365
-cond4359(no)->cond4367
-cond4367(yes)->op4371
-op4371->sub4373
-cond4367(no)->io4381
-io4381->e4379
-cond4356(no)->io4381
+op4418->cond4421
+cond4421->op4431
+op4431->op4433
+op4433->op4435
+op4435->op4437
+op4437->op4439
+op4439->op4441
+op4441->op4443
+op4443->op4445
+op4445->op4448
+op4448->cond4447
+cond4447(yes)->cond4450
+cond4450(yes)->op4454
+op4454->sub4456
+cond4450(no)->cond4458
+cond4458(yes)->op4462
+op4462->sub4464
+cond4458(no)->io4472
+io4472->e4470
+cond4447(no)->io4472
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -257,10 +257,10 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
           </p>
           <div id="canvas"></div>
         </div>
