@@ -133,7 +133,7 @@ gco monitoring open --region us-east-1 --via-ssm auto
 
 `--via-ssm <id>` opens an `AWS-StartPortForwardingSessionToRemoteHost` session to
 the cluster's API endpoint on a local port, then runs `kubectl port-forward`
-against `https://localhost:8443` with the real endpoint as the TLS server name.
+against `https://127.0.0.1:8443` with the real endpoint as the TLS server name.
 It requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 locally and an SSM-managed instance in the VPC that can reach the endpoint.
 

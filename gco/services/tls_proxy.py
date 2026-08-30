@@ -118,6 +118,7 @@ class TlsProxy:
         self._keypair_digest = ""
         self._stop = asyncio.Event()
         self._connections: set[asyncio.Task[Any]] = set()
+        self._retired_acceptors: set[asyncio.Task[Any]] = set()
 
     async def _handle_connection(
         self,
@@ -173,8 +174,14 @@ class TlsProxy:
     async def _reload_certificate(self, context: ssl.SSLContext, digest: str) -> None:
         old_server = self._server
         if old_server is not None:
+            # ``Server.wait_closed`` waits for accepted clients on current
+            # Python releases. Closing the acceptor releases its listening
+            # socket synchronously; retire it in the background so a long-lived
+            # stream cannot block the replacement listener from binding.
             old_server.close()
-            await old_server.wait_closed()
+            retired = asyncio.create_task(old_server.wait_closed())
+            self._retired_acceptors.add(retired)
+            retired.add_done_callback(self._retired_acceptors.discard)
         try:
             self._server = await asyncio.start_server(
                 self._handle_connection,
@@ -214,9 +221,9 @@ class TlsProxy:
     async def shutdown(self) -> None:
         """Stop accepting connections and drain established streams."""
         self._stop.set()
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+        current_server = self._server
+        if current_server is not None:
+            current_server.close()
 
         active = set(self._connections)
         if active:
@@ -234,6 +241,12 @@ class TlsProxy:
                 for task in active:
                     task.cancel()
                 await asyncio.gather(*active, return_exceptions=True)
+
+        acceptor_waiters: list[asyncio.Future[Any]] = list(self._retired_acceptors)
+        if current_server is not None:
+            acceptor_waiters.append(asyncio.ensure_future(current_server.wait_closed()))
+        if acceptor_waiters:
+            await asyncio.gather(*acceptor_waiters, return_exceptions=True)
 
 
 async def run_proxy(config: ProxyConfig | None = None) -> None:

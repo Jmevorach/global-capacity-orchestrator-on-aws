@@ -9,11 +9,11 @@ import {
 } from "./support.mjs";
 
 test("upstream responses preserve backpressure, bytes, and Lambda metadata", async () => {
-  const chunks = Array.from({ length: 24 }, (_, index) =>
-    Buffer.alloc(64, index),
+  const chunks = Array.from({ length: 128 }, (_, index) =>
+    Buffer.alloc(1024, index),
   );
   const upstream = Readable.from(chunks, {
-    highWaterMark: 16,
+    highWaterMark: 1024,
     objectMode: false,
   });
   upstream.statusCode = 206;
@@ -39,7 +39,7 @@ test("upstream responses preserve backpressure, bytes, and Lambda metadata", asy
   };
   const downstream = new CollectingWritable({
     delayMs: 1,
-    highWaterMark: 16,
+    highWaterMark: 1024,
   });
   const responseState = { started: false };
 
@@ -53,7 +53,10 @@ test("upstream responses preserve backpressure, bytes, and Lambda metadata", asy
   assert.equal(responseState.started, true);
   assert.deepEqual(downstream.buffer(), Buffer.concat(chunks));
   assert.ok(downstream.maxWritableLength > 0);
-  assert.ok(downstream.maxWritableLength <= chunks[0].length);
+  const framingPrefixBytes = downstream.framing().delimiterIndex + 8;
+  assert.ok(
+    downstream.maxWritableLength <= framingPrefixBytes + chunks[0].length,
+  );
   assert.deepEqual(responseMetadata.get(downstream), {
     statusCode: 206,
     headers: {
@@ -63,6 +66,85 @@ test("upstream responses preserve backpressure, bytes, and Lambda metadata", asy
   });
   assert.equal(cleanupCalls, 1);
   assert.equal(destroyCalls, 0);
+});
+
+test("empty upstream responses still emit metadata and the required delimiter", async () => {
+  const upstream = Readable.from([]);
+  upstream.statusCode = 200;
+  upstream.headers = { "Content-Type": "text/plain", "Content-Length": "0" };
+  const resource = {
+    response: upstream,
+    cleanup() {},
+    destroy(error) {
+      upstream.destroy(error);
+    },
+  };
+  const downstream = new CollectingWritable();
+  const responseState = { started: false };
+
+  await __test.streamFinalResponse(
+    resource,
+    downstream,
+    responseState,
+    new AbortController().signal,
+  );
+
+  assert.equal(responseState.started, true);
+  assert.deepEqual(responseMetadata.get(downstream), {
+    statusCode: 200,
+    headers: { "content-type": "text/plain" },
+  });
+  assert.equal(downstream.buffer().byteLength, 0);
+  assert.ok(downstream.framing().delimiterIndex < 16 * 1024);
+  assert.deepEqual(
+    downstream
+      .rawBuffer()
+      .subarray(
+        downstream.framing().delimiterIndex,
+        downstream.framing().delimiterIndex + 8,
+      ),
+    Buffer.alloc(8),
+  );
+});
+
+test("response metadata must place its delimiter within the first 16 KiB", async () => {
+  const downstream = new CollectingWritable();
+  const oversizedHeaders = { "x-oversized": "x".repeat(16 * 1024) };
+  assert.throws(
+    () =>
+      __test.beginStreamingResponse(downstream, {
+        statusCode: 200,
+        headers: oversizedHeaders,
+      }),
+    (error) => error instanceof __test.PublicError && error.statusCode === 502,
+  );
+  assert.equal(downstream.rawBuffer().byteLength, 0);
+
+  const upstream = Readable.from(["never-written"]);
+  upstream.statusCode = 200;
+  upstream.headers = oversizedHeaders;
+  const resource = {
+    response: upstream,
+    cleanupCalls: 0,
+    destroyCalls: 0,
+    cleanup() {
+      this.cleanupCalls += 1;
+    },
+    destroy() {
+      this.destroyCalls += 1;
+    },
+  };
+  await assert.rejects(
+    __test.streamFinalResponse(
+      resource,
+      new CollectingWritable(),
+      { started: false },
+      new AbortController().signal,
+    ),
+    (error) => error instanceof __test.PublicError && error.statusCode === 502,
+  );
+  assert.equal(resource.cleanupCalls, 1);
+  assert.equal(resource.destroyCalls, 1);
 });
 
 test("JSON errors are finite, metadata-framed, and omit internal details", async () => {
@@ -92,6 +174,23 @@ test("JSON errors are finite, metadata-framed, and omit internal details", async
   });
   assert.equal(downstream.listenerCount("close"), 0);
   assert.equal(downstream.listenerCount("error"), 0);
+
+  const failing = new CollectingWritable();
+  let writes = 0;
+  failing._write = (chunk, _encoding, callback) => {
+    writes += 1;
+    if (writes === 1) {
+      failing.chunks.push(Buffer.from(chunk));
+      callback();
+      return;
+    }
+    callback(new Error("downstream write failed"));
+  };
+  await __test.sendJsonError(failing, 500, "Internal server error");
+  assert.equal(writes, 2);
+  assert.equal(responseMetadata.has(failing), true);
+  assert.equal(failing.listenerCount("close"), 0);
+  assert.equal(failing.listenerCount("error"), 0);
 
   const disconnected = new CollectingWritable();
   disconnected.destroy();

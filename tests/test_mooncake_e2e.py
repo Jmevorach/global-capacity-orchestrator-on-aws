@@ -77,7 +77,15 @@ class _FakeAppsApi:
         self.deployments[name] = deployment
         return deployment
 
+    def delete_namespaced_deployment(self, name, namespace, **_kw):
+        if name not in self.deployments:
+            raise ApiException(status=404, reason="Not Found")
+        return self.deployments.pop(name)
+
     def patch_namespaced_deployment(self, name, namespace, body=None, **_kw):
+        if hasattr(body, "spec"):
+            self.deployments[name] = body
+            return body
         deployment = self.deployments[name]
         replicas = (body or {}).get("spec", {}).get("replicas")
         if replicas is not None:
@@ -115,6 +123,23 @@ class _FakeCoreApi:
         self.services[name] = service
         return service
 
+    def read_namespaced_service(self, name, namespace, **_kw):
+        if name not in self.services:
+            raise ApiException(status=404, reason="Not Found")
+        return self.services[name]
+
+    def patch_namespaced_service(self, name, namespace, body=None, **_kw):
+        if name not in self.services:
+            raise ApiException(status=404, reason="Not Found")
+        if hasattr(body, "spec"):
+            self.services[name] = body
+        return self.services[name]
+
+    def delete_namespaced_service(self, name, namespace, **_kw):
+        if name not in self.services:
+            raise ApiException(status=404, reason="Not Found")
+        return self.services.pop(name)
+
     def read_namespaced_secret(self, name, namespace, **_kw):
         return self._secret
 
@@ -124,6 +149,16 @@ class _FakeCoreApi:
             raise ApiException(status=409, reason="Conflict")
         self.config_maps[name] = config_map
         return config_map
+
+    def read_namespaced_config_map(self, name, namespace, **_kw):
+        if name not in self.config_maps:
+            raise ApiException(status=404, reason="Not Found")
+        return self.config_maps[name]
+
+    def delete_namespaced_config_map(self, name, namespace, **_kw):
+        if name not in self.config_maps:
+            raise ApiException(status=404, reason="Not Found")
+        return self.config_maps.pop(name)
 
     def patch_namespaced_config_map(self, name, namespace, config_map, **_kw):
         self.config_maps[name] = config_map
@@ -255,7 +290,7 @@ def _make_monitor(apps, core, networking, store, region: str = OWN_REGION):
         patch("gco.services.inference_monitor.client.NetworkingV1Api"),
         patch("gco.services.inference_monitor.client.AutoscalingV2Api"),
     ):
-        from gco.services.inference_monitor import InferenceMonitor
+        from gco.services.inference_monitor import InferenceMonitor, ResourceCleanupResult
 
         monitor = InferenceMonitor(
             cluster_id="test-cluster",
@@ -267,6 +302,8 @@ def _make_monitor(apps, core, networking, store, region: str = OWN_REGION):
     monitor.apps_v1 = apps
     monitor.core_v1 = core
     monitor.networking_v1 = networking
+    monitor._delete_autoscalers = lambda *_args, **_kwargs: ResourceCleanupResult()
+    monitor._reconcile_role_autoscaler = lambda *_args, **_kwargs: ResourceCleanupResult()
     return monitor
 
 
@@ -301,6 +338,7 @@ class _RecordingStore:
         replicas_desired=0,
         error=None,
         extra=None,
+        **conditions,
     ):
         self.status_writes.append(
             {
@@ -341,6 +379,7 @@ def test_split_endpoint_materializes_roles_proxy_service_and_role_keyed_status()
     spec = _disaggregated_spec(prefill=2, decode=3)
     endpoint = {
         "endpoint_name": "chat",
+        "lifecycle_id": "life-chat",
         "desired_state": "deploying",
         "target_regions": [OWN_REGION],
         "spec": spec,
@@ -432,7 +471,12 @@ def test_topology_change_rescales_role_deployments():
         # through the stand-in DynamoDB table).
         changed = copy.deepcopy(first["spec"])
         changed["mooncake"]["topology"] = {"prefill": 5, "decode": 1}
-        store.update_spec("chat", changed)
+        store.update_spec(
+            "chat",
+            changed,
+            expected_lifecycle_id=first["lifecycle_id"],
+            expected_updated_at=first["updated_at"],
+        )
 
         reloaded = store.get_endpoint("chat")
         assert reloaded["spec"]["mooncake"]["topology"] == {"prefill": 5, "decode": 1}

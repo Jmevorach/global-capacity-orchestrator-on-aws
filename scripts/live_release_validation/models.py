@@ -4,20 +4,53 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
-import stat
-import tempfile
 import time
 import traceback as traceback_module
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, Literal, TextIO, cast
+from typing import Any, Literal, cast
 
+from .artifact_io import (
+    REPORT_FILENAMES as _REPORT_FILENAMES,
+)
+from .artifact_io import (
+    atomic_write_text,
+    ensure_private_directory,
+    ensure_private_run_directory,
+)
+from .artifact_io import (
+    read_private_text as _read_private_text,
+)
+from .inference_contract import (
+    INFERENCE_OWNER_LABEL,
+    Framework,
+    InferenceRuntimeSpec,
+    inference_deploy_extra_args,
+    inference_framework_env,
+    inference_identity_fields,
+    inference_request_body,
+    validate_inference_settings,
+)
 from .json_utils import loads_without_duplicate_keys
+
+__all__ = [
+    "INFERENCE_OWNER_LABEL",
+    "ActionResult",
+    "Framework",
+    "InferenceRuntimeSpec",
+    "RunCheckpoint",
+    "RunContext",
+    "RunSettings",
+    "ValidationReport",
+    "atomic_write_json",
+    "atomic_write_text",
+    "ensure_private_directory",
+    "ensure_private_run_directory",
+    "utc_now",
+]
 
 SCHEMA_VERSION = 2
 ActionStatus = Literal["passed", "failed", "skipped"]
@@ -45,216 +78,6 @@ def to_jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
-
-
-_PRIVATE_DIRECTORY_MODE = 0o700
-_PRIVATE_FILE_MODE = 0o600
-_REPORT_FILENAMES = frozenset(
-    {
-        "live-release-validation.json",
-        "live-release-validation.md",
-        # The sibling example-job harness reuses this module's report/checkpoint
-        # machinery with its own report stem.
-        "example-job-validation.json",
-        "example-job-validation.md",
-    }
-)
-
-
-def _validate_private_regular_metadata(metadata: os.stat_result, path: Path) -> None:
-    """Reject links, special files, foreign owners, and non-private POSIX modes."""
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"Live-validation output must be a regular file, not {path}")
-    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
-        raise PermissionError(f"Live-validation output is not owned by this user: {path}")
-    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != _PRIVATE_FILE_MODE:
-        raise PermissionError(f"Live-validation output must have mode 0600: {path}")
-
-
-def _validate_private_regular_file(path: Path) -> None:
-    _validate_private_regular_metadata(path.lstat(), path)
-
-
-def _validate_private_directory_metadata(metadata: os.stat_result, directory: Path) -> None:
-    """Require a real, current-user-owned, owner-only run directory."""
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError(f"Live-validation output directory must be real: {directory}")
-    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
-        raise PermissionError(
-            f"Live-validation output directory is not owned by this user: {directory}"
-        )
-    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != _PRIVATE_DIRECTORY_MODE:
-        raise PermissionError(
-            f"Live-validation output directory must already have mode 0700: {directory}"
-        )
-
-
-def ensure_private_directory(directory: Path) -> None:
-    """Create a private directory or validate it without changing existing permissions."""
-    directory = Path(directory)
-    with suppress(FileExistsError):
-        directory.mkdir(parents=True, mode=_PRIVATE_DIRECTORY_MODE, exist_ok=False)
-    _validate_private_directory_metadata(directory.lstat(), directory)
-
-
-def _assert_directory_binding(directory: Path, descriptor: int) -> None:
-    """Fail if the verified pathname no longer names the pinned directory."""
-    try:
-        current = directory.lstat()
-    except OSError as exc:
-        raise RuntimeError(
-            f"Live-validation output directory was rebound while open: {directory}"
-        ) from exc
-    if not os.path.samestat(current, os.fstat(descriptor)):
-        raise RuntimeError(f"Live-validation output directory was rebound while open: {directory}")
-
-
-@contextmanager
-def _open_private_directory(directory: Path) -> Iterator[int | None]:
-    """Pin a validated directory so artifact I/O cannot follow a rebound pathname."""
-    directory = Path(directory)
-    ensure_private_directory(directory)
-    if os.name == "nt":
-        # The supported live-validation platforms are macOS and Linux. Keep
-        # offline model/report use functional on Windows with the validated
-        # path fallback below, where POSIX directory descriptors are absent.
-        yield None
-        return
-
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    directory_only = getattr(os, "O_DIRECTORY", 0)
-    if not no_follow or not directory_only:
-        raise RuntimeError("Secure directory-descriptor operations are unavailable")
-
-    before = directory.lstat()
-    descriptor = os.open(
-        directory,
-        os.O_RDONLY | no_follow | directory_only | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        opened = os.fstat(descriptor)
-        if not os.path.samestat(before, opened):
-            raise RuntimeError(
-                f"Live-validation output directory changed while opening: {directory}"
-            )
-        _validate_private_directory_metadata(opened, directory)
-        yield descriptor
-        _assert_directory_binding(directory, descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def ensure_private_run_directory(directory: Path, checkpoint_path: Path) -> None:
-    """Validate that an existing private directory is dedicated to one harness run."""
-    directory = Path(directory)
-    allowed_names = {*_REPORT_FILENAMES, checkpoint_path.name}
-    with _open_private_directory(directory) as descriptor:
-        if descriptor is None:
-            entries = [(entry.name, entry.lstat()) for entry in directory.iterdir()]
-        else:
-            entries = [
-                (
-                    name,
-                    os.stat(name, dir_fd=descriptor, follow_symlinks=False),
-                )
-                for name in os.listdir(descriptor)
-            ]
-        for name, metadata in entries:
-            is_temporary = any(
-                name.startswith(f".{allowed_name}.") and name.endswith(".tmp")
-                for allowed_name in allowed_names
-            )
-            entry = directory / name
-            if name not in allowed_names and not is_temporary:
-                raise ValueError(
-                    "Live-validation output directory contains an unrelated entry and is not "
-                    f"dedicated to this run: {entry}"
-                )
-            _validate_private_regular_metadata(metadata, entry)
-
-
-def _read_private_text(path: Path) -> str:
-    """Read one owner-only regular file relative to a pinned directory."""
-    with _open_private_directory(path.parent) as descriptor:
-        if descriptor is None:
-            _validate_private_regular_file(path)
-            return path.read_text(encoding="utf-8")
-
-        opened_descriptor = os.open(
-            path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=descriptor,
-        )
-        descriptor_to_close: int | None = opened_descriptor
-        try:
-            _validate_private_regular_metadata(os.fstat(opened_descriptor), path)
-            text_handle: TextIO = os.fdopen(opened_descriptor, mode="r", encoding="utf-8")
-            descriptor_to_close = None
-            with text_handle:
-                return text_handle.read()
-        finally:
-            if descriptor_to_close is not None:
-                os.close(descriptor_to_close)
-
-
-def atomic_write_text(path: Path, content: str) -> None:
-    """Atomically persist owner-only text relative to a pinned private directory."""
-    with _open_private_directory(path.parent) as descriptor:
-        if descriptor is None:
-            temporary_path_to_unlink: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    encoding="utf-8",
-                    dir=path.parent,
-                    prefix=f".{path.name}.",
-                    suffix=".tmp",
-                    delete=False,
-                ) as named_handle:
-                    temporary_path = Path(named_handle.name)
-                    temporary_path_to_unlink = temporary_path
-                    named_handle.write(content)
-                    named_handle.flush()
-                    os.fsync(named_handle.fileno())
-                os.replace(temporary_path, path)
-                temporary_path_to_unlink = None
-            finally:
-                if temporary_path_to_unlink is not None:
-                    temporary_path_to_unlink.unlink(missing_ok=True)
-            return
-
-        temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
-        temporary_name_to_unlink: str | None = temporary_name
-        descriptor_to_close: int | None = None
-        try:
-            opened_descriptor = os.open(
-                temporary_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                _PRIVATE_FILE_MODE,
-                dir_fd=descriptor,
-            )
-            descriptor_to_close = opened_descriptor
-            os.fchmod(opened_descriptor, _PRIVATE_FILE_MODE)
-            text_handle: TextIO = os.fdopen(opened_descriptor, mode="w", encoding="utf-8")
-            descriptor_to_close = None
-            with text_handle:
-                text_handle.write(content)
-                text_handle.flush()
-                os.fsync(text_handle.fileno())
-
-            os.replace(
-                temporary_name,
-                path.name,
-                src_dir_fd=descriptor,
-                dst_dir_fd=descriptor,
-            )
-            temporary_name_to_unlink = None
-        finally:
-            if descriptor_to_close is not None:
-                os.close(descriptor_to_close)
-            if temporary_name_to_unlink is not None:
-                with suppress(FileNotFoundError):
-                    os.unlink(temporary_name_to_unlink, dir_fd=descriptor)
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -291,8 +114,34 @@ class RunSettings:
     #: validate the same chart set it started with.
     optional_schedulers: tuple[str, ...] = ()
 
+    # First-class inference action contract. ``inference_enabled`` is explicit
+    # because sibling harnesses reuse RunSettings with their own ``all`` action.
+    inference_enabled: bool = False
+    selected_region: str = ""
+    inference_runtimes: tuple[InferenceRuntimeSpec, ...] = ()
+    request_prompt: str = "Reply with a short deterministic validation response."
+    request_max_tokens: int = 8
+    namespace: str = "gco-inference"
+    health_path: str = "/health"
+    gpu_count: int = 0
+    baseline_replicas: int = 1
+    autoscale_initial_replicas: int = 1
+    hpa_min_replicas: int = 2
+    hpa_max_replicas: int = 2
+    hpa_cpu_target: int = 70
+    endpoint_count: int = 4
+    proxy_tls_cpu_request: str = "100m"
+    proxy_tls_cpu_target: int = 70
+    command_timeout_seconds: int = 300
+    readiness_timeout_seconds: int = 1800
+    hpa_timeout_seconds: int = 900
+    deletion_timeout_seconds: int = 900
+    monitor_interval_seconds: int = 15
+    hpa_stability_intervals: int = 2
+    consent: bool = False
+
     def __post_init__(self) -> None:
-        """Normalize output paths without resolving symlinks and enforce one run directory."""
+        """Normalize output paths and validate the selected action contracts."""
         report_dir = Path(os.path.abspath(os.fspath(self.report_dir)))
         checkpoint_path = Path(os.path.abspath(os.fspath(self.checkpoint_path)))
         object.__setattr__(self, "report_dir", report_dir)
@@ -303,22 +152,38 @@ class RunSettings:
             raise ValueError(
                 f"Checkpoint filename is reserved for a validation report: {checkpoint_path.name}"
             )
+        if self.inference_enabled:
+            validate_inference_settings(self)
+
+    def request_body(self, runtime: InferenceRuntimeSpec) -> dict[str, Any]:
+        """Return the deterministic body for one runtime in the matrix."""
+        return inference_request_body(self, runtime)
+
+    @staticmethod
+    def framework_env(runtime: InferenceRuntimeSpec) -> dict[str, str]:
+        return inference_framework_env(runtime)
+
+    @staticmethod
+    def deploy_extra_args(runtime: InferenceRuntimeSpec) -> tuple[str, ...]:
+        return inference_deploy_extra_args(runtime)
+
+    @property
+    def kubeconfig_path(self) -> Path:
+        """Return the isolated kubeconfig path without touching the filesystem."""
+        return self.report_dir / "kubeconfig"
+
+    def _inference_identity_fields(self) -> dict[str, Any]:
+        return inference_identity_fields(self)
 
     def extra_cdk_context(self) -> dict[str, str]:
-        """Extra ``--context`` pairs every CDK invocation of this run must carry.
-
-        Subclass hook: sibling harnesses (``scripts/example_job_validation``)
-        extend this with their own per-run enablement context. Anything
-        returned here must also be reflected in :meth:`identity` fields so a
-        resumed run synthesizes the same graph it started with.
-        """
+        """Extra ``--context`` pairs every CDK invocation of this run must carry."""
         if self.optional_schedulers:
             return {"helm_enabled_overrides": ",".join(self.optional_schedulers)}
         return {}
 
     def identity(self) -> dict[str, Any]:
         """Return fields that must remain identical across resume attempts."""
-        return {
+        identity = {
             "run_id": self.run_id,
             "repo_root": str(self.repo_root.resolve()),
             "expected_account": self.expected_account,
@@ -330,6 +195,9 @@ class RunSettings:
             "confirm_kms_key_deletion": self.confirm_kms_key_deletion,
             "optional_schedulers": list(self.optional_schedulers),
         }
+        if self.inference_enabled:
+            identity["inference"] = self._inference_identity_fields()
+        return identity
 
 
 @dataclass

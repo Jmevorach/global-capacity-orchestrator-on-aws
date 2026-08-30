@@ -1,16 +1,34 @@
 import { Writable } from "node:stream";
 
-export const responseMetadata = new WeakMap();
+const RESPONSE_METADATA_DELIMITER = Buffer.alloc(8);
+
+function framedResponse(stream) {
+  const raw = stream.rawBuffer();
+  const delimiterIndex = raw.indexOf(RESPONSE_METADATA_DELIMITER);
+  if (delimiterIndex < 0) {
+    return null;
+  }
+  return {
+    metadata: JSON.parse(raw.subarray(0, delimiterIndex).toString("utf8")),
+    payload: raw.subarray(
+      delimiterIndex + RESPONSE_METADATA_DELIMITER.byteLength,
+    ),
+    delimiterIndex,
+  };
+}
+
+export const responseMetadata = {
+  get(stream) {
+    return framedResponse(stream)?.metadata;
+  },
+  has(stream) {
+    return framedResponse(stream) !== null;
+  },
+};
 
 globalThis.awslambda = {
   streamifyResponse(streamingHandler) {
     return streamingHandler;
-  },
-  HttpResponseStream: {
-    from(responseStream, metadata) {
-      responseMetadata.set(responseStream, metadata);
-      return responseStream;
-    },
   },
 };
 
@@ -72,8 +90,16 @@ export class CollectingWritable extends Writable {
     callback();
   }
 
-  buffer() {
+  rawBuffer() {
     return Buffer.concat(this.chunks);
+  }
+
+  framing() {
+    return framedResponse(this);
+  }
+
+  buffer() {
+    return this.framing()?.payload ?? this.rawBuffer();
   }
 
   text() {

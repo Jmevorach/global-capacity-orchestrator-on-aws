@@ -25,6 +25,7 @@ from .convergence import action_convergence
 from .deploy import action_deploy
 from .destroy import action_destroy, destroy_deployment
 from .final_inventory import action_final_inventory
+from .inference import action_inference
 from .jobs import action_api_lifecycle, action_sqs_lifecycle
 from .opencost import action_opencost
 from .policy import action_policy
@@ -40,6 +41,7 @@ __all__ = [
     "action_deploy",
     "action_destroy",
     "action_final_inventory",
+    "action_inference",
     "action_opencost",
     "action_policy",
     "action_preflight",

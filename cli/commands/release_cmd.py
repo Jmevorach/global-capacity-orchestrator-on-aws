@@ -32,8 +32,11 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 
 import click
+
+from .._image_reference import immutable_sha256_digest
 
 _ACCOUNT_RE = re.compile(r"\d{12}")
 
@@ -41,7 +44,7 @@ _ACCOUNT_RE = re.compile(r"\d{12}")
 CONSENT_FLAG = "--i-understand-this-deploys-and-destroys-infrastructure"
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise click.ClickException(message)
 
 
@@ -106,6 +109,22 @@ def release() -> None:
     metavar="NAME[,NAME...]",
     help="Harness actions to run; dependencies are added automatically.",
 )
+@click.option("--inference-region", default=None, help="Region for the inference matrix.")
+@click.option("--inference-vllm-image", default=None, help="Immutable vLLM @sha256 image.")
+@click.option("--inference-vllm-model-id", default=None, help="Exact vLLM model identifier.")
+@click.option(
+    "--inference-vllm-model-revision",
+    default=None,
+    help="Full immutable 40-hex vLLM model commit.",
+)
+@click.option("--inference-tgi-image", default=None, help="Immutable TGI @sha256 image.")
+@click.option("--inference-tgi-model-id", default=None, help="Exact TGI model identifier.")
+@click.option(
+    "--inference-tgi-model-revision",
+    default=None,
+    help="Full immutable 40-hex TGI model commit.",
+)
+@click.option("--inference-gpu-count", type=click.IntRange(min=0), default=0, show_default=True)
 @click.option(
     "--optional-schedulers",
     "optional_schedulers",
@@ -156,6 +175,14 @@ def release_validate(
     authorized: bool,
     confirm_kms_key_deletion: bool,
     actions: str,
+    inference_region: str | None,
+    inference_vllm_image: str | None,
+    inference_vllm_model_id: str | None,
+    inference_vllm_model_revision: str | None,
+    inference_tgi_image: str | None,
+    inference_tgi_model_id: str | None,
+    inference_tgi_model_revision: str | None,
+    inference_gpu_count: int,
     optional_schedulers: str | None,
     profile: str,
     run_id: str | None,
@@ -182,6 +209,7 @@ def release_validate(
     selected = {name.strip() for name in actions.split(",") if name.strip()}
     if not selected:
         _fail("--actions must name at least one action")
+    inference_selected = bool(selected & {"all", "inference"})
     # Every action other than preflight/baseline transitively depends on
     # deploy, and the harness expands dependencies automatically — so any
     # such selection deploys real infrastructure and creates retained EKS
@@ -200,6 +228,36 @@ def release_validate(
             "--resume replays an exact checkpoint identity: pass the original "
             "--run-id and --report-dir from the interrupted run."
         )
+    if inference_selected:
+        required_inference = {
+            "--inference-region": inference_region,
+            "--inference-vllm-image": inference_vllm_image,
+            "--inference-vllm-model-id": inference_vllm_model_id,
+            "--inference-vllm-model-revision": inference_vllm_model_revision,
+            "--inference-tgi-image": inference_tgi_image,
+            "--inference-tgi-model-id": inference_tgi_model_id,
+            "--inference-tgi-model-revision": inference_tgi_model_revision,
+        }
+        missing = [name for name, value in required_inference.items() if not value]
+        if missing:
+            _fail("The inference action requires " + ", ".join(missing) + ".")
+        image_digests: list[str] = []
+        for option, image in (
+            ("--inference-vllm-image", inference_vllm_image),
+            ("--inference-tgi-image", inference_tgi_image),
+        ):
+            digest = immutable_sha256_digest(image)
+            if digest is None:
+                _fail(f"{option} must be an immutable lowercase @sha256: reference")
+            image_digests.append(digest)
+        if len(set(image_digests)) != 2:
+            _fail("vLLM and TGI inference images must have distinct immutable digests")
+        for option, revision in (
+            ("--inference-vllm-model-revision", inference_vllm_model_revision),
+            ("--inference-tgi-model-revision", inference_tgi_model_revision),
+        ):
+            if revision is None or not re.fullmatch(r"[0-9a-f]{40}", revision):
+                _fail(f"{option} must be a full lowercase 40-hex commit")
 
     repo_root = _repo_root()
     expected_sha = _run_git(repo_root, "rev-parse", "HEAD")
@@ -242,6 +300,28 @@ def release_validate(
         "--checkpoint",
         str(resolved_report_dir / "checkpoint.json"),
     ]
+    if inference_selected:
+        command.extend(
+            [
+                "--inference-region",
+                str(inference_region),
+                "--inference-vllm-image",
+                str(inference_vllm_image),
+                "--inference-vllm-model-id",
+                str(inference_vllm_model_id),
+                "--inference-vllm-model-revision",
+                str(inference_vllm_model_revision),
+                "--inference-tgi-image",
+                str(inference_tgi_image),
+                "--inference-tgi-model-id",
+                str(inference_tgi_model_id),
+                "--inference-tgi-model-revision",
+                str(inference_tgi_model_revision),
+                "--inference-gpu-count",
+                str(inference_gpu_count),
+                "--confirm-inference-deployment",
+            ]
+        )
     if confirm_kms_key_deletion:
         command.append("--confirm-kms-key-deletion")
     if optional_schedulers:

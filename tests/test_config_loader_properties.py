@@ -37,7 +37,7 @@ _BASE_CONTEXT: dict[str, Any] = json.loads(
 )["context"]
 
 
-def _context_with(key: str, value: dict[str, Any]) -> dict[str, Any]:
+def _context_with(key: str, value: Any) -> dict[str, Any]:
     context = json.loads(json.dumps(_BASE_CONTEXT))
     context[key] = value
     return context
@@ -120,6 +120,55 @@ class TestTrafficDialProperties:
         if mode.lower() in ("monitor", "enforce"):
             merged = ConfigLoader(MockApp(context)).get_global_accelerator_config()
             assert merged["traffic_dial"]["mode"] == mode
+        else:
+            with pytest.raises(ConfigValidationError):
+                ConfigLoader(MockApp(context))
+
+
+# ---------------------------------------------------------------------------
+# inference_proxy TLS sidecar autoscaling
+# ---------------------------------------------------------------------------
+
+_INFERENCE_PROXY_RANGES = {
+    "tls_proxy_cpu_request_millicores": (1, 250),
+    "tls_proxy_cpu_target_utilization_percentage": (1, 100),
+}
+
+
+class TestInferenceProxyProperties:
+    @settings(max_examples=40, deadline=None)
+    @given(
+        request=st.integers(min_value=1, max_value=250),
+        target=st.integers(min_value=1, max_value=100),
+    )
+    def test_in_range_values_merge_losslessly(self, request: int, target: int) -> None:
+        configured = {
+            "tls_proxy_cpu_request_millicores": request,
+            "tls_proxy_cpu_target_utilization_percentage": target,
+        }
+        merged = ConfigLoader(
+            MockApp(_context_with("inference_proxy", configured))
+        ).get_inference_proxy_config()
+        assert merged == configured
+
+    @settings(max_examples=50, deadline=None)
+    @given(
+        field=st.sampled_from(sorted(_INFERENCE_PROXY_RANGES)),
+        value=st.one_of(
+            st.integers(min_value=-1_000, max_value=1_000),
+            st.booleans(),
+            st.floats(allow_nan=False, allow_infinity=False),
+            st.text(max_size=8),
+            st.none(),
+        ),
+    )
+    def test_only_exact_in_range_integers_validate(self, field: str, value: Any) -> None:
+        minimum, maximum = _INFERENCE_PROXY_RANGES[field]
+        valid = type(value) is int and minimum <= value <= maximum
+        context = _context_with("inference_proxy", {field: value})
+        if valid:
+            merged = ConfigLoader(MockApp(context)).get_inference_proxy_config()
+            assert merged[field] == value
         else:
             with pytest.raises(ConfigValidationError):
                 ConfigLoader(MockApp(context))

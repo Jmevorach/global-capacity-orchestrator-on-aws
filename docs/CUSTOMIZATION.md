@@ -416,7 +416,7 @@ inbound ports) and tears it down on exit:
 gco cluster tunnel --region us-east-1 --via-ssm auto
 
 # In another shell, kubectl through the tunnel:
-kubectl --server https://localhost:8443 --tls-server-name <endpoint-host> apply -f job.yaml
+kubectl --server https://127.0.0.1:8443 --tls-server-name <endpoint-host> apply -f job.yaml
 
 # Prefer to run it yourself? Print the exact commands (no changes made):
 gco cluster tunnel --region us-east-1 --print
@@ -691,6 +691,31 @@ Configure in `cdk.json`:
 | `unhealthy_threshold_seconds` | `300` | Seconds at zero ready replicas before the monitor emits an explicit degraded-state warning |
 
 Before the threshold, the monitor records the start of the outage. After the threshold, it logs that the authenticated inference proxy will return 503 until the model recovers. When a replica becomes ready, the timer is cleared. Reconciliation never creates endpoint-specific public routes.
+
+#### Inference Proxy TLS Autoscaling
+
+Configure the shared inference data plane's `api-tls-proxy` CPU request and
+HPA target in `cdk.json`:
+
+```json
+"inference_proxy": {
+  "tls_proxy_cpu_request_millicores": 100,
+  "tls_proxy_cpu_target_utilization_percentage": 70
+}
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `tls_proxy_cpu_request_millicores` | `100` | Exact integer from 1 through 250. CDK renders it as a Kubernetes CPU quantity such as `100m`; this request is the TLS sidecar HPA utilization denominator |
+| `tls_proxy_cpu_target_utilization_percentage` | `70` | Exact integer from 1 through 100 used only by the `api-tls-proxy` CPU `ContainerResource` HPA signal |
+
+The section is optional. Omission and JSON `null` use both defaults because AWS
+CDK normalizes top-level `null` context values to omission; partial objects retain
+the other default. Unknown keys, non-object non-null sections, booleans, floats,
+strings, and out-of-range values fail configuration validation. Redeploy the
+regional stack after changing a value. This tuning does not change the inference
+application CPU or memory, the TLS proxy CPU limit or memory profile, HPA replica
+bounds or behavior, the PodDisruptionBudget, or stream-drain settings.
 
 #### ALB Architecture
 

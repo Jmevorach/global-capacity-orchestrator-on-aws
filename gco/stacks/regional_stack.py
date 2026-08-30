@@ -112,6 +112,9 @@ from aws_cdk import custom_resources as cr
 from constructs import Construct
 
 from gco.config.config_loader import ConfigLoader
+from gco.inference_proxy_config import (
+    compute_inference_proxy_tls_replacements as _compute_inference_proxy_tls_replacements,
+)
 from gco.manifest_security_policy import validate_manifest_security_policy
 from gco.stacks.aws_load_balancer_controller_policy import (
     aws_load_balancer_controller_policy_document,
@@ -3320,8 +3323,10 @@ class GCORegionalStack(Stack):
         # shared job_validation_policy section because both the REST
         # manifest_processor and the SQS queue_processor read them. Service-
         # specific knobs (replicas, validation_enabled, max_request_body_bytes,
-        # etc.) stay under manifest_processor.
+        # etc.) stay under manifest_processor. Inference TLS proxy CPU and HPA
+        # settings live in their own optional block.
         mp_config = self.config.get_manifest_processor_config()
+        inference_proxy_config = self.config.get_inference_proxy_config()
         job_policy = self.node.try_get_context("job_validation_policy") or {}
         job_quotas = _validated_manifest_caps(
             job_policy.get("resource_quotas", {}),
@@ -3464,6 +3469,9 @@ class GCORegionalStack(Stack):
             "{{INFERENCE_PROXY_MAX_REQUEST_BODY_BYTES}}": str(
                 mp_config.get("max_request_body_bytes", 1_048_576)
             ),
+            # Shared pure renderer keeps production and Kind typed values in
+            # lockstep (Quantity string for request, YAML integer for target).
+            **_compute_inference_proxy_tls_replacements(inference_proxy_config),
             # Regional worker for the DynamoDB-backed global queue. Multiple API
             # replicas are safe because JobStore claims are conditional and
             # lease-backed; each replica also reconciles K8s status transitions.

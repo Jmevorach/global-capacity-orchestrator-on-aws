@@ -169,15 +169,13 @@ class TestActionRegistry:
         assert derived == frozenset({"deploy", "examples"})
 
     def test_live_registry_guard_covers_every_deploy_dependent(self) -> None:
-        """The derivation covers the old hardcoded set PLUS opencost.
+        """The derivation covers every reviewed live deploy-dependent action.
 
-        The previous literal guard omitted ``opencost`` even though it
-        depends on topology (and therefore deploy) — deriving from the
-        dependency graph closed that gap.
-
-        This literal is the counterweight: it is the assertion that an action
-        added to the live registry has been thought about here too. Every
-        action in it refuses to resume once the checkpoint records teardown,
+        Earlier literals omitted ``opencost`` and later ``inference`` even
+        though both depend on topology (and therefore deploy). Deriving from
+        the dependency graph closes the runtime gap; this explicit set forces
+        each newly registered action to receive a human review here too.
+        Every action in it refuses to resume once the checkpoint records teardown,
         which is why a read-only action like ``policy`` still belongs — there
         is nothing to read once the cluster is gone.
         """
@@ -191,6 +189,7 @@ class TestActionRegistry:
             {
                 "deploy",
                 "topology",
+                "inference",
                 "policy",
                 "api",
                 "sqs",

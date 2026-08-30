@@ -98,7 +98,7 @@ change is required to add a new CRD-dependent resource, just use the prefix.
 | `30-health-monitor.yaml` | `Deployment` + `PodDisruptionBudget` + TLS-only `Service`; the application binds pod loopback and a same-image sidecar hot-reloads the cert-manager leaf on port 8443 |
 | `31-manifest-processor.yaml` | `Deployment` + `PodDisruptionBudget` + TLS-only `Service`; the application binds pod loopback and a same-image sidecar hot-reloads the cert-manager leaf on port 8443 |
 | `32-inference-monitor.yaml` | `Deployment` + `PodDisruptionBudget` |
-| `33-inference-proxy.yaml` | Dedicated inference `Deployment` with a hot-reloading TLS proxy sidecar (three replicas on create; HPA owns updates) + per-container application CPU/memory and TLS CPU `HorizontalPodAutoscaler` signals + two-pod `PodDisruptionBudget` + 15-minute stream-drain lifecycle + TLS-only `Service` |
+| `33-inference-proxy.yaml` | Dedicated inference `Deployment` with a hot-reloading TLS proxy sidecar (three replicas on create; HPA owns updates) + per-container application CPU/memory and TLS CPU `HorizontalPodAutoscaler` signals (TLS defaults: `100m` request, 70% target; configurable through `cdk.json` `inference_proxy`) + two-pod `PodDisruptionBudget` + 15-minute stream-drain lifecycle + TLS-only `Service` |
 | `34-cost-monitor.yaml` | Cost monitor `ServiceAccount` + single-replica `Recreate` `Deployment` + `Service` + three `NetworkPolicy` rules (manifest-processor ingress/egress, [OpenCost](https://opencost.io/) egress) — **skipped and pruned when cost monitoring is disabled** |
 
 ### NodePools (40–49)
@@ -147,7 +147,10 @@ deploy time using values from the CDK stack
 (`gco/stacks/regional_stack.py`). Files with unreplaced `UPPER_SNAKE`
 placeholders are automatically skipped — the mechanism that conditionally
 enables FSx, Valkey, Aurora pgvector, cluster observability, and the queue
-processor.
+processor. The required inference TLS settings use a quoted CPU-quantity token
+(`{{INFERENCE_PROXY_TLS_CPU_REQUEST}}`) and an unquoted integer HPA token
+(`{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}`); the regional stack always
+supplies both from `cdk.json` defaults or overrides.
 
 Lower- or mixed-case double-brace tokens (e.g. Grafana dashboard legends like
 `{{gpu}}` or `{{Hostname}}`) are **not** placeholders — the handler's skip

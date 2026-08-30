@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, X509Certificate } from "node:crypto";
 import * as https from "node:https";
-import { pipeline } from "node:stream/promises";
+import { finished, pipeline } from "node:stream/promises";
 import { checkServerIdentity } from "node:tls";
 import { performance } from "node:perf_hooks";
 
@@ -61,6 +61,8 @@ const LAMBDA_MAX_FORWARD_MS = 899_000;
 const RESPONSE_HEADROOM_MS = 1_000;
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576;
 const MAX_CONFIGURABLE_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
+const RESPONSE_METADATA_DELIMITER = Buffer.alloc(8);
+const MAX_RESPONSE_METADATA_PREFIX_BYTES = 16 * 1024;
 
 function boundedEnvFloat(name, defaultValue, minimum, maximum) {
   const raw = process.env[name];
@@ -747,6 +749,19 @@ function sanitizeResponseHeaders(headers) {
   return sanitized;
 }
 
+function beginStreamingResponse(responseStream, metadata) {
+  const encodedMetadata = Buffer.from(JSON.stringify(metadata), "utf8");
+  const prefixLength =
+    encodedMetadata.byteLength + RESPONSE_METADATA_DELIMITER.byteLength;
+  if (prefixLength > MAX_RESPONSE_METADATA_PREFIX_BYTES) {
+    throw new PublicError(502, "Upstream response metadata is too large");
+  }
+  responseStream.write(
+    Buffer.concat([encodedMetadata, RESPONSE_METADATA_DELIMITER], prefixLength),
+  );
+  return responseStream;
+}
+
 function requestBudgetMilliseconds(context) {
   let available = LAMBDA_MAX_FORWARD_MS;
   try {
@@ -973,14 +988,17 @@ function sleep(milliseconds, signal) {
 async function streamFinalResponse(resource, responseStream, state, signal) {
   let output;
   try {
-    output = awslambda.HttpResponseStream.from(responseStream, {
+    output = beginStreamingResponse(responseStream, {
       statusCode: resource.response.statusCode || 502,
       headers: sanitizeResponseHeaders(resource.response.headers),
     });
     state.started = true;
-  } catch {
+  } catch (error) {
     resource.cleanup();
     resource.destroy();
+    if (error instanceof PublicError) {
+      throw error;
+    }
     throw new PublicError(500, "Internal server error");
   }
 
@@ -1100,7 +1118,7 @@ async function sendJsonError(
   }
   const body = JSON.stringify({ error: message, ...details });
   try {
-    const output = awslambda.HttpResponseStream.from(responseStream, {
+    const output = beginStreamingResponse(responseStream, {
       statusCode,
       headers: {
         "content-type": "application/json",
@@ -1108,6 +1126,7 @@ async function sendJsonError(
       },
     });
     output.end(body);
+    await finished(output, { cleanup: true });
   } catch {
     // The caller may have disconnected before the bounded error could be sent.
   }
@@ -1349,6 +1368,7 @@ export const __test = Object.freeze({
   sanitizeRequestHeaders,
   outboundHeaders,
   sanitizeResponseHeaders,
+  beginStreamingResponse,
   buildSignedHeaders,
   requestBudgetMilliseconds,
   transportFailureKind,

@@ -30,6 +30,12 @@ def inference(config: Any) -> None:
     "--mooncake-mode: falls back to the default upstream Mooncake-enabled vLLM image.",
 )
 @click.option(
+    "--framework",
+    type=click.Choice(["vllm", "tgi"]),
+    default=None,
+    help="Explicit serving runtime contract; persisted for renderer/probe behavior.",
+)
+@click.option(
     "--region",
     "-r",
     multiple=True,
@@ -157,6 +163,7 @@ def inference_deploy(
     config: Any,
     endpoint_name: Any,
     image: Any,
+    framework: Any,
     region: Any,
     replicas: Any,
     gpu_count: Any,
@@ -345,6 +352,7 @@ def inference_deploy(
         result = manager.deploy(
             endpoint_name=endpoint_name,
             image=image,
+            framework=framework,
             target_regions=list(region) if region else None,
             replicas=replicas,
             gpu_count=gpu_count,
@@ -600,7 +608,10 @@ def inference_start(config: Any, endpoint_name: Any) -> None:
         if result:
             formatter.print_success(f"Endpoint '{endpoint_name}' marked for start")
         else:
-            formatter.print_error(f"Endpoint '{endpoint_name}' not found")
+            formatter.print_error(
+                f"Endpoint '{endpoint_name}' is not a stopped endpoint. If it was deleted "
+                "or purged, redeploy it with 'gco inference deploy'."
+            )
             sys.exit(1)
 
     except Exception as e:
@@ -610,9 +621,28 @@ def inference_start(config: Any, endpoint_name: Any) -> None:
 
 @inference.command("delete")
 @click.argument("endpoint_name")
+@click.option(
+    "--expected-owner-label",
+    default=None,
+    metavar="KEY=VALUE",
+    hidden=True,
+    help="Require an exact stored owner label in the same atomic delete-state update",
+)
+@click.option(
+    "--expected-lifecycle-id",
+    default=None,
+    hidden=True,
+    help="Require the immutable endpoint lifecycle observed by an automation client",
+)
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
 @pass_config
-def inference_delete(config: Any, endpoint_name: Any, yes: Any) -> None:
+def inference_delete(
+    config: Any,
+    endpoint_name: Any,
+    expected_owner_label: Any,
+    expected_lifecycle_id: Any,
+    yes: Any,
+) -> None:
     """Delete an inference endpoint from all regions.
 
     The inference_monitor in each region will clean up the K8s resources.
@@ -624,12 +654,35 @@ def inference_delete(config: Any, endpoint_name: Any, yes: Any) -> None:
 
     formatter = get_output_formatter(config)
 
+    owner_condition: tuple[str, str] | None = None
+    if expected_owner_label is not None:
+        label_name, separator, label_value = str(expected_owner_label).partition("=")
+        if not separator or not label_name or not label_value:
+            formatter.print_error("--expected-owner-label must be KEY=VALUE")
+            sys.exit(1)
+        owner_condition = (label_name, label_value)
+    lifecycle_condition = (
+        str(expected_lifecycle_id).strip() if expected_lifecycle_id is not None else None
+    )
+    if lifecycle_condition == "":
+        formatter.print_error("--expected-lifecycle-id must be non-empty")
+        sys.exit(1)
+    if (owner_condition is None) != (lifecycle_condition is None):
+        formatter.print_error(
+            "--expected-owner-label and --expected-lifecycle-id must be supplied together"
+        )
+        sys.exit(1)
+
     if not yes:
         click.confirm(f"Delete endpoint '{endpoint_name}' from all regions?", abort=True)
 
     try:
         manager = get_inference_manager(config)
-        result = manager.delete(endpoint_name)
+        result = manager.delete(
+            endpoint_name,
+            expected_owner_label=owner_condition,
+            expected_lifecycle_id=lifecycle_condition,
+        )
 
         if result:
             formatter.print_success(
@@ -637,7 +690,8 @@ def inference_delete(config: Any, endpoint_name: Any, yes: Any) -> None:
                 "The inference_monitor will clean up resources in each region."
             )
         else:
-            formatter.print_error(f"Endpoint '{endpoint_name}' not found")
+            suffix = " or ownership/lifecycle condition failed" if owner_condition else ""
+            formatter.print_error(f"Endpoint '{endpoint_name}' not found{suffix}")
             sys.exit(1)
 
     except Exception as e:
@@ -742,6 +796,8 @@ def inference_invoke(
         endpoint_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
         spec = endpoint.get("spec", {})
         image = spec.get("image", "") if isinstance(spec, dict) else ""
+        image_lower = image.lower() if isinstance(image, str) else ""
+        persisted_framework = spec.get("framework") if isinstance(spec, dict) else None
 
         parsed_data: dict[str, Any] | None = None
         if data:
@@ -759,15 +815,17 @@ def inference_invoke(
         if parsed_data is not None and stream is not None:
             parsed_data["stream"] = stream_response
 
-        # Auto-detect the API sub-path based on the container image. TGI uses a
-        # distinct route for streamed token delivery; OpenAI-compatible servers
-        # use the same route and select streaming in the JSON body.
+        # Persisted framework is authoritative for neutral/private image names;
+        # image heuristics remain only for legacy records created before that
+        # field existed.
         if api_path is None:
-            if "vllm" in image:
-                api_path = "/v1/completions"
-            elif "text-generation-inference" in image or "tgi" in image:
+            if persisted_framework == "tgi":
                 api_path = "/generate_stream" if stream_response else "/generate"
-            elif "tritonserver" in image or "triton" in image:
+            elif persisted_framework == "vllm" or "vllm" in image_lower:
+                api_path = "/v1/completions"
+            elif "text-generation-inference" in image_lower or "tgi" in image_lower:
+                api_path = "/generate_stream" if stream_response else "/generate"
+            elif "tritonserver" in image_lower or "triton" in image_lower:
                 api_path = "/v2/models"
             else:
                 api_path = "/v1/completions"
@@ -801,7 +859,9 @@ def inference_invoke(
                             break
                     # Default for vLLM with no explicit model — auto-detect
                     # by querying /v1/models on the running endpoint
-                    if model_name == endpoint_name and "vllm" in image:
+                    if model_name == endpoint_name and (
+                        persisted_framework == "vllm" or "vllm" in image_lower
+                    ):
                         try:
                             detect_client = get_aws_client(config)
                             models_path = f"/inference/{endpoint_name}/v1/models"
@@ -1149,16 +1209,21 @@ def inference_health(config: Any, endpoint_name: Any, region: Any) -> None:
 
 @inference.command("models")
 @click.argument("endpoint_name")
+@click.option(
+    "--framework",
+    type=click.Choice(["vllm", "tgi"]),
+    default=None,
+    help="Runtime metadata contract (default: persisted endpoint framework or vLLM).",
+)
 @click.option("--region", "-r", help="Target region to query")
 @pass_config
-def inference_models(config: Any, endpoint_name: Any, region: Any) -> None:
-    """List models loaded on an inference endpoint.
-
-    Queries the /v1/models path (OpenAI-compatible) to discover loaded models.
-
-    Examples:
-        gco inference models my-llm
-    """
+def inference_models(
+    config: Any,
+    endpoint_name: Any,
+    framework: Any,
+    region: Any,
+) -> None:
+    """Read exact model identity from vLLM /v1/models or TGI /info."""
     import json as _json
 
     from ..aws_client import get_aws_client
@@ -1174,7 +1239,20 @@ def inference_models(config: Any, endpoint_name: Any, region: Any) -> None:
             sys.exit(1)
 
         ingress_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
-        full_path = f"{ingress_path}/v1/models"
+        spec = endpoint.get("spec")
+        persisted_framework = spec.get("framework") if isinstance(spec, dict) else None
+        image = spec.get("image") if isinstance(spec, dict) else None
+        inferred_framework = (
+            "tgi"
+            if isinstance(image, str)
+            and ("text-generation-inference" in image.lower() or "/tgi" in image.lower())
+            else "vllm"
+        )
+        selected_framework = framework or persisted_framework or inferred_framework
+        if selected_framework not in ("vllm", "tgi"):
+            raise ValueError("endpoint has an unsupported persisted inference framework")
+        model_path = "info" if selected_framework == "tgi" else "v1/models"
+        full_path = f"{ingress_path}/{model_path}"
 
         client = get_aws_client(config)
         response = client.make_authenticated_request(

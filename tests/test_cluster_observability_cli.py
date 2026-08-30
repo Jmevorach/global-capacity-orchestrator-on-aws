@@ -52,10 +52,10 @@ class TestPortForwardCommand:
             "svc/kube-prometheus-stack-grafana",
             3000,
             80,
-            server="https://localhost:8443",
+            server="https://127.0.0.1:8443",
             tls_server_name="ABC123.gr7.us-east-1.eks.amazonaws.com",
         )
-        assert "--server" in cmd and "https://localhost:8443" in cmd
+        assert "--server" in cmd and "https://127.0.0.1:8443" in cmd
         assert "--tls-server-name" in cmd
         assert "ABC123.gr7.us-east-1.eks.amazonaws.com" in cmd
 
@@ -252,8 +252,19 @@ class TestOpenCommand:
         )
 
         class _FakeProc:
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def poll(self) -> int | None:
+                return -15 if self.terminated else None
+
             def terminate(self) -> None:
+                self.terminated = True
                 captured["terminated"] = True
+
+            def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                captured["reaped"] = True
+                return b"", b""
 
         started: dict[str, object] = {}
 
@@ -273,10 +284,11 @@ class TestOpenCommand:
         assert started["instance"] == "i-0123456789abcdef0"
         # kubectl points at the SSM local port with the real endpoint as TLS SNI.
         cmd = captured["cmd"]
-        assert "--server" in cmd and "https://localhost:8443" in cmd
+        assert "--server" in cmd and "https://127.0.0.1:8443" in cmd
         assert "ABC.gr7.us-east-1.eks.amazonaws.com" in cmd
         # Tunnel is torn down after the forward returns.
         assert captured.get("terminated") is True
+        assert captured.get("reaped") is True
 
 
 def test_describe_cluster_access_parses_query(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -327,12 +339,34 @@ def test_describe_cluster_access_missing_aws_cli(monkeypatch: pytest.MonkeyPatch
 
 
 class TestStartApiTunnel:
-    def test_returns_proc_when_session_stays_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Socket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    def test_returns_proc_only_after_listener_accepts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         class _Proc:
             def poll(self) -> None:
-                return None  # still running
+                return None
 
-        monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", lambda *a, **k: _Proc())
+        connection = self._Socket()
+        popen_call: dict[str, object] = {}
+
+        def popen(*args: object, **kwargs: object) -> _Proc:
+            popen_call["args"] = args
+            popen_call["kwargs"] = kwargs
+            return _Proc()
+
+        monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", popen)
+        monkeypatch.setattr(
+            ssm_tunnel.socket,
+            "create_connection",
+            lambda *a, **k: connection,
+        )
         proc = ssm_tunnel.start_api_tunnel(
             "i-0123456789abcdef0",
             "https://ABC.gr7.us-east-1.eks.amazonaws.com",
@@ -341,13 +375,279 @@ class TestStartApiTunnel:
             ready_wait_seconds=0,
         )
         assert isinstance(proc, _Proc)
+        assert connection.closed is True
+        kwargs = popen_call["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs["start_new_session"] is (ssm_tunnel.os.name == "posix")
+        if ssm_tunnel.os.name == "nt":
+            assert kwargs["creationflags"] == getattr(
+                ssm_tunnel.subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+
+    def test_windows_launch_uses_new_process_group(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Proc:
+            @staticmethod
+            def poll() -> None:
+                return None
+
+        captured: dict[str, object] = {}
+
+        def popen(*args: object, **kwargs: object) -> _Proc:
+            captured.update(kwargs)
+            return _Proc()
+
+        monkeypatch.setattr(ssm_tunnel.os, "name", "nt")
+        monkeypatch.setattr(
+            ssm_tunnel.subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            512,
+            raising=False,
+        )
+        monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", popen)
+        monkeypatch.setattr(
+            ssm_tunnel.socket,
+            "create_connection",
+            lambda *a, **k: self._Socket(),
+        )
+
+        ssm_tunnel.start_api_tunnel(
+            "i-0123456789abcdef0",
+            "https://ABC.gr7.us-east-1.eks.amazonaws.com",
+            8443,
+            "us-east-1",
+            ready_wait_seconds=0,
+        )
+
+        assert captured["start_new_session"] is False
+        assert captured["creationflags"] == 512
+
+    def test_waits_for_delayed_listener(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Proc:
+            def poll(self) -> None:
+                return None
+
+        attempts = 0
+        sleeps: list[float] = []
+
+        def connect(*args: object, **kwargs: object) -> TestStartApiTunnel._Socket:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise ConnectionRefusedError(61, "Connection refused")
+            return self._Socket()
+
+        monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", lambda *a, **k: _Proc())
+        monkeypatch.setattr(ssm_tunnel.socket, "create_connection", connect)
+        monkeypatch.setattr(ssm_tunnel.time, "sleep", sleeps.append)
+
+        ssm_tunnel.start_api_tunnel(
+            "i-0123456789abcdef0",
+            "https://ABC.gr7.us-east-1.eks.amazonaws.com",
+            8443,
+            "us-east-1",
+            ready_wait_seconds=5,
+            ready_poll_seconds=0.1,
+        )
+
+        assert attempts == 3
+        assert sleeps == [0.1, 0.1]
+
+    def test_reports_session_exit_while_waiting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Proc:
+            def __init__(self) -> None:
+                self.polls = 0
+
+            def poll(self) -> int | None:
+                self.polls += 1
+                return None if self.polls == 1 else 23
+
+            def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                return b"", b"Session Manager channel failed"
+
+        def refused(*args: object, **kwargs: object) -> None:
+            raise ConnectionRefusedError(61, "Connection refused")
+
+        monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", lambda *a, **k: _Proc())
+        monkeypatch.setattr(ssm_tunnel.socket, "create_connection", refused)
+        monkeypatch.setattr(ssm_tunnel.time, "sleep", lambda _seconds: None)
+
+        with pytest.raises(RuntimeError, match="exit code 23.*Session Manager channel failed"):
+            ssm_tunnel.start_api_tunnel(
+                "i-0123456789abcdef0",
+                "https://ABC.gr7.us-east-1.eks.amazonaws.com",
+                8443,
+                "us-east-1",
+                ready_wait_seconds=5,
+            )
+
+    def test_timeout_terminates_and_reaps_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Proc:
+            def __init__(self) -> None:
+                self.terminated = False
+                self.reaped = False
+
+            def poll(self) -> int | None:
+                return -15 if self.terminated else None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                self.reaped = True
+                return b"", b"listener setup failed"
+
+        proc = _Proc()
+        clock = iter((0.0, 2.0))
+
+        def refused(*args: object, **kwargs: object) -> None:
+            raise ConnectionRefusedError(61, "Connection refused")
+
+        monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", lambda *a, **k: proc)
+        monkeypatch.setattr(ssm_tunnel.socket, "create_connection", refused)
+        monkeypatch.setattr(ssm_tunnel.time, "monotonic", lambda: next(clock))
+
+        with pytest.raises(RuntimeError, match="did not accept local connections") as exc_info:
+            ssm_tunnel.start_api_tunnel(
+                "i-0123456789abcdef0",
+                "https://ABC.gr7.us-east-1.eks.amazonaws.com",
+                8443,
+                "us-east-1",
+                ready_wait_seconds=1,
+            )
+        assert "listener setup failed" in str(exc_info.value)
+        assert proc.terminated is True
+        assert proc.reaped is True
+
+    def test_stop_escalates_complete_posix_process_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Proc:
+            pid = 4321
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.communications = 0
+
+            def poll(self) -> None:
+                return None
+
+            def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                self.communications += 1
+                if self.communications == 1:
+                    raise ssm_tunnel.subprocess.TimeoutExpired("aws", timeout)
+                return b"stdout", b"stderr"
+
+        signals: list[tuple[int, int]] = []
+        monkeypatch.setattr(ssm_tunnel.os, "name", "posix")
+        monkeypatch.setattr(
+            ssm_tunnel.os,
+            "killpg",
+            lambda pid, sent_signal: signals.append((pid, sent_signal)),
+        )
+
+        stdout, stderr = ssm_tunnel.stop_api_tunnel(_Proc(), wait_seconds=1)
+
+        assert signals == [
+            (4321, ssm_tunnel.signal.SIGTERM),
+            (4321, ssm_tunnel.signal.SIGKILL),
+        ]
+        assert (stdout, stderr) == (b"stdout", b"stderr")
+
+    def test_stop_forces_windows_tree_before_wrapper_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Proc:
+            pid = 4321
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.communications = 0
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+
+            def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                self.communications += 1
+                if self.communications == 1:
+                    raise ssm_tunnel.subprocess.TimeoutExpired("aws", timeout)
+                return b"", b""
+
+        class _Result:
+            def __init__(self, returncode: int) -> None:
+                self.returncode = returncode
+
+        commands: list[list[str]] = []
+
+        def taskkill(command: list[str], **kwargs: object) -> _Result:
+            commands.append(command)
+            return _Result(1 if len(commands) == 1 else 0)
+
+        proc = _Proc()
+        monkeypatch.setattr(ssm_tunnel.os, "name", "nt")
+        monkeypatch.setattr(ssm_tunnel.shutil, "which", lambda _name: "taskkill.exe")
+        monkeypatch.setattr(ssm_tunnel.subprocess, "run", taskkill)
+
+        ssm_tunnel.stop_api_tunnel(proc, wait_seconds=1)
+
+        assert commands == [
+            ["taskkill.exe", "/PID", "4321", "/T"],
+            ["taskkill.exe", "/PID", "4321", "/T", "/F"],
+        ]
+        assert proc.terminate_calls == 0
+        assert proc.kill_calls == 0
+
+    def test_interrupted_startup_terminates_and_reaps_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Proc:
+            def __init__(self) -> None:
+                self.terminated = False
+                self.reaped = False
+
+            def poll(self) -> int | None:
+                return -15 if self.terminated else None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                self.reaped = True
+                return b"", b""
+
+        proc = _Proc()
+
+        def interrupt(*args: object, **kwargs: object) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", lambda *a, **k: proc)
+        monkeypatch.setattr(ssm_tunnel.socket, "create_connection", interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            ssm_tunnel.start_api_tunnel(
+                "i-0123456789abcdef0",
+                "https://ABC.gr7.us-east-1.eks.amazonaws.com",
+                8443,
+                "us-east-1",
+            )
+        assert proc.terminated is True
+        assert proc.reaped is True
 
     def test_raises_when_session_dies_immediately(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _Proc:
             def poll(self) -> int:
-                return 1  # exited
+                return 1
 
-            def communicate(self) -> tuple[bytes, bytes]:
+            def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
                 return b"", b"SessionManagerPlugin not found"
 
         monkeypatch.setattr(ssm_tunnel.subprocess, "Popen", lambda *a, **k: _Proc())

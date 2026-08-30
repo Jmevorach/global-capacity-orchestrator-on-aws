@@ -11,11 +11,17 @@ Docker daemon. The MockConfigLoader here is reused by sibling test
 files (drift detection, MCP IAM, stacks-ordering-FSx).
 """
 
+import json
+import re
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import aws_cdk as cdk
 import pytest
+import yaml
 from aws_cdk import assertions
+
+from gco.config.config_loader import ConfigLoader
 
 
 class MockConfigLoader:
@@ -89,6 +95,12 @@ class MockConfigLoader:
                 "max_memory_per_manifest": "96Gi",
                 "max_gpu_per_manifest": 8,
             },
+        }
+
+    def get_inference_proxy_config(self):
+        return {
+            "tls_proxy_cpu_request_millicores": 100,
+            "tls_proxy_cpu_target_utilization_percentage": 70,
         }
 
     def get_api_gateway_config(self):
@@ -1222,6 +1234,86 @@ class TestRegionalStackSynthesis:
             "Fn::GetAtt": [proxy_role_id, "Arn"]
         }
         assert replacements["{{INFERENCE_PROXY_MAX_REQUEST_BODY_BYTES}}"] == "1048576"
+        assert replacements["{{INFERENCE_PROXY_TLS_CPU_REQUEST}}"] == "100m"
+        assert replacements["{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}"] == "70"
+
+    def test_non_default_inference_proxy_config_renders_typed_manifest(self):
+        """Real config values flow through ImageReplacements into typed YAML."""
+        from gco.stacks.regional_stack import GCORegionalStack
+
+        context = json.loads(
+            (Path(__file__).resolve().parent.parent / "cdk.json").read_text(encoding="utf-8")
+        )["context"]
+        context["inference_proxy"] = {
+            "tls_proxy_cpu_request_millicores": 125,
+            "tls_proxy_cpu_target_utilization_percentage": 85,
+        }
+        app = cdk.App(context=context)
+        config = ConfigLoader(app)
+
+        with (
+            patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
+            patch.object(
+                GCORegionalStack,
+                "_create_helm_installer_lambda",
+                TestRegionalStackSynthesis._mock_helm_installer,
+            ),
+        ):
+            mock_image = MagicMock()
+            mock_image.image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
+            mock_docker.return_value = mock_image
+            stack = GCORegionalStack(
+                app,
+                "test-inference-proxy-tuned",
+                config=config,
+                region="us-east-1",
+                auth_secret_arn=(
+                    "arn:aws:secretsmanager:us-east-2:123456789012:secret:"
+                    "gco/api-gateway-auth-token"
+                ),
+                env=cdk.Environment(account="123456789012", region="us-east-1"),
+            )
+
+        resources = assertions.Template.from_stack(stack).to_json()["Resources"]
+        replacements = resources["HelmInstallCharts"]["Properties"]["ImageReplacements"]
+        assert replacements["{{INFERENCE_PROXY_TLS_CPU_REQUEST}}"] == "125m"
+        assert replacements["{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}"] == "85"
+
+        manifest = (
+            Path(__file__).resolve().parent.parent
+            / "lambda"
+            / "kubectl-applier-simple"
+            / "manifests"
+            / "33-inference-proxy.yaml"
+        ).read_text(encoding="utf-8")
+        for token in (
+            "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}",
+            "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}",
+        ):
+            manifest = manifest.replace(token, replacements[token])
+        manifest = manifest.replace(
+            "{{INFERENCE_PROXY_IMAGE}}", "example.invalid/inference-proxy:test"
+        )
+        manifest = re.sub(r"\{\{[A-Z0-9_]+\}\}", "test-value", manifest)
+        documents = list(yaml.safe_load_all(manifest))
+        deployment = next(doc for doc in documents if doc["kind"] == "Deployment")
+        hpa = next(doc for doc in documents if doc["kind"] == "HorizontalPodAutoscaler")
+
+        containers = {
+            container["name"]: container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+        }
+        request = containers["api-tls-proxy"]["resources"]["requests"]["cpu"]
+        tls_metric = next(
+            metric
+            for metric in hpa["spec"]["metrics"]
+            if metric["containerResource"]["container"] == "api-tls-proxy"
+        )
+        target = tls_metric["containerResource"]["target"]["averageUtilization"]
+        assert request == "125m"
+        assert type(request) is str
+        assert target == 85
+        assert type(target) is int
 
     def test_regional_stack_creates_lambda_functions(self):
         """Test that RegionalStack creates Lambda functions."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from typing import Any
 
 from ..constants import (
@@ -53,6 +54,16 @@ def action_preflight(ctx: RunContext) -> dict[str, Any]:
             "Live validation requires a clean worktree; commit or remove these paths:\n" + dirty
         )
 
+    selected = set(ctx.report.selected_actions)
+    session_manager_plugin = None
+    if "inference" in selected:
+        session_manager_plugin = shutil.which("session-manager-plugin")
+        if session_manager_plugin is None:
+            raise RuntimeError(
+                "The inference action requires the AWS Session Manager plugin before deploy. "
+                "Install session-manager-plugin and ensure it is on PATH, then resume."
+            )
+
     identity = ctx.session.client("sts", region_name=ctx.config.global_region).get_caller_identity()
     account = str(identity.get("Account") or "")
     if account != settings.expected_account:
@@ -62,7 +73,6 @@ def action_preflight(ctx: RunContext) -> dict[str, Any]:
         )
 
     _validate_profile(ctx)
-    selected = set(ctx.report.selected_actions)
     if "deploy" in selected and not settings.confirm_kms_key_deletion:
         raise RuntimeError(
             "Deployment creates retained EKS encryption keys. Pass "
@@ -182,6 +192,7 @@ def action_preflight(ctx: RunContext) -> dict[str, Any]:
         "bootstrap_stacks": bootstrap_stacks,
         "expected_ecr_images": expected_ecr_images,
         "direct_regional_access": direct_regional_access,
+        "session_manager_plugin": session_manager_plugin or "not-required",
         "kms_key_deletion_confirmed": settings.confirm_kms_key_deletion,
         "resume": settings.resume,
     }

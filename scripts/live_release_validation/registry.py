@@ -25,6 +25,7 @@ from .actions import (
     action_deploy,
     action_destroy,
     action_final_inventory,
+    action_inference,
     action_opencost,
     action_policy,
     action_preflight,
@@ -73,6 +74,12 @@ def build_action_registry() -> dict[str, ActionDefinition]:
             "Verify stacks, EKS, API endpoints, queues, and DynamoDB",
             ("deploy",),
             action_topology,
+        ),
+        ActionDefinition(
+            "inference",
+            "Run vLLM/TGI baseline and HPA matrix, then prove stable absence",
+            ("topology",),
+            action_inference,
         ),
         ActionDefinition(
             "policy",

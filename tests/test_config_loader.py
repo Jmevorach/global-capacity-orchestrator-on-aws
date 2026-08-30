@@ -4,7 +4,7 @@ Tests for gco/config/config_loader.ConfigLoader.
 Drives ConfigLoader against a MockApp/MockNode pair that surfaces a
 hand-crafted CDK context dict. Verifies happy-path loading of every
 top-level field (project_name, deployment_regions, kubernetes_version,
-resource_thresholds, global_accelerator, alb_config,
+resource_thresholds, global_accelerator, alb_config, inference_proxy,
 manifest_processor, job_validation_policy, api_gateway, tags) and
 that missing required fields raise ConfigValidationError with an
 informative message. Companion suite to test_config_loader_validation.py
@@ -28,6 +28,9 @@ class MockNode:
 
     def try_get_context(self, key: str):
         return self._context.get(key)
+
+    def get_all_context(self) -> dict:
+        return self._context
 
 
 class MockApp:
@@ -62,6 +65,10 @@ def valid_context():
             "health_check_timeout": 5,
             "healthy_threshold": 2,
             "unhealthy_threshold": 2,
+        },
+        "inference_proxy": {
+            "tls_proxy_cpu_request_millicores": 100,
+            "tls_proxy_cpu_target_utilization_percentage": 70,
         },
         "manifest_processor": {
             "image": "gco/manifest-processor:latest",
@@ -491,6 +498,110 @@ class TestConfigLoaderGetters:
         config = ConfigLoader(app)
         alb_config = config.get_alb_config()
         assert alb_config["health_check_interval"] == 30
+
+
+class TestInferenceProxyConfig:
+    """Strict optional inference TLS proxy autoscaling configuration."""
+
+    DEFAULTS = {
+        "tls_proxy_cpu_request_millicores": 100,
+        "tls_proxy_cpu_target_utilization_percentage": 70,
+    }
+
+    def test_omitted_section_uses_defaults(self, valid_context):
+        """Legacy contexts without the optional block retain current behavior."""
+        del valid_context["inference_proxy"]
+        assert ConfigLoader(MockApp(valid_context)).get_inference_proxy_config() == self.DEFAULTS
+
+    @pytest.mark.parametrize(
+        "configured,expected",
+        [
+            ({}, DEFAULTS),
+            (
+                {"tls_proxy_cpu_request_millicores": 125},
+                {
+                    "tls_proxy_cpu_request_millicores": 125,
+                    "tls_proxy_cpu_target_utilization_percentage": 70,
+                },
+            ),
+            (
+                {"tls_proxy_cpu_target_utilization_percentage": 85},
+                {
+                    "tls_proxy_cpu_request_millicores": 100,
+                    "tls_proxy_cpu_target_utilization_percentage": 85,
+                },
+            ),
+        ],
+    )
+    def test_empty_and_partial_sections_merge_defaults(self, valid_context, configured, expected):
+        """Empty and one-field objects preserve every unspecified default."""
+        valid_context["inference_proxy"] = configured
+        assert ConfigLoader(MockApp(valid_context)).get_inference_proxy_config() == expected
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("tls_proxy_cpu_request_millicores", 1),
+            ("tls_proxy_cpu_request_millicores", 250),
+            ("tls_proxy_cpu_target_utilization_percentage", 1),
+            ("tls_proxy_cpu_target_utilization_percentage", 100),
+        ],
+    )
+    def test_exact_boundaries_are_accepted(self, valid_context, field, value):
+        """Both inclusive boundaries survive validation and default merging."""
+        valid_context["inference_proxy"] = {field: value}
+        assert ConfigLoader(MockApp(valid_context)).get_inference_proxy_config()[field] == value
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("tls_proxy_cpu_request_millicores", 0),
+            ("tls_proxy_cpu_request_millicores", 251),
+            ("tls_proxy_cpu_request_millicores", True),
+            ("tls_proxy_cpu_request_millicores", 100.0),
+            ("tls_proxy_cpu_request_millicores", "100"),
+            ("tls_proxy_cpu_target_utilization_percentage", 0),
+            ("tls_proxy_cpu_target_utilization_percentage", 101),
+            ("tls_proxy_cpu_target_utilization_percentage", False),
+            ("tls_proxy_cpu_target_utilization_percentage", 70.0),
+            ("tls_proxy_cpu_target_utilization_percentage", "70"),
+        ],
+    )
+    def test_out_of_range_and_non_exact_integers_are_rejected(self, valid_context, field, value):
+        """Booleans, floats, strings, and values outside the range fail closed."""
+        valid_context["inference_proxy"] = {field: value}
+        with pytest.raises(
+            ConfigValidationError,
+            match=rf"inference_proxy\.{field} must be an integer between",
+        ):
+            ConfigLoader(MockApp(valid_context))
+
+    @pytest.mark.parametrize("value", [True, 1, 1.5, "invalid", []])
+    def test_non_object_section_is_rejected(self, valid_context, value):
+        """Malformed non-null sections never alias omission."""
+        valid_context["inference_proxy"] = value
+        with pytest.raises(ConfigValidationError, match="inference_proxy must be an object"):
+            ConfigLoader(MockApp(valid_context))
+
+    def test_json_null_uses_defaults_at_real_cdk_boundary(self):
+        """CDK normalizes top-level JSON null to omission before validation."""
+        from aws_cdk import App
+
+        app = App(context={"inference_proxy": None})
+
+        assert "inference_proxy" not in app.node.get_all_context()
+        assert ConfigLoader(app).get_inference_proxy_config() == self.DEFAULTS
+
+    def test_unknown_key_error_uses_fully_qualified_paths(self, valid_context):
+        """Typos identify both the rejected and allowed fully qualified keys."""
+        valid_context["inference_proxy"] = {"tls_proxy_cpu_request_millicore": 100}
+        with pytest.raises(ConfigValidationError) as exc_info:
+            ConfigLoader(MockApp(valid_context))
+
+        message = str(exc_info.value)
+        assert "inference_proxy.tls_proxy_cpu_request_millicore" in message
+        assert "inference_proxy.tls_proxy_cpu_request_millicores" in message
+        assert "inference_proxy.tls_proxy_cpu_target_utilization_percentage" in message
 
 
 class TestDefaultValues:

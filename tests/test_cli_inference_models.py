@@ -50,6 +50,44 @@ class TestInferenceDeploy:
         assert result.exit_code == 0
         assert "registered for deployment" in result.output
 
+    def test_documented_tgi_deploy_persists_runtime_contract(self, runner):
+        mock_mgr = MagicMock()
+        mock_mgr.deploy.return_value = {
+            "endpoint_name": "tgi-mistral",
+            "target_regions": ["us-east-1"],
+            "ingress_path": "/inference/tgi-mistral",
+        }
+        with patch("cli.inference.get_inference_manager", return_value=mock_mgr):
+            result = runner.invoke(
+                cli,
+                [
+                    "inference",
+                    "deploy",
+                    "tgi-mistral",
+                    "-i",
+                    "ghcr.io/huggingface/text-generation-inference:3.3.7",
+                    "--framework",
+                    "tgi",
+                    "--port",
+                    "8080",
+                    "-e",
+                    "MODEL_ID=test/model",
+                    "-e",
+                    "REVISION=" + "a" * 40,
+                    "-e",
+                    "PORT=8080",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        call_kwargs = mock_mgr.deploy.call_args.kwargs
+        assert call_kwargs["framework"] == "tgi"
+        assert call_kwargs["port"] == 8080
+        assert call_kwargs["env"] == {
+            "MODEL_ID": "test/model",
+            "REVISION": "a" * 40,
+            "PORT": "8080",
+        }
+
     def test_deploy_with_regions(self, runner):
         mock_mgr = MagicMock()
         mock_mgr.deploy.return_value = {
@@ -349,6 +387,17 @@ class TestInferenceScale:
             result = runner.invoke(cli, ["inference", "scale", "ep", "-r", "4"])
         assert result.exit_code != 0
 
+    def test_scale_mooncake_error_guides_to_set_topology(self, runner):
+        mock_mgr = MagicMock()
+        mock_mgr.scale.side_effect = ValueError(
+            "Mooncake topology; use 'gco inference set-topology' instead"
+        )
+        with patch("cli.inference.get_inference_manager", return_value=mock_mgr):
+            result = runner.invoke(cli, ["inference", "scale", "ep", "-r", "4"])
+        assert result.exit_code != 0
+        assert "gco inference set-topology" in result.output
+        assert "scaled to 4" not in result.output
+
 
 # =============================================================================
 # inference stop
@@ -399,6 +448,8 @@ class TestInferenceStart:
         with patch("cli.inference.get_inference_manager", return_value=mock_mgr):
             result = runner.invoke(cli, ["inference", "start", "ghost"])
         assert result.exit_code != 0
+        assert "redeploy" in result.output
+        assert "gco inference deploy" in result.output
 
     def test_start_error(self, runner):
         mock_mgr = MagicMock()
@@ -590,11 +641,19 @@ class TestModelsUri:
 
 
 class TestInferenceInvoke:
-    def _mock_endpoint(self, image="vllm/vllm-openai:v0.8.0", env=None):
+    def _mock_endpoint(
+        self,
+        image="vllm/vllm-openai:v0.8.0",
+        env=None,
+        framework=None,
+    ):
+        spec = {"image": image, "env": env or {}}
+        if framework is not None:
+            spec["framework"] = framework
         return {
             "endpoint_name": "ep",
             "ingress_path": "/inference/ep",
-            "spec": {"image": image, "env": env or {}},
+            "spec": spec,
         }
 
     def test_invoke_with_prompt_vllm(self, runner):
@@ -616,7 +675,8 @@ class TestInferenceInvoke:
     def test_invoke_with_prompt_tgi(self, runner):
         mock_mgr = MagicMock()
         mock_mgr.get_endpoint.return_value = self._mock_endpoint(
-            image="ghcr.io/huggingface/text-generation-inference:3.2"
+            image="registry.example/team/private-server@sha256:" + "a" * 64,
+            framework="tgi",
         )
         mock_client = MagicMock()
         mock_resp = MagicMock()
@@ -630,6 +690,12 @@ class TestInferenceInvoke:
             result = runner.invoke(cli, ["inference", "invoke", "ep", "-p", "Hello"])
         assert result.exit_code == 0
         assert "TGI response" in result.output
+        call_kwargs = mock_client.make_authenticated_request.call_args.kwargs
+        assert call_kwargs["path"] == "/inference/ep/generate"
+        assert call_kwargs["body"] == {
+            "inputs": "Hello",
+            "parameters": {"max_new_tokens": 100},
+        }
 
     def test_invoke_with_raw_data(self, runner):
         mock_mgr = MagicMock()
@@ -771,7 +837,8 @@ class TestInferenceInvoke:
     def test_invoke_tgi_stream_uses_generate_stream_path(self, runner):
         mock_mgr = MagicMock()
         mock_mgr.get_endpoint.return_value = self._mock_endpoint(
-            image="ghcr.io/huggingface/text-generation-inference:3.2"
+            image="registry.example/team/private-server@sha256:" + "b" * 64,
+            framework="tgi",
         )
         mock_client = MagicMock()
         mock_resp = MagicMock(ok=True, status_code=200, encoding="utf-8")
@@ -790,6 +857,10 @@ class TestInferenceInvoke:
         call_kwargs = mock_client.make_authenticated_request.call_args.kwargs
         assert call_kwargs["path"].endswith("/generate_stream")
         assert call_kwargs["stream"] is True
+        assert call_kwargs["body"] == {
+            "inputs": "hello",
+            "parameters": {"max_new_tokens": 100},
+        }
 
     def test_invoke_endpoint_not_found(self, runner):
         mock_mgr = MagicMock()
@@ -1030,6 +1101,48 @@ class TestInferenceModels:
         assert "facebook/opt-125m" in result.output
         call_kwargs = mock_client.make_authenticated_request.call_args.kwargs
         assert "/v1/models" in call_kwargs["path"]
+
+    def test_tgi_models_uses_read_only_info_path_from_persisted_framework(self, runner):
+        endpoint = self._mock_endpoint()
+        endpoint["spec"]["framework"] = "tgi"
+        mock_mgr = MagicMock()
+        mock_mgr.get_endpoint.return_value = endpoint
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.ok = True
+        mock_resp.json.return_value = {
+            "model_id": "test/tgi-model",
+            "model_sha": "a" * 40,
+        }
+        mock_client.make_authenticated_request.return_value = mock_resp
+        with (
+            patch("cli.inference.get_inference_manager", return_value=mock_mgr),
+            patch("cli.aws_client.get_aws_client", return_value=mock_client),
+        ):
+            result = runner.invoke(cli, ["inference", "models", "ep"])
+        assert result.exit_code == 0
+        call_kwargs = mock_client.make_authenticated_request.call_args.kwargs
+        assert call_kwargs["method"] == "GET"
+        assert call_kwargs["path"] == "/inference/ep/info"
+
+    def test_tgi_models_infers_legacy_official_image(self, runner):
+        endpoint = self._mock_endpoint()
+        endpoint["spec"]["image"] = "ghcr.io/huggingface/text-generation-inference:3.3.7"
+        mock_mgr = MagicMock()
+        mock_mgr.get_endpoint.return_value = endpoint
+        mock_client = MagicMock()
+        mock_resp = MagicMock(ok=True)
+        mock_resp.json.return_value = {"model_id": "test/model", "model_sha": "a" * 40}
+        mock_client.make_authenticated_request.return_value = mock_resp
+        with (
+            patch("cli.inference.get_inference_manager", return_value=mock_mgr),
+            patch("cli.aws_client.get_aws_client", return_value=mock_client),
+        ):
+            result = runner.invoke(cli, ["inference", "models", "ep"])
+        assert result.exit_code == 0
+        assert mock_client.make_authenticated_request.call_args.kwargs["path"] == (
+            "/inference/ep/info"
+        )
 
     def test_models_endpoint_not_found(self, runner):
         mock_mgr = MagicMock()

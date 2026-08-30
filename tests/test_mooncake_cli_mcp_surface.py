@@ -187,6 +187,9 @@ class TestSetTopology:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "snapshot",
+            "desired_state": "running",
             "spec": {"image": "img:v1", "mooncake": {"mode": "disaggregated"}},
         }
         mock_store.update_spec.return_value = {"endpoint_name": "ep", "desired_state": "deploying"}
@@ -256,6 +259,9 @@ class TestConfigureStore:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "snapshot",
+            "desired_state": "running",
             "spec": {
                 "image": "img:v1",
                 "mooncake": {"mode": "both", "topology": {"prefill": 1, "decode": 1}},
@@ -299,6 +305,9 @@ class TestConfigureStore:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "snapshot",
+            "desired_state": "running",
             "spec": {"mooncake": {"mode": "store"}},
         }
         mgr = _make_manager()
@@ -310,6 +319,33 @@ class TestConfigureStore:
             mgr.configure_store("ep", {"enabled": True, "global_segment_size": -5})
 
         mock_store.update_spec.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "kwargs"),
+    [
+        ("set_topology", {"prefill": 2, "decode": 2}),
+        ("configure_store", {"store_config": {"enabled": True}}),
+    ],
+)
+def test_deleted_endpoint_rejects_mooncake_configuration(method_name, kwargs):
+    mock_store = MagicMock()
+    mock_store.get_endpoint.return_value = {
+        "endpoint_name": "ep",
+        "lifecycle_id": "life-deleted",
+        "updated_at": "snapshot",
+        "desired_state": "deleted",
+        "spec": {"mooncake": {"mode": "both"}},
+    }
+    mgr = _make_manager()
+
+    with (
+        patch.object(mgr, "_get_store", return_value=mock_store),
+        pytest.raises(ValueError, match="deleted.*redeploy"),
+    ):
+        getattr(mgr, method_name)("ep", **kwargs)
+
+    mock_store.update_spec.assert_not_called()
 
 
 # ===========================================================================

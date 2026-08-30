@@ -137,7 +137,7 @@ def test_full_proxy_materialization_keeps_internal_service_scoped(monitor):
     monitor.core_v1.read_namespaced_secret.return_value = admin_secret
 
     with patch("gco.services.inference_monitor.client.CustomObjectsApi") as custom_api:
-        monitor._create_pd_proxy("my-endpoint", "gco-inference", spec, {})
+        monitor._create_pd_proxy("my-endpoint", "gco-inference", spec, {"lifecycle_id": "life-1"})
 
     # The proxy is reachable only as an in-cluster Service.
     svc_args, _ = monitor.core_v1.create_namespaced_service.call_args
@@ -185,8 +185,20 @@ def test_proxy_runs_the_router_script_against_role_services(monitor):
         PD_PROXY_SCRIPT_PATH,
     )
 
-    spec = {"mooncake": {"mode": "disaggregated", "proxy": {"image": "vllm/vllm-openai:v0.23.0"}}}
-    monitor._create_pd_proxy("ep", "gco-inference", spec, {})
+    spec = {
+        "mooncake": {
+            "mode": "disaggregated",
+            "proxy": {
+                "image": "vllm/vllm-openai:v0.23.0",
+                "admin_api_key_secret": "ep-admin",
+            },
+        }
+    }
+    admin_secret = MagicMock()
+    admin_secret.string_data = {"ADMIN_API_KEY": "router-key"}
+    admin_secret.data = None
+    monitor.core_v1.read_namespaced_secret.return_value = admin_secret
+    monitor._create_pd_proxy("ep", "gco-inference", spec, {"lifecycle_id": "life-1"})
 
     # The router program is published as a ConfigMap carrying the real script.
     cm_args, _ = monitor.core_v1.create_namespaced_config_map.call_args
@@ -221,17 +233,22 @@ def test_disaggregated_reconcile_creates_prefill_and_decode_services(monitor):
     """
     import asyncio
 
-    monitor._resolve_region_services = lambda *a, **k: __import__(
-        "gco.services.inference_monitor", fromlist=["RegionServicesResolution"]
-    ).RegionServicesResolution(region_services={"metadata_server": "http://m:8080/metadata"})
-    monitor._resolve_regional_scope = lambda *a, **k: __import__(
-        "gco.services.inference_monitor", fromlist=["RegionalScopeResolution"]
-    ).RegionalScopeResolution(in_region=True)
-    monitor._gate_on_mooncake_master = lambda *a, **k: __import__(
-        "gco.services.inference_monitor", fromlist=["MasterReadinessGate"]
-    ).MasterReadinessGate(proceed=True)
+    from gco.services.inference_monitor import (
+        MasterReadinessGate,
+        RegionalScopeResolution,
+        RegionServicesResolution,
+        ResourceCleanupResult,
+    )
+
+    monitor._resolve_region_services = lambda *a, **k: RegionServicesResolution(
+        region_services={"metadata_server": "http://m:8080/metadata"}
+    )
+    monitor._resolve_regional_scope = lambda *a, **k: RegionalScopeResolution(in_region=True)
+    monitor._gate_on_mooncake_master = lambda *a, **k: MasterReadinessGate(proceed=True)
     monitor._ensure_mooncake_configmap = lambda *a, **k: None
-    monitor._ensure_role_deployment = lambda *a, **k: None
+    monitor._delete_autoscalers = lambda *a, **k: ResourceCleanupResult()
+    monitor._reconcile_role_autoscaler = lambda *a, **k: ResourceCleanupResult()
+    monitor._ensure_role_deployment = lambda *a, **k: (0, 1, False)
     monitor._create_pd_proxy = lambda *a, **k: None
     monitor._report_role_status = lambda *a, **k: "creating"
 

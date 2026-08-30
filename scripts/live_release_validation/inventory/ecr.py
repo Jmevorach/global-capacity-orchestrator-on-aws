@@ -32,14 +32,72 @@ def _optional_ecr_configuration(
     return _normalize_json_text(response.get(response_key))
 
 
+def _select_manifest_record(
+    *,
+    repository_name: str,
+    digest: str,
+    detail: dict[str, Any],
+    records: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Select one immutable native manifest, collapsing only exact duplicates."""
+    native_media_type = str(detail.get("imageManifestMediaType") or "")
+    if native_media_type and native_media_type not in _ECR_MANIFEST_MEDIA_TYPES:
+        raise RuntimeError(
+            f"ECR image {repository_name}@{digest} has unsupported native media type "
+            f"{native_media_type!r}"
+        )
+
+    response_records = list(records)
+    unique_native: dict[tuple[str, str], dict[str, Any]] = {}
+    observed_media_types: set[str] = set()
+    for record in response_records:
+        record_digest = str((record.get("imageId") or {}).get("imageDigest") or "")
+        if record_digest != digest:
+            raise RuntimeError(
+                f"ECR manifest lookup returned unexpected digest {record_digest!r} "
+                f"for {repository_name}@{digest}"
+            )
+        response_media_type = str(record.get("imageManifestMediaType") or "")
+        effective_media_type = response_media_type or native_media_type
+        if effective_media_type not in _ECR_MANIFEST_MEDIA_TYPES:
+            raise RuntimeError(
+                f"ECR manifest lookup returned unsupported media type "
+                f"{effective_media_type!r} for {repository_name}@{digest}"
+            )
+        observed_media_types.add(effective_media_type)
+        raw_manifest = record.get("imageManifest")
+        if not isinstance(raw_manifest, str) or not raw_manifest.strip():
+            raise RuntimeError(
+                f"ECR manifest lookup omitted manifest bytes for {repository_name}@{digest}"
+            )
+        if native_media_type and effective_media_type != native_media_type:
+            continue
+        unique_native.setdefault((effective_media_type, raw_manifest), record)
+
+    if len(unique_native) != 1:
+        raise RuntimeError(
+            f"ECR manifest lookup could not select one immutable native record for "
+            f"{repository_name}@{digest}: {len(response_records)} response record(s), "
+            f"{len(unique_native)} unique native record(s), media types "
+            f"{sorted(observed_media_types)}"
+        )
+    return next(iter(unique_native.values()))
+
+
 def _collect_repository_images(client: Any, repository_name: str) -> list[dict[str, Any]]:
-    """Collect every digest, tag set, and exact manifest in one repository."""
+    """Collect every digest, tag set, and exact native manifest in one repository."""
     details: dict[str, dict[str, Any]] = {}
     for page in client.get_paginator("describe_images").paginate(repositoryName=repository_name):
         for image in page.get("imageDetails", []):
             digest = str(image.get("imageDigest") or "")
             if not digest:
                 raise RuntimeError(f"ECR image in {repository_name} omitted its digest")
+            previous = details.get(digest)
+            if previous is not None and previous != image:
+                raise RuntimeError(
+                    f"ECR describe-images returned conflicting details for "
+                    f"{repository_name}@{digest}"
+                )
             details[digest] = image
 
     manifests: dict[str, dict[str, Any]] = {}
@@ -57,14 +115,26 @@ def _collect_repository_images(client: Any, repository_name: str) -> list[dict[s
                 f"ECR manifest lookup failed for {repository_name}: "
                 + json.dumps(failures, sort_keys=True)
             )
+        grouped: dict[str, list[dict[str, Any]]] = {digest: [] for digest in requested}
         for image in response.get("images", []):
             digest = str((image.get("imageId") or {}).get("imageDigest") or "")
-            if digest:
-                manifests[digest] = image
-        missing = sorted(set(requested) - set(manifests))
+            if digest not in grouped:
+                raise RuntimeError(
+                    f"ECR manifest lookup returned unexpected digest {digest!r} "
+                    f"for {repository_name}"
+                )
+            grouped[digest].append(image)
+        missing = [digest for digest, records in grouped.items() if not records]
         if missing:
             raise RuntimeError(
                 f"ECR manifest lookup omitted {repository_name} digests: " + ", ".join(missing)
+            )
+        for digest, records in grouped.items():
+            manifests[digest] = _select_manifest_record(
+                repository_name=repository_name,
+                digest=digest,
+                detail=details[digest],
+                records=records,
             )
 
     images: list[dict[str, Any]] = []
@@ -96,7 +166,7 @@ def describe_ecr_image_by_tag(
     repository_name: str,
     tag: str,
 ) -> dict[str, Any] | None:
-    """Resolve one ECR tag to its exact digest and manifest.
+    """Resolve one ECR tag to its exact digest and native manifest.
 
     ``None`` means ECR authoritatively reported that the tag is absent. Any
     ambiguous, incomplete, or failed lookup raises so callers cannot turn a
@@ -144,15 +214,12 @@ def describe_ecr_image_by_tag(
             f"ECR manifest lookup failed for {repository_name}:{tag}: "
             + json.dumps(failures, sort_keys=True)
         )
-    manifests = manifest_response.get("images", [])
-    if len(manifests) != 1:
-        raise RuntimeError(
-            f"ECR manifest lookup returned {len(manifests)} records for {repository_name}:{tag}"
-        )
-    manifest = manifests[0]
-    manifest_digest = str((manifest.get("imageId") or {}).get("imageDigest") or "")
-    if manifest_digest != digest:
-        raise RuntimeError(f"ECR manifest digest changed for {region}:{repository_name}:{tag}")
+    manifest = _select_manifest_record(
+        repository_name=repository_name,
+        digest=digest,
+        detail=detail,
+        records=manifest_response.get("images", []),
+    )
     pushed_at = detail.get("imagePushedAt")
     return {
         "digest": digest,

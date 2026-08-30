@@ -243,14 +243,21 @@ plane. Each regional stack installs the managed EKS Metrics Server add-on that
 feeds per-container resource metrics to the proxy's `autoscaling/v2` HPA. The
 shared Deployment preserves a three-pod high-availability floor and scales to
 ten replicas when the application reaches 70% CPU or 80% memory, or when its
-TLS sidecar reaches 70% CPU against a `100m` request. Kubernetes evaluates each
-`ContainerResource` signal independently and uses the largest desired replica
-count, so TLS pressure cannot hide application pressure. TLS memory is not a
-scale signal because established streams remain on their original pod and
-retained Python RSS may not fall when new replicas start. Scale-down retains a
-15-minute stabilization window. The Deployment's `replicas: 3` seeds only
-initial creation; kubectl-applier update patches omit that HPA-owned field so
-reconciliation cannot reset a live scale decision.
+TLS sidecar reaches the configurable CPU target (70% by default) against its
+configurable request (`100m` by default). Set the exact-integer
+`inference_proxy.tls_proxy_cpu_request_millicores` (1-250) and
+`inference_proxy.tls_proxy_cpu_target_utilization_percentage` (1-100) values in
+`cdk.json`; the request is rendered as a Kubernetes millicore quantity and is
+the utilization denominator. Kubernetes evaluates each `ContainerResource`
+signal independently and uses the largest desired replica count, so TLS
+pressure cannot hide application pressure. TLS memory is not a scale signal
+because established streams remain on their original pod and retained Python
+RSS may not fall when new replicas start. Application resources and signals,
+proxy memory and CPU limit, replica bounds, HPA behavior, disruption budget,
+and drain settings remain fixed. Scale-down retains a 15-minute stabilization
+window. The Deployment's `replicas: 3` seeds only initial creation;
+kubectl-applier update patches omit that HPA-owned field so reconciliation
+cannot reset a live scale decision.
 
 Stream shutdown is protected end to end: the ALB target group drains for 900
 seconds, `preStop` removes a terminating pod from readiness before shutdown,
@@ -289,10 +296,13 @@ gco inference deploy vllm-llama3 \
 ```bash
 gco inference deploy tgi-mistral \
   -i ghcr.io/huggingface/text-generation-inference:3.3.7 \
+  --framework tgi \
   --port 8080 \
   --health-path /health \
   --gpu-count 1 \
-  -e MODEL_ID=mistralai/Mistral-7B-Instruct-v0.2
+  -e MODEL_ID=mistralai/Mistral-7B-Instruct-v0.2 \
+  -e REVISION=<40-lowercase-hex-model-commit> \
+  -e PORT=8080
 ```
 
 ### Triton Example
@@ -389,7 +399,7 @@ gco inference deploy my-llm --mooncake-mode disaggregated \
   --mooncake-admin-key-secret my-llm-admin
 ```
 
-A Secret named with `--mooncake-admin-key-secret` must already exist and carry a non-empty `ADMIN_API_KEY`, or the deployment is rejected (so a typo fails fast). A key is generated for you only when you name no Secret.
+A Secret named with `--mooncake-admin-key-secret` must already exist and carry a non-empty `ADMIN_API_KEY`, or the deployment is rejected (so a typo fails fast). A key is generated for you only when you name no Secret. Auto-managed Secrets carry the endpoint's immutable lifecycle provenance; an existing conventional `{name}-admin` Secret without matching provenance is treated as an ownership collision and blocks both proxy creation and terminal cleanup rather than being adopted or deleted. Any explicitly user-named external Secret survives endpoint deletion.
 
 ### Per-Role Autoscaling
 
@@ -410,7 +420,7 @@ The `--mooncake-autoscale` format is `ROLE:MIN:MAX[:METRIC:TARGET...]`:
 - `MIN:MAX` — replica bounds for that role
 - `METRIC:TARGET` pairs (optional, repeatable) — scaling signals (`cpu`, `memory`, `gpu`, `gpu_memory`)
 
-Each role gets its own KEDA ScaledObject (for GPU metrics) or HPA (for CPU/memory only), targeting just that role's Deployment.
+Each role gets its own KEDA ScaledObject (for GPU metrics) or HPA (for CPU/memory only), targeting just that role's Deployment. Role ownership uses the same read-confirmed handoff barrier as classic endpoints: recreate, CPU↔KEDA handoff, disabled or removed autoscaling, stop, and start all remove obsolete native/KEDA owners before a Deployment is created or a static replica count is applied.
 
 ### Resize Topology
 
@@ -519,9 +529,11 @@ gco inference list -r us-east-1
 ### Scale
 
 ```bash
-# Scale to 4 replicas (applied across all target regions)
+# Scale a static endpoint to 4 replicas (applied across all target regions)
 gco inference scale my-llm --replicas 4
 ```
+
+`gco inference scale` rejects an autoscaled endpoint instead of reporting a successful no-op. HPA or KEDA owns `Deployment.spec.replicas`; change its min/max bounds through endpoint configuration, or disable autoscaling and wait for the monitor to remove every old HPA/ScaledObject before using static scale.
 
 ### Autoscaling (HPA)
 
@@ -554,7 +566,7 @@ gco inference deploy my-llm \
 
 The `--autoscale-metric` flag is repeatable — you can combine multiple metrics. The format is `type:target` where `target` is the utilization percentage threshold. If no target is specified, it defaults to 70%.
 
-The HPA respects `--min-replicas` (default: 1) and `--max-replicas` (default: 10) bounds. The `--replicas` flag sets the initial replica count before the HPA takes over.
+The HPA respects `--min-replicas` (default: 1) and `--max-replicas` (default: 10) bounds. The `--replicas` flag sets the initial replica count before the HPA takes over. On every path—existing or recreated Deployment, CPU↔KEDA handoff, disable, stop, and start—the monitor removes and read-confirms obsolete owners before applying the next owner or a static count. Autoscaled readiness is truthful against the minimum serving floor while status reports the live HPA-owned desired count; during disable handoff it continues reporting that observed target until static ownership actually takes control.
 
 **GPU autoscaling.** GPU utilization cannot be read by a native HPA (Kubernetes Resource metrics are limited to CPU and memory). When any `--autoscale-metric gpu:...` (or `gpu_memory:...`) is requested, the endpoint is materialized as a KEDA `ScaledObject` with an `aws-cloudwatch` trigger that reads the `ContainerInsights` per-pod GPU metric (`pod_gpu_utilization` / `pod_gpu_memory_utilization`) for the Deployment. CPU/memory targets supplied alongside a GPU metric ride on the same `ScaledObject` as native KEDA triggers. KEDA is a mandatory cluster component, and the KEDA operator's IAM role is granted read-only CloudWatch access (`GetMetricData`, `GetMetricStatistics`, `ListMetrics`) for this purpose.
 
@@ -568,12 +580,14 @@ gco inference update-image my-llm -i vllm/vllm-openai:v0.27.1
 ### Stop and Start
 
 ```bash
-# Stop (scales to zero, keeps configuration)
+# Stop (removes any HPA/KEDA owner, then scales to zero)
 gco inference stop my-llm -y
 
-# Start (restores previous replica count)
+# Start (restores static/HPA ownership from the saved configuration)
 gco inference start my-llm
 ```
+
+Starting a stopped endpoint preserves its lifecycle identity. Deletion is terminal for that lifecycle: wait for the record to be purged, then deploy the same name again to create a fresh lifecycle. A deleted record cannot be restarted in place.
 
 ### Delete
 
@@ -581,6 +595,10 @@ gco inference start my-llm
 # Mark for deletion — inference_monitor cleans up K8s resources in each region
 gco inference delete my-llm -y
 ```
+
+The first delete request creates an immutable deletion generation and snapshots the endpoint lifecycle's append-only historical cleanup-region set; repeated requests are idempotent for that generation. Adding or removing a Region also rotates that Region's membership generation, so a terminal acknowledgement from an earlier remove→re-add cycle can never suppress current cleanup. Every authoritative region writes fresh generation-scoped `deleting` and then `deleted` acknowledgements only after two complete absence observations. Terminal proof includes Deployments, ReplicaSets, Pods, Services, Endpoints, EndpointSlices, native and `keda-hpa-*` HPAs, KEDA ScaledObjects, ConfigMaps, the lifecycle-owned generated Secret, and legacy Ingress/HTTPRoute objects. DynamoDB purge requires the full current-generation quorum and is conditioned on lifecycle, generation, and the verified snapshot, so late writers cannot recreate a purged record.
+
+If deletion remains in `deleting`, do not remove the DynamoDB record or retry with a new endpoint of the same name. Inspect the named endpoint resources plus ReplicaSets, Pods, Endpoints, and EndpointSlices in `gco-inference`; a retained child or Kubernetes finalizer intentionally blocks purge. Remove a finalizer only after verifying the object's owner references and endpoint lifecycle, then let the monitor obtain two fresh absent observations. A conventional `{name}-admin` Secret with missing or mismatched lifecycle provenance is an ownership collision: repair its provenance only from authoritative records or rename/preserve it as an external Secret; never force-delete it by name alone.
 
 ### Canary Deployments (A/B Testing)
 

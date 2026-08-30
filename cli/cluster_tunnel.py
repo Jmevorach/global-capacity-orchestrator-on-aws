@@ -26,9 +26,10 @@ modules (not ``from ... import``) so tests can monkeypatch them at the source.
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import click
@@ -80,7 +81,7 @@ class TunnelPlan:
         """The ``kubectl`` flags that point at the tunnel with the right TLS SNI."""
         return [
             "--server",
-            f"https://localhost:{self.local_port}",
+            f"https://{ssm_tunnel.LOCAL_TUNNEL_HOST}:{self.local_port}",
             "--tls-server-name",
             self.endpoint_host,
         ]
@@ -263,6 +264,9 @@ class TunnelSession:
     plan: TunnelPlan
     # True when an SSM tunnel process is running for this session.
     active: bool
+    # Process handle lets readiness gates detect a tunnel that exits after its
+    # local listener first appears. It is not part of session equality/repr.
+    process: subprocess.Popen[bytes] | None = field(default=None, compare=False, repr=False)
 
 
 @contextmanager
@@ -320,7 +324,7 @@ def open_api_server_tunnel(
                     f"Opening SSM tunnel to the private API endpoint via {instance_id}..."
                 )
                 tunnel = ssm_tunnel.start_api_tunnel(instance_id, plan.endpoint, local_port, region)
-                server = f"https://localhost:{local_port}"
+                server = f"https://{ssm_tunnel.LOCAL_TUNNEL_HOST}:{local_port}"
                 tls_server_name = plan.endpoint_host
             else:
                 formatter.print_warning(private_endpoint_guidance(cluster, region))
@@ -330,9 +334,12 @@ def open_api_server_tunnel(
             tls_server_name=tls_server_name,
             plan=plan,
             active=tunnel is not None,
+            process=tunnel,
         )
     finally:
-        if tunnel is not None:
-            tunnel.terminate()
-        if created_bastion is not None:
-            teardown_bastion(formatter, created_bastion, region, project_name)
+        try:
+            if tunnel is not None:
+                ssm_tunnel.stop_api_tunnel(tunnel)
+        finally:
+            if created_bastion is not None:
+                teardown_bastion(formatter, created_bastion, region, project_name)

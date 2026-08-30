@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import sys
 import threading
 import uuid
 import zlib
@@ -43,6 +44,7 @@ from scripts.live_release_validation.checks import topology as checks_topology
 from scripts.live_release_validation.cleanup import ecr as cleanup_ecr
 from scripts.live_release_validation.cleanup import log_groups as cleanup_log_groups
 from scripts.live_release_validation.cleanup import workloads as cleanup_workloads_module
+from scripts.live_release_validation.inventory import ecr as inventory_ecr
 from scripts.live_release_validation.inventory import scanners as inventory_scanners
 from scripts.live_release_validation.ownership import dynamodb_streams as ownership_streams
 from scripts.live_release_validation.ownership import ecr as ownership_ecr
@@ -2608,6 +2610,46 @@ class TestEcrOwnershipCleanup:
         "artifact_media_type": "",
         "manifest": {"schemaVersion": 2},
     }
+    _DOCKER_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
+
+    @staticmethod
+    def _manifest_record(
+        media_type: str,
+        manifest: object,
+        *,
+        digest: str = "sha256:abc",
+        tag: str | None = None,
+    ) -> dict[str, object]:
+        image_id = {"imageDigest": digest}
+        if tag is not None:
+            image_id["imageTag"] = tag
+        return {
+            "imageId": image_id,
+            "imageManifestMediaType": media_type,
+            "imageManifest": json.dumps(manifest, sort_keys=True),
+        }
+
+    def _ecr_session_with_records(
+        self,
+        records: list[dict[str, object]],
+        *,
+        native_media_type: str | None = None,
+    ) -> tuple[MagicMock, MagicMock]:
+        media_type = native_media_type or str(self._IDENTITY["manifest_media_type"])
+        ecr = MagicMock()
+        ecr.describe_images.return_value = {
+            "imageDetails": [
+                {
+                    "imageDigest": "sha256:abc",
+                    "imageTags": ["run-tag"],
+                    "imageManifestMediaType": media_type,
+                }
+            ]
+        }
+        ecr.batch_get_image.return_value = {"images": records, "failures": []}
+        session = MagicMock()
+        session.client.return_value = ecr
+        return ecr, session
 
     def test_describe_tag_captures_exact_manifest(self) -> None:
         ecr = MagicMock()
@@ -2645,7 +2687,102 @@ class TestEcrOwnershipCleanup:
             repositoryName="baseline/repository",
             imageIds=[{"imageTag": "run-tag"}],
         )
-        ecr.batch_get_image.assert_called_once()
+        ecr.batch_get_image.assert_called_once_with(
+            repositoryName="baseline/repository",
+            imageIds=[{"imageDigest": "sha256:abc"}],
+            acceptedMediaTypes=list(inventory_ecr._ECR_MANIFEST_MEDIA_TYPES),
+        )
+
+    def test_describe_tag_collapses_exact_duplicate_manifest_records(self) -> None:
+        record = self._manifest_record(
+            str(self._IDENTITY["manifest_media_type"]),
+            self._IDENTITY["manifest"],
+            tag="first-tag",
+        )
+        duplicate = self._manifest_record(
+            str(self._IDENTITY["manifest_media_type"]),
+            self._IDENTITY["manifest"],
+            tag="second-tag",
+        )
+        _ecr, session = self._ecr_session_with_records([record, duplicate])
+
+        result = inventory.describe_ecr_image_by_tag(
+            session,
+            region="us-east-1",
+            repository_name="baseline/repository",
+            tag="run-tag",
+        )
+
+        assert ownership_ecr._ecr_image_identity(result or {}) == self._IDENTITY
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_describe_tag_selects_native_manifest_independent_of_order(self, reverse: bool) -> None:
+        native_manifest = {"schemaVersion": 2, "annotations": {"representation": "native"}}
+        translated_manifest = {
+            "schemaVersion": 2,
+            "annotations": {"representation": "translated"},
+        }
+        native = self._manifest_record(str(self._IDENTITY["manifest_media_type"]), native_manifest)
+        translated = self._manifest_record(self._DOCKER_MEDIA_TYPE, translated_manifest)
+        records = [native, translated]
+        if reverse:
+            records.reverse()
+        _ecr, session = self._ecr_session_with_records(records)
+
+        result = inventory.describe_ecr_image_by_tag(
+            session,
+            region="us-east-1",
+            repository_name="baseline/repository",
+            tag="run-tag",
+        )
+
+        assert result is not None
+        assert result["manifest_media_type"] == self._IDENTITY["manifest_media_type"]
+        assert result["manifest"] == native_manifest
+
+    def test_describe_tag_rejects_conflicting_native_manifests(self) -> None:
+        media_type = str(self._IDENTITY["manifest_media_type"])
+        first = self._manifest_record(media_type, {"schemaVersion": 2, "variant": 1})
+        second = self._manifest_record(media_type, {"schemaVersion": 2, "variant": 2})
+        _ecr, session = self._ecr_session_with_records([first, second])
+
+        with pytest.raises(RuntimeError, match="2 unique native record"):
+            inventory.describe_ecr_image_by_tag(
+                session,
+                region="us-east-1",
+                repository_name="baseline/repository",
+                tag="run-tag",
+            )
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_bulk_inventory_uses_same_native_manifest_resolver(self, reverse: bool) -> None:
+        native_manifest = {"schemaVersion": 2, "kind": "native"}
+        native = self._manifest_record(str(self._IDENTITY["manifest_media_type"]), native_manifest)
+        translated = self._manifest_record(
+            self._DOCKER_MEDIA_TYPE,
+            {"schemaVersion": 2, "kind": "translated"},
+        )
+        records = [native, translated]
+        if reverse:
+            records.reverse()
+        ecr, _session = self._ecr_session_with_records(records)
+        ecr.get_paginator.return_value.paginate.return_value = [
+            {
+                "imageDetails": [
+                    {
+                        "imageDigest": "sha256:abc",
+                        "imageTags": ["run-tag"],
+                        "imageManifestMediaType": self._IDENTITY["manifest_media_type"],
+                    }
+                ]
+            }
+        ]
+
+        images = inventory_ecr._collect_repository_images(ecr, "baseline/repository")
+
+        assert len(images) == 1
+        assert images[0]["manifest_media_type"] == self._IDENTITY["manifest_media_type"]
+        assert images[0]["manifest"] == native_manifest
 
     @pytest.mark.parametrize(
         "error_code",
@@ -4206,7 +4343,7 @@ class TestCheckpointPersistence:
         self,
         tmp_path: Path,
     ) -> None:
-        from scripts.live_release_validation import models
+        from scripts.live_release_validation import artifact_io, models
 
         report_dir = tmp_path / "live-report"
         checkpoint = report_dir / "checkpoint.json"
@@ -4222,7 +4359,7 @@ class TestCheckpointPersistence:
             replacement_modes.append(stat.S_IMODE(metadata.st_mode))
             real_replace(source, destination, **kwargs)
 
-        with patch.object(models.os, "replace", side_effect=tracked_replace):
+        with patch.object(artifact_io.os, "replace", side_effect=tracked_replace):
             for generation in (1, 2):
                 models.atomic_write_json(checkpoint, {"generation": generation})
                 assert stat.S_IMODE(report_dir.stat().st_mode) == 0o700
@@ -4236,7 +4373,7 @@ class TestCheckpointPersistence:
         self,
         tmp_path: Path,
     ) -> None:
-        from scripts.live_release_validation import models
+        from scripts.live_release_validation import artifact_io, models
 
         original_ancestor = tmp_path / "original"
         report_dir = original_ancestor / "live-report"
@@ -4254,7 +4391,7 @@ class TestCheckpointPersistence:
             real_replace(source, destination, **kwargs)
 
         with (
-            patch.object(models.os, "replace", side_effect=rebind_then_replace),
+            patch.object(artifact_io.os, "replace", side_effect=rebind_then_replace),
             pytest.raises(RuntimeError, match="rebound while open"),
         ):
             models.atomic_write_json(checkpoint, {"generation": 1})
@@ -4460,6 +4597,265 @@ class TestLocalOnlyRuntime:
 
         assert args.expected_sha is None
         assert args.expected_branch is None
+
+    def test_deployed_checkpoint_constructor_failure_reports_blocked_recovery(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+        from scripts.live_release_validation import runner
+        from scripts.live_release_validation.models import (
+            RunCheckpoint,
+            RunSettings,
+            atomic_write_json,
+        )
+
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        (tmp_path / "cdk.json").write_text(
+            json.dumps(
+                {
+                    "context": {
+                        "project_name": "gco",
+                        "deployment_regions": {
+                            "global": "us-west-2",
+                            "api_gateway": "us-east-1",
+                            "monitoring": "us-east-1",
+                            "regional": ["us-east-1"],
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        report_dir = tmp_path / "report"
+        report_dir.mkdir(mode=0o700)
+        settings = RunSettings(
+            run_id="run-123",
+            repo_root=tmp_path,
+            report_dir=report_dir,
+            checkpoint_path=report_dir / "checkpoint.json",
+            expected_account="123456789012",
+            expected_sha="a" * 40,
+            expected_branch="chore/test",
+            profile="configured",
+            requested_actions=("preflight",),
+            resume=True,
+        )
+        checkpoint = RunCheckpoint(identity=settings.identity(), deployment_attempted=True)
+        atomic_write_json(settings.checkpoint_path, checkpoint.to_dict())
+        parser = MagicMock()
+        parser.parse_args.return_value = SimpleNamespace(list_actions=False)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "live_release_validation",
+                "--repo-root",
+                str(tmp_path),
+                "--run-id",
+                "run-123",
+                "--resume",
+            ],
+        )
+
+        with (
+            patch.object(live_main, "_build_parser", return_value=parser),
+            patch.object(live_main, "_settings_from_args", return_value=settings),
+            patch.object(
+                runner,
+                "ThrottleResilientSession",
+                side_effect=RuntimeError("session bootstrap failed"),
+            ),
+            patch.object(runner, "destroy_deployment") as destroy,
+        ):
+            assert live_main.main() == 1
+
+        destroy.assert_not_called()
+        report = json.loads(
+            (report_dir / "live-release-validation.json").read_text(encoding="utf-8")
+        )
+        assert report["cleanup"]["needed"] is True
+        assert report["cleanup"]["completed"] is False
+        assert "construction failed" in report["cleanup"]["blocked"]
+        recovery = report["cleanup"]["recovery_command"]
+        assert "-m scripts.live_release_validation" in recovery
+        assert "--resume" in recovery
+        assert report["status"] == "failed"
+
+    def test_constructor_failure_never_claims_cleanup_for_mismatched_checkpoint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+        from scripts.live_release_validation.models import (
+            RunCheckpoint,
+            RunSettings,
+            atomic_write_json,
+        )
+
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        report_dir = tmp_path / "report"
+        report_dir.mkdir(mode=0o700)
+        settings = RunSettings(
+            run_id="run-123",
+            repo_root=tmp_path,
+            report_dir=report_dir,
+            checkpoint_path=report_dir / "checkpoint.json",
+            expected_account="123456789012",
+            expected_sha="a" * 40,
+            expected_branch="chore/test",
+            profile="configured",
+            requested_actions=("preflight",),
+            resume=True,
+        )
+        wrong_identity = settings.identity()
+        wrong_identity["expected_sha"] = "b" * 40
+        checkpoint = RunCheckpoint(identity=wrong_identity, deployment_attempted=True)
+        atomic_write_json(settings.checkpoint_path, checkpoint.to_dict())
+        parser = MagicMock()
+        parser.parse_args.return_value = SimpleNamespace(list_actions=False)
+
+        with (
+            patch.object(live_main, "_build_parser", return_value=parser),
+            patch.object(live_main, "_settings_from_args", return_value=settings),
+            patch.object(
+                live_main,
+                "LiveValidationRunner",
+                side_effect=ValueError("checkpoint identity mismatch"),
+            ),
+        ):
+            assert live_main.main() == 1
+
+        report = json.loads(
+            (report_dir / "live-release-validation.json").read_text(encoding="utf-8")
+        )
+        assert report["cleanup"]["needed"] is True
+        assert report["cleanup"]["completed"] is False
+        assert "does not match" in report["cleanup"]["blocked"]
+        assert "recovery_command" not in report["cleanup"]
+
+    def test_main_inference_cli_inputs_are_checkpoint_identity(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+        from scripts.live_release_validation.models import RunSettings
+
+        parser = live_main._build_parser()
+        args = parser.parse_args(
+            [
+                "--expected-account",
+                "123456789012",
+                "--expected-sha",
+                "a" * 40,
+                "--expected-branch",
+                "chore/test",
+                "--actions",
+                "inference",
+                "--inference-region",
+                "us-east-1",
+                "--inference-vllm-image",
+                "registry.example/vllm@sha256:" + "b" * 64,
+                "--inference-vllm-model-id",
+                "publisher/vllm-model",
+                "--inference-vllm-model-revision",
+                "c" * 40,
+                "--inference-tgi-image",
+                "registry.example/tgi@sha256:" + "d" * 64,
+                "--inference-tgi-model-id",
+                "publisher/tgi-model",
+                "--inference-tgi-model-revision",
+                "e" * 40,
+                "--inference-gpu-count",
+                "1",
+                "--confirm-inference-deployment",
+            ]
+        )
+        (tmp_path / "cdk.json").write_text(
+            json.dumps(
+                {
+                    "context": {
+                        "inference_proxy": {
+                            "tls_proxy_cpu_request_millicores": 125,
+                            "tls_proxy_cpu_target_utilization_percentage": 85,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(live_main, "_repository_root", lambda _value: tmp_path)
+        settings = live_main._settings_from_args(parser, args)
+
+        assert isinstance(settings, RunSettings)
+        assert settings.inference_enabled is True
+        identity = settings.identity()["inference"]
+        assert identity["selected_region"] == "us-east-1"
+        assert [runtime["framework"] for runtime in identity["runtimes"]] == ["vllm", "tgi"]
+        assert identity["runtimes"][0]["image"].endswith("b" * 64)
+        assert identity["runtimes"][0]["model"] == {
+            "id": "publisher/vllm-model",
+            "revision": "c" * 40,
+        }
+        assert identity["runtimes"][1]["image"].endswith("d" * 64)
+        assert identity["runtimes"][1]["model"] == {
+            "id": "publisher/tgi-model",
+            "revision": "e" * 40,
+        }
+        assert identity["endpoint_contract"]["gpu_count"] == 1
+        assert identity["shared_proxy_contract"]["tls_cpu_request"] == "125m"
+        assert identity["shared_proxy_contract"]["tls_cpu_target"] == 85
+
+    @pytest.mark.parametrize("proxy_value", ["missing", None])
+    def test_main_inference_cli_uses_production_tls_defaults_when_block_omitted_or_null(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        proxy_value: object,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+
+        context: dict[str, object] = {}
+        if proxy_value != "missing":
+            context["inference_proxy"] = proxy_value
+        (tmp_path / "cdk.json").write_text(json.dumps({"context": context}), encoding="utf-8")
+        parser = live_main._build_parser()
+        args = parser.parse_args(
+            [
+                "--expected-account",
+                "123456789012",
+                "--expected-sha",
+                "a" * 40,
+                "--expected-branch",
+                "chore/test",
+                "--actions",
+                "inference",
+                "--inference-region",
+                "us-east-1",
+                "--inference-vllm-image",
+                "registry.example/vllm@sha256:" + "b" * 64,
+                "--inference-vllm-model-id",
+                "publisher/vllm-model",
+                "--inference-vllm-model-revision",
+                "c" * 40,
+                "--inference-tgi-image",
+                "registry.example/tgi@sha256:" + "d" * 64,
+                "--inference-tgi-model-id",
+                "publisher/tgi-model",
+                "--inference-tgi-model-revision",
+                "e" * 40,
+                "--confirm-inference-deployment",
+            ]
+        )
+        monkeypatch.setattr(live_main, "_repository_root", lambda _value: tmp_path)
+
+        settings = live_main._settings_from_args(parser, args)
+
+        assert settings.proxy_tls_cpu_request == "100m"
+        assert settings.proxy_tls_cpu_target == 70
 
     def test_detached_head_does_not_consume_github_branch_variables(
         self,
@@ -5857,3 +6253,30 @@ class TestOpenCostLiveValidationRetry:
 
         assert ctx.checkpoint.state["opencost_status"]["us-east-1"] is status
         ctx.persist_callback.assert_called_once_with(ctx.checkpoint)
+
+
+class TestInferencePreflightPrerequisites:
+    def test_missing_session_manager_plugin_fails_before_any_aws_call(self, tmp_path: Path) -> None:
+        from scripts.live_release_validation.actions import preflight
+
+        session = MagicMock()
+        ctx = SimpleNamespace(
+            settings=SimpleNamespace(
+                repo_root=tmp_path,
+                expected_sha="a" * 40,
+                expected_branch="feature/test",
+            ),
+            report=SimpleNamespace(
+                selected_actions=["preflight", "baseline", "deploy", "topology", "inference"]
+            ),
+            session=session,
+        )
+        with (
+            patch.object(preflight, "_run_git", side_effect=["a" * 40, ""]),
+            patch.object(preflight, "_resolve_branch", return_value="feature/test"),
+            patch.object(preflight.shutil, "which", return_value=None),
+            pytest.raises(RuntimeError, match="Session Manager plugin"),
+        ):
+            preflight.action_preflight(ctx)
+
+        session.client.assert_not_called()

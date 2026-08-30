@@ -630,6 +630,17 @@ CONFIGS.extend(
                 },
             },
         ),
+        # Inference TLS sidecar autoscaling has a real render path and no IAM
+        # effect. Vary both exact-integer knobs through full-app synthesis.
+        (
+            "inference-proxy-tls-autoscaling-tuned",
+            {
+                "inference_proxy": {
+                    "tls_proxy_cpu_request_millicores": 200,
+                    "tls_proxy_cpu_target_utilization_percentage": 60,
+                }
+            },
+        ),
         # Manifest-processor service shape (replica count + request-body
         # cap) and a tightened job-validation policy flow into the regional
         # stack's container env and the queue processor.

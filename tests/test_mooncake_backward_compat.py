@@ -141,7 +141,16 @@ def test_plain_spec_reconciles_to_one_deployment_and_service(bundle: dict) -> No
     """
     monitor = _make_monitor()
 
-    with patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api:
+    with (
+        patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
+        patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
+    ):
+        mock_hpa_api.return_value.read_namespaced_horizontal_pod_autoscaler.side_effect = (
+            ApiException(status=404)
+        )
+        mock_custom_api.return_value.get_namespaced_custom_object.side_effect = ApiException(
+            status=404
+        )
         result = asyncio.run(
             monitor._reconcile_running(
                 bundle["name"], NAMESPACE, bundle["spec"], bundle["endpoint"]

@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import shlex
 import sys
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gco.inference_proxy_config import (
+    INFERENCE_PROXY_TLS_CPU_REQUEST_MILLICORES_DEFAULT,
+    INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION_DEFAULT,
+)
+
 from .checks.schedulers import OPTIONAL_SCHEDULERS
 from .cli_args import path_from_root, repository_root, split_csv_names
 from .models import (
+    InferenceRuntimeSpec,
+    RunCheckpoint,
     RunSettings,
     ValidationReport,
     ensure_private_run_directory,
@@ -115,8 +124,40 @@ def _build_parser() -> argparse.ArgumentParser:
             "schedulers action can prove them (yunikorn, slurm, or all)"
         ),
     )
+    parser.add_argument(
+        "--inference-region",
+        help="Deployed Region used by the inference action",
+    )
+    for framework, default_port in (("vllm", 8000), ("tgi", 8080)):
+        parser.add_argument(
+            f"--inference-{framework}-image",
+            help=f"Immutable {framework} image reference containing @sha256:",
+        )
+        parser.add_argument(
+            f"--inference-{framework}-model-id",
+            help=f"Exact model identifier served by {framework}",
+        )
+        parser.add_argument(
+            f"--inference-{framework}-model-revision",
+            help=f"Full immutable 40-hex model commit served by {framework}",
+        )
+        parser.set_defaults(**{f"inference_{framework}_port": default_port})
+    parser.add_argument("--inference-gpu-count", type=int, default=0)
+    parser.add_argument(
+        "--confirm-inference-deployment",
+        action="store_true",
+        help=(
+            "Explicitly authorize the inference action to create and delete "
+            "four strictly sequential vLLM/TGI endpoint scenarios"
+        ),
+    )
     parser.epilog = "Actions: " + ", ".join(registry)
     return parser
+
+
+def _inference_selected(actions: tuple[str, ...]) -> bool:
+    """Return whether dependency expansion will execute the inference action."""
+    return "all" in actions or "inference" in actions
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -151,6 +192,25 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         )
     if "all" in args.optional_schedulers and len(args.optional_schedulers) != 1:
         parser.error("--optional-schedulers 'all' cannot be combined with individual names")
+    if _inference_selected(args.actions):
+        required = (
+            "inference_region",
+            "inference_vllm_image",
+            "inference_vllm_model_id",
+            "inference_vllm_model_revision",
+            "inference_tgi_image",
+            "inference_tgi_model_id",
+            "inference_tgi_model_revision",
+        )
+        for option in required:
+            if not getattr(args, option):
+                parser.error(f"--{option.replace('_', '-')} is required when inference runs")
+        if not args.confirm_inference_deployment:
+            parser.error(
+                "--confirm-inference-deployment is required when the inference action runs"
+            )
+    if args.inference_gpu_count < 0:
+        parser.error("--inference-gpu-count must be non-negative")
 
 
 def _settings_from_args(
@@ -173,6 +233,48 @@ def _settings_from_args(
         report_dir / "checkpoint.json",
     )
     protected = tuple(dict.fromkeys(("CDKToolkit", "GCOGitHubOIDCStack", *args.protected_stack)))
+    inference_enabled = _inference_selected(args.actions)
+    proxy_config: dict[str, object] = {
+        "tls_proxy_cpu_request_millicores": (INFERENCE_PROXY_TLS_CPU_REQUEST_MILLICORES_DEFAULT),
+        "tls_proxy_cpu_target_utilization_percentage": (
+            INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION_DEFAULT
+        ),
+    }
+    if inference_enabled:
+        try:
+            cdk_config = json.loads((root / "cdk.json").read_text(encoding="utf-8"))
+            context = cdk_config.get("context") if isinstance(cdk_config, dict) else None
+            candidate = context.get("inference_proxy") if isinstance(context, dict) else None
+            if candidate is not None and not isinstance(candidate, dict):
+                parser.error("cdk.json context.inference_proxy must be an object or null")
+            if isinstance(candidate, dict):
+                proxy_config.update(candidate)
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            parser.error(f"could not read inference_proxy settings from cdk.json: {error}")
+    proxy_request = proxy_config["tls_proxy_cpu_request_millicores"]
+    proxy_target = proxy_config["tls_proxy_cpu_target_utilization_percentage"]
+    if inference_enabled and (type(proxy_request) is not int or type(proxy_target) is not int):
+        parser.error("cdk.json inference_proxy TLS CPU settings must be integers")
+    runtimes = (
+        (
+            InferenceRuntimeSpec(
+                framework="vllm",
+                image=args.inference_vllm_image or "",
+                model_id=args.inference_vllm_model_id or "",
+                model_revision=args.inference_vllm_model_revision or "",
+                port=8000,
+            ),
+            InferenceRuntimeSpec(
+                framework="tgi",
+                image=args.inference_tgi_image or "",
+                model_id=args.inference_tgi_model_id or "",
+                model_revision=args.inference_tgi_model_revision or "",
+                port=8080,
+            ),
+        )
+        if inference_enabled
+        else ()
+    )
     return RunSettings(
         run_id=run_id,
         repo_root=root,
@@ -197,6 +299,13 @@ def _settings_from_args(
             if "all" in args.optional_schedulers
             else tuple(sorted(set(args.optional_schedulers)))
         ),
+        inference_enabled=inference_enabled,
+        selected_region=args.inference_region or "",
+        inference_runtimes=runtimes,
+        proxy_tls_cpu_request=f"{proxy_request}m" if inference_enabled else "100m",
+        proxy_tls_cpu_target=proxy_target if isinstance(proxy_target, int) else 70,
+        gpu_count=args.inference_gpu_count,
+        consent=args.confirm_inference_deployment,
     )
 
 
@@ -235,6 +344,41 @@ def main() -> int:
                 status="failed",
                 fatal_error="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
             )
+            if settings.checkpoint_path.is_file():
+                try:
+                    checkpoint = RunCheckpoint.from_path(settings.checkpoint_path)
+                except OSError, ValueError:
+                    checkpoint = None
+                if checkpoint is not None and checkpoint.deployment_attempted:
+                    if checkpoint.identity == settings.identity():
+                        recovery_argv = [
+                            sys.executable,
+                            "-m",
+                            "scripts.live_release_validation",
+                            *sys.argv[1:],
+                        ]
+                        if "--resume" not in recovery_argv:
+                            recovery_argv.append("--resume")
+                        report.cleanup = {
+                            "needed": True,
+                            "completed": False,
+                            "blocked": (
+                                "Runner construction failed after an identity-verified deployed "
+                                "checkpoint was loaded; safe automatic destruction could not be "
+                                "initialized."
+                            ),
+                            "recovery_command": shlex.join(recovery_argv),
+                        }
+                    else:
+                        report.cleanup = {
+                            "needed": True,
+                            "completed": False,
+                            "blocked": (
+                                "A deployed checkpoint exists, but its identity does not match "
+                                "this invocation. No cleanup authority was established; resume "
+                                "with the original exact command and checkpoint identity."
+                            ),
+                        }
             try:
                 ensure_private_run_directory(settings.report_dir, settings.checkpoint_path)
                 json_path, markdown_path = report.write(settings.report_dir)

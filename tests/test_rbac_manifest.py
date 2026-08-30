@@ -431,12 +431,42 @@ class TestInferenceMonitorRole:
         assert role["metadata"]["namespace"] == "gco-inference"
 
     def test_inference_monitor_covers_expected_resources(self, rbac_docs):
-        """Inference monitor manages workloads and retains legacy Ingress cleanup."""
+        """Inference monitor has every active and terminal-proof resource."""
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
         resources = _get_all_resources(role)
-        resource_names = {r[1] for r in resources}
-        expected = {"deployments", "services", "ingresses", "horizontalpodautoscalers", "leases"}
-        assert expected.issubset(resource_names), f"Missing resources: {expected - resource_names}"
+        expected = {
+            ("apps", "deployments"),
+            ("apps", "replicasets"),
+            ("", "services"),
+            ("", "pods"),
+            ("", "endpoints"),
+            ("discovery.k8s.io", "endpointslices"),
+            ("autoscaling", "horizontalpodautoscalers"),
+            ("keda.sh", "scaledobjects"),
+            ("networking.k8s.io", "ingresses"),
+            ("gateway.networking.k8s.io", "httproutes"),
+            ("coordination.k8s.io", "leases"),
+        }
+        assert expected.issubset(resources), f"Missing resources: {expected - resources}"
+
+    @pytest.mark.parametrize(
+        ("api_group", "resource"),
+        [
+            ("apps", "replicasets"),
+            ("", "pods"),
+            ("", "endpoints"),
+            ("discovery.k8s.io", "endpointslices"),
+        ],
+    )
+    def test_generated_children_are_strictly_read_only(self, rbac_docs, api_group, resource):
+        role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
+        matching = [
+            rule
+            for rule in role.get("rules", [])
+            if api_group in rule.get("apiGroups", []) and resource in rule.get("resources", [])
+        ]
+        assert len(matching) == 1
+        assert set(matching[0]["verbs"]) == {"get", "list", "watch"}
 
     def test_inference_monitor_has_patch_verb(self, rbac_docs):
         """patch must be granted on every active resource inference-monitor updates."""
@@ -449,13 +479,26 @@ class TestInferenceMonitorRole:
                     f"inference-monitor rule for {rule_resources} must include patch"
                 )
 
-    def test_inference_monitor_ingress_access_is_delete_only(self, rbac_docs):
-        """Historical endpoint Ingresses may only be removed during upgrades."""
+    @pytest.mark.parametrize(
+        ("api_group", "resource"),
+        [
+            ("networking.k8s.io", "ingresses"),
+            ("gateway.networking.k8s.io", "httproutes"),
+        ],
+    )
+    def test_inference_monitor_legacy_routes_have_exact_cleanup_verbs(
+        self, rbac_docs, api_group, resource
+    ):
+        """Legacy routes allow only deterministic get/provenance-patch/delete."""
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
-        ingress_rules = [rule for rule in role["rules"] if "ingresses" in rule.get("resources", [])]
-        assert len(ingress_rules) == 1
-        assert ingress_rules[0]["apiGroups"] == ["networking.k8s.io"]
-        assert ingress_rules[0]["verbs"] == ["delete"]
+        rules = [
+            rule
+            for rule in role["rules"]
+            if rule.get("apiGroups") == [api_group] and rule.get("resources") == [resource]
+        ]
+        assert len(rules) == 1
+        assert rules[0]["verbs"] == ["get", "patch", "delete"]
+        assert not ({"create", "list", "update", "watch"} & set(rules[0]["verbs"]))
 
     def test_inference_monitor_covers_mooncake_resources(self, rbac_docs):
         """Mooncake disaggregated/store endpoints need statefulsets, configmaps, secrets.
@@ -481,21 +524,14 @@ class TestInferenceMonitorRole:
             )
 
     def test_inference_monitor_secrets_have_generated_key_lifecycle_verbs(self, rbac_docs):
-        """The monitor reads named Secrets and creates/deletes generated ones.
-
-        User-supplied proxy admin-key Secrets are only read. When an endpoint
-        names none, the monitor creates ``{name}-admin`` and deletes that owned
-        Secret during endpoint teardown. It never updates or lists Secrets.
-        """
+        """Generated Secrets may be created, migrated, read, and deleted only."""
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
         secrets_verbs = set()
         for rule in role.get("rules", []):
             if "secrets" in rule.get("resources", []):
                 secrets_verbs.update(rule.get("verbs", []))
-        assert secrets_verbs == {"get", "create", "delete"}, (
-            "inference-monitor secrets access must be "
-            f"{{'get', 'create', 'delete'}}, got {secrets_verbs}"
-        )
+        assert secrets_verbs == {"get", "create", "patch", "delete"}
+        assert not ({"list", "watch", "update"} & secrets_verbs)
 
     def test_inference_monitor_statefulsets_support_full_lifecycle(self, rbac_docs):
         """The master StatefulSet is created and its status read each loop, so

@@ -176,9 +176,9 @@ spec:
               value: "900"
           resources:
             requests:
-              # Reserve enough CPU and memory that utilization-based scaling is
-              # driven by TLS throughput rather than the Python runtime baseline.
-              cpu: 100m
+              # This request is the TLS HPA utilization denominator. Keep the
+              # quantity quoted because CDK substitutes values such as "100m".
+              cpu: "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}"
               memory: 128Mi
             limits:
               cpu: 250m
@@ -288,13 +288,14 @@ spec:
     # TLS CPU tracks distributable encrypted throughput. Avoid proxy-memory
     # scaling: established streams stay on their original pod and Python may
     # retain RSS, so adding replicas might not reduce average memory usage.
+    # Keep this token unquoted so the rendered Kubernetes field is an integer.
     - type: ContainerResource
       containerResource:
         name: cpu
         container: api-tls-proxy
         target:
           type: Utilization
-          averageUtilization: 70
+          averageUtilization: {{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

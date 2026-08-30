@@ -30,13 +30,21 @@ def runner() -> CliRunner:
 
 
 class _FakeTunnel:
-    """Stand-in for the SSM tunnel Popen; records termination."""
+    """Stand-in for the SSM tunnel Popen; records termination and reaping."""
 
     def __init__(self) -> None:
         self.terminated = False
+        self.reaped = False
+
+    def poll(self) -> int | None:
+        return -15 if self.terminated else None
 
     def terminate(self) -> None:
         self.terminated = True
+
+    def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+        self.reaped = True
+        return b"", b""
 
 
 class _FakeFormatter:
@@ -95,7 +103,7 @@ class TestTunnelPlan:
         flags = _private_plan().kubectl_flags()
         assert flags == [
             "--server",
-            "https://localhost:8443",
+            "https://127.0.0.1:8443",
             "--tls-server-name",
             PRIVATE_HOST,
         ]
@@ -114,7 +122,7 @@ class TestTunnelPlan:
         assert d["reachable"] == "ssm-tunnel"
         assert d["ssm_command_str"].startswith("aws ssm start-session")
         assert "i-0123456789abcdef0" in d["ssm_command_str"]
-        assert d["kubectl_flags"][1] == "https://localhost:8443"
+        assert d["kubectl_flags"][1] == "https://127.0.0.1:8443"
 
     def test_as_dict_private_without_instance_uses_template(self) -> None:
         d = _private_plan().as_dict()
@@ -257,11 +265,12 @@ class TestOpenApiServerTunnel:
         with ct.open_api_server_tunnel(
             fmt, cluster="gco-us-east-1", region="us-east-1", via_ssm="i-0123456789abcdef0"
         ) as session:
-            assert session.server == "https://localhost:8443"
+            assert session.server == "https://127.0.0.1:8443"
             assert session.tls_server_name == PRIVATE_HOST
             assert session.active is True
         assert started["instance"] == "i-0123456789abcdef0"
         assert proc.terminated is True  # torn down on exit
+        assert proc.reaped is True
 
     def test_private_auto_provisions_and_tears_down(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -451,7 +460,7 @@ class TestClusterTunnelInteractive:
         )
         assert res.exit_code == 0, res.output
         assert "SSM tunnel open" in res.output
-        assert "kubectl --server https://localhost:8443" in res.output
+        assert "kubectl --server https://127.0.0.1:8443" in res.output
         assert blocked.get("waited") is True
         assert proc.terminated is True
 
@@ -562,7 +571,7 @@ class TestMonitoringOpenAutoBastion:
         assert destroyed == ["i-0aaaaaaaaaaaaaaaa"]  # and torn down
         # Port-forward routed through the SSM tunnel (server override present).
         assert "--server" in captured["cmd"]
-        assert "https://localhost:8443" in captured["cmd"]
+        assert "https://127.0.0.1:8443" in captured["cmd"]
 
 
 # ---------------------------------------------------------------------------

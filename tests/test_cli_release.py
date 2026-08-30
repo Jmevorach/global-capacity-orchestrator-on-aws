@@ -56,7 +56,29 @@ def _invoke(*args: str):
 
 
 CONSENT = "--i-understand-this-deploys-and-destroys-infrastructure"
-BASE = ("--expected-account", "123456789012", CONSENT, "--confirm-kms-key-deletion")
+INFERENCE = (
+    "--inference-region",
+    "us-east-1",
+    "--inference-vllm-image",
+    "registry.example/vllm@sha256:" + "a" * 64,
+    "--inference-vllm-model-id",
+    "test/vllm-model",
+    "--inference-vllm-model-revision",
+    "b" * 40,
+    "--inference-tgi-image",
+    "registry.example/tgi@sha256:" + "c" * 64,
+    "--inference-tgi-model-id",
+    "test/tgi-model",
+    "--inference-tgi-model-revision",
+    "d" * 40,
+)
+BASE = (
+    "--expected-account",
+    "123456789012",
+    CONSENT,
+    "--confirm-kms-key-deletion",
+    *INFERENCE,
+)
 
 
 class TestConsentGates:
@@ -84,7 +106,11 @@ class TestConsentGates:
         )
         assert result.exit_code == 0, result.output
         assert len(fake_processes.harness_calls) == 1
-        assert "--confirm-kms-key-deletion" not in fake_processes.harness_calls[0]["command"]
+        command = fake_processes.harness_calls[0]["command"]
+        assert "--confirm-kms-key-deletion" not in command
+        assert "--inference-vllm-image" not in command
+        assert "--inference-tgi-image" not in command
+        assert "--confirm-inference-deployment" not in command
 
     def test_workload_actions_imply_deploy_for_the_kms_gate(self, fake_processes):
         """`--actions api` expands to deploy inside the harness; the KMS
@@ -93,6 +119,13 @@ class TestConsentGates:
             result = _invoke("--expected-account", "123456789012", CONSENT, "--actions", actions)
             assert result.exit_code != 0, f"--actions {actions} skipped the KMS gate"
             assert "--confirm-kms-key-deletion" in result.output
+        assert fake_processes.harness_calls == []
+
+    def test_inference_framework_images_require_distinct_digests(self, fake_processes):
+        same = "registry.example/tgi@sha256:" + "a" * 64
+        result = _invoke(*BASE, "--inference-tgi-image", same)
+        assert result.exit_code != 0
+        assert "distinct immutable digests" in result.output
         assert fake_processes.harness_calls == []
 
     def test_resume_requires_run_id_and_report_dir(self, fake_processes):
@@ -122,6 +155,15 @@ class TestHarnessInvocation:
         assert value_of("--expected-sha") == "a" * 40
         assert value_of("--expected-branch") == "test/floci-integration"
         assert value_of("--actions") == "all"
+        assert value_of("--inference-region") == "us-east-1"
+        assert value_of("--inference-vllm-image").endswith("a" * 64)
+        assert value_of("--inference-vllm-model-id") == "test/vllm-model"
+        assert value_of("--inference-vllm-model-revision") == "b" * 40
+        assert value_of("--inference-tgi-image").endswith("c" * 64)
+        assert value_of("--inference-tgi-model-id") == "test/tgi-model"
+        assert value_of("--inference-tgi-model-revision") == "d" * 40
+        assert value_of("--inference-gpu-count") == "0"
+        assert "--confirm-inference-deployment" in command
         assert value_of("--repo-root") == str(fake_processes.repo_root)
         assert "--confirm-kms-key-deletion" in command
         run_id = value_of("--run-id")
@@ -136,6 +178,21 @@ class TestHarnessInvocation:
         assert call["cwd"] == fake_processes.repo_root
         # Echoed derivations keep the operator informed without a prompt.
         assert "run-id:" in result.output and "branch:" in result.output
+
+    def test_uppercase_image_tag_is_accepted_with_digest(self, fake_processes):
+        image = "registry.example/team/vllm:CUDA12@sha256:" + "e" * 64
+        result = _invoke(*BASE, "--inference-vllm-image", image)
+        assert result.exit_code == 0, result.output
+        command = fake_processes.harness_calls[0]["command"]
+        assert command[command.index("--inference-vllm-image") + 1] == image
+
+    def test_unbounded_numeric_registry_port_is_controlled_validation_error(self, fake_processes):
+        image = "registry.example:" + "9" * 5_000 + "/team/vllm:CUDA12@sha256:" + "e" * 64
+        result = _invoke(*BASE, "--inference-vllm-image", image)
+        assert result.exit_code != 0
+        assert "immutable lowercase @sha256" in result.output
+        assert "Exceeds the limit" not in result.output
+        assert fake_processes.harness_calls == []
 
     def test_explicit_overrides_and_protected_stacks_are_forwarded(self, fake_processes, tmp_path):
         report_dir = tmp_path / "reports"
