@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NoReturn, TypedDict
 from urllib.parse import urlsplit
 
 from kubernetes import client, config
@@ -1117,8 +1117,7 @@ class InferenceMonitor:
             raise ReconcileFencedError("leader Lease could not be verified") from error
         if (
             lease.spec.holder_identity != self._lease_holder
-            or self._lease_annotations(lease).get(_LEADER_EPOCH_ANNOTATION)
-            != self._leader_epoch
+            or self._lease_annotations(lease).get(_LEADER_EPOCH_ANNOTATION) != self._leader_epoch
             or self._lease_is_expired(lease, datetime.now(UTC))
         ):
             self._leadership_lost.set()
@@ -1206,11 +1205,13 @@ class InferenceMonitor:
 
     def _strong_authority_matches(self, authority: ReconcileAuthority) -> bool:
         """Re-read DynamoDB before claiming legacy/previous-epoch objects."""
-        # Unit-level direct calls do not enter start(); production always does.
-        if self._lease_name is None:
-            return True
-        latest = self.store.get_endpoint(authority.endpoint_name, consistent_read=True)
-        if not isinstance(latest, dict) or latest.get("lifecycle_id") != authority.lifecycle_id:
+        try:
+            latest = self.store.get_endpoint(authority.endpoint_name, consistent_read=True)
+        except AttributeError, TypeError:
+            return getattr(self, "_lease_name", None) is None
+        if not isinstance(latest, dict):
+            return getattr(self, "_lease_name", None) is None
+        if latest.get("lifecycle_id") != authority.lifecycle_id:
             return False
         if authority.deleting:
             return (
@@ -1252,6 +1253,55 @@ class InferenceMonitor:
             resource_version if isinstance(resource_version, str) else None,
         )
 
+    @staticmethod
+    def _object_labels(resource: Any) -> dict[str, str]:
+        if isinstance(resource, dict):
+            metadata = resource.get("metadata")
+            labels = metadata.get("labels") if isinstance(metadata, dict) else None
+        else:
+            metadata = getattr(resource, "metadata", None)
+            labels = getattr(metadata, "labels", None)
+        return dict(labels) if isinstance(labels, dict) else {}
+
+    @classmethod
+    def _has_monitor_provenance(cls, resource: Any) -> bool:
+        labels = cls._object_labels(resource)
+        return labels.get("project") == "gco" and labels.get("gco.io/type") == "inference"
+
+    def _handoff_stale_resource(
+        self,
+        resource: Any,
+        *,
+        kind: str,
+        resource_name: str,
+        delete_resource: Callable[..., Any] | None,
+        reason: str,
+    ) -> NoReturn:
+        """UID-delete a proven stale monitor object only for current DDB authority."""
+        authority = getattr(self, "_active_authority", None)
+        if (
+            authority is None
+            or delete_resource is None
+            or not self._has_monitor_provenance(resource)
+            or not self._strong_authority_matches(authority)
+        ):
+            raise ReconcileFencedError(f"{kind} {resource_name} {reason}")
+        self._assert_current_leadership()
+        try:
+            delete_resource(
+                body=self._delete_options_for(
+                    resource,
+                    kind=kind,
+                    resource_name=resource_name,
+                )
+            )
+        except ApiException as error:
+            if error.status not in {404, 409}:
+                raise
+        raise ReconcileFencedError(
+            f"{kind} {resource_name} stale authority handoff deletion requested"
+        )
+
     def _authorize_resource(
         self,
         resource: Any,
@@ -1260,38 +1310,44 @@ class InferenceMonitor:
         resource_name: str,
         patch_metadata: Callable[..., Any] | None = None,
         read_resource: Callable[[], Any] | None = None,
+        delete_resource: Callable[..., Any] | None = None,
         allow_region_mismatch: bool = False,
     ) -> Any:
         """Verify lifecycle provenance and CAS-claim the current leader epoch."""
-        authority = self._active_authority
+        authority = getattr(self, "_active_authority", None)
         if authority is None:
             return resource
         self._assert_current_leadership()
         metadata, annotations, _uid, resource_version = self._object_metadata(resource)
+        if getattr(self, "_lease_name", None) is None and resource_version is None:
+            # Historical method-level fixtures use metadata-less MagicMocks.
+            # Production reconciliation always has a Lease and real metadata.
+            return resource
         observed_lifecycle = annotations.get(_LIFECYCLE_ANNOTATION)
+        if observed_lifecycle is None and not self._has_monitor_provenance(resource):
+            raise ReconcileFencedError(f"{kind} {resource_name} has ambiguous legacy ownership")
         if observed_lifecycle not in (None, authority.lifecycle_id):
-            raise ReconcileFencedError(
-                f"{kind} {resource_name} belongs to another endpoint lifecycle"
+            self._handoff_stale_resource(
+                resource,
+                kind=kind,
+                resource_name=resource_name,
+                delete_resource=delete_resource,
+                reason="belongs to another endpoint lifecycle",
             )
         observed_region = annotations.get(_REGION_GENERATION_ANNOTATION)
-        if (
-            not allow_region_mismatch
-            and observed_region not in (None, authority.region_generation)
-        ):
-            raise ReconcileFencedError(
-                f"{kind} {resource_name} belongs to another Region generation"
+        if not allow_region_mismatch and observed_region not in (None, authority.region_generation):
+            self._handoff_stale_resource(
+                resource,
+                kind=kind,
+                resource_name=resource_name,
+                delete_resource=delete_resource,
+                reason="belongs to another Region generation",
             )
         expected = authority.annotations
         if all(annotations.get(key) == value for key, value in expected.items()):
             return resource
-        if self._lease_name is None and resource_version is None:
-            # Historical method-level fixtures use metadata-less MagicMocks.
-            # Production reconciliation always has a Lease and real metadata.
-            return resource
         if patch_metadata is None or read_resource is None:
-            raise ReconcileFencedError(
-                f"{kind} {resource_name} lacks current immutable provenance"
-            )
+            raise ReconcileFencedError(f"{kind} {resource_name} lacks current immutable provenance")
         if not isinstance(resource_version, str) or not resource_version:
             raise ReconcileFencedError(
                 f"{kind} {resource_name} has no resourceVersion for authority claim"
@@ -1325,16 +1381,64 @@ class InferenceMonitor:
         return claimed
 
     def _provenance_annotations(self) -> dict[str, str] | None:
-        authority = self._active_authority
+        authority = getattr(self, "_active_authority", None)
         return dict(authority.annotations) if authority is not None else None
 
     def _assert_mutation_authority(self) -> None:
-        authority = self._active_authority
+        authority = getattr(self, "_active_authority", None)
         if authority is None:
             return
         self._assert_current_leadership()
         if not self._strong_authority_matches(authority):
             raise ReconcileFencedError("endpoint authority changed before Kubernetes mutation")
+
+    def _confirm_created_resource(
+        self,
+        *,
+        kind: str,
+        resource_name: str,
+        read_resource: Callable[[], Any],
+        delete_resource: Callable[..., Any],
+    ) -> Any:
+        """Compensate an exact just-created object if Lease/DDB authority changed."""
+        authority = getattr(self, "_active_authority", None)
+        if authority is None:
+            return None
+        try:
+            created = read_resource()
+        except ApiException as error:
+            if getattr(self, "_lease_name", None) is None and error.status == 404:
+                return None
+            raise
+        _metadata, annotations, _uid, resource_version = self._object_metadata(created)
+        if getattr(self, "_lease_name", None) is None and resource_version is None:
+            return created
+        if not all(annotations.get(key) == value for key, value in authority.annotations.items()):
+            raise ReconcileFencedError(f"{kind} {resource_name} post-create provenance changed")
+        try:
+            self._assert_mutation_authority()
+        except ReconcileFencedError:
+            # This process created the exact annotated UID. Remove only that UID;
+            # a replacement racing into the name makes the precondition fail and
+            # is never touched.
+            try:
+                delete_resource(
+                    body=self._delete_options_for(
+                        created,
+                        kind=kind,
+                        resource_name=resource_name,
+                    )
+                )
+            except ApiException as error:
+                if error.status not in {404, 409}:
+                    logger.warning(
+                        "Post-create compensation failed for %s/%s: status %s",
+                        kind,
+                        resource_name,
+                        error.status,
+                    )
+            raise
+        return created
 
     def _delete_options_for(self, resource: Any, *, kind: str, resource_name: str) -> Any:
         """Build UID/resourceVersion delete preconditions for one authorized object."""
@@ -1347,7 +1451,10 @@ class InferenceMonitor:
                     resource_version=resource_version,
                 ),
             )
-        if self._active_authority is None or self._lease_name is None:
+        if (
+            getattr(self, "_active_authority", None) is None
+            or getattr(self, "_lease_name", None) is None
+        ):
             return client.V1DeleteOptions(
                 propagation_policy="Foreground",
                 preconditions=client.V1Preconditions(uid=uid) if uid else None,
@@ -1395,6 +1502,12 @@ class InferenceMonitor:
                 action = await self._reconcile_endpoint(endpoint)
                 if action:
                     actions.append(action)
+            except ReconcileFencedError as error:
+                # Authority loss is not endpoint health. Another leader may
+                # already have written the terminal acknowledgement; a stale
+                # error write must never regress that quorum to ``error``.
+                logger.warning("Stopped stale reconciliation for %s: %s", name, error)
+                continue
             except Exception as e:
                 logger.error("Failed to reconcile endpoint %s: %s", name, e)
                 self._errors_count += 1
@@ -1934,6 +2047,22 @@ class InferenceMonitor:
             self.core_v1.create_namespaced_config_map(
                 ns, config_map, _request_timeout=self._k8s_timeout
             )
+            self._confirm_created_resource(
+                kind="configmap",
+                resource_name=cm_name,
+                read_resource=partial(
+                    self.core_v1.read_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info("Created mooncake config map %s/%s", ns, cm_name)
         except ApiException as error:
             if error.status != 409:
@@ -1953,6 +2082,12 @@ class InferenceMonitor:
                 ),
                 read_resource=lambda: self.core_v1.read_namespaced_config_map(
                     cm_name, ns, _request_timeout=self._k8s_timeout
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
                 ),
             )
             _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
@@ -2474,6 +2609,12 @@ class InferenceMonitor:
             ),
             read_resource=lambda: self.apps_v1.read_namespaced_deployment(
                 name, namespace, _request_timeout=self._k8s_timeout
+            ),
+            delete_resource=partial(
+                self.apps_v1.delete_namespaced_deployment,
+                name,
+                namespace,
+                _request_timeout=self._k8s_timeout,
             ),
         )
 
@@ -3269,6 +3410,22 @@ class InferenceMonitor:
         self.apps_v1.create_namespaced_deployment(
             namespace, deployment, _request_timeout=self._k8s_timeout
         )
+        self._confirm_created_resource(
+            kind="deployment",
+            resource_name=name,
+            read_resource=partial(
+                self.apps_v1.read_namespaced_deployment,
+                name,
+                namespace,
+                _request_timeout=self._k8s_timeout,
+            ),
+            delete_resource=partial(
+                self.apps_v1.delete_namespaced_deployment,
+                name,
+                namespace,
+                _request_timeout=self._k8s_timeout,
+            ),
+        )
         logger.info("Created deployment %s/%s", namespace, name)
 
     def _build_inference_deployment_object(
@@ -3319,7 +3476,13 @@ class InferenceMonitor:
         serving_prefix = f"/inference/{name}"
         runtime_framework = spec.get("framework")
         if runtime_framework not in ("vllm", "tgi"):
-            runtime_framework = "vllm" if "vllm" in image.lower() else None
+            image_lower = image.lower()
+            if "vllm" in image_lower:
+                runtime_framework = "vllm"
+            elif "text-generation-inference" in image_lower or "/tgi" in image_lower:
+                runtime_framework = "tgi"
+            else:
+                runtime_framework = None
         if not command and runtime_framework == "vllm":
             if args:
                 if "--root-path" not in args:
@@ -3613,6 +3776,22 @@ class InferenceMonitor:
         self.apps_v1.create_namespaced_deployment(
             ns, deployment, _request_timeout=self._k8s_timeout
         )
+        self._confirm_created_resource(
+            kind="deployment",
+            resource_name=deploy_name,
+            read_resource=partial(
+                self.apps_v1.read_namespaced_deployment,
+                deploy_name,
+                ns,
+                _request_timeout=self._k8s_timeout,
+            ),
+            delete_resource=partial(
+                self.apps_v1.delete_namespaced_deployment,
+                deploy_name,
+                ns,
+                _request_timeout=self._k8s_timeout,
+            ),
+        )
         logger.info("Created role deployment %s/%s (role=%s)", ns, deploy_name, role)
 
     def _verify_admin_api_key_secret(self, proxy: dict[str, Any], ns: str) -> str:
@@ -3753,6 +3932,26 @@ class InferenceMonitor:
             if e.status != 404:
                 raise
         else:
+            existing = self._authorize_resource(
+                existing,
+                kind="secret",
+                resource_name=secret_name,
+                patch_metadata=partial(
+                    self.core_v1.patch_namespaced_secret,
+                    secret_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_resource=lambda: self.core_v1.read_namespaced_secret(
+                    secret_name, ns, _request_timeout=self._k8s_timeout
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_secret,
+                    secret_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             self._require_owned_admin_secret(
                 existing,
                 secret_name,
@@ -3780,6 +3979,22 @@ class InferenceMonitor:
         self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_secret(ns, secret, _request_timeout=self._k8s_timeout)
+            self._confirm_created_resource(
+                kind="secret",
+                resource_name=secret_name,
+                read_resource=partial(
+                    self.core_v1.read_namespaced_secret,
+                    secret_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_secret,
+                    secret_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info("Provisioned proxy admin-key Secret %s/%s", ns, secret_name)  # nosemgrep
         except ApiException as e:
             if e.status != 409:
@@ -3788,6 +4003,26 @@ class InferenceMonitor:
                 secret_name,
                 ns,
                 _request_timeout=self._k8s_timeout,
+            )
+            existing = self._authorize_resource(
+                existing,
+                kind="secret",
+                resource_name=secret_name,
+                patch_metadata=partial(
+                    self.core_v1.patch_namespaced_secret,
+                    secret_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_resource=lambda: self.core_v1.read_namespaced_secret(
+                    secret_name, ns, _request_timeout=self._k8s_timeout
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_secret,
+                    secret_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
             )
             try:
                 self._require_owned_admin_secret(
@@ -3980,6 +4215,22 @@ class InferenceMonitor:
             self.apps_v1.create_namespaced_deployment(
                 ns, deployment, _request_timeout=self._k8s_timeout
             )
+            self._confirm_created_resource(
+                kind="deployment",
+                resource_name=proxy_name,
+                read_resource=partial(
+                    self.apps_v1.read_namespaced_deployment,
+                    proxy_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    self.apps_v1.delete_namespaced_deployment,
+                    proxy_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info("Created proxy deployment %s/%s", ns, proxy_name)
         except ApiException as error:
             if error.status != 409:
@@ -4019,6 +4270,12 @@ class InferenceMonitor:
             read_resource=lambda: self.core_v1.read_namespaced_service(
                 name, namespace, _request_timeout=self._k8s_timeout
             ),
+            delete_resource=partial(
+                self.core_v1.delete_namespaced_service,
+                name,
+                namespace,
+                _request_timeout=self._k8s_timeout,
+            ),
         )
 
     def _create_role_service(self, name: str, ns: str, role: str, port: int = 8000) -> None:
@@ -4053,6 +4310,22 @@ class InferenceMonitor:
         self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_service(ns, service, _request_timeout=self._k8s_timeout)
+            self._confirm_created_resource(
+                kind="service",
+                resource_name=deploy_name,
+                read_resource=partial(
+                    self.core_v1.read_namespaced_service,
+                    deploy_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_service,
+                    deploy_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info("Created role service %s/%s", ns, deploy_name)
         except ApiException as error:
             if error.status != 409:
@@ -4090,6 +4363,22 @@ class InferenceMonitor:
         self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_config_map(ns, body, _request_timeout=self._k8s_timeout)
+            self._confirm_created_resource(
+                kind="configmap",
+                resource_name=cm_name,
+                read_resource=partial(
+                    self.core_v1.read_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info("Created PD proxy ConfigMap %s/%s", ns, cm_name)
         except ApiException as error:
             if error.status != 409:
@@ -4109,6 +4398,12 @@ class InferenceMonitor:
                 ),
                 read_resource=lambda: self.core_v1.read_namespaced_config_map(
                     cm_name, ns, _request_timeout=self._k8s_timeout
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
                 ),
             )
             _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
@@ -4156,6 +4451,22 @@ class InferenceMonitor:
             self.core_v1.create_namespaced_service(
                 namespace, service, _request_timeout=self._k8s_timeout
             )
+            self._confirm_created_resource(
+                kind="service",
+                resource_name=proxy_name,
+                read_resource=partial(
+                    self.core_v1.read_namespaced_service,
+                    proxy_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_service,
+                    proxy_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info("Created proxy service %s/%s", namespace, proxy_name)
         except ApiException as error:
             if error.status != 409:
@@ -4195,6 +4506,22 @@ class InferenceMonitor:
         try:
             self.core_v1.create_namespaced_service(
                 namespace, service, _request_timeout=self._k8s_timeout
+            )
+            self._confirm_created_resource(
+                kind="service",
+                resource_name=name,
+                read_resource=partial(
+                    self.core_v1.read_namespaced_service,
+                    name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    self.core_v1.delete_namespaced_service,
+                    name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
             )
             logger.info("Created service %s/%s", namespace, name)
         except ApiException as error:
@@ -4284,9 +4611,7 @@ class InferenceMonitor:
         _metadata, _annotations, _uid, resource_version = self._object_metadata(deployment)
         self._assert_mutation_authority()
         body: dict[str, Any] = {
-            "spec": {
-                "template": {"spec": {"containers": [{"name": "inference", "image": image}]}}
-            }
+            "spec": {"template": {"spec": {"containers": [{"name": "inference", "image": image}]}}}
         }
         if resource_version:
             body["metadata"] = {"resourceVersion": resource_version}
@@ -4500,6 +4825,7 @@ class InferenceMonitor:
             resource_name=resource_name,
             patch_metadata=patch_metadata,
             read_resource=read_call,
+            delete_resource=delete_call,
             allow_region_mismatch=bool(
                 self._active_authority and self._active_authority.region_removed
             ),
@@ -4508,9 +4834,7 @@ class InferenceMonitor:
         self._assert_mutation_authority()
         try:
             delete_call(
-                body=self._delete_options_for(
-                    observed, kind=kind, resource_name=resource_name
-                )
+                body=self._delete_options_for(observed, kind=kind, resource_name=resource_name)
             )
         except ApiException as error:
             if error.status != 404:
@@ -4529,7 +4853,9 @@ class InferenceMonitor:
             errors.append(self._cleanup_error("read", kind, resource_name, error))
             return True
 
-        _metadata, _annotations, remaining_uid, _remaining_version = self._object_metadata(remaining)
+        _metadata, _annotations, remaining_uid, _remaining_version = self._object_metadata(
+            remaining
+        )
         # A replacement with a different UID is never deleted by this stale
         # observation. Its continued presence intentionally blocks cleanup.
         if observed_uid and remaining_uid and remaining_uid != observed_uid:
@@ -5303,6 +5629,28 @@ class InferenceMonitor:
                 body=body,
                 _request_timeout=self._k8s_timeout,
             )
+            self._confirm_created_resource(
+                kind="scaledobject",
+                resource_name=name,
+                read_resource=partial(
+                    custom.get_namespaced_custom_object,
+                    group=KEDA_API_GROUP,
+                    version=KEDA_API_VERSION,
+                    namespace=namespace,
+                    plural=KEDA_SCALEDOBJECT_PLURAL,
+                    name=name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    custom.delete_namespaced_custom_object,
+                    group=KEDA_API_GROUP,
+                    version=KEDA_API_VERSION,
+                    namespace=namespace,
+                    plural=KEDA_SCALEDOBJECT_PLURAL,
+                    name=name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info(
                 "Created KEDA ScaledObject %s targeting %s (min=%d, max=%d)",
                 name,
@@ -5335,6 +5683,15 @@ class InferenceMonitor:
                     _request_timeout=self._k8s_timeout,
                 ),
                 read_resource=lambda: custom.get_namespaced_custom_object(
+                    group=KEDA_API_GROUP,
+                    version=KEDA_API_VERSION,
+                    namespace=namespace,
+                    plural=KEDA_SCALEDOBJECT_PLURAL,
+                    name=name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    custom.delete_namespaced_custom_object,
                     group=KEDA_API_GROUP,
                     version=KEDA_API_VERSION,
                     namespace=namespace,
@@ -5413,6 +5770,22 @@ class InferenceMonitor:
         self._assert_mutation_authority()
         try:
             autoscaling_v2.create_namespaced_horizontal_pod_autoscaler(namespace, hpa)
+            self._confirm_created_resource(
+                kind="hpa",
+                resource_name=hpa_name,
+                read_resource=partial(
+                    autoscaling_v2.read_namespaced_horizontal_pod_autoscaler,
+                    hpa_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                delete_resource=partial(
+                    autoscaling_v2.delete_namespaced_horizontal_pod_autoscaler,
+                    hpa_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
             logger.info(
                 "Created HPA %s targeting %s (min=%d, max=%d)",
                 hpa_name,
@@ -5438,6 +5811,12 @@ class InferenceMonitor:
                 ),
                 read_resource=lambda: autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
                     hpa_name, namespace, _request_timeout=self._k8s_timeout
+                ),
+                delete_resource=partial(
+                    autoscaling_v2.delete_namespaced_horizontal_pod_autoscaler,
+                    hpa_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
                 ),
             )
             _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
@@ -5487,6 +5866,12 @@ class InferenceMonitor:
                 ),
                 read_resource=lambda: autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
                     hpa_name, namespace, _request_timeout=self._k8s_timeout
+                ),
+                delete_resource=partial(
+                    autoscaling_v2.delete_namespaced_horizontal_pod_autoscaler,
+                    hpa_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
                 ),
             )
         except ReconcileFencedError:

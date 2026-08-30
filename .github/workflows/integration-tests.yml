@@ -1456,13 +1456,13 @@ jobs:
           tls_replacements="$(
             python3 - <<'PY'
           import json
-          from gco.stacks.regional_stack import _compute_inference_proxy_tls_replacements
+          from gco.inference_proxy_config import compute_inference_proxy_tls_replacements
 
           configured = {
               "tls_proxy_cpu_request_millicores": 125,
               "tls_proxy_cpu_target_utilization_percentage": 85,
           }
-          print(json.dumps(_compute_inference_proxy_tls_replacements(configured)))
+          print(json.dumps(compute_inference_proxy_tls_replacements(configured)))
           PY
           )"
           tls_cpu_request="$(

@@ -32,8 +32,11 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 
 import click
+
+from .._image_reference import immutable_sha256_digest
 
 _ACCOUNT_RE = re.compile(r"\d{12}")
 
@@ -41,7 +44,7 @@ _ACCOUNT_RE = re.compile(r"\d{12}")
 CONSENT_FLAG = "--i-understand-this-deploys-and-destroys-infrastructure"
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise click.ClickException(message)
 
 
@@ -238,14 +241,17 @@ def release_validate(
         missing = [name for name, value in required_inference.items() if not value]
         if missing:
             _fail("The inference action requires " + ", ".join(missing) + ".")
+        image_digests: list[str] = []
         for option, image in (
             ("--inference-vllm-image", inference_vllm_image),
             ("--inference-tgi-image", inference_tgi_image),
         ):
-            if image is None or not re.fullmatch(
-                r"[^\s@]+(?:/[^\s@]+)*@sha256:[0-9a-f]{64}", image
-            ):
+            digest = immutable_sha256_digest(image)
+            if digest is None:
                 _fail(f"{option} must be an immutable lowercase @sha256: reference")
+            image_digests.append(digest)
+        if len(set(image_digests)) != 2:
+            _fail("vLLM and TGI inference images must have distinct immutable digests")
         for option, revision in (
             ("--inference-vllm-model-revision", inference_vllm_model_revision),
             ("--inference-tgi-model-revision", inference_tgi_model_revision),

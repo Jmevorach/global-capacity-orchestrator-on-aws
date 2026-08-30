@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any, cast
 
 from .inference_common import ManagedInferenceValidationError
@@ -36,14 +37,7 @@ class InferenceRuntimeMixin:
     ) -> None:  # pragma: no cover - implemented by lifecycle
         raise NotImplementedError
 
-    def _kubectl_json(
-        self,
-        record: dict[str, Any],
-        *arguments: str,
-        optional_api: bool = False,
-        deadline: float | None = None,
-    ) -> Any | None:  # pragma: no cover - implemented by inventory mixin
-        raise NotImplementedError
+    _kubectl_json: Callable[..., Any | None]
 
     def wait_for_ddb_running(self, plan: Any, record: dict[str, Any]) -> None:
         """Require this run's exact DDB record and running regional observation."""
@@ -289,9 +283,7 @@ class InferenceRuntimeMixin:
             if isinstance(deployment, dict):
                 deployment_spec = deployment.get("spec")
                 template = (
-                    deployment_spec.get("template")
-                    if isinstance(deployment_spec, dict)
-                    else None
+                    deployment_spec.get("template") if isinstance(deployment_spec, dict) else None
                 )
                 pod_spec = template.get("spec") if isinstance(template, dict) else None
                 containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
@@ -314,15 +306,11 @@ class InferenceRuntimeMixin:
                 spec_value = hpa.get("spec")
                 status_value = hpa.get("status")
                 metadata = (
-                    cast(dict[str, Any], metadata_value)
-                    if isinstance(metadata_value, dict)
-                    else {}
+                    cast(dict[str, Any], metadata_value) if isinstance(metadata_value, dict) else {}
                 )
                 spec = cast(dict[str, Any], spec_value) if isinstance(spec_value, dict) else {}
                 status = (
-                    cast(dict[str, Any], status_value)
-                    if isinstance(status_value, dict)
-                    else {}
+                    cast(dict[str, Any], status_value) if isinstance(status_value, dict) else {}
                 )
                 target = spec.get("scaleTargetRef")
                 metrics = spec.get("metrics")

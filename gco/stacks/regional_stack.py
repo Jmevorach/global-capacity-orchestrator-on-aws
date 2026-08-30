@@ -112,6 +112,9 @@ from aws_cdk import custom_resources as cr
 from constructs import Construct
 
 from gco.config.config_loader import ConfigLoader
+from gco.inference_proxy_config import (
+    compute_inference_proxy_tls_replacements as _compute_inference_proxy_tls_replacements,
+)
 from gco.manifest_security_policy import validate_manifest_security_policy
 from gco.stacks.aws_load_balancer_controller_policy import (
     aws_load_balancer_controller_policy_document,
@@ -213,20 +216,6 @@ def _compute_kubectl_regional_shared_replacements(
         "{{REGIONAL_SHARED_BUCKET}}": name,
         "{{REGIONAL_SHARED_BUCKET_ARN}}": arn,
         "{{REGIONAL_SHARED_BUCKET_REGION}}": region,
-    }
-
-
-def _compute_inference_proxy_tls_replacements(
-    config: Mapping[str, object],
-) -> dict[str, str]:
-    """Render typed inference TLS CPU placeholders for production and Kind."""
-    request = config["tls_proxy_cpu_request_millicores"]
-    target = config["tls_proxy_cpu_target_utilization_percentage"]
-    if type(request) is not int or type(target) is not int:
-        raise ValueError("validated inference proxy TLS settings must be integers")
-    return {
-        "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}": f"{request}m",
-        "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}": str(target),
     }
 
 

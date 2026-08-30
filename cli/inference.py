@@ -972,9 +972,12 @@ class InferenceManager:
     def add_region(self, endpoint_name: str, region: str) -> dict[str, Any] | None:
         """Add a target and append it to this lifecycle's cleanup history."""
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name, consistent_read=True)
-        if endpoint is None:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "added to a Region")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
+        if updated_at is None:
+            raise ValueError(f"Endpoint '{endpoint_name}' has no conditional update timestamp")
         regions = list(endpoint.get("target_regions") or [])
         cleanup_regions = list(endpoint.get("cleanup_regions") or regions)
         if region in regions:
@@ -997,10 +1000,6 @@ class InferenceManager:
         # Region appeared earlier in cleanup history. This invalidates a prior
         # terminal removal acknowledgement before resources can be recreated.
         region_generations[region] = secrets.token_hex(32)
-        lifecycle_id = endpoint.get("lifecycle_id")
-        updated_at = endpoint.get("updated_at")
-        if not isinstance(lifecycle_id, str) or not isinstance(updated_at, str):
-            raise ValueError(f"Endpoint '{endpoint_name}' has no lifecycle identity")
         try:
             return store.update_target_regions(
                 endpoint_name,
@@ -1017,9 +1016,12 @@ class InferenceManager:
     def remove_region(self, endpoint_name: str, region: str) -> dict[str, Any] | None:
         """Remove a target without erasing its authoritative cleanup history."""
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name, consistent_read=True)
-        if endpoint is None:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "removed from a Region")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
+        if updated_at is None:
+            raise ValueError(f"Endpoint '{endpoint_name}' has no conditional update timestamp")
         regions = list(endpoint.get("target_regions") or [])
         cleanup_regions = list(endpoint.get("cleanup_regions") or regions)
         if region not in regions:
@@ -1041,10 +1043,6 @@ class InferenceManager:
         # The cleanup pass must acknowledge this removal, not any earlier
         # remove/re-add cycle for the same Region.
         region_generations[region] = secrets.token_hex(32)
-        lifecycle_id = endpoint.get("lifecycle_id")
-        updated_at = endpoint.get("updated_at")
-        if not isinstance(lifecycle_id, str) or not isinstance(updated_at, str):
-            raise ValueError(f"Endpoint '{endpoint_name}' has no lifecycle identity")
         try:
             return store.update_target_regions(
                 endpoint_name,

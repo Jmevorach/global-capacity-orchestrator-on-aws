@@ -456,11 +456,15 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                 "inference stored endpoint has no immutable lifecycle identity"
             )
         closed = record.get("closed_incarnations")
-        closed_ids = {
-            entry.get("lifecycle_id")
-            for entry in closed
-            if isinstance(entry, dict) and isinstance(entry.get("lifecycle_id"), str)
-        } if isinstance(closed, list) else set()
+        closed_ids = (
+            {
+                entry.get("lifecycle_id")
+                for entry in closed
+                if isinstance(entry, dict) and isinstance(entry.get("lifecycle_id"), str)
+            }
+            if isinstance(closed, list)
+            else set()
+        )
         if lifecycle_id in closed_ids:
             raise ManagedInferenceValidationError(
                 "inference endpoint reverted to a closed lifecycle incarnation"
@@ -523,6 +527,19 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
     def _truncated(value: str) -> str:
         return value[-_MAX_PRIVATE_OUTPUT:]
 
+    def _set_invoke_journal_outcome(
+        self,
+        record: dict[str, Any],
+        status: str,
+        **values: Any,
+    ) -> None:
+        """Update the durable non-replay journal in the same checkpoint write."""
+        journal = record.get("invoke_journal")
+        if not isinstance(journal, dict):
+            raise ManagedInferenceValidationError("managed inference invoke journal is invalid")
+        journal["status"] = status
+        journal.update(values)
+
     def _run_command(
         self,
         record: dict[str, Any],
@@ -552,6 +569,13 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                     "stderr": self._truncated(str(exc.stderr or "")),
                 }
             )
+            if stage == "invoke":
+                self._set_invoke_journal_outcome(
+                    record,
+                    "ambiguous",
+                    reason="timeout",
+                    stdout=self._truncated(str(exc.stdout or "")),
+                )
             self._persist()
             raise _CommandFailure(f"{stage} timed out") from None
         except (OSError, UnicodeError) as exc:
@@ -563,6 +587,12 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                     "launch_error": f"{type(exc).__name__}: {exc}",
                 }
             )
+            if stage == "invoke":
+                self._set_invoke_journal_outcome(
+                    record,
+                    "failed",
+                    reason="launch-error",
+                )
             self._persist()
             raise _CommandFailure(f"{stage} could not start") from None
 
@@ -576,6 +606,14 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                 "stderr": self._truncated(result.stderr),
             }
         )
+        if stage == "invoke":
+            self._set_invoke_journal_outcome(
+                record,
+                "succeeded" if result.returncode == 0 else "failed",
+                returncode=result.returncode,
+                stdout=self._truncated(result.stdout),
+                stderr=self._truncated(result.stderr),
+            )
         self._persist()
         if result.returncode != 0:
             raise _CommandFailure(f"{stage} exited nonzero")
@@ -733,13 +771,44 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         self._set_phase(record, "backend-probes-verified")
 
     def invoke(self, plan: EndpointPlan, record: dict[str, Any]) -> None:
-        """Invoke through the real CLI and require actual non-empty generated text."""
+        """Invoke once, or recover a durable successful outcome without replay."""
+        command = build_invoke_command(self.settings, plan)
+        journal = record.get("invoke_journal")
+        if journal is None:
+            journal = {
+                "status": "started",
+                "framework": plan.runtime.framework,
+                "request_path": plan.runtime.request_path,
+                "argv": command,
+            }
+            record["invoke_journal"] = journal
+            self._persist()
+            output: str | None = None
+        elif not isinstance(journal, dict):
+            raise ManagedInferenceValidationError("managed inference invoke journal is invalid")
+        else:
+            if (
+                journal.get("framework") != plan.runtime.framework
+                or journal.get("request_path") != plan.runtime.request_path
+                or journal.get("argv") != command
+            ):
+                raise ManagedInferenceValidationError(
+                    "managed inference invoke journal identity changed"
+                )
+            status = journal.get("status")
+            if status == "succeeded" and isinstance(journal.get("stdout"), str):
+                output = journal["stdout"]
+            elif status in {"started", "ambiguous", "failed"}:
+                raise ManagedInferenceValidationError(
+                    "managed inference invocation has a non-replayable persisted outcome"
+                )
+            else:
+                raise ManagedInferenceValidationError(
+                    "managed inference invoke journal status is invalid"
+                )
         try:
-            output = self._run_command(
-                record,
-                "invoke",
-                build_invoke_command(self.settings, plan),
-            )
+            if output is None:
+                output = self._run_command(record, "invoke", command)
             generated_text = extract_generated_text(output, plan.runtime.framework)
         except (ManagedInferenceValidationError, _CommandFailure) as exc:
             self._record_failure(record, "invoke", exc)
@@ -750,6 +819,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
             "framework": plan.runtime.framework,
             "generated_text_non_empty": True,
             "generated_text_length": len(generated_text),
+            "replayed": False,
         }
         self._set_phase(record, "invoked")
 
@@ -765,6 +835,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
             or not isinstance(lifecycle_id, str)
             or not lifecycle_id
             or isinstance(record.get("invoke_evidence"), dict)
+            or isinstance(record.get("invoke_journal"), dict)
         ):
             return
         # Persisted booleans are not authority. Re-prove strong DDB and complete
@@ -807,6 +878,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         for key in (
             "backend_probe_evidence",
             "invoke_evidence",
+            "invoke_journal",
             "hpa_stability_observations",
             "last_hpa_replica_observation",
             "last_readiness",
@@ -834,6 +906,15 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
             record["phase"] = "validation-complete-resume"
             self._persist()
             return False
+        journal = record.get("invoke_journal")
+        if isinstance(journal, dict) and not isinstance(record.get("invoke_evidence"), dict):
+            # The invocation intent is a one-way boundary. A durable success is
+            # parsed into evidence without another request; any other persisted
+            # state fails closed and the caller's finally performs cleanup.
+            self.invoke(plan, record)
+            record["validation_steps_complete"] = True
+            self._persist()
+            return False
         self._prepare_incarnation_for_resume(plan, record)
         record["absence_proven"] = False
         self._set_phase(record, "starting")
@@ -859,7 +940,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         record["cleanup_phase"] = "checking-ownership"
         self._persist()
 
-        delete_error: BaseException | None = None
+        delete_error: Exception | None = None
         item = self._strong_get(record)
         if item is not None:
             if not self._is_owned(item):
@@ -905,7 +986,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
 
         try:
             evidence = self.prove_absence(record)
-        except BaseException as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             attempt["completed"] = False
             attempt["error"] = f"{type(exc).__name__}: {exc}"
             if delete_error is not None:
@@ -920,25 +1001,25 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
 
     def execute(self) -> dict[str, Any]:
         """Run strictly sequential endpoints and aggregate only after all cleanup attempts."""
-        primary_error: BaseException | None = None
-        cleanup_errors: list[tuple[int, BaseException]] = []
+        primary_error: Exception | KeyboardInterrupt | None = None
+        cleanup_errors: list[tuple[int, Exception | KeyboardInterrupt]] = []
         validated = 0
         self.state["phase"] = "running"
         self._persist()
 
         try:
             for plan, record in zip(self.plans, self.records, strict=True):
-                endpoint_error: BaseException | None = None
+                endpoint_error: Exception | KeyboardInterrupt | None = None
                 ran = False
                 try:
                     ran = self.run_endpoint(plan, record)
-                except BaseException as exc:
+                except (Exception, KeyboardInterrupt) as exc:
                     endpoint_error = exc
                     self._record_failure(record, str(record.get("phase", "endpoint")), exc)
                 finally:
                     try:
                         self.cleanup_endpoint(plan, record)
-                    except BaseException as exc:
+                    except (Exception, KeyboardInterrupt) as exc:
                         cleanup_errors.append((plan.ordinal, exc))
                         self._record_failure(record, "endpoint-finally-cleanup", exc)
                         if endpoint_error is None:
@@ -959,7 +1040,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
             for plan, record in zip(self.plans, self.records, strict=True):
                 try:
                     self.cleanup_endpoint(plan, record)
-                except BaseException as exc:
+                except (Exception, KeyboardInterrupt) as exc:
                     cleanup_errors.append((plan.ordinal, exc))
                     self._record_failure(record, "aggregate-finally-cleanup", exc)
 

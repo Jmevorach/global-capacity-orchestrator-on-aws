@@ -296,10 +296,13 @@ gco inference deploy vllm-llama3 \
 ```bash
 gco inference deploy tgi-mistral \
   -i ghcr.io/huggingface/text-generation-inference:3.3.7 \
+  --framework tgi \
   --port 8080 \
   --health-path /health \
   --gpu-count 1 \
-  -e MODEL_ID=mistralai/Mistral-7B-Instruct-v0.2
+  -e MODEL_ID=mistralai/Mistral-7B-Instruct-v0.2 \
+  -e REVISION=<40-lowercase-hex-model-commit> \
+  -e PORT=8080
 ```
 
 ### Triton Example

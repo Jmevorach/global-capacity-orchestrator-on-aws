@@ -458,9 +458,7 @@ class TestInferenceMonitorRole:
             ("discovery.k8s.io", "endpointslices"),
         ],
     )
-    def test_generated_children_are_strictly_read_only(
-        self, rbac_docs, api_group, resource
-    ):
+    def test_generated_children_are_strictly_read_only(self, rbac_docs, api_group, resource):
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
         matching = [
             rule
@@ -491,7 +489,7 @@ class TestInferenceMonitorRole:
     def test_inference_monitor_legacy_routes_have_exact_cleanup_verbs(
         self, rbac_docs, api_group, resource
     ):
-        """Legacy routes are readable/deletable for terminal proof, never writable."""
+        """Legacy routes allow only deterministic get/provenance-patch/delete."""
         role = _find_doc(rbac_docs, "Role", "gco-inference-monitor-role")
         rules = [
             rule
@@ -499,8 +497,8 @@ class TestInferenceMonitorRole:
             if rule.get("apiGroups") == [api_group] and rule.get("resources") == [resource]
         ]
         assert len(rules) == 1
-        assert rules[0]["verbs"] == ["get", "list", "delete"]
-        assert not ({"create", "patch", "update", "watch"} & set(rules[0]["verbs"]))
+        assert rules[0]["verbs"] == ["get", "patch", "delete"]
+        assert not ({"create", "list", "update", "watch"} & set(rules[0]["verbs"]))
 
     def test_inference_monitor_covers_mooncake_resources(self, rbac_docs):
         """Mooncake disaggregated/store endpoints need statefulsets, configmaps, secrets.

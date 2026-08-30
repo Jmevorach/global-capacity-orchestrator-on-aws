@@ -796,6 +796,8 @@ def inference_invoke(
         endpoint_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
         spec = endpoint.get("spec", {})
         image = spec.get("image", "") if isinstance(spec, dict) else ""
+        image_lower = image.lower() if isinstance(image, str) else ""
+        persisted_framework = spec.get("framework") if isinstance(spec, dict) else None
 
         parsed_data: dict[str, Any] | None = None
         if data:
@@ -813,15 +815,17 @@ def inference_invoke(
         if parsed_data is not None and stream is not None:
             parsed_data["stream"] = stream_response
 
-        # Auto-detect the API sub-path based on the container image. TGI uses a
-        # distinct route for streamed token delivery; OpenAI-compatible servers
-        # use the same route and select streaming in the JSON body.
+        # Persisted framework is authoritative for neutral/private image names;
+        # image heuristics remain only for legacy records created before that
+        # field existed.
         if api_path is None:
-            if "vllm" in image:
-                api_path = "/v1/completions"
-            elif "text-generation-inference" in image or "tgi" in image:
+            if persisted_framework == "tgi":
                 api_path = "/generate_stream" if stream_response else "/generate"
-            elif "tritonserver" in image or "triton" in image:
+            elif persisted_framework == "vllm" or "vllm" in image_lower:
+                api_path = "/v1/completions"
+            elif "text-generation-inference" in image_lower or "tgi" in image_lower:
+                api_path = "/generate_stream" if stream_response else "/generate"
+            elif "tritonserver" in image_lower or "triton" in image_lower:
                 api_path = "/v2/models"
             else:
                 api_path = "/v1/completions"
@@ -855,7 +859,9 @@ def inference_invoke(
                             break
                     # Default for vLLM with no explicit model — auto-detect
                     # by querying /v1/models on the running endpoint
-                    if model_name == endpoint_name and "vllm" in image:
+                    if model_name == endpoint_name and (
+                        persisted_framework == "vllm" or "vllm" in image_lower
+                    ):
                         try:
                             detect_client = get_aws_client(config)
                             models_path = f"/inference/{endpoint_name}/v1/models"
@@ -1235,7 +1241,14 @@ def inference_models(
         ingress_path = endpoint.get("ingress_path", f"/inference/{endpoint_name}")
         spec = endpoint.get("spec")
         persisted_framework = spec.get("framework") if isinstance(spec, dict) else None
-        selected_framework = framework or persisted_framework or "vllm"
+        image = spec.get("image") if isinstance(spec, dict) else None
+        inferred_framework = (
+            "tgi"
+            if isinstance(image, str)
+            and ("text-generation-inference" in image.lower() or "/tgi" in image.lower())
+            else "vllm"
+        )
+        selected_framework = framework or persisted_framework or inferred_framework
         if selected_framework not in ("vllm", "tgi"):
             raise ValueError("endpoint has an unsupported persisted inference framework")
         model_path = "info" if selected_framework == "tgi" else "v1/models"

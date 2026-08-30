@@ -17,6 +17,7 @@ import yaml
 from botocore.exceptions import ClientError
 from click.testing import CliRunner
 
+from cli._image_reference import immutable_sha256_digest
 from cli.inference import InferenceManager
 from cli.main import cli
 from gco.services.inference_store import InferenceEndpointStore
@@ -229,7 +230,10 @@ class TestStrictSettings:
             ("selected_region", "us-west-2"),
             (
                 "inference_runtimes",
-                (_runtime("vllm", image="registry.example/vllm@sha256:" + "9" * 64), _runtime("tgi")),
+                (
+                    _runtime("vllm", image="registry.example/vllm@sha256:" + "9" * 64),
+                    _runtime("tgi"),
+                ),
             ),
             (
                 "inference_runtimes",
@@ -271,10 +275,76 @@ class TestStrictSettings:
                 inference_runtimes=(_runtime("vllm", image=image), _runtime("tgi")),
             )
 
-    @pytest.mark.parametrize("revision", ["main", "A" * 40, "a" * 39])
-    def test_model_revision_is_full_immutable_commit(
-        self, tmp_path: Path, revision: str
+    def test_digest_parser_is_linear_on_repeated_slash_prefixes(self, tmp_path: Path) -> None:
+        adversarial = "!/" * 20_000 + "image@sha256:" + "a" * 64
+        assert immutable_sha256_digest(adversarial) is None
+        with pytest.raises(ValueError, match="@sha256"):
+            _settings(
+                tmp_path,
+                inference_runtimes=(
+                    _runtime("vllm", image=adversarial),
+                    _runtime("tgi"),
+                ),
+            )
+
+    def test_digest_parser_accepts_standard_uppercase_tags(self, tmp_path: Path) -> None:
+        image = "registry.example/team/vllm:CUDA12_4@sha256:" + "6" * 64
+        assert immutable_sha256_digest(image) == "6" * 64
+        settings = _settings(
+            tmp_path,
+            inference_runtimes=(
+                _runtime("vllm", image=image),
+                _runtime("tgi"),
+            ),
+        )
+        assert settings.inference_runtimes[0].image == image
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "repo::TAG",
+            "registry.example:abc/team/repo:TAG",
+            "registry.example:0/team/repo:TAG",
+            "repo..name:TAG",
+            "team/Uppercase-repository:TAG",
+        ],
+    )
+    def test_digest_parser_rejects_malformed_repository_grammar(self, name: str) -> None:
+        assert immutable_sha256_digest(name + "@sha256:" + "a" * 64) is None
+
+    def test_digest_parser_rejects_unbounded_numeric_port_without_raising(
+        self, tmp_path: Path
     ) -> None:
+        image = "registry.example:" + "9" * 5_000 + "/team/vllm:CUDA12@sha256:" + "a" * 64
+        assert immutable_sha256_digest(image) is None
+        with pytest.raises(ValueError, match="immutable lowercase @sha256"):
+            _settings(
+                tmp_path,
+                inference_runtimes=(
+                    _runtime("vllm", image=image),
+                    _runtime("tgi"),
+                ),
+            )
+
+    def test_framework_images_must_be_independent_digests(self, tmp_path: Path) -> None:
+        same_digest = "7" * 64
+        with pytest.raises(ValueError, match="distinct immutable digests"):
+            _settings(
+                tmp_path,
+                inference_runtimes=(
+                    _runtime(
+                        "vllm",
+                        image="registry.example/vllm@sha256:" + same_digest,
+                    ),
+                    _runtime(
+                        "tgi",
+                        image="registry.example/tgi@sha256:" + same_digest,
+                    ),
+                ),
+            )
+
+    @pytest.mark.parametrize("revision", ["main", "A" * 40, "a" * 39])
+    def test_model_revision_is_full_immutable_commit(self, tmp_path: Path, revision: str) -> None:
         with pytest.raises(ValueError, match="model_revision"):
             _settings(
                 tmp_path,
@@ -410,9 +480,7 @@ class TestNamesAndOwnership:
 class TestCommandsAndResponses:
     def test_commands_are_argument_arrays_with_noninteractive_delete(self, tmp_path: Path) -> None:
         settings = _settings(tmp_path)
-        vllm_baseline, vllm_hpa, tgi_baseline, tgi_hpa = build_endpoint_plans(
-            settings, OWNER_NONCE
-        )
+        vllm_baseline, vllm_hpa, tgi_baseline, tgi_hpa = build_endpoint_plans(settings, OWNER_NONCE)
         baseline_command = build_deploy_command(settings, vllm_baseline, OWNER_NONCE)
         hpa_command = build_deploy_command(settings, vllm_hpa, OWNER_NONCE)
         tgi_command = build_deploy_command(settings, tgi_baseline, OWNER_NONCE)
@@ -615,6 +683,27 @@ class TestSequentialAndFinallyBehavior:
             runner.execute()
         assert f"cleanup-{failing_ordinal}" in events
         assert all(f"cleanup-{ordinal}" in events for ordinal in range(1, 5))
+
+    def test_keyboard_interrupt_still_runs_all_cleanup_without_baseexception_catch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, _, _, _ = _lifecycle(tmp_path)
+        cleanup_events: list[int] = []
+        monkeypatch.setattr(
+            runner,
+            "run_endpoint",
+            lambda plan, record: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+        def cleanup(plan: EndpointPlan, record: dict[str, Any]) -> dict[str, Any]:
+            cleanup_events.append(plan.ordinal)
+            record["absence_proven"] = True
+            return {}
+
+        monkeypatch.setattr(runner, "cleanup_endpoint", cleanup)
+        with pytest.raises(KeyboardInterrupt):
+            runner.execute()
+        assert cleanup_events == [1, 1, 2, 3, 4]
 
     def test_cleanup_continues_after_one_cleanup_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1270,6 +1359,62 @@ class TestAdditionalResumeAndDeadlineSafety:
         assert records[0]["validation_steps_complete"] is True
         assert records[0]["phase"] == "validation-complete-resume"
 
+    def test_successful_invoke_journal_recovers_without_replaying(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        plan = plans[0]
+        record = records[0]
+        command = build_invoke_command(runner.settings, plan)
+        record["invoke_journal"] = {
+            "status": "succeeded",
+            "framework": plan.runtime.framework,
+            "request_path": plan.runtime.request_path,
+            "argv": command,
+            "returncode": 0,
+            "stdout": json.dumps({"choices": [{"text": "recovered"}]}),
+            "stderr": "",
+        }
+        monkeypatch.setattr(
+            runner,
+            "_run_command",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("successful invocation must not be replayed")
+            ),
+        )
+
+        assert runner.run_endpoint(plan, record) is False
+        assert record["invoke_evidence"] == {
+            "framework": "vllm",
+            "generated_text_non_empty": True,
+            "generated_text_length": len("recovered"),
+            "replayed": False,
+        }
+        assert record["validation_steps_complete"] is True
+
+    def test_ambiguous_invoke_journal_fails_closed_without_replaying(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        plan = plans[0]
+        record = records[0]
+        record["invoke_journal"] = {
+            "status": "started",
+            "framework": plan.runtime.framework,
+            "request_path": plan.runtime.request_path,
+            "argv": build_invoke_command(runner.settings, plan),
+        }
+        monkeypatch.setattr(
+            runner,
+            "_run_command",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("ambiguous invocation must not be replayed")
+            ),
+        )
+
+        with pytest.raises(ManagedInferenceValidationError, match="non-replayable"):
+            runner.run_endpoint(plan, record)
+
     def test_deletion_deadline_bounds_serial_inventory_commands(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1750,8 +1895,10 @@ class TestSharedProxyAutoscalingProof:
 
         def kubectl_json(record: dict[str, Any], *args: str, **kwargs: Any) -> Any:
             del record, kwargs
-            return self._deployment() if args[1] == "deployment" else self._hpa(
-                target=85, active=False
+            return (
+                self._deployment()
+                if args[1] == "deployment"
+                else self._hpa(target=85, active=False)
             )
 
         monkeypatch.setattr(runner, "_kubectl_json", kubectl_json)

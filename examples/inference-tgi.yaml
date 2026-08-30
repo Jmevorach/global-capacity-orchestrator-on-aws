@@ -10,8 +10,11 @@
 # Usage (recommended, multi-region aware):
 #   gco inference deploy tgi-mistral \
 #     -i ghcr.io/huggingface/text-generation-inference:3.3.7 \
+#     --framework tgi --port 8080 \
 #     --gpu-count 1 --replicas 1 \
 #     -e MODEL_ID=mistralai/Mistral-7B-Instruct-v0.3 \
+#     -e REVISION=<40-lowercase-hex-model-commit> \
+#     -e PORT=8080 \
 #     -e MAX_INPUT_TOKENS=2048 \
 #     -e MAX_TOTAL_TOKENS=4096
 #

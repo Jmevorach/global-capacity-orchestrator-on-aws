@@ -516,9 +516,11 @@ class _ConditionalInterleavingTable:
                 == values[":expected_region_generation"]
             )
         if valid and ":expected_deletion_generation" in values:
+            region = kwargs["ExpressionAttributeNames"]["#r"]
             valid = (
                 item.get("desired_state") == "deleted"
                 and item.get("deletion_generation") == values[":expected_deletion_generation"]
+                and item.get("region_status", {}).get(region, {}).get("state") != "deleted"
             )
         elif valid and ":deleted" in values:
             valid = item.get("desired_state") != values[":deleted"]
@@ -611,6 +613,36 @@ class TestCrossMonitorInterleavings:
             expected_deletion_generation="delete-1",
         )
         assert store._table.item is not None
+
+    def test_terminal_deletion_ack_rejects_same_generation_error_regression(self):
+        store = _stateful_store(
+            {
+                "endpoint_name": "ep",
+                "desired_state": "deleted",
+                "lifecycle_id": "life-1",
+                "deletion_generation": "delete-1",
+                "updated_at": "terminal",
+                "region_status": {
+                    "eu-west-1": {
+                        "state": "deleted",
+                        "lifecycle_id": "life-1",
+                        "deletion_generation": "delete-1",
+                        "absence_observations": 2,
+                    }
+                },
+            }
+        )
+
+        assert not store.update_region_status(
+            "ep",
+            "eu-west-1",
+            "error",
+            error="stale leader lost authority",
+            expected_lifecycle_id="life-1",
+            expected_deletion_generation="delete-1",
+        )
+        assert store._table.item["updated_at"] == "terminal"
+        assert store._table.item["region_status"]["eu-west-1"]["state"] == "deleted"
 
     def test_terminal_transition_rejects_same_lifecycle_ordinary_status(self):
         store = _stateful_store(

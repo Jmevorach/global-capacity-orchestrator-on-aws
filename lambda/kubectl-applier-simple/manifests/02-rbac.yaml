@@ -350,14 +350,15 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "create", "patch", "delete"]
 
-  # Temporary upgrade cleanup: terminal proof reads and foreground-deletes
-  # historical endpoint-specific Ingresses and HTTPRoutes.
+  # Temporary upgrade cleanup: terminal proof gets, provenance-patches, and
+  # UID/resourceVersion-deletes historical endpoint-specific routes. List is
+  # intentionally omitted because cleanup uses deterministic names.
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["get", "list", "delete"]
+    verbs: ["get", "patch", "delete"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
-    verbs: ["get", "list", "delete"]
+    verbs: ["get", "patch", "delete"]
 
   # Networking resources — NetworkPolicy allow rules that let inference pods
   # reach the shared Mooncake master RPC/metadata ports and each other on the

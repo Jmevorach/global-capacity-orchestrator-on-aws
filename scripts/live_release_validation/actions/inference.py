@@ -55,7 +55,7 @@ def action_inference(ctx: RunContext) -> dict[str, Any]:
             return lifecycle.execute()
     except ManagedInferenceValidationError:
         raise
-    except BaseException as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         state["session_error"] = f"{type(exc).__name__}: {exc}"
         ctx.persist()
         if not isinstance(exc, Exception):

@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from cli._image_reference import immutable_sha256_digest
+
 Framework = Literal["vllm", "tgi"]
 
 INFERENCE_OWNER_LABEL = "gco-managed-inference-validation-owner"
@@ -45,7 +47,6 @@ class InferenceRuntimeSpec:
         return _MODEL_INFO_PATHS[self.framework]
 
 
-
 def _plain_positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
@@ -53,7 +54,7 @@ def _plain_positive_int(value: object) -> bool:
 def _validate_runtime(runtime: InferenceRuntimeSpec) -> None:
     if runtime.framework not in _FRAMEWORK_ORDER:
         raise ValueError("inference runtime framework must be 'vllm' or 'tgi'")
-    if not re.fullmatch(r"[^\s@]+(?:/[^\s@]+)*@sha256:[0-9a-f]{64}", runtime.image):
+    if immutable_sha256_digest(runtime.image) is None:
         raise ValueError(
             f"{runtime.framework} image must be an immutable lowercase @sha256: reference"
         )
@@ -81,6 +82,9 @@ def validate_inference_settings(settings: Any) -> None:
         raise ValueError("managed inference validation requires vLLM then TGI runtime specs")
     for runtime in runtimes:
         _validate_runtime(runtime)
+    image_digests = [runtime.image.rsplit("@sha256:", 1)[1] for runtime in runtimes]
+    if len(set(image_digests)) != len(image_digests):
+        raise ValueError("vLLM and TGI runtime images must have distinct immutable digests")
     if not settings.request_prompt.strip():
         raise ValueError("request_prompt must be non-empty")
     if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", settings.namespace):
@@ -212,7 +216,9 @@ def inference_identity_fields(settings: Any) -> dict[str, Any]:
     return {
         "contract_version": INFERENCE_CONTRACT_VERSION,
         "selected_region": settings.selected_region,
-        "runtimes": [_runtime_identity(settings, runtime) for runtime in settings.inference_runtimes],
+        "runtimes": [
+            _runtime_identity(settings, runtime) for runtime in settings.inference_runtimes
+        ],
         "endpoint_contract": {
             "count": settings.endpoint_count,
             "namespace": settings.namespace,

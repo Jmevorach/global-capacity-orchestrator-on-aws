@@ -32,6 +32,10 @@ from typing import Any, cast
 import boto3
 from aws_cdk import App
 
+from gco.inference_proxy_config import (
+    INFERENCE_PROXY_TLS_CPU_REQUEST_MILLICORES_DEFAULT,
+    INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION_DEFAULT,
+)
 from gco.manifest_security_policy import validate_manifest_security_policy
 from gco.models import ClusterConfig, ResourceThresholds
 from gco.stacks.constants import (
@@ -1266,8 +1270,12 @@ class ConfigLoader:
         ``None`` follows the same default-preserving contract.
         """
         defaults = {
-            "tls_proxy_cpu_request_millicores": 100,
-            "tls_proxy_cpu_target_utilization_percentage": 70,
+            "tls_proxy_cpu_request_millicores": (
+                INFERENCE_PROXY_TLS_CPU_REQUEST_MILLICORES_DEFAULT
+            ),
+            "tls_proxy_cpu_target_utilization_percentage": (
+                INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION_DEFAULT
+            ),
         }
         configured = self.app.node.try_get_context("inference_proxy")
         if configured is None:

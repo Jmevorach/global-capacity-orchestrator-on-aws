@@ -4673,6 +4673,54 @@ class TestLocalOnlyRuntime:
         assert identity["shared_proxy_contract"]["tls_cpu_request"] == "125m"
         assert identity["shared_proxy_contract"]["tls_cpu_target"] == 85
 
+    @pytest.mark.parametrize("proxy_value", ["missing", None])
+    def test_main_inference_cli_uses_production_tls_defaults_when_block_omitted_or_null(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        proxy_value: object,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+
+        context: dict[str, object] = {}
+        if proxy_value != "missing":
+            context["inference_proxy"] = proxy_value
+        (tmp_path / "cdk.json").write_text(json.dumps({"context": context}), encoding="utf-8")
+        parser = live_main._build_parser()
+        args = parser.parse_args(
+            [
+                "--expected-account",
+                "123456789012",
+                "--expected-sha",
+                "a" * 40,
+                "--expected-branch",
+                "chore/test",
+                "--actions",
+                "inference",
+                "--inference-region",
+                "us-east-1",
+                "--inference-vllm-image",
+                "registry.example/vllm@sha256:" + "b" * 64,
+                "--inference-vllm-model-id",
+                "publisher/vllm-model",
+                "--inference-vllm-model-revision",
+                "c" * 40,
+                "--inference-tgi-image",
+                "registry.example/tgi@sha256:" + "d" * 64,
+                "--inference-tgi-model-id",
+                "publisher/tgi-model",
+                "--inference-tgi-model-revision",
+                "e" * 40,
+                "--confirm-inference-deployment",
+            ]
+        )
+        monkeypatch.setattr(live_main, "_repository_root", lambda _value: tmp_path)
+
+        settings = live_main._settings_from_args(parser, args)
+
+        assert settings.proxy_tls_cpu_request == "100m"
+        assert settings.proxy_tls_cpu_target == 70
+
     def test_detached_head_does_not_consume_github_branch_variables(
         self,
         tmp_path: Path,

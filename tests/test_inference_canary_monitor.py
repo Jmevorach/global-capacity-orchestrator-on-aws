@@ -11,7 +11,7 @@ cleanup when the canary field is removed. Kubernetes APIs are fully mocked.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from kubernetes.client.rest import ApiException
@@ -197,10 +197,10 @@ class TestCleanupCanary:
         monitor._cleanup_canary("ep", "ns")
 
         monitor.apps_v1.delete_namespaced_deployment.assert_called_once_with(
-            "ep-canary", "ns", _request_timeout=30
+            "ep-canary", "ns", body=ANY, _request_timeout=30
         )
         monitor.core_v1.delete_namespaced_service.assert_called_once_with(
-            "ep-canary", "ns", _request_timeout=30
+            "ep-canary", "ns", body=ANY, _request_timeout=30
         )
 
     def test_handles_404_gracefully(self, monitor):

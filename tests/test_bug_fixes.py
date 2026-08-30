@@ -23,7 +23,7 @@ import pytest
 
 
 class TestAddRegionTimestamp:
-    """Verify add_region sets updated_at to an ISO timestamp, not a region name."""
+    """Verify add_region migrates legacy identity and writes conditionally."""
 
     @pytest.fixture
     def manager(self):
@@ -34,65 +34,66 @@ class TestAddRegionTimestamp:
         mgr._aws_client = MagicMock()
         return mgr
 
-    def test_add_region_sets_iso_timestamp(self, manager):
-        """updated_at should be an ISO 8601 timestamp, not a region name."""
-        mock_store = MagicMock()
-        mock_store.get_endpoint.return_value = {
+    @staticmethod
+    def _legacy_and_migrated(*, include_region: bool = False):
+        regions = ["us-east-1", *(["eu-west-1"] if include_region else [])]
+        legacy = {
             "endpoint_name": "my-ep",
-            "target_regions": ["us-east-1"],
+            "desired_state": "running",
+            "target_regions": regions,
+            "updated_at": "2026-01-01T00:00:00+00:00",
         }
-        mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "my-ep"}}
+        migrated = {
+            **legacy,
+            "lifecycle_id": "life-1",
+            "cleanup_regions": list(regions),
+            "region_generations": {region: f"generation-{region}" for region in regions},
+            "updated_at": "2026-01-01T00:00:01+00:00",
+        }
+        return legacy, migrated
+
+    def test_add_region_migrates_legacy_identity_and_uses_timestamp(self, manager):
+        mock_store = MagicMock()
+        legacy, migrated = self._legacy_and_migrated()
+        mock_store.get_endpoint.return_value = legacy
+        mock_store.ensure_lifecycle_metadata.return_value = migrated
+        mock_store.update_target_regions.return_value = {"endpoint_name": "my-ep"}
         manager._get_store = MagicMock(return_value=mock_store)
 
         manager.add_region("my-ep", "eu-west-1")
 
-        call_args = mock_store._table.update_item.call_args
-        updated_at = call_args[1]["ExpressionAttributeValues"][":u"]
+        mock_store.ensure_lifecycle_metadata.assert_called_once_with(legacy)
+        kwargs = mock_store.update_target_regions.call_args.kwargs
+        datetime.fromisoformat(kwargs["expected_updated_at"])
+        assert kwargs["expected_updated_at"] == migrated["updated_at"]
+        assert kwargs["expected_lifecycle_id"] == "life-1"
 
-        # Should be a valid ISO timestamp, not a region name
-        assert "T" in updated_at, f"Expected ISO timestamp, got: {updated_at}"
-        # Should be parseable as a datetime
-        datetime.fromisoformat(updated_at)
-        # Should NOT be a region name
-        assert updated_at not in (
-            "us-east-1",
-            "us-west-2",
-            "eu-west-1",
-            "ap-southeast-1",
-        )
-
-    def test_add_region_includes_new_region_in_list(self, manager):
-        """The new region should be appended to the target_regions list."""
+    def test_add_region_includes_new_region_in_conditional_write(self, manager):
         mock_store = MagicMock()
-        mock_store.get_endpoint.return_value = {
-            "endpoint_name": "my-ep",
-            "target_regions": ["us-east-1"],
-        }
-        mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "my-ep"}}
+        legacy, migrated = self._legacy_and_migrated()
+        mock_store.get_endpoint.return_value = legacy
+        mock_store.ensure_lifecycle_metadata.return_value = migrated
+        mock_store.update_target_regions.return_value = {"endpoint_name": "my-ep"}
         manager._get_store = MagicMock(return_value=mock_store)
 
         manager.add_region("my-ep", "eu-west-1")
 
-        call_args = mock_store._table.update_item.call_args
-        regions = call_args[1]["ExpressionAttributeValues"][":r"]
-        assert "eu-west-1" in regions
-        assert "us-east-1" in regions
+        args = mock_store.update_target_regions.call_args.args
+        assert args[1] == ["us-east-1", "eu-west-1"]
+        assert args[2] == ["us-east-1", "eu-west-1"]
+        assert set(args[3]) == {"us-east-1", "eu-west-1"}
 
     def test_add_region_does_not_duplicate(self, manager):
-        """Adding an already-present region should not duplicate it."""
         mock_store = MagicMock()
-        mock_store.get_endpoint.return_value = {
-            "endpoint_name": "my-ep",
-            "target_regions": ["us-east-1", "eu-west-1"],
-        }
-        mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "my-ep"}}
+        legacy, migrated = self._legacy_and_migrated(include_region=True)
+        mock_store.get_endpoint.return_value = legacy
+        mock_store.ensure_lifecycle_metadata.return_value = migrated
         manager._get_store = MagicMock(return_value=mock_store)
 
-        manager.add_region("my-ep", "eu-west-1")
+        result = manager.add_region("my-ep", "eu-west-1")
 
-        call_args = mock_store._table.update_item.call_args
-        regions = call_args[1]["ExpressionAttributeValues"][":r"]
-        assert regions.count("eu-west-1") == 1
+        assert result == migrated
+        mock_store.update_target_regions.assert_not_called()
 
 
 # ============================================================================
@@ -117,6 +118,8 @@ class TestPromoteCanaryValidation:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "spec": {"image": "old:v1", "canary": {"weight": 10, "replicas": 1}},
         }
         manager._get_store = MagicMock(return_value=mock_store)
@@ -129,6 +132,8 @@ class TestPromoteCanaryValidation:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "spec": {"image": "old:v1"},
         }
         manager._get_store = MagicMock(return_value=mock_store)
@@ -141,6 +146,8 @@ class TestPromoteCanaryValidation:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "spec": {
                 "image": "old:v1",
                 "canary": {"image": "new:v2", "weight": 20, "replicas": 1},
@@ -190,6 +197,8 @@ class TestRollbackCanary:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "spec": {
                 "image": "primary:v1",
                 "canary": {"image": "canary:v2", "weight": 10},
@@ -211,6 +220,8 @@ class TestRollbackCanary:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "spec": {"image": "primary:v1"},
         }
         manager._get_store = MagicMock(return_value=mock_store)
@@ -251,6 +262,8 @@ class TestCanaryDeployValidation:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "desired_state": "stopped",
             "spec": {"image": "old:v1"},
         }

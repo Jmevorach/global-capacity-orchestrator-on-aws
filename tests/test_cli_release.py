@@ -121,6 +121,13 @@ class TestConsentGates:
             assert "--confirm-kms-key-deletion" in result.output
         assert fake_processes.harness_calls == []
 
+    def test_inference_framework_images_require_distinct_digests(self, fake_processes):
+        same = "registry.example/tgi@sha256:" + "a" * 64
+        result = _invoke(*BASE, "--inference-tgi-image", same)
+        assert result.exit_code != 0
+        assert "distinct immutable digests" in result.output
+        assert fake_processes.harness_calls == []
+
     def test_resume_requires_run_id_and_report_dir(self, fake_processes):
         result = _invoke(*BASE, "--resume")
         assert result.exit_code != 0
@@ -171,6 +178,21 @@ class TestHarnessInvocation:
         assert call["cwd"] == fake_processes.repo_root
         # Echoed derivations keep the operator informed without a prompt.
         assert "run-id:" in result.output and "branch:" in result.output
+
+    def test_uppercase_image_tag_is_accepted_with_digest(self, fake_processes):
+        image = "registry.example/team/vllm:CUDA12@sha256:" + "e" * 64
+        result = _invoke(*BASE, "--inference-vllm-image", image)
+        assert result.exit_code == 0, result.output
+        command = fake_processes.harness_calls[0]["command"]
+        assert command[command.index("--inference-vllm-image") + 1] == image
+
+    def test_unbounded_numeric_registry_port_is_controlled_validation_error(self, fake_processes):
+        image = "registry.example:" + "9" * 5_000 + "/team/vllm:CUDA12@sha256:" + "e" * 64
+        result = _invoke(*BASE, "--inference-vllm-image", image)
+        assert result.exit_code != 0
+        assert "immutable lowercase @sha256" in result.output
+        assert "Exceeds the limit" not in result.output
+        assert fake_processes.harness_calls == []
 
     def test_explicit_overrides_and_protected_stacks_are_forwarded(self, fake_processes, tmp_path):
         report_dir = tmp_path / "reports"

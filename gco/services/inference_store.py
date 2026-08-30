@@ -464,6 +464,7 @@ class InferenceEndpointStore:
             status_value.update(extra)
 
         condition = "attribute_exists(endpoint_name)"
+        names: dict[str, str] = {"#r": region}
         values: dict[str, Any] = {":s": status_value, ":u": _utc_now_iso()}
         if expected_lifecycle_id is not None:
             condition += " AND lifecycle_id = :expected_lifecycle_id"
@@ -474,9 +475,13 @@ class InferenceEndpointStore:
         if expected_deletion_generation is not None:
             condition += (
                 " AND desired_state = :deleted "
-                "AND deletion_generation = :expected_deletion_generation"
+                "AND deletion_generation = :expected_deletion_generation "
+                "AND (attribute_not_exists(region_status.#r.#state) "
+                "OR region_status.#r.#state <> :terminal_deleted)"
             )
+            names["#state"] = "state"
             values[":deleted"] = "deleted"
+            values[":terminal_deleted"] = "deleted"
             values[":expected_deletion_generation"] = expected_deletion_generation
         else:
             # Ordinary observations are never allowed to overwrite a terminal
@@ -490,7 +495,7 @@ class InferenceEndpointStore:
             self._table.update_item(
                 Key={"endpoint_name": endpoint_name},
                 UpdateExpression="SET region_status.#r = :s, updated_at = :u",
-                ExpressionAttributeNames={"#r": region},
+                ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,
                 ConditionExpression=condition,
             )

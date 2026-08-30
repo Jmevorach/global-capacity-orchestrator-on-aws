@@ -176,6 +176,29 @@ async def test_reconcile_isolates_one_endpoint_failure_and_continues() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reconcile_does_not_turn_authority_loss_into_endpoint_error() -> None:
+    store = MagicMock()
+    endpoint = {
+        "endpoint_name": "terminal",
+        "desired_state": "deleted",
+        "lifecycle_id": LIFECYCLE_ID,
+        "deletion_generation": DELETION_GENERATION,
+    }
+    store.list_endpoints.return_value = [endpoint]
+    store.get_endpoint.return_value = endpoint
+    monitor = _make_monitor(store)
+
+    with patch.object(
+        monitor,
+        "_reconcile_endpoint",
+        AsyncMock(side_effect=ReconcileFencedError("leader Lease was lost")),
+    ):
+        assert await monitor.reconcile() == []
+
+    store.update_region_status.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_purges_only_fresh_current_generation_quorum() -> None:
     store = MagicMock()
     eligible = _deleted_endpoint(
@@ -1323,6 +1346,7 @@ class TestKubernetesLifecycleFencing:
                     "gco.io/region-generation": region_generation,
                     "gco.io/leader-epoch": epoch,
                 },
+                labels={"app": "ep", "project": "gco", "gco.io/type": "inference"},
                 uid=uid,
                 resource_version=rv,
             )
@@ -1337,6 +1361,12 @@ class TestKubernetesLifecycleFencing:
             leader_epoch="epoch-1",
             deleting=True,
         )
+        monitor.store.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-2",
+            "desired_state": "running",
+            "region_generations": {monitor.region: "region-2"},
+        }
         replacement = self._resource(
             lifecycle="life-2",
             region_generation="region-2",
@@ -1358,6 +1388,124 @@ class TestKubernetesLifecycleFencing:
             )
 
         delete.assert_not_called()
+
+    def test_current_authority_uid_deletes_previous_region_generation(self) -> None:
+        monitor = _make_monitor()
+        monitor._active_authority = ReconcileAuthority(
+            endpoint_name="ep",
+            lifecycle_id="life-2",
+            region_generation="region-2",
+            leader_epoch="epoch-2",
+        )
+        monitor.store.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-2",
+            "desired_state": "running",
+            "region_generations": {monitor.region: "region-2"},
+        }
+        previous = self._resource(
+            lifecycle="life-2",
+            region_generation="region-1",
+            epoch="epoch-1",
+        )
+        delete = MagicMock()
+
+        with pytest.raises(ReconcileFencedError, match="handoff deletion requested"):
+            monitor._authorize_resource(
+                previous,
+                kind="deployment",
+                resource_name="ep",
+                patch_metadata=MagicMock(),
+                read_resource=lambda: previous,
+                delete_resource=delete,
+            )
+
+        options = delete.call_args.kwargs["body"]
+        assert options.preconditions.uid == "uid-1"
+        assert options.preconditions.resource_version == "7"
+
+    def test_post_create_authority_loss_compensates_only_created_uid(self) -> None:
+        monitor = _make_monitor()
+        monitor._active_authority = ReconcileAuthority(
+            endpoint_name="ep",
+            lifecycle_id="life-1",
+            region_generation="region-1",
+            leader_epoch="epoch-1",
+        )
+        created = self._resource(
+            lifecycle="life-1",
+            region_generation="region-1",
+            epoch="epoch-1",
+        )
+        monitor._assert_mutation_authority = MagicMock(  # type: ignore[method-assign]
+            side_effect=ReconcileFencedError("authority changed")
+        )
+        delete = MagicMock()
+
+        with pytest.raises(ReconcileFencedError, match="authority changed"):
+            monitor._confirm_created_resource(
+                kind="deployment",
+                resource_name="ep",
+                read_resource=lambda: created,
+                delete_resource=delete,
+            )
+
+        options = delete.call_args.kwargs["body"]
+        assert options.preconditions.uid == "uid-1"
+        assert options.preconditions.resource_version == "7"
+
+    def test_unannotated_legacy_route_is_patched_then_uid_deleted(self) -> None:
+        monitor = _make_monitor()
+        authority = ReconcileAuthority(
+            endpoint_name="ep",
+            lifecycle_id="life-1",
+            region_generation="region-1",
+            leader_epoch="epoch-1",
+            deleting=True,
+            deletion_generation="delete-1",
+        )
+        monitor._active_authority = authority
+        monitor.store.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-1",
+            "desired_state": "deleted",
+            "deletion_generation": "delete-1",
+            "region_generations": {monitor.region: "region-1"},
+        }
+        legacy = self._resource(
+            lifecycle="life-1",
+            region_generation="region-1",
+            epoch="epoch-1",
+        )
+        legacy.metadata.annotations = {}
+        claimed = self._resource(
+            lifecycle="life-1",
+            region_generation="region-1",
+            epoch="epoch-1",
+        )
+        observations = iter((legacy, claimed, ApiException(status=404)))
+
+        def read():
+            value = next(observations)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        patch_metadata = MagicMock()
+        delete = MagicMock()
+        assert monitor._delete_and_confirm(
+            kind="ingress",
+            resource_name="ep",
+            delete_call=delete,
+            read_call=read,
+            patch_metadata=patch_metadata,
+            pending=[],
+            errors=[],
+        )
+        assert patch_metadata.call_args.kwargs["body"]["metadata"]["annotations"] == (
+            authority.annotations
+        )
+        assert delete.call_args.kwargs["body"].preconditions.uid == "uid-1"
 
     def test_delete_is_bound_to_observed_uid_and_resource_version(self) -> None:
         monitor = _make_monitor()
@@ -1465,3 +1613,20 @@ def test_tgi_renderer_uses_official_unprefixed_startup_contract_and_provenance()
     }
     assert deployment.metadata.annotations == expected
     assert deployment.spec.template.metadata.annotations == expected
+
+
+def test_legacy_official_tgi_image_infers_tgi_probe_contract() -> None:
+    monitor = _make_monitor()
+    deployment = _build_deployment(
+        monitor,
+        {
+            "image": "ghcr.io/huggingface/text-generation-inference:3.3.7",
+            "port": 8080,
+            "health_check_path": "/health",
+            "env": {"MODEL_ID": "test/model", "PORT": "8080"},
+        },
+    )
+    container = deployment.spec.template.spec.containers[0]
+    assert container.startup_probe is not None
+    assert container.startup_probe.http_get.path == "/health"
+    assert not container.args or "--root-path" not in container.args

@@ -156,41 +156,54 @@ class TestDeployAllOptions:
 
 
 class TestRemoveRegionTimestamp:
-    """Tests for remove_region timestamp format."""
+    """Tests for legacy migration and conditional remove_region writes."""
 
-    def test_remove_region_sets_iso_timestamp(self, manager):
-        """remove_region should set updated_at to an ISO timestamp."""
+    @staticmethod
+    def _store():
         mock_store = MagicMock()
-        mock_store.get_endpoint.return_value = {
+        legacy = {
             "endpoint_name": "ep",
+            "desired_state": "running",
             "target_regions": ["us-east-1", "eu-west-1"],
+            "updated_at": "2026-01-01T00:00:00+00:00",
         }
-        mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "ep"}}
+        migrated = {
+            **legacy,
+            "lifecycle_id": "life-1",
+            "cleanup_regions": ["us-east-1", "eu-west-1"],
+            "region_generations": {
+                "us-east-1": "generation-east",
+                "eu-west-1": "generation-west",
+            },
+            "updated_at": "2026-01-01T00:00:01+00:00",
+        }
+        mock_store.get_endpoint.return_value = legacy
+        mock_store.ensure_lifecycle_metadata.return_value = migrated
+        mock_store.update_target_regions.return_value = {"endpoint_name": "ep"}
+        return mock_store, legacy, migrated
+
+    def test_remove_region_migrates_and_uses_iso_timestamp(self, manager):
+        mock_store, legacy, migrated = self._store()
         manager._get_store = MagicMock(return_value=mock_store)
 
         manager.remove_region("ep", "eu-west-1")
 
-        call_args = mock_store._table.update_item.call_args
-        updated_at = call_args[1]["ExpressionAttributeValues"][":u"]
-        assert "T" in updated_at
-        datetime.fromisoformat(updated_at)
+        mock_store.ensure_lifecycle_metadata.assert_called_once_with(legacy)
+        kwargs = mock_store.update_target_regions.call_args.kwargs
+        datetime.fromisoformat(kwargs["expected_updated_at"])
+        assert kwargs["expected_updated_at"] == migrated["updated_at"]
+        assert kwargs["expected_lifecycle_id"] == "life-1"
 
-    def test_remove_region_removes_from_list(self, manager):
-        """remove_region should remove the region from the list."""
-        mock_store = MagicMock()
-        mock_store.get_endpoint.return_value = {
-            "endpoint_name": "ep",
-            "target_regions": ["us-east-1", "eu-west-1"],
-        }
-        mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "ep"}}
+    def test_remove_region_removes_from_conditional_write(self, manager):
+        mock_store, _legacy, _migrated = self._store()
         manager._get_store = MagicMock(return_value=mock_store)
 
         manager.remove_region("ep", "eu-west-1")
 
-        call_args = mock_store._table.update_item.call_args
-        regions = call_args[1]["ExpressionAttributeValues"][":r"]
-        assert "eu-west-1" not in regions
-        assert "us-east-1" in regions
+        args = mock_store.update_target_regions.call_args.args
+        assert args[1] == ["us-east-1"]
+        assert args[2] == ["us-east-1", "eu-west-1"]
+        assert set(args[3]) == {"us-east-1", "eu-west-1"}
 
 
 class TestCanaryDeploySuccess:
@@ -201,6 +214,8 @@ class TestCanaryDeploySuccess:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "desired_state": "running",
             "spec": {"image": "primary:v1", "port": 8000},
         }
