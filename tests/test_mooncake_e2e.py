@@ -77,6 +77,11 @@ class _FakeAppsApi:
         self.deployments[name] = deployment
         return deployment
 
+    def delete_namespaced_deployment(self, name, namespace, **_kw):
+        if name not in self.deployments:
+            raise ApiException(status=404, reason="Not Found")
+        return self.deployments.pop(name)
+
     def patch_namespaced_deployment(self, name, namespace, body=None, **_kw):
         if hasattr(body, "spec"):
             self.deployments[name] = body
@@ -118,6 +123,23 @@ class _FakeCoreApi:
         self.services[name] = service
         return service
 
+    def read_namespaced_service(self, name, namespace, **_kw):
+        if name not in self.services:
+            raise ApiException(status=404, reason="Not Found")
+        return self.services[name]
+
+    def patch_namespaced_service(self, name, namespace, body=None, **_kw):
+        if name not in self.services:
+            raise ApiException(status=404, reason="Not Found")
+        if hasattr(body, "spec"):
+            self.services[name] = body
+        return self.services[name]
+
+    def delete_namespaced_service(self, name, namespace, **_kw):
+        if name not in self.services:
+            raise ApiException(status=404, reason="Not Found")
+        return self.services.pop(name)
+
     def read_namespaced_secret(self, name, namespace, **_kw):
         return self._secret
 
@@ -127,6 +149,16 @@ class _FakeCoreApi:
             raise ApiException(status=409, reason="Conflict")
         self.config_maps[name] = config_map
         return config_map
+
+    def read_namespaced_config_map(self, name, namespace, **_kw):
+        if name not in self.config_maps:
+            raise ApiException(status=404, reason="Not Found")
+        return self.config_maps[name]
+
+    def delete_namespaced_config_map(self, name, namespace, **_kw):
+        if name not in self.config_maps:
+            raise ApiException(status=404, reason="Not Found")
+        return self.config_maps.pop(name)
 
     def patch_namespaced_config_map(self, name, namespace, config_map, **_kw):
         self.config_maps[name] = config_map
