@@ -557,6 +557,27 @@ class TestCommandsAndResponses:
         assert captured["shell"] is False
         assert captured["env"]["KUBECONFIG"] == str(runner.kubeconfig_path)
 
+    def test_subprocess_timeout_is_clamped_to_phase_deadline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, _, records, _ = _lifecycle(tmp_path)
+        captured: dict[str, Any] = {}
+
+        def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(lifecycle_module.time, "monotonic", lambda: 9.0)
+        monkeypatch.setattr(lifecycle_module.subprocess, "run", fake_run)
+        runner._run_command(
+            records[0],
+            "health",
+            ["gco", "inference", "health"],
+            deadline=10.25,
+        )
+
+        assert captured["timeout"] == pytest.approx(1.25)
+
     @pytest.mark.parametrize(
         ("framework", "payload", "expected"),
         [
@@ -1698,10 +1719,16 @@ class TestBackendProbeContracts:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner, plans, records, _ = _lifecycle(tmp_path)
+        runner.table.item = _owned_item(runner.settings, plans[0], runner.owner_nonce)
         stages: list[str] = []
 
-        def run_command(record: dict[str, Any], stage: str, command: list[str]) -> str:
-            del record, command
+        def run_command(
+            record: dict[str, Any],
+            stage: str,
+            command: list[str],
+            **kwargs: Any,
+        ) -> str:
+            del record, command, kwargs
             stages.append(stage)
             if stage == "health":
                 return json.dumps({"status": "healthy", "http_status": 200})
@@ -1732,10 +1759,16 @@ class TestBackendProbeContracts:
         runner, plans, records, _ = _lifecycle(tmp_path, settings=settings)
         plan = plans[2]
         record = records[2]
+        runner.table.item = _owned_item(settings, plan, runner.owner_nonce)
         stages: list[str] = []
 
-        def run_command(checkpoint: dict[str, Any], stage: str, command: list[str]) -> str:
-            del checkpoint, command
+        def run_command(
+            checkpoint: dict[str, Any],
+            stage: str,
+            command: list[str],
+            **kwargs: Any,
+        ) -> str:
+            del checkpoint, command, kwargs
             stages.append(stage)
             if stage == "health":
                 return json.dumps({"status": "healthy", "http_status": 204})
@@ -1756,18 +1789,162 @@ class TestBackendProbeContracts:
             "configured_revision_present": True,
         }
 
-    def test_unhealthy_probe_fails_before_inference_invocation(
+    def test_health_502_then_healthy_converges_and_records_attempts(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner, plans, records, _ = _lifecycle(tmp_path)
+        plan = plans[0]
+        record = records[0]
+        runner.table.item = _owned_item(runner.settings, plan, runner.owner_nonce)
+        clock = SimpleNamespace(now=0.0)
+        stages: list[str] = []
+        deadlines: list[float | None] = []
+
+        monkeypatch.setattr(lifecycle_module.time, "monotonic", lambda: float(clock.now))
         monkeypatch.setattr(
-            runner,
-            "_run_command",
-            lambda record, stage, command: json.dumps({"status": "unhealthy", "http_status": 503}),
+            lifecycle_module.time,
+            "sleep",
+            lambda seconds: setattr(clock, "now", clock.now + float(seconds)),
         )
 
+        def run_command(
+            checkpoint: dict[str, Any],
+            stage: str,
+            command: list[str],
+            *,
+            deadline: float | None = None,
+        ) -> str:
+            del checkpoint, command
+            stages.append(stage)
+            deadlines.append(deadline)
+            if stage == "health" and stages.count("health") == 1:
+                return json.dumps(
+                    {
+                        "status": "unhealthy",
+                        "http_status": 502,
+                        "path": f"/inference/{plan.name}/health",
+                        "latency_ms": 7500.0,
+                        "body": {"message": "Internal server error"},
+                    }
+                )
+            if stage == "health":
+                return json.dumps({"status": "healthy", "http_status": 200})
+            return json.dumps({"data": [{"id": plan.runtime.model_id}]})
+
+        monkeypatch.setattr(runner, "_run_command", run_command)
+        runner.verify_backend_probes(plan, record)
+
+        assert stages == ["health", "health", "model-info"]
+        assert deadlines == [2.0, 2.0, None]
+        assert clock.now == 1.0
+        assert len(runner.table.get_calls) == 2
+        assert [item["classification"] for item in record["backend_probe_attempts"]] == [
+            "retryable-unhealthy",
+            "healthy",
+        ]
+        assert record["backend_probe_attempts"][0]["http_status"] == 502
+        assert "Internal server error" in record["backend_probe_attempts"][0]["body_summary"]
+
+    def test_persistent_health_502_exhausts_deadline_before_model_or_invoke(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        plan = plans[0]
+        record = records[0]
+        runner.table.item = _owned_item(runner.settings, plan, runner.owner_nonce)
+        clock = SimpleNamespace(now=0.0)
+        stages: list[str] = []
+        monkeypatch.setattr(lifecycle_module.time, "monotonic", lambda: float(clock.now))
+        monkeypatch.setattr(
+            lifecycle_module.time,
+            "sleep",
+            lambda seconds: setattr(clock, "now", clock.now + float(seconds)),
+        )
+
+        def unhealthy(
+            checkpoint: dict[str, Any],
+            stage: str,
+            command: list[str],
+            **kwargs: Any,
+        ) -> str:
+            del checkpoint, command, kwargs
+            stages.append(stage)
+            return json.dumps(
+                {
+                    "status": "unhealthy",
+                    "http_status": 502,
+                    "body": {"message": "still unavailable"},
+                }
+            )
+
+        monkeypatch.setattr(runner, "_run_command", unhealthy)
         with pytest.raises(ManagedInferenceValidationError, match="health/model"):
-            runner.verify_backend_probes(plans[0], records[0])
+            runner.verify_backend_probes(plan, record)
+
+        assert stages == ["health", "health"]
+        assert clock.now == 2.0
+        assert len(record["backend_probe_attempts"]) == 2
+        assert all(
+            item["classification"] == "retryable-unhealthy"
+            for item in record["backend_probe_attempts"]
+        )
+
+    def test_malformed_health_output_fails_fast(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        plan = plans[0]
+        record = records[0]
+        runner.table.item = _owned_item(runner.settings, plan, runner.owner_nonce)
+        stages: list[str] = []
+
+        def malformed(
+            checkpoint: dict[str, Any], stage: str, command: list[str], **kwargs: Any
+        ) -> str:
+            del checkpoint, command, kwargs
+            stages.append(stage)
+            return "not JSON"
+
+        monkeypatch.setattr(runner, "_run_command", malformed)
+        monkeypatch.setattr(
+            lifecycle_module.time,
+            "sleep",
+            lambda _seconds: (_ for _ in ()).throw(AssertionError("must not retry")),
+        )
+        with pytest.raises(ManagedInferenceValidationError, match="health/model"):
+            runner.verify_backend_probes(plan, record)
+
+        assert stages == ["health"]
+        assert record["backend_probe_attempts"][0]["classification"] == "malformed-output"
+
+    @pytest.mark.parametrize("http_status", [401, 403])
+    def test_auth_health_failure_is_terminal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, http_status: int
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        plan = plans[0]
+        record = records[0]
+        runner.table.item = _owned_item(runner.settings, plan, runner.owner_nonce)
+        stages: list[str] = []
+
+        def denied(
+            checkpoint: dict[str, Any], stage: str, command: list[str], **kwargs: Any
+        ) -> str:
+            del checkpoint, command, kwargs
+            stages.append(stage)
+            return json.dumps({"status": "unhealthy", "http_status": http_status})
+
+        monkeypatch.setattr(runner, "_run_command", denied)
+        monkeypatch.setattr(
+            lifecycle_module.time,
+            "sleep",
+            lambda _seconds: (_ for _ in ()).throw(AssertionError("must not retry")),
+        )
+        with pytest.raises(ManagedInferenceValidationError, match="health/model"):
+            runner.verify_backend_probes(plan, record)
+
+        assert stages == ["health"]
+        assert record["backend_probe_attempts"][0]["classification"] == "terminal-contract"
 
 
 class TestDefaultKubeconfigCompatibility:
@@ -1856,12 +2033,20 @@ class TestIncarnationRotation:
     ) -> None:
         runner, plans, records, _ = _lifecycle(tmp_path)
         record = records[0]
+        probe_attempts = [
+            {
+                "attempt": 1,
+                "classification": "retryable-unhealthy",
+                "http_status": 502,
+            }
+        ]
         record.update(
             {
                 "lifecycle_id": LIFECYCLE_ID,
                 "phase": "kubernetes-ready",
                 "cleanup_phase": "absent",
                 "absence_proven": True,
+                "backend_probe_attempts": probe_attempts,
             }
         )
         evidence = {
@@ -1884,10 +2069,12 @@ class TestIncarnationRotation:
                 "cleanup_phase": "absent",
                 "absence_evidence": evidence,
                 "commands": [],
+                "backend_probe_attempts": probe_attempts,
                 "cleanup_attempts": [],
                 "failures": [],
             }
         ]
+        assert "backend_probe_attempts" not in record
 
     def test_closed_lifecycle_is_never_readopted_and_new_lifecycle_binds(
         self, tmp_path: Path

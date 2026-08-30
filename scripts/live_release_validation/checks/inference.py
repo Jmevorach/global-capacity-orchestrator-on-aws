@@ -545,16 +545,27 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         record: dict[str, Any],
         stage: str,
         command: list[str],
+        *,
+        deadline: float | None = None,
     ) -> str:
         environment = dict(os.environ)
         environment["KUBECONFIG"] = str(self.kubeconfig_path)
+        command_timeout = float(self.settings.command_timeout_seconds)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                commands = cast(list[dict[str, Any]], record.setdefault("commands", []))
+                commands.append({"stage": stage, "argv": command, "deadline_exhausted": True})
+                self._persist()
+                raise _CommandFailure(f"{stage} phase deadline exhausted")
+            command_timeout = min(command_timeout, remaining)
         try:
             result = subprocess.run(
                 command,
                 cwd=self.settings.repo_root,
                 capture_output=True,
                 text=True,
-                timeout=self.settings.command_timeout_seconds,
+                timeout=command_timeout,
                 env=environment,
                 shell=False,
             )
@@ -565,6 +576,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                     "stage": stage,
                     "argv": command,
                     "timed_out": True,
+                    "timeout_seconds": command_timeout,
                     "stdout": self._truncated(str(exc.stdout or "")),
                     "stderr": self._truncated(str(exc.stderr or "")),
                 }
@@ -689,28 +701,116 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                 ) from None
         self._wait_for_owned_record(plan, record)
 
+    def _wait_for_healthy_backend(
+        self,
+        plan: EndpointPlan,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        attempts = record.setdefault("backend_probe_attempts", [])
+        if not isinstance(attempts, list):
+            raise ManagedInferenceValidationError("managed backend probe history is invalid")
+        deadline = time.monotonic() + self.settings.readiness_timeout_seconds
+        while True:
+            if time.monotonic() >= deadline:
+                raise ManagedInferenceValidationError(
+                    "managed health did not converge before timeout"
+                )
+            item = self._strong_get(record)
+            if item is None or not self._is_owned(item):
+                raise ManagedInferenceValidationError("managed ownership changed during health")
+            self._verify_item_contract(plan, item, record)
+            statuses = item.get("region_status")
+            regional = (
+                statuses.get(self.settings.selected_region) if isinstance(statuses, dict) else None
+            )
+            if (
+                item.get("desired_state") != "running"
+                or not isinstance(regional, dict)
+                or regional.get("state") != "running"
+            ):
+                raise ManagedInferenceValidationError(
+                    "managed endpoint stopped running during health"
+                )
+
+            attempt: dict[str, Any] = {
+                "attempt": len(attempts) + 1,
+                "started_at_monotonic": time.monotonic(),
+                "classification": "started",
+            }
+            attempts.append(attempt)
+
+            def finish(classification: str, **values: Any) -> None:
+                attempt.update(  # noqa: B023 - helper is called synchronously in this iteration
+                    ended_at_monotonic=time.monotonic(), classification=classification, **values
+                )
+                self._persist()
+
+            self._persist()
+            try:
+                output = self._run_command(
+                    record,
+                    "health",
+                    build_health_command(self.settings, plan),
+                    deadline=deadline,
+                )
+            except _CommandFailure as exc:
+                finish("command-failed", error=str(exc))
+                raise
+            try:
+                health = _last_json_document(output)
+            except ManagedInferenceValidationError as exc:
+                finish("malformed-output", error=str(exc))
+                raise
+            status = health.get("status") if isinstance(health, dict) else None
+            http_status = health.get("http_status") if isinstance(health, dict) else None
+            if (
+                not isinstance(status, str)
+                or isinstance(http_status, bool)
+                or not isinstance(http_status, int)
+            ):
+                finish("malformed-contract")
+                raise ManagedInferenceValidationError(
+                    "managed inference health probe returned a malformed contract"
+                )
+            attempt.update(
+                {
+                    "status": status,
+                    "http_status": http_status,
+                    "path": health.get("path"),
+                    "latency_ms": health.get("latency_ms"),
+                    "body_summary": self._truncated(
+                        json.dumps(health.get("body"), sort_keys=True, default=str)
+                    ),
+                }
+            )
+            if status == "healthy" and 200 <= http_status < 300:
+                finish("healthy")
+                return cast(dict[str, Any], health)
+            retryable = status == "unhealthy" and (
+                http_status in {404, 429} or 500 <= http_status < 600
+            )
+            if not retryable:
+                finish("terminal-contract")
+                raise ManagedInferenceValidationError(
+                    "managed inference health probe returned a terminal status or contract"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                finish("deadline-exhausted")
+                raise ManagedInferenceValidationError(
+                    "managed inference health endpoint did not converge before timeout"
+                )
+            finish("retryable-unhealthy")
+            time.sleep(min(float(self.settings.poll_interval_seconds), remaining))
+
     def verify_backend_probes(
         self,
         plan: EndpointPlan,
         record: dict[str, Any],
     ) -> None:
-        """Require authenticated health and, for vLLM, exact model discovery."""
+        """Require converged authenticated health and exact model discovery."""
         try:
-            health_output = self._run_command(
-                record,
-                "health",
-                build_health_command(self.settings, plan),
-            )
-            health = _last_json_document(health_output)
-            if (
-                not isinstance(health, dict)
-                or health.get("status") != "healthy"
-                or not isinstance(health.get("http_status"), int)
-                or not 200 <= health["http_status"] < 300
-            ):
-                raise ManagedInferenceValidationError(
-                    "managed inference health probe did not report a healthy 2xx response"
-                )
+            health = self._wait_for_healthy_backend(plan, record)
             evidence: dict[str, Any] = {
                 "health": {
                     "healthy": True,
@@ -856,6 +956,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                 "cleanup_phase": "absent",
                 "absence_evidence": evidence,
                 "commands": record.get("commands", []),
+                "backend_probe_attempts": record.get("backend_probe_attempts", []),
                 "cleanup_attempts": record.get("cleanup_attempts", []),
                 "failures": record.get("failures", []),
             }
@@ -877,6 +978,7 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         )
         for key in (
             "backend_probe_evidence",
+            "backend_probe_attempts",
             "invoke_evidence",
             "invoke_journal",
             "hpa_stability_observations",
