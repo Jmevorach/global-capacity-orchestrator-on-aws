@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import sys
 import threading
 import uuid
 import zlib
@@ -4206,7 +4207,7 @@ class TestCheckpointPersistence:
         self,
         tmp_path: Path,
     ) -> None:
-        from scripts.live_release_validation import models
+        from scripts.live_release_validation import artifact_io, models
 
         report_dir = tmp_path / "live-report"
         checkpoint = report_dir / "checkpoint.json"
@@ -4222,7 +4223,7 @@ class TestCheckpointPersistence:
             replacement_modes.append(stat.S_IMODE(metadata.st_mode))
             real_replace(source, destination, **kwargs)
 
-        with patch.object(models.os, "replace", side_effect=tracked_replace):
+        with patch.object(artifact_io.os, "replace", side_effect=tracked_replace):
             for generation in (1, 2):
                 models.atomic_write_json(checkpoint, {"generation": generation})
                 assert stat.S_IMODE(report_dir.stat().st_mode) == 0o700
@@ -4236,7 +4237,7 @@ class TestCheckpointPersistence:
         self,
         tmp_path: Path,
     ) -> None:
-        from scripts.live_release_validation import models
+        from scripts.live_release_validation import artifact_io, models
 
         original_ancestor = tmp_path / "original"
         report_dir = original_ancestor / "live-report"
@@ -4254,7 +4255,7 @@ class TestCheckpointPersistence:
             real_replace(source, destination, **kwargs)
 
         with (
-            patch.object(models.os, "replace", side_effect=rebind_then_replace),
+            patch.object(artifact_io.os, "replace", side_effect=rebind_then_replace),
             pytest.raises(RuntimeError, match="rebound while open"),
         ):
             models.atomic_write_json(checkpoint, {"generation": 1})
@@ -4460,6 +4461,217 @@ class TestLocalOnlyRuntime:
 
         assert args.expected_sha is None
         assert args.expected_branch is None
+
+    def test_deployed_checkpoint_constructor_failure_reports_blocked_recovery(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+        from scripts.live_release_validation import runner
+        from scripts.live_release_validation.models import (
+            RunCheckpoint,
+            RunSettings,
+            atomic_write_json,
+        )
+
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        (tmp_path / "cdk.json").write_text(
+            json.dumps(
+                {
+                    "context": {
+                        "project_name": "gco",
+                        "deployment_regions": {
+                            "global": "us-west-2",
+                            "api_gateway": "us-east-1",
+                            "monitoring": "us-east-1",
+                            "regional": ["us-east-1"],
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        report_dir = tmp_path / "report"
+        report_dir.mkdir(mode=0o700)
+        settings = RunSettings(
+            run_id="run-123",
+            repo_root=tmp_path,
+            report_dir=report_dir,
+            checkpoint_path=report_dir / "checkpoint.json",
+            expected_account="123456789012",
+            expected_sha="a" * 40,
+            expected_branch="chore/test",
+            profile="configured",
+            requested_actions=("preflight",),
+            resume=True,
+        )
+        checkpoint = RunCheckpoint(identity=settings.identity(), deployment_attempted=True)
+        atomic_write_json(settings.checkpoint_path, checkpoint.to_dict())
+        parser = MagicMock()
+        parser.parse_args.return_value = SimpleNamespace(list_actions=False)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "live_release_validation",
+                "--repo-root",
+                str(tmp_path),
+                "--run-id",
+                "run-123",
+                "--resume",
+            ],
+        )
+
+        with (
+            patch.object(live_main, "_build_parser", return_value=parser),
+            patch.object(live_main, "_settings_from_args", return_value=settings),
+            patch.object(
+                runner,
+                "ThrottleResilientSession",
+                side_effect=RuntimeError("session bootstrap failed"),
+            ),
+            patch.object(runner, "destroy_deployment") as destroy,
+        ):
+            assert live_main.main() == 1
+
+        destroy.assert_not_called()
+        report = json.loads(
+            (report_dir / "live-release-validation.json").read_text(encoding="utf-8")
+        )
+        assert report["cleanup"]["needed"] is True
+        assert report["cleanup"]["completed"] is False
+        assert "construction failed" in report["cleanup"]["blocked"]
+        recovery = report["cleanup"]["recovery_command"]
+        assert "-m scripts.live_release_validation" in recovery
+        assert "--resume" in recovery
+        assert report["status"] == "failed"
+
+    def test_constructor_failure_never_claims_cleanup_for_mismatched_checkpoint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+        from scripts.live_release_validation.models import (
+            RunCheckpoint,
+            RunSettings,
+            atomic_write_json,
+        )
+
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        report_dir = tmp_path / "report"
+        report_dir.mkdir(mode=0o700)
+        settings = RunSettings(
+            run_id="run-123",
+            repo_root=tmp_path,
+            report_dir=report_dir,
+            checkpoint_path=report_dir / "checkpoint.json",
+            expected_account="123456789012",
+            expected_sha="a" * 40,
+            expected_branch="chore/test",
+            profile="configured",
+            requested_actions=("preflight",),
+            resume=True,
+        )
+        wrong_identity = settings.identity()
+        wrong_identity["expected_sha"] = "b" * 40
+        checkpoint = RunCheckpoint(identity=wrong_identity, deployment_attempted=True)
+        atomic_write_json(settings.checkpoint_path, checkpoint.to_dict())
+        parser = MagicMock()
+        parser.parse_args.return_value = SimpleNamespace(list_actions=False)
+
+        with (
+            patch.object(live_main, "_build_parser", return_value=parser),
+            patch.object(live_main, "_settings_from_args", return_value=settings),
+            patch.object(
+                live_main,
+                "LiveValidationRunner",
+                side_effect=ValueError("checkpoint identity mismatch"),
+            ),
+        ):
+            assert live_main.main() == 1
+
+        report = json.loads(
+            (report_dir / "live-release-validation.json").read_text(encoding="utf-8")
+        )
+        assert report["cleanup"]["needed"] is True
+        assert report["cleanup"]["completed"] is False
+        assert "does not match" in report["cleanup"]["blocked"]
+        assert "recovery_command" not in report["cleanup"]
+
+    def test_main_inference_cli_inputs_are_checkpoint_identity(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from scripts.live_release_validation import __main__ as live_main
+        from scripts.live_release_validation.models import RunSettings
+
+        parser = live_main._build_parser()
+        args = parser.parse_args(
+            [
+                "--expected-account",
+                "123456789012",
+                "--expected-sha",
+                "a" * 40,
+                "--expected-branch",
+                "chore/test",
+                "--actions",
+                "inference",
+                "--inference-region",
+                "us-east-1",
+                "--inference-vllm-image",
+                "registry.example/vllm@sha256:" + "b" * 64,
+                "--inference-vllm-model-id",
+                "publisher/vllm-model",
+                "--inference-vllm-model-revision",
+                "c" * 40,
+                "--inference-tgi-image",
+                "registry.example/tgi@sha256:" + "d" * 64,
+                "--inference-tgi-model-id",
+                "publisher/tgi-model",
+                "--inference-tgi-model-revision",
+                "e" * 40,
+                "--inference-gpu-count",
+                "1",
+                "--confirm-inference-deployment",
+            ]
+        )
+        (tmp_path / "cdk.json").write_text(
+            json.dumps(
+                {
+                    "context": {
+                        "inference_proxy": {
+                            "tls_proxy_cpu_request_millicores": 125,
+                            "tls_proxy_cpu_target_utilization_percentage": 85,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(live_main, "_repository_root", lambda _value: tmp_path)
+        settings = live_main._settings_from_args(parser, args)
+
+        assert isinstance(settings, RunSettings)
+        assert settings.inference_enabled is True
+        identity = settings.identity()["inference"]
+        assert identity["selected_region"] == "us-east-1"
+        assert [runtime["framework"] for runtime in identity["runtimes"]] == ["vllm", "tgi"]
+        assert identity["runtimes"][0]["image"].endswith("b" * 64)
+        assert identity["runtimes"][0]["model"] == {
+            "id": "publisher/vllm-model",
+            "revision": "c" * 40,
+        }
+        assert identity["runtimes"][1]["image"].endswith("d" * 64)
+        assert identity["runtimes"][1]["model"] == {
+            "id": "publisher/tgi-model",
+            "revision": "e" * 40,
+        }
+        assert identity["endpoint_contract"]["gpu_count"] == 1
+        assert identity["shared_proxy_contract"]["tls_cpu_request"] == "125m"
+        assert identity["shared_proxy_contract"]["tls_cpu_target"] == 85
 
     def test_detached_head_does_not_consume_github_branch_variables(
         self,
@@ -5857,3 +6069,30 @@ class TestOpenCostLiveValidationRetry:
 
         assert ctx.checkpoint.state["opencost_status"]["us-east-1"] is status
         ctx.persist_callback.assert_called_once_with(ctx.checkpoint)
+
+
+class TestInferencePreflightPrerequisites:
+    def test_missing_session_manager_plugin_fails_before_any_aws_call(self, tmp_path: Path) -> None:
+        from scripts.live_release_validation.actions import preflight
+
+        session = MagicMock()
+        ctx = SimpleNamespace(
+            settings=SimpleNamespace(
+                repo_root=tmp_path,
+                expected_sha="a" * 40,
+                expected_branch="feature/test",
+            ),
+            report=SimpleNamespace(
+                selected_actions=["preflight", "baseline", "deploy", "topology", "inference"]
+            ),
+            session=session,
+        )
+        with (
+            patch.object(preflight, "_run_git", side_effect=["a" * 40, ""]),
+            patch.object(preflight, "_resolve_branch", return_value="feature/test"),
+            patch.object(preflight.shutil, "which", return_value=None),
+            pytest.raises(RuntimeError, match="Session Manager plugin"),
+        ):
+            preflight.action_preflight(ctx)
+
+        session.client.assert_not_called()

@@ -13,9 +13,10 @@ fixtures so store tests run against a realistic schema without AWS.
 from __future__ import annotations
 
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+from kubernetes.client.rest import ApiException
 
 from gco.models.inference_models import (
     EndpointState,
@@ -29,6 +30,32 @@ from gco.services.inference_store import (
     _deserialize_from_dynamo,
     _serialize_for_dynamo,
 )
+
+
+def _not_found(*_args, **_kwargs):
+    raise ApiException(status=404)
+
+
+def _configure_endpoint_cleanup_absent(monitor, hpa_api, custom_api) -> None:
+    """Make every endpoint-owned Kubernetes object read/delete as absent."""
+    monitor.apps_v1.delete_namespaced_deployment.side_effect = _not_found
+    monitor.apps_v1.read_namespaced_deployment.side_effect = _not_found
+    monitor.core_v1.delete_namespaced_service.side_effect = _not_found
+    monitor.core_v1.read_namespaced_service.side_effect = _not_found
+    monitor.core_v1.delete_namespaced_config_map.side_effect = _not_found
+    monitor.core_v1.read_namespaced_config_map.side_effect = _not_found
+    monitor.core_v1.read_namespaced_secret.side_effect = _not_found
+    monitor.networking_v1.delete_namespaced_ingress.side_effect = _not_found
+    monitor.networking_v1.read_namespaced_ingress.side_effect = _not_found
+    monitor.apps_v1.list_namespaced_replica_set.return_value = MagicMock(items=[])
+    monitor.core_v1.list_namespaced_pod.return_value = MagicMock(items=[])
+    monitor.core_v1.list_namespaced_endpoints.return_value = MagicMock(items=[])
+    monitor.discovery_v1.list_namespaced_endpoint_slice.return_value = MagicMock(items=[])
+    hpa_api.delete_namespaced_horizontal_pod_autoscaler.side_effect = _not_found
+    hpa_api.read_namespaced_horizontal_pod_autoscaler.side_effect = _not_found
+    custom_api.delete_namespaced_custom_object.side_effect = _not_found
+    custom_api.get_namespaced_custom_object.side_effect = _not_found
+
 
 # =============================================================================
 # Model Tests — EndpointState & RegionSyncState enums
@@ -438,8 +465,12 @@ class TestInferenceEndpointStore:
         assert len(result) == 2
 
     def test_list_endpoints_filtered_by_state(self, store):
-        store.create_endpoint("ep-c", {"image": "c"}, ["us-east-1"])
-        store.update_desired_state("ep-c", "running")
+        created = store.create_endpoint("ep-c", {"image": "c"}, ["us-east-1"])
+        store.update_desired_state(
+            "ep-c",
+            "running",
+            expected_lifecycle_id=created["lifecycle_id"],
+        )
         store.create_endpoint("ep-d", {"image": "d"}, ["us-east-1"])
         result = store.list_endpoints(desired_state="running")
         assert len(result) == 1
@@ -455,22 +486,85 @@ class TestInferenceEndpointStore:
     # -- update_desired_state --
 
     def test_update_desired_state_success(self, store):
-        store.create_endpoint("state-ep", {"image": "img"}, ["us-east-1"])
-        result = store.update_desired_state("state-ep", "running")
+        created = store.create_endpoint("state-ep", {"image": "img"}, ["us-east-1"])
+        result = store.update_desired_state(
+            "state-ep", "running", expected_lifecycle_id=created["lifecycle_id"]
+        )
         assert result is not None
         assert result["desired_state"] == "running"
 
     def test_update_desired_state_not_found(self, store):
-        result = store.update_desired_state("ghost", "running")
+        result = store.update_desired_state(
+            "ghost", "running", expected_lifecycle_id="missing-life"
+        )
         assert result is None
 
     # -- update_spec --
 
     def test_update_spec_success(self, store):
-        store.create_endpoint("spec-ep", {"image": "old"}, ["us-east-1"])
-        result = store.update_spec("spec-ep", {"image": "new", "replicas": 5})
+        created = store.create_endpoint("spec-ep", {"image": "old"}, ["us-east-1"])
+        result = store.update_spec(
+            "spec-ep",
+            {"image": "new", "replicas": 5},
+            expected_lifecycle_id=created["lifecycle_id"],
+            expected_updated_at=created["updated_at"],
+        )
         assert result is not None
         assert result["desired_state"] == "deploying"  # reset on spec change
+
+    def test_deleted_lifecycle_rejects_ordinary_store_mutations(self, store):
+        created = store.create_endpoint(
+            "terminal-ep", {"image": "old", "replicas": 1}, ["us-east-1"]
+        )
+        deleted = store.update_desired_state(
+            "terminal-ep",
+            "deleted",
+            expected_lifecycle_id=created["lifecycle_id"],
+        )
+        assert deleted and deleted["desired_state"] == "deleted"
+
+        assert (
+            store.update_desired_state(
+                "terminal-ep",
+                "stopped",
+                expected_lifecycle_id=created["lifecycle_id"],
+            )
+            is None
+        )
+        assert (
+            store.update_spec(
+                "terminal-ep",
+                {"image": "new"},
+                expected_lifecycle_id=created["lifecycle_id"],
+            )
+            is None
+        )
+        assert (
+            store.scale_endpoint("terminal-ep", 3, expected_lifecycle_id=created["lifecycle_id"])
+            is None
+        )
+
+    def test_repeated_delete_preserves_generation_and_historical_regions(self, store):
+        created = store.create_endpoint(
+            "repeat-delete",
+            {"image": "old"},
+            ["us-east-1", "eu-west-1"],
+        )
+        first = store.update_desired_state(
+            "repeat-delete",
+            "deleted",
+            expected_lifecycle_id=created["lifecycle_id"],
+        )
+        second = store.update_desired_state(
+            "repeat-delete",
+            "deleted",
+            expected_lifecycle_id=created["lifecycle_id"],
+        )
+
+        assert first and second
+        assert second["deletion_generation"] == first["deletion_generation"]
+        assert second["deletion_regions"] == first["deletion_regions"]
+        assert second["cleanup_regions"] == ["us-east-1", "eu-west-1"]
 
     # -- update_region_status --
 
@@ -504,12 +598,12 @@ class TestInferenceEndpointStore:
     # -- scale_endpoint --
 
     def test_scale_endpoint_success(self, store):
-        store.create_endpoint("scale-ep", {"image": "img", "replicas": 1}, ["us-east-1"])
-        result = store.scale_endpoint("scale-ep", 5)
+        created = store.create_endpoint("scale-ep", {"image": "img", "replicas": 1}, ["us-east-1"])
+        result = store.scale_endpoint("scale-ep", 5, expected_lifecycle_id=created["lifecycle_id"])
         assert result is not None
 
     def test_scale_endpoint_not_found(self, store):
-        result = store.scale_endpoint("missing", 3)
+        result = store.scale_endpoint("missing", 3, expected_lifecycle_id="missing-life")
         assert result is None
 
 
@@ -532,7 +626,9 @@ class TestInferenceMonitor:
             patch("gco.services.inference_monitor.client.AppsV1Api") as mock_apps,
             patch("gco.services.inference_monitor.client.CoreV1Api") as mock_core,
             patch("gco.services.inference_monitor.client.NetworkingV1Api") as mock_net,
-            patch("gco.services.inference_monitor.client.AutoscalingV2Api"),
+            patch("gco.services.inference_monitor.client.DiscoveryV1Api") as mock_discovery,
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa,
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom,
         ):
             from gco.services.inference_monitor import InferenceMonitor
 
@@ -547,6 +643,16 @@ class TestInferenceMonitor:
             m.apps_v1 = mock_apps.return_value
             m.core_v1 = mock_core.return_value
             m.networking_v1 = mock_net.return_value
+            m.discovery_v1 = mock_discovery.return_value
+            mock_hpa.return_value.delete_namespaced_horizontal_pod_autoscaler.side_effect = (
+                _not_found
+            )
+            mock_hpa.return_value.read_namespaced_horizontal_pod_autoscaler.side_effect = _not_found
+            mock_custom.return_value.delete_namespaced_custom_object.side_effect = _not_found
+            mock_custom.return_value.get_namespaced_custom_object.side_effect = _not_found
+            m.networking_v1.delete_namespaced_ingress.side_effect = _not_found
+            m.networking_v1.read_namespaced_ingress.side_effect = _not_found
+            m.discovery_v1.list_namespaced_endpoint_slice.return_value = MagicMock(items=[])
             yield m
 
     # -- _deployment_exists --
@@ -564,25 +670,32 @@ class TestInferenceMonitor:
     # -- _delete_resources --
 
     def test_delete_resources_handles_404(self, monitor):
-        from kubernetes.client.rest import ApiException
-
-        monitor.apps_v1.delete_namespaced_deployment.side_effect = ApiException(status=404)
-        monitor.core_v1.delete_namespaced_service.side_effect = ApiException(status=404)
-        monitor.core_v1.delete_namespaced_config_map.side_effect = ApiException(status=404)
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
             patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
         ):
-            mock_hpa_api.return_value.delete_namespaced_horizontal_pod_autoscaler.side_effect = (
-                ApiException(status=404)
+            _configure_endpoint_cleanup_absent(
+                monitor,
+                mock_hpa_api.return_value,
+                mock_custom_api.return_value,
             )
-            mock_custom_api.return_value.delete_namespaced_custom_object.side_effect = ApiException(
-                status=404
-            )
-            # Should not raise
-            monitor._delete_resources("ep", "ns")
+            result = monitor._delete_resources("ep", "ns")
+
+        assert result.complete is True
+        assert result.pending == ()
+        assert result.errors == ()
 
     def test_delete_resources_calls_all(self, monitor):
+        observed_ingresses: set[str] = set()
+
+        def read_ingress(name, _namespace, **_kwargs):
+            if name in observed_ingresses:
+                raise ApiException(status=404)
+            observed_ingresses.add(name)
+            return MagicMock()
+
+        monitor.networking_v1.read_namespaced_ingress.side_effect = read_ingress
+        monitor.networking_v1.delete_namespaced_ingress.side_effect = None
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api"),
             patch("gco.services.inference_monitor.client.CustomObjectsApi"),
@@ -590,11 +703,16 @@ class TestInferenceMonitor:
             monitor._delete_resources("ep", "ns")
         # Primary deployment delete (canary cleanup also calls delete for ep-canary)
         monitor.apps_v1.delete_namespaced_deployment.assert_any_call(
-            "ep", "ns", _request_timeout=30
+            "ep", "ns", body=ANY, _request_timeout=30
         )
-        monitor.core_v1.delete_namespaced_service.assert_any_call("ep", "ns", _request_timeout=30)
-        # The shared Gateway API route is never touched by endpoint deletion.
-        monitor.networking_v1.delete_namespaced_ingress.assert_not_called()
+        monitor.core_v1.delete_namespaced_service.assert_any_call(
+            "ep", "ns", body=ANY, _request_timeout=30
+        )
+        # Legacy per-endpoint routing objects are removed during terminal proof;
+        # the shared platform route has a different fixed name and is untouched.
+        monitor.networking_v1.delete_namespaced_ingress.assert_any_call(
+            "ep", "ns", body=ANY, _request_timeout=30
+        )
         monitor.networking_v1.create_namespaced_ingress.assert_not_called()
 
     def test_delete_resources_tears_down_mooncake_topology(self, monitor):
@@ -607,6 +725,22 @@ class TestInferenceMonitor:
         The shared regional mooncake-master and a user-named admin Secret must
         NOT be deleted.
         """
+        managed_secret = MagicMock()
+        managed_secret.metadata.labels = {
+            "app": "ep-admin",
+            "project": "gco",
+            "gco.io/type": "inference",
+        }
+        managed_secret.metadata.annotations = {"gco.io/lifecycle-id": "life-1"}
+        managed_secret.metadata.uid = "owned-secret-uid"
+        managed_secret.metadata.resource_version = "23"
+        managed_secret.type = "Opaque"
+        managed_secret.string_data = {"ADMIN_API_KEY": "stable-key"}
+        managed_secret.data = None
+        monitor.core_v1.read_namespaced_secret.side_effect = [
+            managed_secret,
+            ApiException(status=404),
+        ]
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
             patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
@@ -617,6 +751,7 @@ class TestInferenceMonitor:
                 "ep",
                 "ns",
                 {"mooncake": {"mode": "disaggregated", "proxy": {}}},
+                expected_lifecycle_id="life-1",
             )
 
         deleted_deploys = {
@@ -645,38 +780,212 @@ class TestInferenceMonitor:
         assert {"ep", "ep-prefill", "ep-decode"}.issubset(deleted_scaled_objects)
 
         monitor.core_v1.delete_namespaced_secret.assert_called_once_with(
-            "ep-admin", "ns", _request_timeout=30
+            "ep-admin", "ns", body=ANY, _request_timeout=30
         )
+        delete_options = monitor.core_v1.delete_namespaced_secret.call_args.kwargs["body"]
+        assert delete_options.preconditions.uid == "owned-secret-uid"
 
-    def test_reconcile_deleted_detects_disaggregated_role_deployments(self, monitor, mock_store):
-        """A disaggregated endpoint is detected and torn down, not skipped.
+    def test_delete_resources_migrates_exact_legacy_generated_secret(self, monitor):
+        legacy = MagicMock()
+        legacy.metadata.labels = {
+            "app": "ep-admin",
+            "project": "gco",
+            "gco.io/type": "inference",
+        }
+        legacy.metadata.annotations = {}
+        legacy.metadata.resource_version = "31"
+        legacy.metadata.uid = "legacy-secret-uid"
+        legacy.type = "Opaque"
+        legacy.string_data = {"ADMIN_API_KEY": "legacy-key"}
+        legacy.data = None
+        adopted = MagicMock()
+        adopted.metadata.labels = dict(legacy.metadata.labels)
+        adopted.metadata.annotations = {"gco.io/lifecycle-id": "life-1"}
+        adopted.metadata.resource_version = "32"
+        adopted.metadata.uid = "legacy-secret-uid"
+        adopted.type = "Opaque"
+        adopted.string_data = {"ADMIN_API_KEY": "legacy-key"}
+        adopted.data = None
+        monitor.core_v1.read_namespaced_secret.side_effect = [
+            legacy,
+            adopted,
+            ApiException(status=404),
+        ]
 
-        Regression: the deletion gate only checked for a Deployment named after
-        the endpoint. A disaggregated endpoint has no such Deployment (only
-        ``name-prefill``/``-decode``/``-proxy``), so it was marked deleted
-        without its resources ever being removed — orphaning the role
-        Deployments and the GPU nodes they held.
-        """
-        from kubernetes.client.rest import ApiException
-
-        def _read(dep_name, _namespace, **_kw):
-            # No single Deployment named after the endpoint; only a role worker.
-            if dep_name == "disagg-ep-prefill":
-                return MagicMock()
-            raise ApiException(status=404)
-
-        monitor.apps_v1.read_namespaced_deployment.side_effect = _read
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api"),
             patch("gco.services.inference_monitor.client.CustomObjectsApi"),
         ):
-            result = monitor._reconcile_deleted("disagg-ep", "gco-inference")
+            monitor._delete_resources(
+                "ep",
+                "ns",
+                {"mooncake": {"mode": "disaggregated", "proxy": {}}},
+                expected_lifecycle_id="life-1",
+            )
 
-        assert result is not None
-        assert result["action"] == "delete"
-        deleted = {c.args[0] for c in monitor.apps_v1.delete_namespaced_deployment.call_args_list}
-        assert "disagg-ep-prefill" in deleted
-        mock_store.update_region_status.assert_any_call("disagg-ep", monitor.region, "deleted")
+        monitor.core_v1.patch_namespaced_secret.assert_called_once_with(
+            "ep-admin",
+            "ns",
+            body={
+                "metadata": {
+                    "resourceVersion": "31",
+                    "annotations": {"gco.io/lifecycle-id": "life-1"},
+                }
+            },
+            _request_timeout=30,
+        )
+        monitor.core_v1.delete_namespaced_secret.assert_called_once_with(
+            "ep-admin", "ns", body=ANY, _request_timeout=30
+        )
+        delete_options = monitor.core_v1.delete_namespaced_secret.call_args.kwargs["body"]
+        assert delete_options.preconditions.uid == "legacy-secret-uid"
+
+    def test_delete_resources_uid_precondition_blocks_secret_replacement(self, monitor):
+        owned = MagicMock()
+        owned.metadata.labels = {
+            "app": "ep-admin",
+            "project": "gco",
+            "gco.io/type": "inference",
+        }
+        owned.metadata.annotations = {"gco.io/lifecycle-id": "life-1"}
+        owned.metadata.uid = "owned-uid"
+        owned.type = "Opaque"
+        owned.string_data = {"ADMIN_API_KEY": "stable-key"}
+        owned.data = None
+        replacement = MagicMock()
+        replacement.metadata.uid = "replacement-uid"
+        replacement.metadata.labels = {}
+        replacement.metadata.annotations = {}
+        monitor.core_v1.read_namespaced_secret.side_effect = [owned, replacement]
+        monitor.core_v1.delete_namespaced_secret.side_effect = ApiException(status=409)
+
+        with (
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api") as hpa_api,
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as custom_api,
+        ):
+            _configure_endpoint_cleanup_absent(
+                monitor,
+                hpa_api.return_value,
+                custom_api.return_value,
+            )
+            monitor.core_v1.read_namespaced_secret.side_effect = [owned, replacement]
+            monitor.core_v1.delete_namespaced_secret.side_effect = ApiException(status=409)
+            result = monitor._delete_resources(
+                "ep",
+                "ns",
+                {"mooncake": {"mode": "disaggregated", "proxy": {}}},
+                expected_lifecycle_id="life-1",
+            )
+
+        delete_options = monitor.core_v1.delete_namespaced_secret.call_args.kwargs["body"]
+        assert delete_options.preconditions.uid == "owned-uid"
+        assert "secret/ep-admin:replacement" in result.pending
+        assert any("delete secret ep-admin failed" in error for error in result.errors)
+
+    def test_delete_resources_preserves_user_managed_named_secret(self, monitor):
+        """Even the conventional generated name survives when explicitly user-managed."""
+        with (
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
+        ):
+            _configure_endpoint_cleanup_absent(
+                monitor,
+                mock_hpa_api.return_value,
+                mock_custom_api.return_value,
+            )
+            monitor._delete_resources(
+                "ep",
+                "ns",
+                {
+                    "mooncake": {
+                        "mode": "disaggregated",
+                        "proxy": {"admin_api_key_secret": "ep-admin"},
+                    }
+                },
+            )
+
+        monitor.core_v1.read_namespaced_secret.assert_not_called()
+        monitor.core_v1.delete_namespaced_secret.assert_not_called()
+
+    def test_delete_resources_blocks_on_ambiguous_generated_secret(self, monitor):
+        ambiguous = MagicMock()
+        ambiguous.metadata.labels = {"app": "ep-admin", "project": "gco"}
+        ambiguous.metadata.annotations = {}
+        with (
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
+        ):
+            _configure_endpoint_cleanup_absent(
+                monitor,
+                mock_hpa_api.return_value,
+                mock_custom_api.return_value,
+            )
+            monitor.core_v1.read_namespaced_secret.side_effect = None
+            monitor.core_v1.read_namespaced_secret.return_value = ambiguous
+            result = monitor._delete_resources(
+                "ep",
+                "ns",
+                {"mooncake": {"mode": "disaggregated", "proxy": {}}},
+                expected_lifecycle_id="life-1",
+            )
+
+        assert result.complete is False
+        assert result.pending == ()
+        assert result.errors == ("ambiguous secret ep-admin is not owned by lifecycle life-1",)
+        monitor.core_v1.delete_namespaced_secret.assert_not_called()
+
+    def test_reconcile_deleted_attempts_cleanup_without_any_deployment(self, monitor, mock_store):
+        """A missing primary/role Deployment never gates exhaustive cleanup."""
+        with (
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
+        ):
+            _configure_endpoint_cleanup_absent(
+                monitor,
+                mock_hpa_api.return_value,
+                mock_custom_api.return_value,
+            )
+            mock_store.update_region_status.return_value = True
+            result = monitor._reconcile_deleted(
+                {
+                    "endpoint_name": "disagg-ep",
+                    "lifecycle_id": "life-1",
+                    "desired_state": "deleted",
+                    "deletion_generation": "delete-1",
+                    "region_status": {
+                        monitor.region: {
+                            "state": "deleting",
+                            "lifecycle_id": "life-1",
+                            "deletion_generation": "delete-1",
+                            "absence_observations": 1,
+                        }
+                    },
+                },
+                "gco-inference",
+            )
+
+        assert result == {
+            "action": "delete",
+            "endpoint": "disagg-ep",
+            "cleanup_complete": True,
+        }
+        assert monitor.apps_v1.delete_namespaced_deployment.call_count == 0
+        inspected = {c.args[0] for c in monitor.apps_v1.read_namespaced_deployment.call_args_list}
+        assert {
+            "disagg-ep",
+            "disagg-ep-canary",
+            "disagg-ep-prefill",
+            "disagg-ep-decode",
+            "disagg-ep-proxy",
+        } <= inspected
+        mock_store.update_region_status.assert_called_once_with(
+            "disagg-ep",
+            monitor.region,
+            "deleted",
+            extra={"absence_observations": 2},
+            expected_lifecycle_id="life-1",
+            expected_deletion_generation="delete-1",
+        )
 
     # -- _reconcile_endpoint: create --
 
@@ -693,6 +1002,8 @@ class TestInferenceMonitor:
             "namespace": "gco-inference",
         }
         with patch("gco.services.inference_monitor.client.CustomObjectsApi") as custom_api:
+            custom_api.return_value.delete_namespaced_custom_object.side_effect = _not_found
+            custom_api.return_value.get_namespaced_custom_object.side_effect = _not_found
             result = await monitor._reconcile_endpoint(endpoint)
         assert result is not None
         assert result["action"] == "create"
@@ -711,9 +1022,66 @@ class TestInferenceMonitor:
         mock_store.update_region_status.assert_called()
 
     @pytest.mark.asyncio
+    async def test_missing_deployment_waits_for_obsolete_autoscaler_before_recreate(
+        self, monitor, mock_store
+    ):
+        from gco.services.inference_monitor import ResourceCleanupResult
+
+        monitor.apps_v1.read_namespaced_deployment.side_effect = ApiException(status=404)
+        endpoint = {
+            "endpoint_name": "handoff-ep",
+            "lifecycle_id": "life-handoff",
+            "desired_state": "running",
+            "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
+            "region_generations": {"us-east-1": "region-handoff"},
+            "spec": {
+                "image": "img:v1",
+                "autoscaling": {
+                    "enabled": True,
+                    "metrics": [{"type": "cpu", "target": 70}],
+                },
+            },
+        }
+        pending = ResourceCleanupResult(
+            pending=("scaledobject/handoff-ep",),
+            resources_found=True,
+        )
+
+        with patch.object(
+            monitor,
+            "_reconcile_classic_autoscaler",
+            return_value=pending,
+        ) as handoff:
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        handoff.assert_called_once_with(
+            "handoff-ep",
+            "gco-inference",
+            endpoint["spec"],
+            apply_desired=False,
+        )
+        monitor.apps_v1.create_namespaced_deployment.assert_not_called()
+        assert result == {
+            "action": "reconcile_autoscaler",
+            "endpoint": "handoff-ep",
+            "cleanup_complete": False,
+        }
+        mock_store.update_region_status.assert_called_once_with(
+            "handoff-ep",
+            "us-east-1",
+            "updating",
+            replicas_ready=0,
+            replicas_desired=0,
+            expected_lifecycle_id="life-handoff",
+            expected_region_generation="region-handoff",
+        )
+
+    @pytest.mark.asyncio
     async def test_reconcile_rejects_persisted_mooncake_canary_spec(self, monitor, mock_store):
         endpoint = {
             "endpoint_name": "invalid-ep",
+            "lifecycle_id": "life-invalid",
             "desired_state": "running",
             "target_regions": ["us-east-1"],
             "spec": {
@@ -736,6 +1104,7 @@ class TestInferenceMonitor:
             "us-east-1",
             "failed",
             error="endpoint spec cannot combine 'mooncake' and 'canary' blocks",
+            expected_lifecycle_id="life-invalid",
         )
         monitor.apps_v1.create_namespaced_deployment.assert_not_called()
 
@@ -762,6 +1131,126 @@ class TestInferenceMonitor:
         assert result["replicas"] == 4
         monitor.apps_v1.patch_namespaced_deployment.assert_called_once()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ready_replicas", "expected_state"), [(2, "running"), (1, "creating")]
+    )
+    async def test_existing_autoscaled_deployment_replica_drift_is_hpa_owned(
+        self,
+        monitor,
+        mock_store,
+        ready_replicas,
+        expected_state,
+    ):
+        """Reconcile the autoscaler without overwriting its live replica target."""
+        from gco.services.inference_monitor import ResourceCleanupResult
+
+        deployment = MagicMock()
+        deployment.spec.replicas = 5
+        deployment.status.ready_replicas = ready_replicas
+        deployment.spec.template.spec.containers = [MagicMock(image="img:v1")]
+        monitor.apps_v1.read_namespaced_deployment.return_value = deployment
+        endpoint = {
+            "endpoint_name": "autoscaled-ep",
+            "desired_state": "running",
+            "target_regions": ["us-east-1"],
+            "spec": {
+                "image": "img:v1",
+                "replicas": 1,
+                "autoscaling": {
+                    "enabled": True,
+                    "min_replicas": 2,
+                    "max_replicas": 8,
+                    "metrics": [{"type": "cpu", "target": 70}],
+                },
+            },
+            "namespace": "gco-inference",
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "_reconcile_classic_autoscaler",
+                return_value=ResourceCleanupResult(),
+            ) as reconcile_autoscaler,
+            patch.object(monitor, "_scale_deployment") as scale_deployment,
+            patch.object(monitor, "_check_health_watchdog") as watchdog,
+        ):
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        assert result is None
+        reconcile_autoscaler.assert_called_once_with(
+            "autoscaled-ep", "gco-inference", endpoint["spec"]
+        )
+        scale_deployment.assert_not_called()
+        watchdog.assert_called_once_with(
+            "autoscaled-ep",
+            "gco-inference",
+            ready_replicas,
+            5,
+            endpoint["spec"],
+            endpoint,
+        )
+        mock_store.update_region_status.assert_called_once_with(
+            "autoscaled-ep",
+            "us-east-1",
+            expected_state,
+            replicas_ready=ready_replicas,
+            replicas_desired=5,
+            extra=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabling_autoscaling_waits_for_old_owner_before_static_scale(
+        self, monitor, mock_store
+    ):
+        from gco.services.inference_monitor import ResourceCleanupResult
+
+        deployment = MagicMock()
+        deployment.spec.replicas = 4
+        deployment.status.ready_replicas = 2
+        deployment.spec.template.spec.containers = [MagicMock(image="img:v1")]
+        monitor.apps_v1.read_namespaced_deployment.return_value = deployment
+        endpoint = {
+            "endpoint_name": "disabled-ep",
+            "desired_state": "running",
+            "target_regions": ["us-east-1"],
+            "spec": {
+                "image": "img:v1",
+                "replicas": 2,
+                "autoscaling": {"enabled": False},
+            },
+        }
+        pending = ResourceCleanupResult(
+            pending=("hpa/disabled-ep",),
+            resources_found=True,
+        )
+
+        with (
+            patch.object(monitor, "_delete_autoscalers", return_value=pending) as cleanup,
+            patch.object(monitor, "_scale_deployment") as scale_deployment,
+        ):
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        cleanup.assert_called_once_with(
+            ("disabled-ep",),
+            ("disabled-ep", "keda-hpa-disabled-ep"),
+            "gco-inference",
+        )
+        scale_deployment.assert_not_called()
+        assert result == {
+            "action": "reconcile_autoscaler",
+            "endpoint": "disabled-ep",
+            "cleanup_complete": False,
+        }
+        mock_store.update_region_status.assert_called_once_with(
+            "disabled-ep",
+            "us-east-1",
+            "updating",
+            replicas_ready=2,
+            replicas_desired=4,
+        )
+
     # -- _reconcile_endpoint: update image --
 
     @pytest.mark.asyncio
@@ -787,64 +1276,421 @@ class TestInferenceMonitor:
     # -- _reconcile_endpoint: cleanup when region removed --
 
     @pytest.mark.asyncio
-    async def test_reconcile_cleans_up_split_endpoint_when_region_removed(
+    async def test_region_removal_retries_service_and_hpa_only_orphans_until_absent(
         self, monitor, mock_store
     ):
-        from kubernetes.client.rest import ApiException
+        """Region removal uses the same exhaustive asynchronous cleanup state machine."""
+        present = {"value": True}
 
-        def _read(deployment_name, _namespace, **_kwargs):
-            if deployment_name == "removed-ep-prefill":
+        def _delete_service(resource_name, *_args, **_kwargs):
+            if resource_name == "removed-ep" and present["value"]:
                 return MagicMock()
             raise ApiException(status=404)
 
-        monitor.apps_v1.read_namespaced_deployment.side_effect = _read
+        def _read_service(resource_name, *_args, **_kwargs):
+            if resource_name == "removed-ep" and present["value"]:
+                return MagicMock()
+            raise ApiException(status=404)
+
+        def _delete_hpa(resource_name, *_args, **_kwargs):
+            if resource_name == "removed-ep" and present["value"]:
+                return MagicMock()
+            raise ApiException(status=404)
+
+        def _read_hpa(resource_name, *_args, **_kwargs):
+            if resource_name == "removed-ep" and present["value"]:
+                return MagicMock()
+            raise ApiException(status=404)
+
         endpoint = {
             "endpoint_name": "removed-ep",
+            "lifecycle_id": "life-removed",
             "desired_state": "running",
-            "target_regions": ["eu-west-1"],  # us-east-1 not in list
-            "spec": {
-                "image": "img:v1",
-                "mooncake": {"mode": "disaggregated", "proxy": {}},
+            "target_regions": ["eu-west-1"],
+            "cleanup_regions": ["us-east-1", "eu-west-1"],
+            "region_generations": {
+                "us-east-1": "remove-generation",
+                "eu-west-1": "target-generation",
             },
+            "region_status": {"us-east-1": {"state": "running"}},
+            "spec": {"image": "img:v1"},
             "namespace": "gco-inference",
         }
         with (
-            patch("gco.services.inference_monitor.client.AutoscalingV2Api"),
-            patch("gco.services.inference_monitor.client.CustomObjectsApi"),
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa_api,
+            patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom_api,
         ):
-            result = await monitor._reconcile_endpoint(endpoint)
-        assert result is not None
-        assert result["action"] == "cleanup"
-        assert result["reason"] == "region_removed"
+            hpa = mock_hpa_api.return_value
+            custom = mock_custom_api.return_value
+            _configure_endpoint_cleanup_absent(monitor, hpa, custom)
+            monitor.core_v1.delete_namespaced_service.side_effect = _delete_service
+            monitor.core_v1.read_namespaced_service.side_effect = _read_service
+            hpa.delete_namespaced_horizontal_pod_autoscaler.side_effect = _delete_hpa
+            hpa.read_namespaced_horizontal_pod_autoscaler.side_effect = _read_hpa
+
+            mock_store.update_region_status.return_value = True
+            first = await monitor._reconcile_endpoint(endpoint)
+            assert first == {
+                "action": "cleanup",
+                "endpoint": "removed-ep",
+                "reason": "region_removed",
+                "cleanup_complete": False,
+            }
+            mock_store.update_region_status.assert_called_once_with(
+                "removed-ep",
+                "us-east-1",
+                "deleting",
+                extra={"absence_observations": 0},
+                expected_lifecycle_id="life-removed",
+                expected_region_generation="remove-generation",
+            )
+
+            present["value"] = False
+            endpoint["region_status"]["us-east-1"] = {
+                "state": "deleting",
+                "lifecycle_id": "life-removed",
+                "region_generation": "remove-generation",
+                "absence_observations": 0,
+            }
+            mock_store.reset_mock()
+            mock_store.update_region_status.return_value = True
+            second = await monitor._reconcile_endpoint(endpoint)
+            assert second["cleanup_complete"] is False
+            mock_store.update_region_status.assert_called_once_with(
+                "removed-ep",
+                "us-east-1",
+                "deleting",
+                extra={"absence_observations": 1},
+                expected_lifecycle_id="life-removed",
+                expected_region_generation="remove-generation",
+            )
+
+            endpoint["region_status"]["us-east-1"]["absence_observations"] = 1
+            mock_store.reset_mock()
+            mock_store.update_region_status.return_value = True
+            third = await monitor._reconcile_endpoint(endpoint)
+
+        assert third == {
+            "action": "cleanup",
+            "endpoint": "removed-ep",
+            "reason": "region_removed",
+            "cleanup_complete": True,
+        }
+        mock_store.update_region_status.assert_called_once_with(
+            "removed-ep",
+            "us-east-1",
+            "deleted",
+            extra={"absence_observations": 2},
+            expected_lifecycle_id="life-removed",
+            expected_region_generation="remove-generation",
+        )
+        monitor.apps_v1.delete_namespaced_deployment.assert_not_called()
+        monitor.core_v1.delete_namespaced_service.assert_any_call(
+            "removed-ep", "gco-inference", body=ANY, _request_timeout=30
+        )
+        hpa.delete_namespaced_horizontal_pod_autoscaler.assert_any_call(
+            "removed-ep", "gco-inference", body=ANY, _request_timeout=30
+        )
 
     # -- _reconcile_endpoint: stopped --
 
     @pytest.mark.asyncio
-    async def test_reconcile_stops_endpoint(self, monitor, mock_store):
+    async def test_reconcile_stops_autoscaled_endpoint_after_removing_autoscaler(
+        self, monitor, mock_store
+    ):
         deployment = MagicMock()
         deployment.spec.replicas = 2
+        deployment.status.ready_replicas = 2
         monitor.apps_v1.read_namespaced_deployment.return_value = deployment
-
         endpoint = {
             "endpoint_name": "stop-ep",
             "desired_state": "stopped",
             "target_regions": ["us-east-1"],
-            "spec": {"image": "img:v1"},
+            "spec": {
+                "image": "img:v1",
+                "autoscaling": {"enabled": True, "min_replicas": 1},
+            },
             "namespace": "gco-inference",
         }
-        result = await monitor._reconcile_endpoint(endpoint)
-        assert result is not None
-        assert result["action"] == "stop"
+        events = []
+        custom = MagicMock()
+        hpa = MagicMock()
+        custom.delete_namespaced_custom_object.side_effect = lambda **_kwargs: events.append(
+            "scaledobject"
+        )
+        custom_reads: dict[str, int] = {}
+
+        def read_scaled_object(**kwargs):
+            name = kwargs["name"]
+            custom_reads[name] = custom_reads.get(name, 0) + 1
+            if custom_reads[name] == 1:
+                return {"metadata": {"uid": f"uid-{name}", "resourceVersion": "1"}}
+            raise ApiException(status=404)
+
+        hpa_reads: dict[str, int] = {}
+
+        def read_hpa(resource_name, *_args, **_kwargs):
+            hpa_reads[resource_name] = hpa_reads.get(resource_name, 0) + 1
+            if hpa_reads[resource_name] == 1:
+                observed = MagicMock()
+                observed.metadata.uid = f"uid-{resource_name}"
+                observed.metadata.resource_version = "1"
+                return observed
+            raise ApiException(status=404)
+
+        custom.get_namespaced_custom_object.side_effect = read_scaled_object
+        hpa.delete_namespaced_horizontal_pod_autoscaler.side_effect = (
+            lambda resource_name, *_args, **_kwargs: events.append(f"hpa:{resource_name}")
+        )
+        hpa.read_namespaced_horizontal_pod_autoscaler.side_effect = read_hpa
+        monitor.apps_v1.patch_namespaced_deployment.side_effect = lambda *_args, **_kwargs: (
+            events.append("scale")
+        )
+
+        with (
+            patch("gco.services.inference_monitor.client.CustomObjectsApi", return_value=custom),
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api", return_value=hpa),
+        ):
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        assert result == {
+            "action": "stop",
+            "endpoint": "stop-ep",
+            "cleanup_complete": True,
+        }
+        assert events == [
+            "scaledobject",
+            "scaledobject",
+            "scaledobject",
+            "hpa:stop-ep",
+            "hpa:stop-ep-prefill",
+            "hpa:stop-ep-decode",
+            "hpa:keda-hpa-stop-ep",
+            "hpa:keda-hpa-stop-ep-prefill",
+            "hpa:keda-hpa-stop-ep-decode",
+            "scale",
+        ]
+        monitor.apps_v1.patch_namespaced_deployment.assert_called_once_with(
+            "stop-ep",
+            "gco-inference",
+            body={"spec": {"replicas": 0}},
+            _request_timeout=30,
+        )
+        mock_store.update_region_status.assert_called_once_with(
+            "stop-ep",
+            "us-east-1",
+            "stopped",
+            replicas_ready=0,
+            replicas_desired=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_waits_for_keda_generated_hpa_to_disappear(self, monitor, mock_store):
+        deployment = MagicMock()
+        deployment.spec.replicas = 2
+        deployment.status.ready_replicas = 2
+        monitor.apps_v1.read_namespaced_deployment.return_value = deployment
+        endpoint = {
+            "endpoint_name": "stop-ep",
+            "desired_state": "stopped",
+            "target_regions": ["us-east-1"],
+            "spec": {"autoscaling": {"enabled": True}},
+        }
+        custom = MagicMock()
+        hpa = MagicMock()
+        custom.delete_namespaced_custom_object.side_effect = ApiException(status=404)
+        custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        hpa.delete_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(status=404)
+
+        def _read_hpa(resource_name, *_args, **_kwargs):
+            if resource_name == "keda-hpa-stop-ep":
+                return MagicMock()
+            raise ApiException(status=404)
+
+        hpa.read_namespaced_horizontal_pod_autoscaler.side_effect = _read_hpa
+        with (
+            patch("gco.services.inference_monitor.client.CustomObjectsApi", return_value=custom),
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api", return_value=hpa),
+        ):
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        assert result == {
+            "action": "stop",
+            "endpoint": "stop-ep",
+            "cleanup_complete": False,
+        }
+        monitor.apps_v1.patch_namespaced_deployment.assert_not_called()
+        mock_store.update_region_status.assert_called_once_with(
+            "stop-ep",
+            "us-east-1",
+            "stopping",
+            replicas_ready=2,
+            replicas_desired=2,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_surfaces_autoscaler_delete_failure_without_scaling(
+        self, monitor, mock_store
+    ):
+        deployment = MagicMock()
+        deployment.spec.replicas = 2
+        deployment.status.ready_replicas = 1
+        monitor.apps_v1.read_namespaced_deployment.return_value = deployment
+        endpoint = {
+            "endpoint_name": "stop-ep",
+            "desired_state": "stopped",
+            "target_regions": ["us-east-1"],
+            "spec": {"autoscaling": {"enabled": True}},
+        }
+        custom = MagicMock()
+        hpa = MagicMock()
+
+        def _delete_scaled_object(**kwargs):
+            if kwargs["name"] == "stop-ep":
+                raise ApiException(status=500, reason="sensitive transport detail")
+            raise ApiException(status=404)
+
+        def _read_scaled_object(**kwargs):
+            if kwargs["name"] == "stop-ep":
+                return {"metadata": {"uid": "uid-stop", "resourceVersion": "1"}}
+            raise ApiException(status=404)
+
+        custom.delete_namespaced_custom_object.side_effect = _delete_scaled_object
+        custom.get_namespaced_custom_object.side_effect = _read_scaled_object
+        hpa.delete_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(status=404)
+        hpa.read_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(status=404)
+
+        with (
+            patch("gco.services.inference_monitor.client.CustomObjectsApi", return_value=custom),
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api", return_value=hpa),
+        ):
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        assert result == {
+            "action": "stop",
+            "endpoint": "stop-ep",
+            "cleanup_complete": False,
+        }
+        monitor.apps_v1.patch_namespaced_deployment.assert_not_called()
+        status_call = mock_store.update_region_status.call_args
+        assert status_call.args == ("stop-ep", "us-east-1", "stopping")
+        assert status_call.kwargs["replicas_ready"] == 1
+        assert status_call.kwargs["replicas_desired"] == 2
+        assert status_call.kwargs["error"] == (
+            "Endpoint cleanup could not be completed: "
+            "delete scaledobject stop-ep failed (status 500)"
+        )
+        assert "sensitive" not in status_call.kwargs["error"]
 
     # -- _reconcile_endpoint: deleted --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "spec",
+        [{}, {"autoscaling": {"enabled": False}}],
+        ids=("removed-block", "disabled-block"),
+    )
+    async def test_stop_removes_stale_owners_when_autoscaling_is_not_enabled(
+        self, monitor, mock_store, spec
+    ):
+        deployment = MagicMock()
+        deployment.spec.replicas = 2
+        deployment.status.ready_replicas = 1
+        monitor.apps_v1.read_namespaced_deployment.return_value = deployment
+        endpoint = {
+            "endpoint_name": "stale-owner",
+            "desired_state": "stopped",
+            "target_regions": ["us-east-1"],
+            "spec": spec,
+        }
+        custom = MagicMock()
+        hpa = MagicMock()
+        custom.delete_namespaced_custom_object.side_effect = ApiException(status=404)
+        custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        hpa.delete_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(status=404)
+        hpa.read_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(status=404)
+
+        with (
+            patch("gco.services.inference_monitor.client.CustomObjectsApi", return_value=custom),
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api", return_value=hpa),
+        ):
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        assert result == {
+            "action": "stop",
+            "endpoint": "stale-owner",
+            "cleanup_complete": True,
+        }
+        assert len(custom.get_namespaced_custom_object.call_args_list) == 3
+        assert len(hpa.read_namespaced_horizontal_pod_autoscaler.call_args_list) == 6
+        assert custom.delete_namespaced_custom_object.call_args_list == []
+        assert hpa.delete_namespaced_horizontal_pod_autoscaler.call_args_list == []
+        monitor.apps_v1.patch_namespaced_deployment.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_scales_every_mooncake_role_only_after_owner_absence(
+        self, monitor, mock_store
+    ):
+        deployments = {}
+        for role_name, replicas in (
+            ("split-prefill", 2),
+            ("split-decode", 3),
+            ("split-proxy", 1),
+        ):
+            deployment = MagicMock()
+            deployment.spec.replicas = replicas
+            deployment.status.ready_replicas = replicas
+            deployments[role_name] = deployment
+
+        def read_deployment(resource_name, *_args, **_kwargs):
+            if resource_name in deployments:
+                return deployments[resource_name]
+            raise ApiException(status=404)
+
+        monitor.apps_v1.read_namespaced_deployment.side_effect = read_deployment
+        endpoint = {
+            "endpoint_name": "split",
+            "desired_state": "stopped",
+            "target_regions": ["us-east-1"],
+            "spec": {
+                "mooncake": {
+                    "mode": "disaggregated",
+                    "autoscaling": {"enabled": False},
+                }
+            },
+        }
+        custom = MagicMock()
+        hpa = MagicMock()
+        custom.delete_namespaced_custom_object.side_effect = ApiException(status=404)
+        custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        hpa.delete_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(status=404)
+        hpa.read_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(status=404)
+
+        with (
+            patch("gco.services.inference_monitor.client.CustomObjectsApi", return_value=custom),
+            patch("gco.services.inference_monitor.client.AutoscalingV2Api", return_value=hpa),
+        ):
+            result = await monitor._reconcile_endpoint(endpoint)
+
+        assert result and result["cleanup_complete"] is True
+        scaled = {
+            call_args.args[0]
+            for call_args in monitor.apps_v1.patch_namespaced_deployment.call_args_list
+        }
+        assert scaled == {"split-prefill", "split-decode", "split-proxy"}
 
     @pytest.mark.asyncio
     async def test_reconcile_deletes_endpoint(self, monitor, mock_store):
         monitor.apps_v1.read_namespaced_deployment.return_value = MagicMock()
         endpoint = {
             "endpoint_name": "del-ep",
+            "lifecycle_id": "life-del",
             "desired_state": "deleted",
             "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
+            "deletion_regions": ["us-east-1"],
+            "deletion_generation": "delete-del",
+            "region_status": {},
             "spec": {"image": "img:v1"},
             "namespace": "gco-inference",
         }
@@ -1039,7 +1885,13 @@ class TestInferenceManager:
 
     @pytest.fixture
     def mock_store_instance(self):
-        return MagicMock()
+        store = MagicMock()
+        store.ensure_lifecycle_metadata.side_effect = lambda endpoint: {
+            **endpoint,
+            "lifecycle_id": endpoint.get("lifecycle_id", "life-test"),
+            "updated_at": endpoint.get("updated_at", "snapshot"),
+        }
+        return store
 
     @pytest.fixture
     def manager(self, mock_config, mock_aws_client, mock_store_instance):
@@ -1109,49 +1961,119 @@ class TestInferenceManager:
     # -- scale --
 
     def test_scale_success(self, manager, mock_store_instance):
+        mock_store_instance.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-scale",
+            "spec": {"replicas": 1},
+        }
         mock_store_instance.scale_endpoint.return_value = {"endpoint_name": "ep"}
         result = manager.scale("ep", 5)
         assert result is not None
-        mock_store_instance.scale_endpoint.assert_called_once_with("ep", 5)
+        mock_store_instance.scale_endpoint.assert_called_once_with(
+            "ep", 5, expected_lifecycle_id="life-scale"
+        )
 
     def test_scale_not_found(self, manager, mock_store_instance):
-        mock_store_instance.scale_endpoint.return_value = None
+        mock_store_instance.get_endpoint.return_value = None
         assert manager.scale("ghost", 3) is None
+        mock_store_instance.scale_endpoint.assert_not_called()
+
+    def test_scale_rejects_autoscaled_endpoint(self, manager, mock_store_instance):
+        mock_store_instance.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-scale",
+            "spec": {"autoscaling": {"enabled": True}},
+        }
+        with pytest.raises(ValueError, match="autoscaled.*min/max"):
+            manager.scale("ep", 5)
+        mock_store_instance.scale_endpoint.assert_not_called()
+
+    @pytest.mark.parametrize("mooncake", [{}, {"mode": "store"}])
+    def test_scale_rejects_every_mooncake_spec(self, manager, mock_store_instance, mooncake):
+        mock_store_instance.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-scale",
+            "desired_state": "running",
+            "spec": {"mooncake": mooncake},
+        }
+        with pytest.raises(ValueError, match="gco inference set-topology"):
+            manager.scale("ep", 5)
+        mock_store_instance.scale_endpoint.assert_not_called()
+
+    def test_scale_rejects_deleted_endpoint(self, manager, mock_store_instance):
+        mock_store_instance.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-scale",
+            "desired_state": "deleted",
+            "spec": {"replicas": 1},
+        }
+        with pytest.raises(ValueError, match="deleted.*redeploy"):
+            manager.scale("ep", 5)
+        mock_store_instance.scale_endpoint.assert_not_called()
 
     # -- stop --
 
     def test_stop_success(self, manager, mock_store_instance):
+        mock_store_instance.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "desired_state": "running",
+            "lifecycle_id": "life-stop",
+        }
         mock_store_instance.update_desired_state.return_value = {"desired_state": "stopped"}
         result = manager.stop("ep")
         assert result is not None
-        mock_store_instance.update_desired_state.assert_called_once_with("ep", "stopped")
+        mock_store_instance.update_desired_state.assert_called_once_with(
+            "ep", "stopped", expected_lifecycle_id="life-stop"
+        )
 
     def test_stop_not_found(self, manager, mock_store_instance):
-        mock_store_instance.update_desired_state.return_value = None
+        mock_store_instance.get_endpoint.return_value = None
         assert manager.stop("ghost") is None
+
+    def test_stop_rejects_deleted_endpoint(self, manager, mock_store_instance):
+        mock_store_instance.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-stop",
+            "desired_state": "deleted",
+        }
+        with pytest.raises(ValueError, match="deleted.*redeploy"):
+            manager.stop("ep")
+        mock_store_instance.update_desired_state.assert_not_called()
 
     # -- start --
 
     def test_start_success(self, manager, mock_store_instance):
-        mock_store_instance.update_desired_state.return_value = {"desired_state": "running"}
+        mock_store_instance.start_endpoint.return_value = {"desired_state": "running"}
         result = manager.start("ep")
         assert result is not None
-        mock_store_instance.update_desired_state.assert_called_once_with("ep", "running")
+        mock_store_instance.start_endpoint.assert_called_once_with("ep")
 
     def test_start_not_found(self, manager, mock_store_instance):
-        mock_store_instance.update_desired_state.return_value = None
+        mock_store_instance.start_endpoint.return_value = None
         assert manager.start("ghost") is None
 
     # -- delete --
 
     def test_delete_success(self, manager, mock_store_instance):
+        endpoint = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-1",
+            "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
+            "region_generations": {"us-east-1": "region-1"},
+            "updated_at": "before",
+        }
+        mock_store_instance.get_endpoint.return_value = endpoint
+        mock_store_instance.ensure_lifecycle_metadata.return_value = endpoint
         mock_store_instance.update_desired_state.return_value = {"desired_state": "deleted"}
         result = manager.delete("ep")
         assert result is not None
-        mock_store_instance.update_desired_state.assert_called_once_with("ep", "deleted")
+        mock_store_instance.update_desired_state.assert_called_once_with(
+            "ep", "deleted", expected_lifecycle_id="life-1"
+        )
 
     def test_delete_not_found(self, manager, mock_store_instance):
-        mock_store_instance.update_desired_state.return_value = None
+        mock_store_instance.get_endpoint.return_value = None
         assert manager.delete("ghost") is None
 
     # -- update_image --
@@ -1188,6 +2110,17 @@ class TestInferenceManager:
     def test_update_image_not_found(self, manager, mock_store_instance):
         mock_store_instance.get_endpoint.return_value = None
         assert manager.update_image("ghost", "img:v1") is None
+
+    def test_update_image_rejects_deleted_endpoint(self, manager, mock_store_instance):
+        mock_store_instance.get_endpoint.return_value = {
+            "endpoint_name": "ep",
+            "lifecycle_id": "life-update",
+            "desired_state": "deleted",
+            "spec": {"image": "old:v1"},
+        }
+        with pytest.raises(ValueError, match="deleted.*redeploy"):
+            manager.update_image("ep", "new:v2")
+        mock_store_instance.update_spec.assert_not_called()
 
     def test_deploy_with_extra_args(self, manager, mock_store_instance):
         mock_store_instance.create_endpoint.return_value = {"endpoint_name": "ep1"}

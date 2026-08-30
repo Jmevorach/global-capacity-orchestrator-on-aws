@@ -24,8 +24,10 @@ guide: how the code is organized and where a new check belongs.
 | Path | Responsibility |
 |---|---|
 | `registry.py` | The ordered action registry: names, descriptions, dependencies, handlers. Single source of truth for `--actions`. |
-| `runner.py` | Executes selected actions, checkpoints after each, and guarantees cleanup + reporting on every exit path (including signals). |
-| `models.py` | `RunSettings`, `RunCheckpoint`, `RunContext`, `ActionResult`, `ValidationReport`, and the owner-only artifact I/O. |
+| `runner.py` | Executes selected actions, checkpoints after each, and guarantees cleanup + reporting once runtime construction succeeds; bootstrap failures report cleanup blocked with an exact recovery command. |
+| `models.py` | Main `RunSettings`, `RunCheckpoint`, `RunContext`, `ActionResult`, and `ValidationReport` types. |
+| `artifact_io.py` | Owner-only report/checkpoint directory validation and atomic text writes. |
+| `inference_contract.py` | Strict vLLM/TGI request, probe, endpoint, and resume-identity helpers used by main `RunSettings`. |
 | `actions/` | One module per action. This is the "test case" layer. |
 | `checks/` | Reusable validation helpers (polling, waiting, payload validation) shared by actions. |
 | `ownership/` | Durable proof of what this run created and may therefore destroy. |
@@ -42,6 +44,8 @@ matches the action name printed in the run log. The one deliberate exception is
 `actions/jobs.py`, which holds both `api` and `sqs`: they are the same Job
 lifecycle over two different transports, and splitting them would duplicate the
 lifecycle rather than clarify it.
+
+The first-class `inference` action lives in `actions/inference.py`; its lifecycle coordinator lives in `checks/inference.py`, with Kubernetes inventory/stable absence in `checks/inference_inventory.py` and endpoint plus shared-proxy readiness/HPA checks in `checks/inference_runtime.py`. `inference_contract.py` defines a required fixed-order vLLM/TGI runtime matrix with separate digest-pinned images, immutable model commits, official ports/launcher inputs, request/response schemas, and model-info probes. Those inputs and the checked-in TLS-sidecar CPU/HPA expectations are part of the main `RunSettings` checkpoint identity. There is no sibling CLI, settings type, report, or registry. The main registry, report, isolated kubeconfig, and teardown path are authoritative. The lifecycle checkpoints a random owner nonce before creation, runs vLLM baseline/HPA then TGI baseline/HPA with peak concurrency one, and proves stable full absence after every scenario. A cleaned pre-invocation resume archives the closed lifecycle and rotates the incarnation only after fresh absence proof; invoked scenarios are never recreated.
 
 The `schedulers` action (`actions/schedulers.py`, enablement resolution in
 `checks/schedulers.py`) runs one scheduling-gated probe Job per enabled batch
@@ -65,9 +69,7 @@ each one in registry order:
 2. Calls the handler with the shared `RunContext`.
 3. Persists the checkpoint and rewrites both reports — pass or fail.
 
-Whatever happens, if a deploy was ever attempted the runner then runs
-guaranteed cleanup (`destroy_deployment`) and `final-inventory`, so an
-interrupted run still tears down and still reports.
+Once runtime construction succeeds, if a deploy was ever attempted the runner runs guaranteed cleanup (`destroy_deployment`) and `final-inventory`, so an interrupted action still tears down and reports. If construction itself fails after loading a deployed checkpoint, no unverified client is allowed to delete: the failure report marks cleanup blocked and prints the exact `--resume` recovery command instead of claiming destruction.
 
 An action handler is just:
 

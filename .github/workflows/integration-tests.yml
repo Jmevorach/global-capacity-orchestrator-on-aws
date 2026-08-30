@@ -1451,6 +1451,26 @@ jobs:
         # exists" rather than waiting for pods to go Ready.
         run: |
           set -euo pipefail
+          # Exercise the same pure replacement renderer used by the regional
+          # stack with non-default validated values; do not duplicate defaults.
+          tls_replacements="$(
+            python3 - <<'PY'
+          import json
+          from gco.stacks.regional_stack import _compute_inference_proxy_tls_replacements
+
+          configured = {
+              "tls_proxy_cpu_request_millicores": 125,
+              "tls_proxy_cpu_target_utilization_percentage": 85,
+          }
+          print(json.dumps(_compute_inference_proxy_tls_replacements(configured)))
+          PY
+          )"
+          tls_cpu_request="$(
+            jq -r '.["{{INFERENCE_PROXY_TLS_CPU_REQUEST}}"]' <<<"$tls_replacements"
+          )"
+          tls_cpu_target="$(
+            jq -r '.["{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}"]' <<<"$tls_replacements"
+          )"
           for manifest in \
               lambda/kubectl-applier-simple/manifests/30-health-monitor.yaml \
               lambda/kubectl-applier-simple/manifests/31-manifest-processor.yaml \
@@ -1470,8 +1490,8 @@ jobs:
             sed -e "s|{{${key}}}|${image}|g" \
                 -e "s|{{DEPLOYMENT_TIMESTAMP}}|$(date +%s)|g" \
                 -e 's|{{INFERENCE_PROXY_MAX_REQUEST_BODY_BYTES}}|1048576|g' \
-                -e 's|{{INFERENCE_PROXY_TLS_CPU_REQUEST}}|100m|g' \
-                -e 's|{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}|70|g' \
+                -e "s|{{INFERENCE_PROXY_TLS_CPU_REQUEST}}|${tls_cpu_request}|g" \
+                -e "s|{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}|${tls_cpu_target}|g" \
                 -e 's|{{COST_REPORT_INTERVAL_MINUTES}}|60|g' \
                 -e 's|{{COST_MONITORING_ENABLED}}|true|g' \
                 -e "s|{{[A-Z_]*}}|ci-stub|g" \
@@ -1500,12 +1520,12 @@ jobs:
             kubectl -n gco-system get deployment inference-proxy \
               -o jsonpath='{.spec.template.spec.containers[?(@.name=="api-tls-proxy")].resources.requests.cpu}'
           )"
-          test "$tls_cpu_request" = "100m"
+          test "$tls_cpu_request" = "125m"
           metric_template='{range .spec.metrics[*]}'
           metric_template+='{.containerResource.container}:{.containerResource.name}:'
           metric_template+='{.containerResource.target.averageUtilization}{"\n"}{end}'
           metrics="$(kubectl -n gco-system get hpa inference-proxy-hpa -o "jsonpath=$metric_template")"
-          expected_metrics=$'inference-proxy:cpu:70\ninference-proxy:memory:80\napi-tls-proxy:cpu:70'
+          expected_metrics=$'inference-proxy:cpu:70\ninference-proxy:memory:80\napi-tls-proxy:cpu:85'
           test "$metrics" = "$expected_metrics"
           # At least one pod got scheduled for each — confirms the apiserver
           # admitted the PodSpec and the scheduler found the nodes.

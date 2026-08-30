@@ -1,15 +1,17 @@
 """
 DynamoDB-backed store for inference endpoint state.
 
-Provides CRUD operations for inference endpoints. The inference_monitor
-in each regional cluster polls this table to reconcile desired state
-with actual Kubernetes resources.
+Provides lifecycle-fenced CRUD operations for inference endpoints. Regional
+monitors use the immutable ``lifecycle_id`` and deletion generation to ensure
+that stale writers cannot mutate a replacement endpoint or recreate a record
+after terminal deletion.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import secrets
 from datetime import UTC, datetime
 from typing import Any
 
@@ -23,6 +25,11 @@ DEFAULT_TABLE_NAME = "gco-inference-endpoints"
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _new_lifecycle_token() -> str:
+    """Return a cryptographically random immutable lifecycle token."""
+    return secrets.token_hex(32)
 
 
 def _validate_endpoint_spec(spec: dict[str, Any]) -> None:
@@ -53,18 +60,27 @@ class InferenceEndpointStore:
         labels: dict[str, str] | None = None,
         created_by: str | None = None,
     ) -> dict[str, Any]:
-        """Create a new inference endpoint entry."""
+        """Create one endpoint incarnation with immutable lifecycle identity."""
         _validate_endpoint_spec(spec)
         now = _utc_now_iso()
-        ingress_path = f"/inference/{endpoint_name}"
-
+        regions = list(dict.fromkeys(target_regions))
+        lifecycle_id = _new_lifecycle_token()
+        region_generations = {region: _new_lifecycle_token() for region in regions}
         item: dict[str, Any] = {
             "endpoint_name": endpoint_name,
+            "lifecycle_id": lifecycle_id,
             "desired_state": "deploying",
-            "target_regions": target_regions,
+            "target_regions": regions,
+            # Append-only membership for this lifecycle. Region removal changes
+            # target_regions but never this authoritative cleanup set.
+            "cleanup_regions": list(regions),
+            # Membership changes rotate only the affected Region's token. A
+            # terminal acknowledgement from an earlier remove/re-add cycle can
+            # therefore never suppress cleanup for the current membership.
+            "region_generations": region_generations,
             "namespace": namespace,
             "spec": _serialize_for_dynamo(spec),
-            "ingress_path": ingress_path,
+            "ingress_path": f"/inference/{endpoint_name}",
             "created_at": now,
             "updated_at": now,
             "region_status": {},
@@ -83,16 +99,21 @@ class InferenceEndpointStore:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise ValueError(f"Endpoint '{endpoint_name}' already exists") from e
             raise
-
         return item
 
-    def get_endpoint(self, endpoint_name: str) -> dict[str, Any] | None:
-        """Get an endpoint by name."""
-        response = self._table.get_item(Key={"endpoint_name": endpoint_name})
+    def get_endpoint(
+        self,
+        endpoint_name: str,
+        *,
+        consistent_read: bool = False,
+    ) -> dict[str, Any] | None:
+        """Get an endpoint by name, optionally using a strong read."""
+        response = self._table.get_item(
+            Key={"endpoint_name": endpoint_name},
+            ConsistentRead=consistent_read,
+        )
         item = response.get("Item")
-        if item:
-            return _deserialize_from_dynamo(item)
-        return None
+        return _deserialize_from_dynamo(item) if isinstance(item, dict) else None
 
     def list_endpoints(
         self,
@@ -102,25 +123,238 @@ class InferenceEndpointStore:
         """List all endpoints, optionally filtered."""
         response = self._table.scan()
         items = [_deserialize_from_dynamo(i) for i in response.get("Items", [])]
-
         if desired_state:
             items = [i for i in items if i.get("desired_state") == desired_state]
         if target_region:
             items = [i for i in items if target_region in i.get("target_regions", [])]
-
         return sorted(items, key=lambda x: x.get("created_at", ""), reverse=True)
 
-    def update_desired_state(self, endpoint_name: str, desired_state: str) -> dict[str, Any] | None:
-        """Update the desired state of an endpoint."""
+    def ensure_lifecycle_metadata(self, endpoint: dict[str, Any]) -> dict[str, Any] | None:
+        """Conditionally backfill immutable lifecycle metadata on a legacy record.
+
+        The migration is derived from one strong snapshot and conditioned on
+        its ``updated_at`` value. Existing lifecycle and Region tokens are
+        preserved, while current targets, prior cleanup members, and regions
+        with historical status are unioned into the authoritative cleanup set.
+        A concurrent mutation wins and makes this call return ``None`` so the
+        caller retries from a fresh snapshot instead of overwriting it.
+        """
+        endpoint_name = endpoint.get("endpoint_name")
+        updated_at = endpoint.get("updated_at")
+        if not isinstance(endpoint_name, str) or not endpoint_name:
+            raise ValueError("Endpoint lifecycle migration requires an endpoint name")
+        if not isinstance(updated_at, str) or not updated_at:
+            raise ValueError(f"Endpoint '{endpoint_name}' has no conditional migration timestamp")
+
+        raw_status = endpoint.get("region_status")
+        status_regions = list(raw_status) if isinstance(raw_status, dict) else []
+        regions = list(
+            dict.fromkeys(
+                region
+                for source in (
+                    endpoint.get("cleanup_regions"),
+                    endpoint.get("target_regions"),
+                    status_regions,
+                )
+                if isinstance(source, list)
+                for region in source
+                if isinstance(region, str) and region
+            )
+        )
+        lifecycle_value = endpoint.get("lifecycle_id")
+        lifecycle_id = (
+            lifecycle_value
+            if isinstance(lifecycle_value, str) and lifecycle_value
+            else _new_lifecycle_token()
+        )
+        raw_generations = endpoint.get("region_generations")
+        existing_generations = raw_generations if isinstance(raw_generations, dict) else {}
+        region_generations = {
+            region: (
+                existing_generations[region]
+                if isinstance(existing_generations.get(region), str)
+                and existing_generations[region]
+                else _new_lifecycle_token()
+            )
+            for region in regions
+        }
+
+        metadata_complete = (
+            endpoint.get("lifecycle_id") == lifecycle_id
+            and endpoint.get("cleanup_regions") == regions
+            and endpoint.get("region_generations") == region_generations
+        )
+        if metadata_complete:
+            return endpoint
+
         try:
             response = self._table.update_item(
                 Key={"endpoint_name": endpoint_name},
-                UpdateExpression="SET desired_state = :s, updated_at = :u",
+                UpdateExpression=(
+                    "SET lifecycle_id = if_not_exists(lifecycle_id, :lifecycle_id), "
+                    "cleanup_regions = :cleanup_regions, "
+                    "region_generations = :region_generations, updated_at = :updated_at"
+                ),
                 ExpressionAttributeValues={
-                    ":s": desired_state,
-                    ":u": _utc_now_iso(),
+                    ":lifecycle_id": lifecycle_id,
+                    ":cleanup_regions": regions,
+                    ":region_generations": region_generations,
+                    ":updated_at": _utc_now_iso(),
+                    ":expected_updated_at": updated_at,
                 },
-                ConditionExpression="attribute_exists(endpoint_name)",
+                ConditionExpression=(
+                    "attribute_exists(endpoint_name) AND updated_at = :expected_updated_at"
+                ),
+                ReturnValues="ALL_NEW",
+            )
+            return _deserialize_from_dynamo(response.get("Attributes", {}))
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return None
+            raise
+
+    @staticmethod
+    def _conditioned_identity(
+        expected_label: tuple[str, str] | None,
+        expected_lifecycle_id: str | None,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        condition = "attribute_exists(endpoint_name)"
+        names: dict[str, str] = {}
+        values: dict[str, Any] = {}
+        if expected_label is not None:
+            label_name, label_value = expected_label
+            if not label_name or not label_value:
+                raise ValueError("Expected endpoint label name and value must be non-empty")
+            condition += " AND labels.#expected_label = :expected_label_value"
+            names["#expected_label"] = label_name
+            values[":expected_label_value"] = label_value
+        if expected_lifecycle_id is not None:
+            if not expected_lifecycle_id:
+                raise ValueError("Expected lifecycle id must be non-empty")
+            condition += " AND lifecycle_id = :expected_lifecycle_id"
+            values[":expected_lifecycle_id"] = expected_lifecycle_id
+        return condition, names, values
+
+    def update_desired_state(
+        self,
+        endpoint_name: str,
+        desired_state: str,
+        *,
+        expected_label: tuple[str, str] | None = None,
+        expected_lifecycle_id: str | None = None,
+        expected_desired_state: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Conditionally update desired state without reviving deletion.
+
+        Ordinary transitions require an immutable lifecycle identity and may
+        only mutate a non-deleted record. The first transition to ``deleted``
+        atomically creates an immutable deletion generation and snapshots the
+        lifecycle's append-only cleanup regions; repeated deletes retain both.
+        """
+        if desired_state != "deleted" and not expected_lifecycle_id:
+            raise ValueError("Ordinary state updates require an expected lifecycle id")
+        condition, names, identity_values = self._conditioned_identity(
+            expected_label, expected_lifecycle_id
+        )
+        values: dict[str, Any] = {
+            ":s": desired_state,
+            ":u": _utc_now_iso(),
+            **identity_values,
+        }
+        update_expression = "SET desired_state = :s, updated_at = :u"
+        if desired_state == "deleted":
+            values[":deletion_generation"] = _new_lifecycle_token()
+            update_expression += (
+                ", deletion_generation = if_not_exists("
+                "deletion_generation, :deletion_generation), "
+                "deletion_regions = if_not_exists(deletion_regions, cleanup_regions)"
+            )
+        else:
+            condition += " AND desired_state <> :deleted"
+            values[":deleted"] = "deleted"
+        if expected_desired_state is not None:
+            condition += " AND desired_state = :expected_desired_state"
+            values[":expected_desired_state"] = expected_desired_state
+        kwargs: dict[str, Any] = {}
+        if names:
+            kwargs["ExpressionAttributeNames"] = names
+        try:
+            response = self._table.update_item(
+                Key={"endpoint_name": endpoint_name},
+                UpdateExpression=update_expression,
+                ExpressionAttributeValues=values,
+                ConditionExpression=condition,
+                ReturnValues="ALL_NEW",
+                **kwargs,
+            )
+            return _deserialize_from_dynamo(response.get("Attributes", {}))
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return None
+            raise
+
+    def start_endpoint(self, endpoint_name: str) -> dict[str, Any] | None:
+        """Start only a stopped endpoint; deletion is terminal for this lifecycle."""
+        current = self.get_endpoint(endpoint_name, consistent_read=True)
+        if current is None:
+            return None
+        migrated = self.ensure_lifecycle_metadata(current)
+        if migrated is None:
+            return None
+        current = migrated
+        lifecycle_id = current.get("lifecycle_id")
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            raise ValueError(f"Endpoint '{endpoint_name}' has no lifecycle identity")
+        state = current.get("desired_state")
+        if state == "deleted":
+            raise ValueError(
+                f"Endpoint '{endpoint_name}' is deleted; wait for purge and redeploy it with "
+                "'gco inference deploy'."
+            )
+        if state != "stopped":
+            raise ValueError(
+                f"Endpoint '{endpoint_name}' is in '{state}' state; only stopped endpoints "
+                "can be started."
+            )
+        return self.update_desired_state(
+            endpoint_name,
+            "running",
+            expected_lifecycle_id=lifecycle_id,
+            expected_desired_state="stopped",
+        )
+
+    def update_spec(
+        self,
+        endpoint_name: str,
+        spec: dict[str, Any],
+        *,
+        expected_lifecycle_id: str,
+        expected_updated_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Conditionally update a live lifecycle's spec and trigger reconciliation."""
+        _validate_endpoint_spec(spec)
+        if not expected_lifecycle_id:
+            raise ValueError("Spec updates require an expected lifecycle id")
+        condition = (
+            "attribute_exists(endpoint_name) AND lifecycle_id = :expected_lifecycle_id "
+            "AND desired_state <> :deleted"
+        )
+        values: dict[str, Any] = {
+            ":s": _serialize_for_dynamo(spec),
+            ":u": _utc_now_iso(),
+            ":ds": "deploying",
+            ":deleted": "deleted",
+            ":expected_lifecycle_id": expected_lifecycle_id,
+        }
+        if expected_updated_at is not None:
+            condition += " AND updated_at = :expected_updated_at"
+            values[":expected_updated_at"] = expected_updated_at
+        try:
+            response = self._table.update_item(
+                Key={"endpoint_name": endpoint_name},
+                UpdateExpression="SET spec = :s, updated_at = :u, desired_state = :ds",
+                ExpressionAttributeValues=values,
+                ConditionExpression=condition,
                 ReturnValues="ALL_NEW",
             )
             return _deserialize_from_dynamo(response.get("Attributes", {}))
@@ -129,19 +363,66 @@ class InferenceEndpointStore:
                 return None
             raise
 
-    def update_spec(self, endpoint_name: str, spec: dict[str, Any]) -> dict[str, Any] | None:
-        """Update the spec of an endpoint (triggers re-reconciliation)."""
-        _validate_endpoint_spec(spec)
+    def update_target_regions(
+        self,
+        endpoint_name: str,
+        target_regions: list[str],
+        cleanup_regions: list[str],
+        region_generations: dict[str, str],
+        *,
+        expected_lifecycle_id: str,
+        expected_updated_at: str,
+    ) -> dict[str, Any] | None:
+        """Conditionally update membership without dropping cleanup authority."""
+        normalized_targets = list(dict.fromkeys(target_regions))
+        requested_cleanup = list(dict.fromkeys(cleanup_regions))
+        current = self.get_endpoint(endpoint_name, consistent_read=True)
+        if (
+            current is None
+            or current.get("lifecycle_id") != expected_lifecycle_id
+            or current.get("updated_at") != expected_updated_at
+            or current.get("desired_state") == "deleted"
+        ):
+            return None
+
+        historical_cleanup = list(
+            dict.fromkeys(current.get("cleanup_regions") or current.get("target_regions") or [])
+        )
+        normalized_cleanup = list(
+            dict.fromkeys([*historical_cleanup, *requested_cleanup, *normalized_targets])
+        )
+        current_generations = current.get("region_generations")
+        merged_generations = (
+            dict(current_generations) if isinstance(current_generations, dict) else {}
+        )
+        merged_generations.update(region_generations)
+        for region in normalized_cleanup:
+            token = merged_generations.get(region)
+            if not isinstance(token, str) or not token:
+                merged_generations[region] = _new_lifecycle_token()
+        merged_generations = {region: merged_generations[region] for region in normalized_cleanup}
         try:
             response = self._table.update_item(
                 Key={"endpoint_name": endpoint_name},
-                UpdateExpression="SET spec = :s, updated_at = :u, desired_state = :ds",
+                UpdateExpression=(
+                    "SET target_regions = :targets, cleanup_regions = :cleanup, "
+                    "region_generations = :region_generations, updated_at = :u"
+                ),
                 ExpressionAttributeValues={
-                    ":s": _serialize_for_dynamo(spec),
+                    ":targets": normalized_targets,
+                    ":cleanup": normalized_cleanup,
+                    ":region_generations": merged_generations,
                     ":u": _utc_now_iso(),
-                    ":ds": "deploying",
+                    ":expected_lifecycle_id": expected_lifecycle_id,
+                    ":expected_updated_at": expected_updated_at,
+                    ":deleted": "deleted",
                 },
-                ConditionExpression="attribute_exists(endpoint_name)",
+                ConditionExpression=(
+                    "attribute_exists(endpoint_name) "
+                    "AND lifecycle_id = :expected_lifecycle_id "
+                    "AND updated_at = :expected_updated_at "
+                    "AND desired_state <> :deleted"
+                ),
                 ReturnValues="ALL_NEW",
             )
             return _deserialize_from_dynamo(response.get("Attributes", {}))
@@ -159,68 +440,148 @@ class InferenceEndpointStore:
         replicas_desired: int = 0,
         error: str | None = None,
         extra: dict[str, Any] | None = None,
-    ) -> None:
-        """Update the sync status for a specific region.
-
-        ``extra`` carries optional, additive sub-status that a richer endpoint
-        shape needs — for example a role-keyed breakdown of a split topology
-        (``{"roles": {...}, "store": {...}}``). Its keys are merged into the
-        stored status alongside the flat fields, so a consumer that only reads
-        the flat shape is unaffected.
-        """
+        *,
+        expected_lifecycle_id: str | None = None,
+        expected_region_generation: str | None = None,
+        expected_deletion_generation: str | None = None,
+    ) -> bool:
+        """Conditionally write one regional observation without upsert risk."""
         status_value: dict[str, Any] = {
             "state": state,
             "replicas_ready": replicas_ready,
             "replicas_desired": replicas_desired,
             "last_sync": _utc_now_iso(),
         }
+        if expected_lifecycle_id is not None:
+            status_value["lifecycle_id"] = expected_lifecycle_id
+        if expected_region_generation is not None:
+            status_value["region_generation"] = expected_region_generation
+        if expected_deletion_generation is not None:
+            status_value["deletion_generation"] = expected_deletion_generation
         if error:
             status_value["error"] = error
         if extra:
             status_value.update(extra)
 
+        condition = "attribute_exists(endpoint_name)"
+        values: dict[str, Any] = {":s": status_value, ":u": _utc_now_iso()}
+        if expected_lifecycle_id is not None:
+            condition += " AND lifecycle_id = :expected_lifecycle_id"
+            values[":expected_lifecycle_id"] = expected_lifecycle_id
+        if expected_region_generation is not None:
+            condition += " AND region_generations.#r = :expected_region_generation"
+            values[":expected_region_generation"] = expected_region_generation
+        if expected_deletion_generation is not None:
+            condition += (
+                " AND desired_state = :deleted "
+                "AND deletion_generation = :expected_deletion_generation"
+            )
+            values[":deleted"] = "deleted"
+            values[":expected_deletion_generation"] = expected_deletion_generation
+        else:
+            # Ordinary observations are never allowed to overwrite a terminal
+            # deletion record. Lifecycle/Region tokens fence replacement and
+            # membership races; this state predicate closes the remaining
+            # same-lifecycle window between the first delete transition and
+            # the final generation-scoped cleanup acknowledgement.
+            condition += " AND desired_state <> :deleted"
+            values[":deleted"] = "deleted"
         try:
             self._table.update_item(
                 Key={"endpoint_name": endpoint_name},
                 UpdateExpression="SET region_status.#r = :s, updated_at = :u",
                 ExpressionAttributeNames={"#r": region},
-                ExpressionAttributeValues={
-                    ":s": status_value,
-                    ":u": _utc_now_iso(),
-                },
+                ExpressionAttributeValues=values,
+                ConditionExpression=condition,
             )
+            return True
         except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                logger.info(
+                    "Skipped stale regional status for %s/%s after lifecycle change",
+                    endpoint_name,
+                    region,
+                )
+                return False
             logger.error(
                 "Failed to update region status for %s/%s: %s",
                 endpoint_name,
                 region,
                 e,
             )
+            return False
 
-    def delete_endpoint(self, endpoint_name: str) -> bool:
-        """Delete an endpoint record entirely."""
+    def delete_endpoint(
+        self,
+        endpoint_name: str,
+        *,
+        expected_updated_at: str | None = None,
+        expected_lifecycle_id: str | None = None,
+        expected_deletion_generation: str | None = None,
+    ) -> bool:
+        """Delete only the freshly verified endpoint deletion generation."""
+        condition = "attribute_exists(endpoint_name)"
+        values: dict[str, Any] = {}
+        if expected_updated_at is not None:
+            condition += " AND desired_state = :deleted AND updated_at = :expected_updated_at"
+            values.update({":deleted": "deleted", ":expected_updated_at": expected_updated_at})
+        if expected_lifecycle_id is not None:
+            condition += " AND lifecycle_id = :expected_lifecycle_id"
+            values[":expected_lifecycle_id"] = expected_lifecycle_id
+        if expected_deletion_generation is not None:
+            condition += " AND deletion_generation = :expected_deletion_generation"
+            values[":expected_deletion_generation"] = expected_deletion_generation
+        kwargs: dict[str, Any] = {
+            "Key": {"endpoint_name": endpoint_name},
+            "ConditionExpression": condition,
+        }
+        if values:
+            kwargs["ExpressionAttributeValues"] = values
         try:
-            self._table.delete_item(
-                Key={"endpoint_name": endpoint_name},
-                ConditionExpression="attribute_exists(endpoint_name)",
-            )
+            self._table.delete_item(**kwargs)
             return True
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return False
             raise
 
-    def scale_endpoint(self, endpoint_name: str, replicas: int) -> dict[str, Any] | None:
-        """Update the replica count in the spec."""
+    def scale_endpoint(
+        self,
+        endpoint_name: str,
+        replicas: int,
+        *,
+        expected_lifecycle_id: str,
+    ) -> dict[str, Any] | None:
+        """Update classic static replicas only on a live, non-Mooncake lifecycle."""
+        if not expected_lifecycle_id:
+            raise ValueError("Scaling requires an expected lifecycle id")
+        condition = (
+            "attribute_exists(endpoint_name) "
+            "AND lifecycle_id = :expected_lifecycle_id "
+            "AND desired_state <> :deleted "
+            "AND attribute_not_exists(#spec.#mooncake) "
+            "AND (attribute_not_exists(#spec.#autoscaling.#enabled) "
+            "OR #spec.#autoscaling.#enabled = :false)"
+        )
+        values: dict[str, Any] = {
+            ":r": replicas,
+            ":u": _utc_now_iso(),
+            ":false": False,
+            ":deleted": "deleted",
+            ":expected_lifecycle_id": expected_lifecycle_id,
+        }
         try:
             response = self._table.update_item(
                 Key={"endpoint_name": endpoint_name},
-                UpdateExpression="SET spec.replicas = :r, updated_at = :u",
-                ExpressionAttributeValues={
-                    ":r": replicas,
-                    ":u": _utc_now_iso(),
+                UpdateExpression="SET #spec.replicas = :r, updated_at = :u",
+                ExpressionAttributeNames={
+                    "#spec": "spec",
+                    "#autoscaling": "autoscaling",
+                    "#enabled": "enabled",
+                    "#mooncake": "mooncake",
                 },
-                ConditionExpression="attribute_exists(endpoint_name)",
+                ExpressionAttributeValues=values,
+                ConditionExpression=condition,
                 ReturnValues="ALL_NEW",
             )
             return _deserialize_from_dynamo(response.get("Attributes", {}))
@@ -231,22 +592,7 @@ class InferenceEndpointStore:
 
 
 def _serialize_for_dynamo(obj: Any) -> Any:
-    """Convert Python objects to DynamoDB-compatible types.
-
-    Recurses through nested dicts and lists, so an arbitrarily deep
-    configuration block carried on an endpoint spec (for example a nested
-    topology/store/transfer block, including list-valued sub-fields) is
-    converted in place rather than only at the top level.
-
-    Type handling:
-    - Integers are kept as integers, so whole-number counts are preserved.
-    - Floats are rendered as their decimal-string form, avoiding binary-float
-      rounding on store/reload.
-    - Strings, booleans, and None pass through unchanged. Byte-size values
-      authored as base-10 integer decimal strings therefore stay strings and
-      are never routed through a float, so they reload exactly as written
-      without float-to-Decimal coercion.
-    """
+    """Convert Python objects to DynamoDB-compatible types recursively."""
     if isinstance(obj, dict):
         return {k: _serialize_for_dynamo(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -257,15 +603,7 @@ def _serialize_for_dynamo(obj: Any) -> Any:
 
 
 def _deserialize_from_dynamo(item: dict[str, Any]) -> dict[str, Any]:
-    """Convert a DynamoDB item back to plain Python types.
-
-    Recurses through nested dicts and lists to mirror the nested structure
-    produced by :func:`_serialize_for_dynamo`. DynamoDB returns numbers as
-    Decimal: whole values become int (so integer counts survive the
-    round-trip) and fractional values become float. Strings are left
-    untouched, so a byte-size value stored as a decimal string returns as the
-    same string.
-    """
+    """Convert a DynamoDB item back to plain Python types recursively."""
     from decimal import Decimal
 
     def convert(v: Any) -> Any:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import socket
 import ssl
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -73,9 +74,9 @@ def _proxy_config(tmp_path: Path) -> ProxyConfig:
     )
 
 
-def _write_test_keypair(config: ProxyConfig) -> None:
+def _write_test_keypair(config: ProxyConfig, common_name: str = "localhost") -> str:
     key = ec.generate_private_key(ec.SECP256R1())
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.now(UTC)
     certificate = (
         x509.CertificateBuilder()
@@ -96,6 +97,7 @@ def _write_test_keypair(config: ProxyConfig) -> None:
             serialization.NoEncryption(),
         )
     )
+    return certificate.fingerprint(hashes.SHA256()).hex()
 
 
 def test_tls_proxy_defaults_are_tls_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -163,6 +165,99 @@ async def test_tls_proxy_terminates_tls_and_forwards_only_to_loopback(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_real_certificate_rotation_preserves_stream_and_updates_new_handshake(
+    tmp_path: Path,
+) -> None:
+    """A live stream survives acceptor replacement and new peers see the new leaf."""
+
+    async def echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while data := await reader.read(1024):
+                writer.write(data)
+                await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        fixed_tls_port = int(reservation.getsockname()[1])
+    config = replace(
+        _proxy_config(tmp_path),
+        port=fixed_tls_port,
+        upstream_port=upstream_port,
+        poll_seconds=0.01,
+    )
+    first_fingerprint = _write_test_keypair(config, "rotation-a")
+    proxy = TlsProxy(config)
+    await proxy.start()
+    assert proxy._server is not None
+    first_port = proxy._server.sockets[0].getsockname()[1]
+    assert first_port == fixed_tls_port
+    watcher = asyncio.create_task(proxy.watch_certificates())
+
+    client_context = ssl.create_default_context()
+    client_context.check_hostname = False
+    client_context.verify_mode = ssl.CERT_NONE
+    old_reader, old_writer = await asyncio.open_connection(
+        "127.0.0.1",
+        first_port,
+        ssl=client_context,
+        server_hostname="localhost",
+    )
+    old_ssl = old_writer.get_extra_info("ssl_object")
+    assert old_ssl is not None
+    old_leaf = x509.load_der_x509_certificate(old_ssl.getpeercert(binary_form=True))
+    assert old_leaf.fingerprint(hashes.SHA256()).hex() == first_fingerprint
+    old_writer.write(b"before-rotation")
+    await old_writer.drain()
+    assert await old_reader.readexactly(len(b"before-rotation")) == b"before-rotation"
+
+    second_fingerprint = _write_test_keypair(config, "rotation-b")
+    rotated_digest = _keypair_digest(config)
+
+    async def wait_for_watcher_rotation() -> None:
+        while proxy._keypair_digest != rotated_digest:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_watcher_rotation(), timeout=2)
+    assert proxy._server is not None
+
+    # The accepted TLS session keeps forwarding even though its acceptor is gone.
+    old_writer.write(b"after-rotation")
+    await old_writer.drain()
+    assert await old_reader.readexactly(len(b"after-rotation")) == b"after-rotation"
+
+    second_port = proxy._server.sockets[0].getsockname()[1]
+    assert second_port == fixed_tls_port == first_port
+    new_reader, new_writer = await asyncio.open_connection(
+        "127.0.0.1",
+        second_port,
+        ssl=client_context,
+        server_hostname="localhost",
+    )
+    new_ssl = new_writer.get_extra_info("ssl_object")
+    assert new_ssl is not None
+    new_leaf = x509.load_der_x509_certificate(new_ssl.getpeercert(binary_form=True))
+    assert new_leaf.fingerprint(hashes.SHA256()).hex() == second_fingerprint
+    assert second_fingerprint != first_fingerprint
+    new_writer.write(b"new-handshake")
+    await new_writer.drain()
+    assert await new_reader.readexactly(len(b"new-handshake")) == b"new-handshake"
+
+    new_writer.close()
+    old_writer.close()
+    await new_writer.wait_closed()
+    await old_writer.wait_closed()
+    await proxy.shutdown()
+    await asyncio.wait_for(watcher, timeout=1)
+    upstream.close()
+    await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_tls_proxy_reloads_acceptor_without_closing_established_streams(
     tmp_path: Path,
 ) -> None:
@@ -178,6 +273,7 @@ async def test_tls_proxy_reloads_acceptor_without_closing_established_streams(
         await proxy._reload_certificate(MagicMock(), "new-digest")
 
     old_server.close.assert_called_once_with()
+    await asyncio.sleep(0)
     old_server.wait_closed.assert_awaited_once_with()
     start_server.assert_awaited_once()
     assert proxy._server is new_server

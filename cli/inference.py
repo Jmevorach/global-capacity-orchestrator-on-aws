@@ -9,6 +9,7 @@ pattern (inference_monitor).
 from __future__ import annotations
 
 import logging
+import secrets
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeGuard
 
@@ -486,6 +487,7 @@ class InferenceManager:
         node_selector: dict[str, str] | None = None,
         rewrite_image: bool = True,
         *,
+        framework: str | None = None,
         mooncake_mode: str | None = None,
         prefill_replicas: int = 1,
         decode_replicas: int = 1,
@@ -551,6 +553,13 @@ class InferenceManager:
         Returns:
             Created endpoint record
         """
+        if framework not in (None, "vllm", "tgi"):
+            raise ValueError("framework must be 'vllm' or 'tgi'")
+        if mooncake_mode is not None and framework == "tgi":
+            raise ValueError("Mooncake serving requires the vllm framework")
+        if mooncake_mode is not None and framework is None:
+            framework = "vllm"
+
         # Build the optional mooncake block first and validate it before any
         # persistence so a rejected block leaves any stored spec untouched. A
         # disaggregated/store deploy without an explicit image falls back to
@@ -611,6 +620,8 @@ class InferenceManager:
             "gpu_count": gpu_count,
             "health_check_path": health_check_path,
         }
+        if framework:
+            spec["framework"] = framework
         # Preserve the rewrite map on the spec so the inference_monitor
         # service can pick the right URI per region when materialising
         # pods. When ``rewrite_image=False`` no map is set and the flat
@@ -667,10 +678,67 @@ class InferenceManager:
         result: dict[str, Any] | None = store.get_endpoint(endpoint_name)
         return result
 
+    @staticmethod
+    def _load_mutable_endpoint(
+        store: InferenceEndpointStore,
+        endpoint_name: str,
+        operation: str,
+    ) -> tuple[dict[str, Any], str, str | None] | None:
+        """Read and lifecycle-fence an endpoint before an ordinary mutation."""
+        endpoint = store.get_endpoint(endpoint_name, consistent_read=True)
+        if endpoint is None:
+            return None
+        if endpoint.get("desired_state") == "deleted":
+            raise ValueError(
+                f"Endpoint '{endpoint_name}' is deleted and cannot be {operation}; "
+                "redeploy it after deletion completes."
+            )
+        lifecycle_id = endpoint.get("lifecycle_id")
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            migrated = store.ensure_lifecycle_metadata(endpoint)
+            if migrated is None:
+                raise ValueError(
+                    f"Endpoint '{endpoint_name}' changed while initializing lifecycle identity"
+                )
+            endpoint = migrated
+            lifecycle_id = endpoint.get("lifecycle_id")
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            raise ValueError(f"Endpoint '{endpoint_name}' has no lifecycle identity")
+        updated_at = endpoint.get("updated_at")
+        return endpoint, lifecycle_id, updated_at if isinstance(updated_at, str) else None
+
+    @staticmethod
+    def _raise_write_conflict(endpoint_name: str, operation: str) -> None:
+        raise ValueError(
+            f"Endpoint '{endpoint_name}' changed while being {operation}; retry after reading status"
+        )
+
     def scale(self, endpoint_name: str, replicas: int) -> dict[str, Any] | None:
-        """Scale an endpoint to a new replica count."""
+        """Scale a classic static endpoint only."""
         store = self._get_store()
-        result: dict[str, Any] | None = store.scale_endpoint(endpoint_name, replicas)
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "scaled")
+        if loaded is None:
+            return None
+        endpoint, lifecycle_id, _updated_at = loaded
+        spec = endpoint.get("spec")
+        if isinstance(spec, dict) and "mooncake" in spec:
+            raise ValueError(
+                f"Endpoint '{endpoint_name}' uses Mooncake topology; use "
+                "'gco inference set-topology' instead of 'gco inference scale'."
+            )
+        autoscaling = spec.get("autoscaling") if isinstance(spec, dict) else None
+        if isinstance(autoscaling, dict) and autoscaling.get("enabled") is True:
+            raise ValueError(
+                f"Endpoint '{endpoint_name}' is autoscaled; update its min/max autoscaling "
+                "bounds or disable autoscaling before using 'gco inference scale'."
+            )
+        result: dict[str, Any] | None = store.scale_endpoint(
+            endpoint_name,
+            replicas,
+            expected_lifecycle_id=lifecycle_id,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "scaled")
         return result
 
     def set_topology(
@@ -721,18 +789,29 @@ class InferenceManager:
                 )
 
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "updated")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
 
-        spec = endpoint.get("spec", {})
+        raw_spec = endpoint.get("spec")
+        if not isinstance(raw_spec, dict):
+            raise ValueError(f"Endpoint '{endpoint_name}' has an invalid spec")
+        spec = deepcopy(raw_spec)
         # Preserve any existing mooncake sub-fields and replace only the
         # topology counts.
         mooncake = dict(spec.get("mooncake") or {})
         mooncake["topology"] = {"prefill": prefill, "decode": decode}
         spec["mooncake"] = mooncake
 
-        result: dict[str, Any] | None = store.update_spec(endpoint_name, spec)
+        result: dict[str, Any] | None = store.update_spec(
+            endpoint_name,
+            spec,
+            expected_lifecycle_id=lifecycle_id,
+            expected_updated_at=updated_at,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "updated")
         return result
 
     def configure_store(
@@ -767,11 +846,15 @@ class InferenceManager:
                 example an out-of-range byte-size field).
         """
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "configured")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
 
-        spec = endpoint.get("spec", {})
+        raw_spec = endpoint.get("spec")
+        if not isinstance(raw_spec, dict):
+            raise ValueError(f"Endpoint '{endpoint_name}' has an invalid spec")
+        spec = deepcopy(raw_spec)
         # Preserve any existing mooncake sub-fields and replace only the store
         # block, authoring byte-size fields as canonical decimal strings.
         mooncake = dict(spec.get("mooncake") or {})
@@ -789,25 +872,73 @@ class InferenceManager:
         # spec untouched.
         validate_mooncake_spec(mooncake)
 
-        result: dict[str, Any] | None = store.update_spec(endpoint_name, spec)
+        result: dict[str, Any] | None = store.update_spec(
+            endpoint_name,
+            spec,
+            expected_lifecycle_id=lifecycle_id,
+            expected_updated_at=updated_at,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "configured")
         return result
 
     def stop(self, endpoint_name: str) -> dict[str, Any] | None:
-        """Stop an endpoint (scale to zero, keep resources)."""
+        """Stop a live endpoint without crossing a deletion boundary."""
         store = self._get_store()
-        result: dict[str, Any] | None = store.update_desired_state(endpoint_name, "stopped")
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "stopped")
+        if loaded is None:
+            return None
+        _endpoint, lifecycle_id, _updated_at = loaded
+        result: dict[str, Any] | None = store.update_desired_state(
+            endpoint_name,
+            "stopped",
+            expected_lifecycle_id=lifecycle_id,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "stopped")
         return result
 
     def start(self, endpoint_name: str) -> dict[str, Any] | None:
-        """Start a stopped endpoint."""
+        """Start a stopped endpoint; deleted endpoints must be redeployed."""
         store = self._get_store()
-        result: dict[str, Any] | None = store.update_desired_state(endpoint_name, "running")
+        result: dict[str, Any] | None = store.start_endpoint(endpoint_name)
         return result
 
-    def delete(self, endpoint_name: str) -> dict[str, Any] | None:
-        """Mark an endpoint for deletion (inference_monitor cleans up)."""
+    def delete(
+        self,
+        endpoint_name: str,
+        *,
+        expected_owner_label: tuple[str, str] | None = None,
+        expected_lifecycle_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Mark an endpoint deleted with optional exact-incarnation ownership."""
+        if expected_owner_label is not None and not expected_lifecycle_id:
+            raise ValueError("Owner-conditioned deletion also requires an immutable lifecycle id")
         store = self._get_store()
-        result: dict[str, Any] | None = store.update_desired_state(endpoint_name, "deleted")
+        if expected_owner_label is None:
+            endpoint = store.get_endpoint(endpoint_name, consistent_read=True)
+            if endpoint is None:
+                return None
+            migrated = store.ensure_lifecycle_metadata(endpoint)
+            if migrated is None:
+                raise ValueError(
+                    f"Endpoint '{endpoint_name}' changed while initializing deletion identity"
+                )
+            lifecycle_id = migrated.get("lifecycle_id")
+            if not isinstance(lifecycle_id, str) or not lifecycle_id:
+                raise ValueError(f"Endpoint '{endpoint_name}' has no lifecycle identity")
+            result: dict[str, Any] | None = store.update_desired_state(
+                endpoint_name,
+                "deleted",
+                expected_lifecycle_id=lifecycle_id,
+            )
+        else:
+            result = store.update_desired_state(
+                endpoint_name,
+                "deleted",
+                expected_label=expected_owner_label,
+                expected_lifecycle_id=expected_lifecycle_id,
+            )
         return result
 
     def update_image(self, endpoint_name: str, image: str) -> dict[str, Any] | None:
@@ -816,9 +947,10 @@ class InferenceManager:
             raise ValueError("Image must be a non-empty string")
 
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "updated")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
         raw_spec = endpoint.get("spec")
         if not isinstance(raw_spec, dict):
             raise ValueError(f"Endpoint '{endpoint_name}' has an invalid spec")
@@ -827,60 +959,101 @@ class InferenceManager:
         # A direct image update is global. Stale regional rewrites would take
         # precedence in the monitor and silently keep serving the old image.
         spec.pop("region_image_uris", None)
-        result: dict[str, Any] | None = store.update_spec(endpoint_name, spec)
+        result: dict[str, Any] | None = store.update_spec(
+            endpoint_name,
+            spec,
+            expected_lifecycle_id=lifecycle_id,
+            expected_updated_at=updated_at,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "updated")
         return result
 
     def add_region(self, endpoint_name: str, region: str) -> dict[str, Any] | None:
-        """Add a region to an existing endpoint."""
-        from datetime import UTC, datetime
-
+        """Add a target and append it to this lifecycle's cleanup history."""
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        endpoint = store.get_endpoint(endpoint_name, consistent_read=True)
+        if endpoint is None:
             return None
-        regions = endpoint.get("target_regions", [])
-        if region not in regions:
-            regions.append(region)
-        # Update via raw DynamoDB update
-        try:
-            response = store._table.update_item(
-                Key={"endpoint_name": endpoint_name},
-                UpdateExpression="SET target_regions = :r, updated_at = :u",
-                ExpressionAttributeValues={
-                    ":r": regions,
-                    ":u": datetime.now(UTC).isoformat(),
-                },
-                ReturnValues="ALL_NEW",
+        regions = list(endpoint.get("target_regions") or [])
+        cleanup_regions = list(endpoint.get("cleanup_regions") or regions)
+        if region in regions:
+            return endpoint
+        regions.append(region)
+        if region not in cleanup_regions:
+            cleanup_regions.append(region)
+        raw_generations = endpoint.get("region_generations")
+        stored_generations = raw_generations if isinstance(raw_generations, dict) else {}
+        region_generations = {
+            cleanup_region: (
+                stored_generations[cleanup_region]
+                if isinstance(stored_generations.get(cleanup_region), str)
+                and stored_generations[cleanup_region]
+                else secrets.token_hex(32)
             )
-            result: dict[str, Any] | None = response.get("Attributes")
-            return result
+            for cleanup_region in cleanup_regions
+        }
+        # Every target membership transition gets a fresh token, even when the
+        # Region appeared earlier in cleanup history. This invalidates a prior
+        # terminal removal acknowledgement before resources can be recreated.
+        region_generations[region] = secrets.token_hex(32)
+        lifecycle_id = endpoint.get("lifecycle_id")
+        updated_at = endpoint.get("updated_at")
+        if not isinstance(lifecycle_id, str) or not isinstance(updated_at, str):
+            raise ValueError(f"Endpoint '{endpoint_name}' has no lifecycle identity")
+        try:
+            return store.update_target_regions(
+                endpoint_name,
+                regions,
+                cleanup_regions,
+                region_generations,
+                expected_lifecycle_id=lifecycle_id,
+                expected_updated_at=updated_at,
+            )
         except Exception as e:
             logger.error("Failed to add region: %s", e)
             return None
 
     def remove_region(self, endpoint_name: str, region: str) -> dict[str, Any] | None:
-        """Remove a region from an existing endpoint."""
+        """Remove a target without erasing its authoritative cleanup history."""
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        endpoint = store.get_endpoint(endpoint_name, consistent_read=True)
+        if endpoint is None:
             return None
-        regions = endpoint.get("target_regions", [])
-        if region in regions:
-            regions.remove(region)
-        try:
-            from datetime import UTC, datetime
-
-            response = store._table.update_item(
-                Key={"endpoint_name": endpoint_name},
-                UpdateExpression="SET target_regions = :r, updated_at = :u",
-                ExpressionAttributeValues={
-                    ":r": regions,
-                    ":u": datetime.now(UTC).isoformat(),
-                },
-                ReturnValues="ALL_NEW",
+        regions = list(endpoint.get("target_regions") or [])
+        cleanup_regions = list(endpoint.get("cleanup_regions") or regions)
+        if region not in regions:
+            return endpoint
+        regions.remove(region)
+        if region not in cleanup_regions:
+            cleanup_regions.append(region)
+        raw_generations = endpoint.get("region_generations")
+        stored_generations = raw_generations if isinstance(raw_generations, dict) else {}
+        region_generations = {
+            cleanup_region: (
+                stored_generations[cleanup_region]
+                if isinstance(stored_generations.get(cleanup_region), str)
+                and stored_generations[cleanup_region]
+                else secrets.token_hex(32)
             )
-            result: dict[str, Any] | None = response.get("Attributes")
-            return result
+            for cleanup_region in cleanup_regions
+        }
+        # The cleanup pass must acknowledge this removal, not any earlier
+        # remove/re-add cycle for the same Region.
+        region_generations[region] = secrets.token_hex(32)
+        lifecycle_id = endpoint.get("lifecycle_id")
+        updated_at = endpoint.get("updated_at")
+        if not isinstance(lifecycle_id, str) or not isinstance(updated_at, str):
+            raise ValueError(f"Endpoint '{endpoint_name}' has no lifecycle identity")
+        try:
+            return store.update_target_regions(
+                endpoint_name,
+                regions,
+                cleanup_regions,
+                region_generations,
+                expected_lifecycle_id=lifecycle_id,
+                expected_updated_at=updated_at,
+            )
         except Exception as e:
             logger.error("Failed to remove region: %s", e)
             return None
@@ -915,9 +1088,10 @@ class InferenceManager:
             raise ValueError("Canary replicas must be a positive integer")
 
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "updated")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
 
         if endpoint.get("desired_state") not in ("running", "deploying"):
             raise ValueError(
@@ -940,15 +1114,23 @@ class InferenceManager:
             "replicas": replicas,
         }
 
-        result: dict[str, Any] | None = store.update_spec(endpoint_name, spec)
+        result: dict[str, Any] | None = store.update_spec(
+            endpoint_name,
+            spec,
+            expected_lifecycle_id=lifecycle_id,
+            expected_updated_at=updated_at,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "updated")
         return result
 
     def promote_canary(self, endpoint_name: str) -> dict[str, Any] | None:
         """Promote a classic canary to primary and remove its deployment."""
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "updated")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
 
         raw_spec = endpoint.get("spec")
         if not isinstance(raw_spec, dict):
@@ -976,15 +1158,23 @@ class InferenceManager:
         # rewrites point at the superseded image and must not take precedence.
         spec.pop("region_image_uris", None)
 
-        result: dict[str, Any] | None = store.update_spec(endpoint_name, spec)
+        result: dict[str, Any] | None = store.update_spec(
+            endpoint_name,
+            spec,
+            expected_lifecycle_id=lifecycle_id,
+            expected_updated_at=updated_at,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "updated")
         return result
 
     def rollback_canary(self, endpoint_name: str) -> dict[str, Any] | None:
         """Remove the canary deployment, keeping the primary unchanged."""
         store = self._get_store()
-        endpoint = store.get_endpoint(endpoint_name)
-        if not endpoint:
+        loaded = self._load_mutable_endpoint(store, endpoint_name, "updated")
+        if loaded is None:
             return None
+        endpoint, lifecycle_id, updated_at = loaded
 
         raw_spec = endpoint.get("spec")
         if not isinstance(raw_spec, dict):
@@ -996,7 +1186,14 @@ class InferenceManager:
         # Mooncake-plus-canary record so an operator can repair it.
         spec = deepcopy(raw_spec)
         spec.pop("canary", None)
-        result: dict[str, Any] | None = store.update_spec(endpoint_name, spec)
+        result: dict[str, Any] | None = store.update_spec(
+            endpoint_name,
+            spec,
+            expected_lifecycle_id=lifecycle_id,
+            expected_updated_at=updated_at,
+        )
+        if result is None:
+            self._raise_write_conflict(endpoint_name, "updated")
         return result
 
 

@@ -183,12 +183,24 @@ class TestHealthWatchdogCleanup:
 
     def test_deleted_endpoint_clears_tracker(self, monitor):
         """Deleting an endpoint should clear its unready tracker entry."""
-        monitor._unready_since["my-llm"] = datetime.now(UTC)
-        monitor.apps_v1.read_namespaced_deployment = MagicMock(
-            side_effect=ApiException(status=404, reason="Not Found")
-        )
+        from gco.services.inference_monitor import ResourceCleanupResult
 
-        monitor._reconcile_deleted("my-llm", "gco-inference")
+        monitor._unready_since["my-llm"] = datetime.now(UTC)
+        with patch.object(
+            monitor,
+            "_delete_resources",
+            return_value=ResourceCleanupResult(),
+        ):
+            monitor._reconcile_deleted(
+                {
+                    "endpoint_name": "my-llm",
+                    "lifecycle_id": "life-1",
+                    "desired_state": "deleted",
+                    "deletion_generation": "delete-1",
+                    "region_status": {},
+                },
+                "gco-inference",
+            )
 
         assert "my-llm" not in monitor._unready_since
 

@@ -29,9 +29,14 @@ def _make_monitor(mock_store=None):
         patch("gco.services.inference_monitor.client.AppsV1Api") as mock_apps,
         patch("gco.services.inference_monitor.client.CoreV1Api") as mock_core,
         patch("gco.services.inference_monitor.client.NetworkingV1Api") as mock_net,
+        patch("gco.services.inference_monitor.client.DiscoveryV1Api") as mock_discovery,
         patch("gco.services.inference_monitor.client.AutoscalingV2Api"),
+        patch("gco.services.inference_monitor.client.CustomObjectsApi"),
     ):
-        from gco.services.inference_monitor import InferenceMonitor
+        from gco.services.inference_monitor import (
+            InferenceMonitor,
+            ResourceCleanupResult,
+        )
 
         store = mock_store or MagicMock()
         m = InferenceMonitor(
@@ -44,6 +49,9 @@ def _make_monitor(mock_store=None):
         m.apps_v1 = mock_apps.return_value
         m.core_v1 = mock_core.return_value
         m.networking_v1 = mock_net.return_value
+        m.discovery_v1 = mock_discovery.return_value
+        m._delete_autoscalers = MagicMock(return_value=ResourceCleanupResult())
+        m._reconcile_classic_autoscaler = MagicMock(return_value=ResourceCleanupResult())
         return m
 
 
@@ -555,6 +563,7 @@ class TestReconcileRunningExtended:
 
         endpoint = {
             "endpoint_name": "promote-ep",
+            "lifecycle_id": "life-promote",
             "desired_state": "deploying",
             "target_regions": ["us-east-1"],
             "spec": {"image": "img:v1", "replicas": 1},
@@ -563,7 +572,12 @@ class TestReconcileRunningExtended:
         }
         result = await monitor._reconcile_endpoint(endpoint)
         assert result is None
-        mock_store.update_desired_state.assert_called_with("promote-ep", "running")
+        mock_store.update_desired_state.assert_called_with(
+            "promote-ep",
+            "running",
+            expected_lifecycle_id="life-promote",
+            expected_desired_state="deploying",
+        )
 
     @pytest.mark.asyncio
     async def test_reconcile_stopped_already_zero(self):
@@ -606,42 +620,84 @@ class TestReconcileRunningExtended:
 
     @pytest.mark.asyncio
     async def test_reconcile_deleted_no_deployment(self):
-        """Deleted endpoint with no deployment — just update status."""
-        from kubernetes.client.rest import ApiException
+        """Deleted endpoint with no Deployment still verifies every owned kind."""
+        from gco.services.inference_monitor import ResourceCleanupResult
 
         mock_store = MagicMock()
         monitor = _make_monitor(mock_store)
-        monitor.apps_v1.read_namespaced_deployment.side_effect = ApiException(status=404)
+        with patch.object(
+            monitor,
+            "_delete_resources",
+            return_value=ResourceCleanupResult(),
+        ) as cleanup:
+            endpoint = {
+                "endpoint_name": "del-ep",
+                "lifecycle_id": "life-del",
+                "desired_state": "deleted",
+                "target_regions": ["us-east-1"],
+                "cleanup_regions": ["us-east-1"],
+                "deletion_regions": ["us-east-1"],
+                "deletion_generation": "delete-del",
+                "region_status": {
+                    "us-east-1": {
+                        "state": "deleting",
+                        "lifecycle_id": "life-del",
+                        "deletion_generation": "delete-del",
+                        "absence_observations": 1,
+                    }
+                },
+                "spec": {"image": "img:v1"},
+                "namespace": "gco-inference",
+            }
+            mock_store.update_region_status.return_value = True
+            result = await monitor._reconcile_endpoint(endpoint)
 
-        endpoint = {
-            "endpoint_name": "del-ep",
-            "desired_state": "deleted",
-            "target_regions": ["us-east-1"],
-            "spec": {"image": "img:v1"},
-            "namespace": "gco-inference",
+        cleanup.assert_called_once_with(
+            "del-ep",
+            "gco-inference",
+            endpoint["spec"],
+            expected_lifecycle_id="life-del",
+        )
+        assert result == {
+            "action": "delete",
+            "endpoint": "del-ep",
+            "cleanup_complete": True,
         }
-        result = await monitor._reconcile_endpoint(endpoint)
-        assert result is None
-        mock_store.update_region_status.assert_called_with("del-ep", "us-east-1", "deleted")
+        mock_store.update_region_status.assert_called_with(
+            "del-ep",
+            "us-east-1",
+            "deleted",
+            extra={"absence_observations": 2},
+            expected_lifecycle_id="life-del",
+            expected_deletion_generation="delete-del",
+        )
 
     @pytest.mark.asyncio
-    async def test_reconcile_not_target_region_no_deployment(self):
-        """Not a target region and no deployment — skip."""
-        from kubernetes.client.rest import ApiException
+    async def test_reconcile_never_targeted_region_does_zero_kubernetes_work(self):
+        """A region outside immutable cleanup history is a zero-request fast path."""
+        from gco.services.inference_monitor import ResourceCleanupResult
 
         mock_store = MagicMock()
         monitor = _make_monitor(mock_store)
-        monitor.apps_v1.read_namespaced_deployment.side_effect = ApiException(status=404)
+        with patch.object(
+            monitor,
+            "_delete_resources",
+            return_value=ResourceCleanupResult(),
+        ) as cleanup:
+            endpoint = {
+                "endpoint_name": "other-ep",
+                "lifecycle_id": "life-other",
+                "desired_state": "running",
+                "target_regions": ["eu-west-1"],
+                "cleanup_regions": ["eu-west-1"],
+                "spec": {"image": "img:v1"},
+                "namespace": "gco-inference",
+            }
+            result = await monitor._reconcile_endpoint(endpoint)
 
-        endpoint = {
-            "endpoint_name": "other-ep",
-            "desired_state": "running",
-            "target_regions": ["eu-west-1"],
-            "spec": {"image": "img:v1"},
-            "namespace": "gco-inference",
-        }
-        result = await monitor._reconcile_endpoint(endpoint)
+        cleanup.assert_not_called()
         assert result is None
+        mock_store.update_region_status.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_reconcile_unknown_desired_state(self):
@@ -757,25 +813,55 @@ class TestStartStop:
 class TestDeleteResourcesExtended:
     """Extended tests for _delete_resources."""
 
-    def test_delete_resources_logs_non_404_errors(self):
+    def test_delete_resources_aggregates_non_404_errors(self):
         from kubernetes.client.rest import ApiException
 
+        from gco.services.inference_monitor import InferenceMonitor
+
         monitor = _make_monitor()
-        monitor.apps_v1.delete_namespaced_deployment.side_effect = ApiException(status=500)
-        monitor.core_v1.delete_namespaced_service.side_effect = ApiException(status=500)
+        monitor._delete_autoscalers = InferenceMonitor._delete_autoscalers.__get__(monitor)
+        monitor.apps_v1.delete_namespaced_deployment.side_effect = ApiException(
+            status=500, reason="server detail"
+        )
+        monitor.apps_v1.read_namespaced_deployment.return_value = MagicMock()
+        monitor.core_v1.delete_namespaced_service.side_effect = ApiException(
+            status=500, reason="server detail"
+        )
+        monitor.core_v1.read_namespaced_service.return_value = MagicMock()
+        monitor.core_v1.delete_namespaced_config_map.side_effect = ApiException(status=404)
+        monitor.core_v1.read_namespaced_config_map.side_effect = ApiException(status=404)
+        monitor.core_v1.read_namespaced_secret.side_effect = ApiException(status=404)
 
         with (
             patch("gco.services.inference_monitor.client.AutoscalingV2Api") as mock_hpa,
             patch("gco.services.inference_monitor.client.CustomObjectsApi") as mock_custom,
         ):
-            mock_hpa.return_value.delete_namespaced_horizontal_pod_autoscaler.side_effect = (
-                ApiException(status=500)
+            hpa = mock_hpa.return_value
+            custom = mock_custom.return_value
+            hpa.delete_namespaced_horizontal_pod_autoscaler.side_effect = ApiException(
+                status=500, reason="server detail"
             )
-            mock_custom.return_value.delete_namespaced_custom_object.side_effect = ApiException(
-                status=500
+            hpa.read_namespaced_horizontal_pod_autoscaler.return_value = MagicMock()
+            custom.delete_namespaced_custom_object.side_effect = ApiException(
+                status=500, reason="server detail"
             )
-            # Should not raise, just log errors
-            monitor._delete_resources("ep", "ns")
+            custom.get_namespaced_custom_object.return_value = {
+                "metadata": {"uid": "uid", "resourceVersion": "1"}
+            }
+            result = monitor._delete_resources("ep", "ns")
+
+        assert result.complete is False
+        assert len(result.errors) == 22
+        assert "delete scaledobject ep failed (status 500)" in result.errors
+        assert "delete hpa ep failed (status 500)" in result.errors
+        assert "delete hpa keda-hpa-ep failed (status 500)" in result.errors
+        assert "delete deployment ep-canary failed (status 500)" in result.errors
+        assert "delete service ep-proxy failed (status 500)" in result.errors
+        assert all("server detail" not in error for error in result.errors)
+        # Failure of one kind never short-circuits inventory of later kinds;
+        # already-absent ConfigMaps are read once and never deleted blindly.
+        assert monitor.core_v1.read_namespaced_config_map.call_count == 2
+        assert monitor.core_v1.delete_namespaced_config_map.call_count == 0
 
 
 # =============================================================================
@@ -955,19 +1041,29 @@ class TestInferenceManagerRegions:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-regions",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
+            "region_generations": {"us-east-1": "east-old"},
         }
         mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "ep"}}
         manager._get_store.return_value = mock_store
 
         result = manager.add_region("ep", "eu-west-1")
         assert result is not None
+        generations = mock_store.update_target_regions.call_args.args[3]
+        assert generations["us-east-1"] == "east-old"
+        assert len(generations["eu-west-1"]) == 64
 
     def test_add_region_already_present(self, manager):
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-regions",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1", "eu-west-1"],
+            "cleanup_regions": ["us-east-1", "eu-west-1"],
         }
         mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "ep"}}
         manager._get_store.return_value = mock_store
@@ -987,9 +1083,12 @@ class TestInferenceManagerRegions:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-regions",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
         }
-        mock_store._table.update_item.side_effect = Exception("DDB error")
+        mock_store.update_target_regions.side_effect = Exception("DDB error")
         manager._get_store.return_value = mock_store
 
         result = manager.add_region("ep", "eu-west-1")
@@ -999,19 +1098,33 @@ class TestInferenceManagerRegions:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-regions",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1", "eu-west-1"],
+            "cleanup_regions": ["us-east-1", "eu-west-1"],
+            "region_generations": {
+                "us-east-1": "east-old",
+                "eu-west-1": "west-old",
+            },
         }
         mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "ep"}}
         manager._get_store.return_value = mock_store
 
         result = manager.remove_region("ep", "eu-west-1")
         assert result is not None
+        generations = mock_store.update_target_regions.call_args.args[3]
+        assert generations["us-east-1"] == "east-old"
+        assert generations["eu-west-1"] != "west-old"
+        assert len(generations["eu-west-1"]) == 64
 
     def test_remove_region_not_present(self, manager):
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-regions",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
         }
         mock_store._table.update_item.return_value = {"Attributes": {"endpoint_name": "ep"}}
         manager._get_store.return_value = mock_store
@@ -1031,9 +1144,12 @@ class TestInferenceManagerRegions:
         mock_store = MagicMock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep",
+            "lifecycle_id": "life-regions",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
         }
-        mock_store._table.update_item.side_effect = Exception("DDB error")
+        mock_store.update_target_regions.side_effect = Exception("DDB error")
         manager._get_store.return_value = mock_store
 
         result = manager.remove_region("ep", "us-east-1")

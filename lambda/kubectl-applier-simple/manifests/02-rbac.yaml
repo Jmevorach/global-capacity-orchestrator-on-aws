@@ -309,38 +309,55 @@ metadata:
     app: inference-monitor
     project: gco
 rules:
-  # Apps resources — Deployments for inference role pods (prefill/decode/single
-  # and the PD proxy); StatefulSet for the shared per-region Mooncake master.
-  # ``statefulsets/status`` is the subresource the monitor reads to gate role
-  # pods on the master's Ready replica count (separate from ``statefulsets``).
+  # Apps resources — Deployments for endpoint role pods and StatefulSet for
+  # the shared per-region Mooncake master are managed directly.
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "statefulsets/status"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
 
-  # Core resources — Services for endpoints and the master; ConfigMaps carry the
-  # Mooncake transport config (mooncake.json) mounted into each role pod.
+  # ReplicaSets are generated children and are inventory-only during stable
+  # absence proof; the monitor never mutates or deletes them directly.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+
+  # Services and ConfigMaps are managed endpoint parents.
   - apiGroups: [""]
     resources: ["services", "configmaps"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
+
+  # Pods and legacy Endpoints are generated children used only for terminal
+  # inventory. Granting write/delete here would bypass parent UID fencing.
+  - apiGroups: [""]
+    resources: ["pods", "endpoints"]
+    verbs: ["get", "list", "watch"]
+
+  # EndpointSlices are generated from endpoint Services and must be absent
+  # before regional deletion can be acknowledged.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
 
   # Core resources — the PD proxy admin API key Secret. The monitor reads a
   # user-supplied Secret by reference (confirming it exists and is non-empty)
   # and, when an endpoint names none, provisions a per-endpoint {name}-admin
   # Secret create-if-absent with a generated key. The key reaches the proxy only
-  # by Secret reference and is never written to the spec, so the monitor needs
-  # get + create + delete and nothing more (no update/list/watch). Delete is
-  # required only for monitor-owned generated keys during endpoint teardown;
-  # user-named Secrets are never removed by the monitor.
+  # by Secret reference and is never written to the spec. Exact pre-v7
+  # monitor-generated Secrets are safely migrated by patching only the
+  # lifecycle annotation, so patch is required in addition to get/create/delete.
+  # User-named or ambiguous Secrets are never patched or removed.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "create", "patch", "delete"]
 
-  # Temporary upgrade cleanup only: endpoint-specific Ingresses are no longer
-  # created or read. Keep exact delete capability until all supported upgrade
-  # paths have removed historical inference-{name} Ingress objects.
+  # Temporary upgrade cleanup: terminal proof reads and foreground-deletes
+  # historical endpoint-specific Ingresses and HTTPRoutes.
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["delete"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "delete"]
 
   # Networking resources — NetworkPolicy allow rules that let inference pods
   # reach the shared Mooncake master RPC/metadata ports and each other on the
@@ -350,9 +367,12 @@ rules:
     resources: ["networkpolicies"]
     verbs: ["create", "get", "list"]
 
-  # Autoscaling — HPA for inference endpoints (AutoscalingV2 uses "autoscaling" apiGroup)
+  # Autoscaling — native HPAs plus KEDA ScaledObjects and generated HPAs.
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
 
   # Coordination — leader election leases

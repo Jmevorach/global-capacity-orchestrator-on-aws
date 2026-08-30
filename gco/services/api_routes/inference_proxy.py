@@ -215,6 +215,7 @@ def _validate_upstream_path(
         not normalized
         or normalized == "health"
         or (configured_health and normalized == configured_health)
+        or normalized == "info"
         or _V1_MODELS_RE.fullmatch(normalized)
     ) and method in {"GET", "HEAD"}:
         return normalized

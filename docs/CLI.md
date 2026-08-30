@@ -2781,7 +2781,7 @@ See [Inference Guide](INFERENCE.md) for architecture details and workflows.
 | [`gco inference deploy`](#gco-inference-deploy) | Deploy an inference endpoint to one or more regions. |
 | [`gco inference list`](#gco-inference-list) | List inference endpoints. |
 | [`gco inference status`](#gco-inference-status) | Show detailed status of an inference endpoint including per-region sync state. |
-| [`gco inference scale`](#gco-inference-scale) | Scale an inference endpoint to a new replica count (applied across all target regions). |
+| [`gco inference scale`](#gco-inference-scale) | Scale a static inference endpoint; autoscaler-owned endpoints are rejected with bounds guidance. |
 | [`gco inference stop`](#gco-inference-stop) | Stop an inference endpoint (scales to zero, keeps configuration). |
 | [`gco inference start`](#gco-inference-start) | Start a stopped inference endpoint. |
 | [`gco inference delete`](#gco-inference-delete) | Delete an inference endpoint from all regions. |
@@ -2815,6 +2815,7 @@ gco inference deploy ENDPOINT_NAME [OPTIONS]
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--image` | `-i` | Container image (required) |
+| `--framework` | | Explicit serving runtime (`vllm` or `tgi`). Persists the adapter contract used for renderer arguments, probes, and model metadata; Mooncake requires `vllm`. |
 | `--region` | `-r` | Target region(s), repeatable (default: all deployed regions) |
 | `--replicas` | | Replicas per region (default: 1) |
 | `--gpu-count` | | GPUs per replica (default: 1) |
@@ -2902,7 +2903,7 @@ gco inference status my-llm
 
 #### `gco inference scale`
 
-Scale an inference endpoint to a new replica count (applied across all target regions).
+Scale a static inference endpoint to a new replica count across all target regions. If HPA or KEDA currently owns replicas, the command fails with guidance to update autoscaling bounds or disable autoscaling; it never reports a successful no-op.
 
 ```bash
 gco inference scale ENDPOINT_NAME [OPTIONS]
@@ -2956,7 +2957,7 @@ gco inference start my-llm
 
 #### `gco inference delete`
 
-Delete an inference endpoint from all regions. The inference_monitor in each region cleans up K8s resources.
+Delete an inference endpoint from all regions. The first request creates an immutable deletion generation and historical cleanup-region snapshot; repeated requests are idempotent. Regional monitors acknowledge stable full Kubernetes absence for that generation before the conditioned DynamoDB purge.
 
 ```bash
 gco inference delete ENDPOINT_NAME [OPTIONS]
@@ -3074,7 +3075,7 @@ gco inference health my-llm -r us-east-1
 
 #### `gco inference models`
 
-List models loaded on an inference endpoint. Queries the `/v1/models` path (OpenAI-compatible) to discover which models are available.
+Read the loaded model identity through the authenticated endpoint route. vLLM uses the OpenAI-compatible `/v1/models`; TGI uses the read-only `/info` contract and reports both model ID and revision. The persisted `--framework` from deploy is used by default.
 
 ```bash
 gco inference models ENDPOINT_NAME [OPTIONS]
@@ -3088,6 +3089,7 @@ gco inference models ENDPOINT_NAME [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
+| `--framework` | | Runtime metadata contract (`vllm` or `tgi`); defaults to the persisted endpoint framework, then vLLM for legacy records. |
 | `--region` | `-r` | Target region to query |
 
 **Example:**
@@ -5344,12 +5346,19 @@ Release validation lifecycle.
 
 #### `gco release validate`
 
-Run [live release validation](LIVE_RELEASE_VALIDATION.md) end to end with no interactive prompts. The command derives the expected commit SHA, branch, run id, and a private report directory outside the checkout, then executes `python -m scripts.live_release_validation` with the derived identity. Consent is expressed through explicit flags — there is deliberately nothing to confirm interactively, which makes the command scriptable while keeping accidental invocation implausible. The harness itself re-verifies every identity claim (account, SHA, branch, clean worktree, healthy `CDKToolkit` stacks) before acting.
+Run [live release validation](LIVE_RELEASE_VALIDATION.md) end to end with no interactive prompts. The command derives the expected commit SHA, branch, run id, and a private report directory outside the checkout, then executes `python -m scripts.live_release_validation` with the derived identity. Consent is expressed through explicit flags — there is deliberately nothing to confirm interactively, which makes the command scriptable while keeping accidental invocation implausible. The harness itself re-verifies every identity claim (account, SHA, branch, clean worktree, healthy `CDKToolkit` stacks) before acting. When `inference` or `all` is selected, preflight also requires `session-manager-plugin` on `PATH` before deployment. Separate digest-pinned vLLM and TGI images plus full immutable model revisions are mandatory; exact framework requests/responses, model-info probes, shared TLS proxy autoscaling, endpoint/HPA shape, and timeout contracts all belong to the main checkpoint identity.
 
 ```bash
 gco release validate --expected-account 123456789012 \
   --i-understand-this-deploys-and-destroys-infrastructure \
-  --confirm-kms-key-deletion
+  --confirm-kms-key-deletion \
+  --inference-region us-east-1 \
+  --inference-vllm-image 'registry.example/vllm@sha256:<64-lowercase-hex-digest>' \
+  --inference-vllm-model-id publisher/vllm-model \
+  --inference-vllm-model-revision '<40-lowercase-hex-model-commit>' \
+  --inference-tgi-image 'registry.example/tgi@sha256:<64-lowercase-hex-digest>' \
+  --inference-tgi-model-id publisher/tgi-model \
+  --inference-tgi-model-revision '<40-lowercase-hex-model-commit>'
 ```
 
 **Options:**
@@ -5359,7 +5368,12 @@ gco release validate --expected-account 123456789012 \
 | `--expected-account` | Required. Exact 12-digit AWS account id the run may touch; preflight fails on any mismatch with the caller identity. |
 | `--i-understand-this-deploys-and-destroys-infrastructure` | Required consent flag: the run deploys real, paid infrastructure and destroys it afterwards. |
 | `--confirm-kms-key-deletion` | Authorize scheduling this run's retained EKS KMS keys for their 7-day deletion window; required whenever the `deploy` action is selected. |
-| `--actions` | Harness actions to run (default `all`); dependencies are added automatically. A subset run reports `PARTIAL`, never `PASSED`. |
+| `--actions` | Harness actions to run (default `all`); dependencies are added automatically. `all` includes first-class `inference` immediately after `topology`. A subset run reports `PARTIAL`, never `PASSED`. |
+| `--inference-region` | Required when `inference` runs. One deployed Region used for all four strictly sequential scenarios. |
+| `--inference-vllm-image` / `--inference-tgi-image` | Required. Separate immutable lowercase `@sha256:` server images; there are no mutable defaults. |
+| `--inference-vllm-model-id` / `--inference-tgi-model-id` | Required. Exact model identifiers checked through framework-specific model-info APIs. |
+| `--inference-vllm-model-revision` / `--inference-tgi-model-revision` | Required. Full lowercase 40-hex model commits forwarded to the official launchers and included in checkpoint identity. |
+| `--inference-gpu-count` | GPUs per endpoint replica (default `0`); part of checkpoint identity. |
 | `--profile` | Topology profile to validate against cdk.json: `configured` (default), `single-region`, or `multi-region`. |
 | `--run-id` | Stable run id (default: UTC timestamp + commit SHA prefix). |
 | `--report-dir` | Report directory (default: `~/gco-live-release-validation-reports/<run-id>`, outside the checkout so the clean-worktree preflight holds). |

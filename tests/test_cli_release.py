@@ -56,7 +56,29 @@ def _invoke(*args: str):
 
 
 CONSENT = "--i-understand-this-deploys-and-destroys-infrastructure"
-BASE = ("--expected-account", "123456789012", CONSENT, "--confirm-kms-key-deletion")
+INFERENCE = (
+    "--inference-region",
+    "us-east-1",
+    "--inference-vllm-image",
+    "registry.example/vllm@sha256:" + "a" * 64,
+    "--inference-vllm-model-id",
+    "test/vllm-model",
+    "--inference-vllm-model-revision",
+    "b" * 40,
+    "--inference-tgi-image",
+    "registry.example/tgi@sha256:" + "c" * 64,
+    "--inference-tgi-model-id",
+    "test/tgi-model",
+    "--inference-tgi-model-revision",
+    "d" * 40,
+)
+BASE = (
+    "--expected-account",
+    "123456789012",
+    CONSENT,
+    "--confirm-kms-key-deletion",
+    *INFERENCE,
+)
 
 
 class TestConsentGates:
@@ -84,7 +106,11 @@ class TestConsentGates:
         )
         assert result.exit_code == 0, result.output
         assert len(fake_processes.harness_calls) == 1
-        assert "--confirm-kms-key-deletion" not in fake_processes.harness_calls[0]["command"]
+        command = fake_processes.harness_calls[0]["command"]
+        assert "--confirm-kms-key-deletion" not in command
+        assert "--inference-vllm-image" not in command
+        assert "--inference-tgi-image" not in command
+        assert "--confirm-inference-deployment" not in command
 
     def test_workload_actions_imply_deploy_for_the_kms_gate(self, fake_processes):
         """`--actions api` expands to deploy inside the harness; the KMS
@@ -122,6 +148,15 @@ class TestHarnessInvocation:
         assert value_of("--expected-sha") == "a" * 40
         assert value_of("--expected-branch") == "test/floci-integration"
         assert value_of("--actions") == "all"
+        assert value_of("--inference-region") == "us-east-1"
+        assert value_of("--inference-vllm-image").endswith("a" * 64)
+        assert value_of("--inference-vllm-model-id") == "test/vllm-model"
+        assert value_of("--inference-vllm-model-revision") == "b" * 40
+        assert value_of("--inference-tgi-image").endswith("c" * 64)
+        assert value_of("--inference-tgi-model-id") == "test/tgi-model"
+        assert value_of("--inference-tgi-model-revision") == "d" * 40
+        assert value_of("--inference-gpu-count") == "0"
+        assert "--confirm-inference-deployment" in command
         assert value_of("--repo-root") == str(fake_processes.repo_root)
         assert "--confirm-kms-key-deletion" in command
         run_id = value_of("--run-id")

@@ -34,6 +34,7 @@ import importlib
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -72,12 +73,39 @@ def monitor():
     return _make_monitor()
 
 
-def _secret_with_key(value_b64: str | None = None, plain: str | None = None):
-    """Return a mock Secret view carrying (or omitting) an admin key value."""
+LIFECYCLE_ID = "a" * 64
+GENERATED_SECRET_LABELS = {
+    "app": "endpoint-admin",
+    "project": "gco",
+    "gco.io/type": "inference",
+}
+
+
+def _secret_with_key(
+    value_b64: str | None = None,
+    plain: str | None = None,
+    *,
+    labels: dict[str, str] | None = None,
+    annotations: dict[str, str] | None = None,
+    resource_version: str | None = None,
+    uid: str | None = None,
+):
+    """Return a Secret view carrying key material and explicit metadata."""
     secret = MagicMock()
     secret.string_data = {"ADMIN_API_KEY": plain} if plain is not None else None
     secret.data = {"ADMIN_API_KEY": value_b64} if value_b64 is not None else None
+    secret.type = "Opaque"
+    secret.metadata = SimpleNamespace(
+        labels=labels,
+        annotations=annotations,
+        resource_version=resource_version,
+        uid=uid,
+    )
     return secret
+
+
+def _endpoint_record() -> dict[str, str]:
+    return {"lifecycle_id": LIFECYCLE_ID}
 
 
 def _proxy_spec(secret_name: str | None = "endpoint-admin") -> dict:
@@ -109,7 +137,9 @@ def test_unnamed_admin_secret_auto_provisions_and_creates_proxy(monitor):
     # The {name}-admin Secret does not exist yet, so provisioning creates it.
     monitor.core_v1.read_namespaced_secret.side_effect = ApiException(status=404)
 
-    monitor._create_pd_proxy("endpoint", "gco-inference", _proxy_spec(secret_name=None), {})
+    monitor._create_pd_proxy(
+        "endpoint", "gco-inference", _proxy_spec(secret_name=None), _endpoint_record()
+    )
 
     # A Secret named {name}-admin was created with a non-empty generated key.
     monitor.core_v1.create_namespaced_secret.assert_called_once()
@@ -119,6 +149,10 @@ def test_unnamed_admin_secret_auto_provisions_and_creates_proxy(monitor):
     generated = (created.string_data or {})[ADMIN_API_KEY_SECRET_DATA_KEY]
     assert generated  # non-empty generated key
     assert len(generated) >= 32
+    assert created.metadata.labels == GENERATED_SECRET_LABELS
+    assert "gco.io/lifecycle-id" not in created.metadata.labels
+    assert all(len(value) <= 63 for value in created.metadata.labels.values())
+    assert created.metadata.annotations == {"gco.io/lifecycle-id": LIFECYCLE_ID}
 
     # The proxy is materialized and references the provisioned Secret by name.
     monitor.apps_v1.create_namespaced_deployment.assert_called_once()
@@ -138,25 +172,137 @@ def test_unnamed_admin_secret_auto_provisions_and_creates_proxy(monitor):
             assert generated not in entry.value
 
 
+def test_existing_proxy_deployment_is_reconciled_after_stop(monitor):
+    """A stopped proxy Deployment is patched back to configured capacity."""
+    import base64
+
+    monitor.core_v1.read_namespaced_secret.return_value = _secret_with_key(
+        value_b64=base64.b64encode(b"byo-key").decode()
+    )
+    monitor.apps_v1.create_namespaced_deployment.side_effect = ApiException(status=409)
+
+    monitor._create_pd_proxy(
+        "endpoint", "gco-inference", _proxy_spec("endpoint-admin"), _endpoint_record()
+    )
+
+    monitor.apps_v1.patch_namespaced_deployment.assert_called_once()
+    args = monitor.apps_v1.patch_namespaced_deployment.call_args.args
+    assert args[:2] == ("endpoint-proxy", "gco-inference")
+    desired = monitor.apps_v1.patch_namespaced_deployment.call_args.kwargs["body"]
+    assert desired.spec.replicas == 2
+    assert desired.spec.template.spec.containers[0].image == "gco/proxy:pinned"
+
+
 def test_admin_secret_provision_is_idempotent_when_present(monitor):
     """An already-present {name}-admin Secret is left untouched (key stays stable).
 
     Create-if-absent means a reconcile pass that finds the Secret already there
     does not recreate it, so proxy pods never see the key churn underneath them.
     """
-    monitor.core_v1.read_namespaced_secret.return_value = MagicMock()  # exists
-    name = monitor._provision_admin_api_key_secret("endpoint-admin", "gco-inference")
+    current = _secret_with_key(
+        plain="stable-key",
+        labels=GENERATED_SECRET_LABELS,
+        annotations={"gco.io/lifecycle-id": LIFECYCLE_ID},
+    )
+    monitor.core_v1.read_namespaced_secret.return_value = current
+    name = monitor._provision_admin_api_key_secret("endpoint-admin", "gco-inference", LIFECYCLE_ID)
     assert name == "endpoint-admin"
     monitor.core_v1.create_namespaced_secret.assert_not_called()
 
 
 def test_admin_secret_provision_treats_conflict_as_success(monitor):
-    """A concurrent create (409) is treated as success rather than an error."""
-    monitor.core_v1.read_namespaced_secret.side_effect = ApiException(status=404)
+    """A concurrent create is accepted only after exact ownership readback."""
+    current = _secret_with_key(
+        plain="winner-key",
+        labels=GENERATED_SECRET_LABELS,
+        annotations={"gco.io/lifecycle-id": LIFECYCLE_ID},
+    )
+    monitor.core_v1.read_namespaced_secret.side_effect = [
+        ApiException(status=404),
+        current,
+    ]
     monitor.core_v1.create_namespaced_secret.side_effect = ApiException(status=409)
-    # A race that loses the create still yields the Secret name without raising.
-    name = monitor._provision_admin_api_key_secret("endpoint-admin", "gco-inference")
+    name = monitor._provision_admin_api_key_secret("endpoint-admin", "gco-inference", LIFECYCLE_ID)
     assert name == "endpoint-admin"
+
+
+def test_exact_legacy_generated_secret_is_annotated_then_verified(monitor):
+    legacy = _secret_with_key(
+        plain="legacy-key",
+        labels=GENERATED_SECRET_LABELS,
+        annotations={},
+        resource_version="17",
+        uid="legacy-uid",
+    )
+    adopted = _secret_with_key(
+        plain="legacy-key",
+        labels=GENERATED_SECRET_LABELS,
+        annotations={"gco.io/lifecycle-id": LIFECYCLE_ID},
+        resource_version="18",
+        uid="legacy-uid",
+    )
+    monitor.core_v1.read_namespaced_secret.side_effect = [legacy, adopted]
+
+    assert (
+        monitor._provision_admin_api_key_secret("endpoint-admin", "gco-inference", LIFECYCLE_ID)
+        == "endpoint-admin"
+    )
+
+    monitor.core_v1.patch_namespaced_secret.assert_called_once_with(
+        "endpoint-admin",
+        "gco-inference",
+        body={
+            "metadata": {
+                "resourceVersion": "17",
+                "annotations": {"gco.io/lifecycle-id": LIFECYCLE_ID},
+            }
+        },
+        _request_timeout=30,
+    )
+    monitor.core_v1.create_namespaced_secret.assert_not_called()
+
+
+def test_legacy_secret_replacement_race_blocks_without_adopting(monitor):
+    legacy = _secret_with_key(
+        plain="legacy-key",
+        labels=GENERATED_SECRET_LABELS,
+        annotations={},
+        resource_version="17",
+        uid="legacy-uid",
+    )
+    monitor.core_v1.read_namespaced_secret.return_value = legacy
+    monitor.core_v1.patch_namespaced_secret.side_effect = ApiException(status=409)
+    from gco.services.inference_monitor import AdminApiKeySecretError
+
+    with pytest.raises(AdminApiKeySecretError, match="changed during lifecycle migration"):
+        monitor._provision_admin_api_key_secret("endpoint-admin", "gco-inference", LIFECYCLE_ID)
+
+    patch_body = monitor.core_v1.patch_namespaced_secret.call_args.kwargs["body"]
+    assert patch_body["metadata"]["resourceVersion"] == "17"
+    monitor.core_v1.create_namespaced_secret.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("labels", "annotations"),
+    [
+        ({}, {}),
+        ({**GENERATED_SECRET_LABELS, "collision": "foreign"}, {}),
+        (GENERATED_SECRET_LABELS, {"gco.io/lifecycle-id": "other-lifecycle"}),
+    ],
+)
+def test_ambiguous_generated_secret_is_never_adopted(monitor, labels, annotations):
+    monitor.core_v1.read_namespaced_secret.return_value = _secret_with_key(
+        plain="foreign-key",
+        labels=labels,
+        annotations=annotations,
+    )
+    from gco.services.inference_monitor import AdminApiKeySecretError
+
+    with pytest.raises(AdminApiKeySecretError, match="lifecycle provenance"):
+        monitor._provision_admin_api_key_secret("endpoint-admin", "gco-inference", LIFECYCLE_ID)
+
+    monitor.core_v1.patch_namespaced_secret.assert_not_called()
+    monitor.core_v1.create_namespaced_secret.assert_not_called()
 
 
 def test_ensure_admin_secret_prefers_named_byo_secret(monitor):
@@ -170,7 +316,7 @@ def test_ensure_admin_secret_prefers_named_byo_secret(monitor):
     valid = _secret_with_key(value_b64=base64.b64encode(b"a-real-key").decode())
     monitor.core_v1.read_namespaced_secret.return_value = valid
     proxy = {"admin_api_key_secret": "byo-secret"}
-    name = monitor._ensure_admin_api_key_secret("endpoint", proxy, "gco-inference")
+    name = monitor._ensure_admin_api_key_secret("endpoint", proxy, "gco-inference", LIFECYCLE_ID)
     assert name == "byo-secret"
     monitor.core_v1.create_namespaced_secret.assert_not_called()
 
@@ -186,7 +332,9 @@ def test_absent_admin_secret_rejects_and_creates_no_proxy(monitor):
     monitor.core_v1.read_namespaced_secret.side_effect = ApiException(status=404)
 
     with pytest.raises(AdminApiKeySecretError) as excinfo:
-        monitor._create_pd_proxy("endpoint", "gco-inference", _proxy_spec("endpoint-admin"), {})
+        monitor._create_pd_proxy(
+            "endpoint", "gco-inference", _proxy_spec("endpoint-admin"), _endpoint_record()
+        )
 
     assert excinfo.value.secret == "endpoint-admin"
     monitor.apps_v1.create_namespaced_deployment.assert_not_called()
@@ -208,7 +356,9 @@ def test_empty_admin_key_rejects_and_creates_no_proxy(monitor):
     monitor.core_v1.read_namespaced_secret.return_value = empty
 
     with pytest.raises(AdminApiKeySecretError) as excinfo:
-        monitor._create_pd_proxy("endpoint", "gco-inference", _proxy_spec("endpoint-admin"), {})
+        monitor._create_pd_proxy(
+            "endpoint", "gco-inference", _proxy_spec("endpoint-admin"), _endpoint_record()
+        )
 
     assert excinfo.value.secret == "endpoint-admin"
     monitor.apps_v1.create_namespaced_deployment.assert_not_called()
@@ -264,7 +414,9 @@ def test_admin_key_injected_only_by_secret_reference(monitor):
     secret = _secret_with_key(value_b64=base64.b64encode(key_material.encode()).decode())
     monitor.core_v1.read_namespaced_secret.return_value = secret
 
-    monitor._create_pd_proxy("endpoint", "gco-inference", _proxy_spec("endpoint-admin"), {})
+    monitor._create_pd_proxy(
+        "endpoint", "gco-inference", _proxy_spec("endpoint-admin"), _endpoint_record()
+    )
 
     deploy_args, _ = monitor.apps_v1.create_namespaced_deployment.call_args
     deployment = deploy_args[1]

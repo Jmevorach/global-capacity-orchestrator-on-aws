@@ -216,6 +216,20 @@ def _compute_kubectl_regional_shared_replacements(
     }
 
 
+def _compute_inference_proxy_tls_replacements(
+    config: Mapping[str, object],
+) -> dict[str, str]:
+    """Render typed inference TLS CPU placeholders for production and Kind."""
+    request = config["tls_proxy_cpu_request_millicores"]
+    target = config["tls_proxy_cpu_target_utilization_percentage"]
+    if type(request) is not int or type(target) is not int:
+        raise ValueError("validated inference proxy TLS settings must be integers")
+    return {
+        "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}": f"{request}m",
+        "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}": str(target),
+    }
+
+
 #: StorageClass name for in-cluster observability PVCs (Prometheus, Grafana,
 #: Alertmanager). The value overrides reference this name, and the gated gp3
 #: StorageClass manifest (25-storage-observability-gp3.yaml) declares it. A
@@ -3466,14 +3480,9 @@ class GCORegionalStack(Stack):
             "{{INFERENCE_PROXY_MAX_REQUEST_BODY_BYTES}}": str(
                 mp_config.get("max_request_body_bytes", 1_048_576)
             ),
-            # The replacement map is string-only. Manifest quoting renders the
-            # request as a Quantity string and the HPA target as a YAML integer.
-            "{{INFERENCE_PROXY_TLS_CPU_REQUEST}}": (
-                f"{inference_proxy_config['tls_proxy_cpu_request_millicores']}m"
-            ),
-            "{{INFERENCE_PROXY_TLS_CPU_TARGET_UTILIZATION}}": str(
-                inference_proxy_config["tls_proxy_cpu_target_utilization_percentage"]
-            ),
+            # Shared pure renderer keeps production and Kind typed values in
+            # lockstep (Quantity string for request, YAML integer for target).
+            **_compute_inference_proxy_tls_replacements(inference_proxy_config),
             # Regional worker for the DynamoDB-backed global queue. Multiple API
             # replicas are safe because JobStore claims are conditional and
             # lease-backed; each replica also reconciles K8s status transitions.

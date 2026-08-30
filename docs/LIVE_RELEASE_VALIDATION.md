@@ -63,6 +63,7 @@ Actions run in registry order. Selecting an individual action automatically incl
 | `baseline` | `preflight` | Capture protected CloudFormation and ECR state |
 | `deploy` | `baseline` | Deploy the checked-in GCO topology |
 | `topology` | `deploy` | Verify stacks, EKS, API endpoints, queues, and DynamoDB; require the owned internal ALB to materialize exactly one tagged HTTPS/IP target group for health-monitor, manifest-processor, and inference-proxy, each with HTTPS `/healthz` checks and only port-8443 traffic/health registrations (stale wrong-port draining targets must disappear), recording bounded ELBv2 convergence samples |
+| `inference` | `topology` | Verify the deployed `api-tls-proxy` CPU request and active `ContainerResource` HPA target, then sequentially run vLLM baseline/HPA and TGI baseline/HPA endpoints from separate digest-pinned images and immutable model commits. Require exact framework request/response schemas, authenticated health and model identity (`/v1/models` or `/info`), HPA ownership/stability, and two strong DynamoDB/full-Kubernetes absence observations for every incarnation. |
 | `policy` | `topology` | `GET /api/v1/policy` reports all three admission layers per Region: the front-door caps, the per-container `LimitRange`, and the namespace `ResourceQuota`. Asserted on the response body, because a Kubernetes read failure degrades to HTTP 200 with a per-namespace `status` and is invisible to a transport-level check. Also requires the project's own ECR hostnames in `trusted_registries`, which CDK appends at synth time. |
 | `api` | `topology` | Run an authenticated API Job through its complete lifecycle |
 | `sqs` | `topology` | Run a direct regional SQS Job through its complete lifecycle |
@@ -84,6 +85,7 @@ Use macOS or Linux with:
 - Python 3.14;
 - Node 24 and the exact npm version declared in `package.json`;
 - Docker available to CDK asset bundling;
+- AWS CLI plus the Session Manager plugin on `PATH` whenever `inference` (including `--actions all`) is selected;
 - the repository's pinned CDK CLI and Python CDK dependencies;
 - short-lived AWS credentials for the isolated validation account; and
 - healthy CDK bootstrap stacks in every Region targeted by `cdk.json`.
@@ -95,7 +97,10 @@ bash .github/scripts/use-pinned-npm.sh package.json
 npm ci --ignore-scripts --no-audit --no-fund
 export PATH="$PWD/node_modules/.bin:$PATH"
 python -m pip install ".[cdk]"
+session-manager-plugin --version
 ```
+
+The main `preflight` action performs the same plugin lookup before `deploy` whenever inference is selected, so a missing local tunnel prerequisite cannot strand a newly deployed topology before endpoint validation begins.
 
 Select local credentials and verify their identity before authorizing a run:
 
@@ -116,6 +121,15 @@ export EXPECTED_SHA="$(git rev-parse HEAD)"
 export EXPECTED_BRANCH="$(git symbolic-ref --short HEAD)"
 export RUN_ID="local-$(date -u +%Y%m%dT%H%M%SZ)-${EXPECTED_SHA:0:12}"
 export REPORT_DIR="$HOME/gco-live-release-validation-reports/$RUN_ID"
+# Operator-verified immutable runtime inputs. Both adapters are mandatory;
+# each model revision is the full 40-hex Hugging Face commit, not a branch/tag.
+export INFERENCE_REGION="us-east-1"
+export INFERENCE_VLLM_IMAGE="registry.example/vllm@sha256:<64-lowercase-hex-digest>"
+export INFERENCE_VLLM_MODEL_ID="publisher/vllm-model"
+export INFERENCE_VLLM_MODEL_REVISION="<40-lowercase-hex-model-commit>"
+export INFERENCE_TGI_IMAGE="registry.example/tgi@sha256:<64-lowercase-hex-digest>"
+export INFERENCE_TGI_MODEL_ID="publisher/tgi-model"
+export INFERENCE_TGI_MODEL_REVISION="<40-lowercase-hex-model-commit>"
 
 python -m scripts.live_release_validation \
   --repo-root "$PWD" \
@@ -124,6 +138,14 @@ python -m scripts.live_release_validation \
   --expected-branch "$EXPECTED_BRANCH" \
   --profile configured \
   --actions all \
+  --inference-region "$INFERENCE_REGION" \
+  --inference-vllm-image "$INFERENCE_VLLM_IMAGE" \
+  --inference-vllm-model-id "$INFERENCE_VLLM_MODEL_ID" \
+  --inference-vllm-model-revision "$INFERENCE_VLLM_MODEL_REVISION" \
+  --inference-tgi-image "$INFERENCE_TGI_IMAGE" \
+  --inference-tgi-model-id "$INFERENCE_TGI_MODEL_ID" \
+  --inference-tgi-model-revision "$INFERENCE_TGI_MODEL_REVISION" \
+  --confirm-inference-deployment \
   --run-id "$RUN_ID" \
   --report-dir "$REPORT_DIR" \
   --checkpoint "$REPORT_DIR/checkpoint.json" \
@@ -131,6 +153,8 @@ python -m scripts.live_release_validation \
 ```
 
 This command performs real AWS deployment and deletion. Reading this runbook or copying the command is not authorization to execute it.
+
+The `inference` action has no mutable image or model defaults. Supply separately verified vLLM and TGI image digests, model IDs, and full model commits. The fixed adapter matrix, exact request bodies and response schemas, official runtime ports, health/model-info probes, endpoint/HPA shape, shared TLS-sidecar CPU/HPA expectations from checked-in `cdk.json`, timeouts, and consent all belong to the main `RunSettings` identity. The action checkpoints a cryptographically random owner nonce before creation, verifies the deployed `gco-system/inference-proxy` sidecar request and active TLS `ContainerResource` metric, then runs four endpoints with peak concurrency one: vLLM baseline, vLLM CPU-HPA, TGI baseline, and TGI CPU-HPA. vLLM must expose the configured model through `/v1/models`; TGI `/info` must report both the exact model ID and immutable revision. Each generation response must match only its selected framework schema. Cleanup binds both the nonce and immutable endpoint lifecycle, inventories Deployments, ReplicaSets, Pods, Services, Endpoints, EndpointSlices, native and KEDA HPAs, ScaledObjects, ConfigMaps, the owned generated Secret, and legacy Ingress/HTTPRoute objects, and requires two complete absent sweeps separated by a monitor interval. A cleaned pre-invocation resume re-proves absence, archives that closed lifecycle, and rotates to a new incarnation before redeploying; an invoked incarnation is never recreated or reinvoked. All four endpoint cleanups are attempted before an error returns.
 
 Add `--optional-schedulers all` (or a comma list of `yunikorn`, `slurm`) when the release touches scheduler charts, the helm installer, or scheduler-adjacent manifests: the run then force-enables the off-by-default schedulers through a run-scoped CDK context override (`helm_enabled_overrides`) — never by editing `cdk.json` — so the `schedulers` action proves them too. The override becomes part of the checkpoint identity, so a `--resume` must repeat it exactly. Without the flag, off-by-default schedulers are reported as skipped with their configuration source, which is valid evidence for releases that do not touch them.
 
@@ -141,10 +165,11 @@ Do not close the terminal merely because a validation action fails. The runner r
 Every initialized run writes these local files under `$REPORT_DIR`:
 
 - `live-release-validation.md` — human-reviewable identity, action results, cleanup, final inventory, and failures;
-- `live-release-validation.json` — the same evidence in structured form; and
-- `checkpoint.json` — resumable destructive authority for this exact local run.
+- `live-release-validation.json` — the same evidence in structured form;
+- `checkpoint.json` — resumable destructive authority for this exact local run; and
+- `kubeconfig` — mode-`0600` isolated cluster access used by the `inference` action (never `~/.kube/config`).
 
-On POSIX systems, the harness creates the dedicated report/checkpoint directory with mode `0700` and every JSON, Markdown, and temporary output with mode `0600`. It never changes permissions on a pre-existing directory: an existing output directory must already be owner-only, owned by the current operator, contain only this harness's checkpoint/report files, and not contain symlinks or special files. A custom `--checkpoint` must be a direct child of `--report-dir` and must not use either fixed report filename (`live-release-validation.json` or `live-release-validation.md`); use a new empty private directory for a fresh run.
+On POSIX systems, the harness creates the dedicated report/checkpoint directory with mode `0700` and every JSON, Markdown, and temporary output with mode `0600`. It never changes permissions on a pre-existing directory: an existing output directory must already be owner-only, owned by the current operator, contain only this harness's checkpoint/report files and optional isolated `kubeconfig`, and not contain symlinks or special files. A custom `--checkpoint` must be a direct child of `--report-dir` and must not use either fixed report filename (`live-release-validation.json` or `live-release-validation.md`); use a new empty private directory for a fresh run.
 
 Both reports are account reconnaissance material, not just review evidence. One run's Markdown report names the 12-digit validation account ID hundreds of times and enumerates CloudWatch Logs, CloudFormation, IAM, and KMS ARNs (including keys inside their live seven-day deletion window), API endpoint URLs, and the account's complete resource-naming inventory. Keep both reports local, and share a full report only through a private maintainer channel when one is explicitly requested for debugging.
 
@@ -176,6 +201,7 @@ Resume is only for an interrupted local run whose original `checkpoint.json` rem
 - run ID and absolute repository path;
 - account, full SHA, and branch;
 - profile and requested action list;
+- every inference matrix contract (Region, both image digests, both model IDs and immutable revisions, fixed framework paths/schemas/ports, namespace, replicas/HPA bounds, shared TLS proxy expectations, pacing, and consent) when selected;
 - default and additional protected-stack names; and
 - KMS deletion confirmation.
 
@@ -183,7 +209,7 @@ Do not edit the checkpoint, move it to another checkout or machine, or use it to
 
 ## Cleanup, Retained Resources, and Recovery
 
-After exact preflight identity succeeds, normal action failures and handled signals route through same-process cleanup. Workload cleanup runs before stack cleanup; unresolved Job or central-queue evidence blocks stack teardown rather than guessing that deletion is safe. Final inventory independently rechecks stack absence and protected baselines.
+After exact preflight identity succeeds, normal action failures and handled signals route through same-process cleanup. Workload cleanup runs before stack cleanup; unresolved Job or central-queue evidence blocks stack teardown rather than guessing that deletion is safe. Final inventory independently rechecks stack absence and protected baselines. If runner construction fails after loading an identity-matched checkpoint that records deployment attempted, the failure report explicitly marks cleanup blocked and includes the exact identity-preserving `--resume` recovery command; it never claims guaranteed destruction when runtime clients could not be initialized. A deployed checkpoint whose identity does not match the invocation is also reported as cleanup-blocked, but no misleading recovery command is generated from the mismatched inputs.
 
 The central-queue action deliberately keeps two identities separate. The requested Job name, namespace, body, and idempotency key remain immutable replay identity. After a successful terminal DynamoDB record is read consistently, the harness separately binds the worker-persisted `k8s_job_name`, `k8s_job_namespace`, and `k8s_job_uid`. Every Kubernetes lookup, log read, deletion, and absence check then uses that actual identity and requires the deterministic queue-derived name, queue ID/original-name annotations, managed-by/queue-key labels, validation run/path labels, and exact UID. Cleanup performs the same reconciliation even after an interrupted or already-complete central action; it never guesses the requested name. Both checkpoint records are validated before either is mutated, and a central workload is eligible for deletion only when terminal DynamoDB reconciliation succeeded in that cleanup attempt. A terminal failed record may omit Kubernetes identity only when the regional worker atomically persisted `workload_not_created=true` after an explicit preflight rejection and while every Kubernetes identity attribute was absent; ambiguous lookup/create failures never produce that proof.
 

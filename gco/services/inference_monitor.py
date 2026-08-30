@@ -34,10 +34,13 @@ import os
 import re
 import secrets
 import signal
+import threading
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
 from kubernetes import client, config
@@ -421,6 +424,84 @@ class RegionalScopeResolution:
     error: str | None = None
 
 
+class RegionStatusConditions(TypedDict, total=False):
+    """Optional DynamoDB predicates shared by every regional status write."""
+
+    expected_lifecycle_id: str
+    expected_region_generation: str
+    expected_deletion_generation: str
+
+
+_LIFECYCLE_ANNOTATION = "gco.io/lifecycle-id"
+_REGION_GENERATION_ANNOTATION = "gco.io/region-generation"
+_LEADER_EPOCH_ANNOTATION = "gco.io/leader-epoch"
+
+
+class ReconcileFencedError(RuntimeError):
+    """The caller no longer owns the endpoint or leader epoch it read."""
+
+
+@dataclass(frozen=True)
+class ReconcileAuthority:
+    """Immutable authority carried by one endpoint reconciliation pass."""
+
+    endpoint_name: str
+    lifecycle_id: str
+    region_generation: str
+    leader_epoch: str
+    deletion_generation: str | None = None
+    deleting: bool = False
+    region_removed: bool = False
+
+    @property
+    def annotations(self) -> dict[str, str]:
+        return {
+            _LIFECYCLE_ANNOTATION: self.lifecycle_id,
+            _REGION_GENERATION_ANNOTATION: self.region_generation,
+            _LEADER_EPOCH_ANNOTATION: self.leader_epoch,
+        }
+
+
+@dataclass(frozen=True)
+class EndpointResourceInventory:
+    """Deterministic names of every top-level Kubernetes object owned by an endpoint."""
+
+    deployments: tuple[str, ...]
+    services: tuple[str, ...]
+    horizontal_pod_autoscalers: tuple[str, ...]
+    scaled_objects: tuple[str, ...]
+    config_maps: tuple[str, ...]
+    legacy_ingresses: tuple[str, ...]
+    legacy_http_routes: tuple[str, ...]
+    generated_admin_secret: str
+
+
+@dataclass(frozen=True)
+class ResourceCleanupResult:
+    """Observed result of one idempotent endpoint cleanup pass.
+
+    A successful Kubernetes delete only starts asynchronous deletion. ``pending``
+    therefore contains objects still returned by a read-after-delete, while
+    ``errors`` contains sanitized request failures. Cleanup is complete only
+    when every owned object is independently observed absent and no request
+    failed during the pass.
+    """
+
+    pending: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    resources_found: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return not self.pending and not self.errors
+
+    @property
+    def error_message(self) -> str | None:
+        if not self.errors:
+            return None
+        return "Endpoint cleanup could not be completed: " + "; ".join(self.errors)
+
+
 def _resolved_mooncake_transfer(mooncake: dict[str, Any]) -> tuple[str, str]:
     """Resolve the persisted transfer intent and optional network device.
 
@@ -794,6 +875,7 @@ class InferenceMonitor:
         self.apps_v1 = client.AppsV1Api()
         self.core_v1 = client.CoreV1Api()
         self.networking_v1 = client.NetworkingV1Api()
+        self.discovery_v1 = client.DiscoveryV1Api()
 
         # Timeout for Kubernetes API calls (seconds)
         self._k8s_timeout = int(os.environ.get("K8S_API_TIMEOUT", "30"))
@@ -815,6 +897,17 @@ class InferenceMonitor:
         # a later restart of the master restarts the clock cleanly.
         self._master_deferral_since: dict[str, datetime] = {}
 
+        # Leader authority is renewed from a dedicated thread while reconcile
+        # performs synchronous Kubernetes calls. The per-acquisition epoch is
+        # also stamped on endpoint-owned objects; object UID/resourceVersion
+        # preconditions remain the hard fence if a process resumes after losing
+        # the Lease.
+        self._lease_name: str | None = None
+        self._lease_holder: str | None = None
+        self._leader_epoch: str | None = None
+        self._leadership_lost = threading.Event()
+        self._active_authority: ReconcileAuthority | None = None
+
         # Metrics
         self._reconcile_count = 0
         self._errors_count = 0
@@ -824,12 +917,7 @@ class InferenceMonitor:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the reconciliation loop with leader election.
-
-        Uses a Kubernetes Lease object for leader election so that only
-        one replica reconciles at a time. Other replicas stay on standby
-        and take over if the leader dies.
-        """
+        """Start reconciliation under an independently renewed leader Lease."""
         if self._running:
             logger.warning("Inference monitor already running")
             return
@@ -841,205 +929,697 @@ class InferenceMonitor:
             self.reconcile_interval,
         )
 
-        # Namespace and ServiceAccount are pre-created by the kubectl-applier
-        # at deploy time (00-namespaces.yaml, 01-serviceaccounts.yaml). The
-        # inference-monitor SA has namespace-scoped RBAC only — it cannot
-        # read_namespace/create_namespace, so we don't try. If the namespace
-        # is ever missing, deployments below will fail with a clear 404.
-
-        # Get pod identity for leader election
         pod_name = os.environ.get("HOSTNAME", f"monitor-{id(self)}")
         lease_name = "inference-monitor-leader"
+        self._lease_name = lease_name
+        self._lease_holder = pod_name
 
         while self._running:
             try:
                 if self._try_acquire_lease(lease_name, pod_name):
-                    await self.reconcile()
+                    with self._renewing_leadership():
+                        await self.reconcile()
                 else:
                     logger.debug("Not the leader, waiting...")
-            except Exception as e:
-                logger.error("Reconciliation error: %s", e, exc_info=True)
+            except ReconcileFencedError as error:
+                logger.warning("Reconciliation stopped after authority loss: %s", error)
+            except Exception as error:
+                logger.error("Reconciliation error: %s", error, exc_info=True)
                 self._errors_count += 1
             try:
                 await asyncio.sleep(self.reconcile_interval)
-            except Exception as e:
-                logger.error("Sleep interrupted: %s", e)
+            except Exception as error:
+                logger.error("Sleep interrupted: %s", error)
                 break
 
+    @staticmethod
+    def _lease_annotations(lease: Any) -> dict[str, str]:
+        metadata = getattr(lease, "metadata", None)
+        annotations = getattr(metadata, "annotations", None)
+        return dict(annotations) if isinstance(annotations, dict) else {}
+
+    def _lease_is_expired(self, lease: Any, now: datetime) -> bool:
+        renew_time = getattr(getattr(lease, "spec", None), "renew_time", None)
+        if renew_time is None:
+            return True
+        if renew_time.tzinfo is None:
+            renew_time = renew_time.replace(tzinfo=UTC)
+        duration = getattr(lease.spec, "lease_duration_seconds", None)
+        if not isinstance(duration, int) or isinstance(duration, bool) or duration <= 0:
+            duration = self.reconcile_interval * 3
+        return bool((now - renew_time).total_seconds() >= int(duration))
+
+    def _stamp_lease_epoch(self, lease: Any, epoch: str) -> None:
+        metadata = getattr(lease, "metadata", None)
+        if metadata is None:
+            lease.metadata = client.V1ObjectMeta()
+            metadata = lease.metadata
+        annotations = self._lease_annotations(lease)
+        annotations[_LEADER_EPOCH_ANNOTATION] = epoch
+        metadata.annotations = annotations
+
     def _try_acquire_lease(self, lease_name: str, holder: str) -> bool:
-        """Try to acquire or renew a Kubernetes Lease for leader election.
-
-        Uses optimistic concurrency via resourceVersion — if two monitors
-        race to update the same lease, K8s returns 409 Conflict for the
-        loser, preventing split-brain.
-
-        Returns True if this instance is the leader.
-        """
-
+        """Acquire/renew a Lease and establish one stable acquisition epoch."""
         coordination_v1 = client.CoordinationV1Api()
         now = datetime.now(UTC)
-
+        lease_duration = self.reconcile_interval * 3
         try:
             lease = coordination_v1.read_namespaced_lease(lease_name, self.namespace)
             current_holder = lease.spec.holder_identity
-            renew_time = lease.spec.renew_time
+            expired = self._lease_is_expired(lease, now)
+            annotations = self._lease_annotations(lease)
+            observed_epoch = annotations.get(_LEADER_EPOCH_ANNOTATION)
 
-            # Check if lease is expired (holder hasn't renewed in 3x interval)
-            if renew_time:
-                elapsed = (now - renew_time.replace(tzinfo=UTC)).total_seconds()
-                if elapsed > self.reconcile_interval * 3:
-                    # Lease expired — take over
-                    logger.info("Lease expired (held by %s), taking over", current_holder)
-                    current_holder = None
-
-            if current_holder == holder:
-                # We're the leader — renew
-                lease.spec.renew_time = now
-                try:
-                    coordination_v1.replace_namespaced_lease(lease_name, self.namespace, lease)
-                except ApiException as conflict:
-                    if conflict.status == 409:
-                        logger.debug("Lease renew conflict (another writer), retrying next cycle")
-                        return False
-                    raise
-                return True
-            if current_holder is None or current_holder == "":
-                # No leader — claim it
+            if current_holder == holder and not expired:
+                # Adopt the persisted epoch after a harmless local restart of
+                # the loop, but never renew a same-name holder with a different
+                # in-memory epoch.
+                if self._leader_epoch is None:
+                    self._leader_epoch = observed_epoch or secrets.token_hex(32)
+                elif observed_epoch and observed_epoch != self._leader_epoch:
+                    self._leadership_lost.set()
+                    return False
+                epoch = self._leader_epoch
+            elif current_holder in (None, "") or expired:
+                epoch = secrets.token_hex(32)
+                self._leader_epoch = epoch
                 lease.spec.holder_identity = holder
-                lease.spec.renew_time = now
-                try:
-                    coordination_v1.replace_namespaced_lease(lease_name, self.namespace, lease)
-                except ApiException as conflict:
-                    if conflict.status == 409:
-                        logger.info("Lost lease race to another monitor")
-                        return False
-                    raise
-                logger.info("Acquired leader lease as %s", holder)
-                return True
-            # Someone else is the leader
-            return False
+                lease.spec.acquire_time = now
+                transitions = getattr(lease.spec, "lease_transitions", None)
+                lease.spec.lease_transitions = int(transitions or 0) + 1
+                logger.info("Acquiring leader lease as %s with a new epoch", holder)
+            else:
+                return False
 
-        except ApiException as e:
-            if e.status == 404:
-                # Lease doesn't exist — create it
+            lease.spec.renew_time = now
+            lease.spec.lease_duration_seconds = lease_duration
+            self._stamp_lease_epoch(lease, epoch)
+            coordination_v1.replace_namespaced_lease(lease_name, self.namespace, lease)
+            self._lease_name = lease_name
+            self._lease_holder = holder
+            self._leadership_lost.clear()
+            return True
+        except ApiException as error:
+            if error.status == 404:
+                epoch = secrets.token_hex(32)
                 lease = client.V1Lease(
                     metadata=client.V1ObjectMeta(
                         name=lease_name,
                         namespace=self.namespace,
+                        annotations={_LEADER_EPOCH_ANNOTATION: epoch},
                     ),
                     spec=client.V1LeaseSpec(
                         holder_identity=holder,
-                        lease_duration_seconds=self.reconcile_interval * 3,
+                        lease_duration_seconds=lease_duration,
+                        acquire_time=now,
                         renew_time=now,
+                        lease_transitions=0,
                     ),
                 )
                 try:
                     coordination_v1.create_namespaced_lease(self.namespace, lease)
-                    logger.info("Created leader lease as %s", holder)
-                    return True
                 except ApiException:
                     return False
-            logger.warning("Lease check failed: %s", e.reason)
+                self._leader_epoch = epoch
+                self._lease_name = lease_name
+                self._lease_holder = holder
+                self._leadership_lost.clear()
+                logger.info("Created leader lease as %s", holder)
+                return True
+            if error.status == 409:
+                logger.info("Lost leader Lease optimistic-concurrency race")
+                self._leadership_lost.set()
+                return False
+            logger.warning("Lease check failed: %s", error.reason)
+            self._leadership_lost.set()
             return False
 
+    def _renew_current_lease(self) -> bool:
+        """Renew only the exact holder/epoch currently owned by this process."""
+        lease_name = self._lease_name
+        holder = self._lease_holder
+        epoch = self._leader_epoch
+        if not all(isinstance(value, str) and value for value in (lease_name, holder, epoch)):
+            return False
+        coordination_v1 = client.CoordinationV1Api()
+        now = datetime.now(UTC)
+        try:
+            lease = coordination_v1.read_namespaced_lease(lease_name, self.namespace)
+            if (
+                lease.spec.holder_identity != holder
+                or self._lease_annotations(lease).get(_LEADER_EPOCH_ANNOTATION) != epoch
+                or self._lease_is_expired(lease, now)
+            ):
+                return False
+            lease.spec.renew_time = now
+            coordination_v1.replace_namespaced_lease(lease_name, self.namespace, lease)
+            return True
+        except Exception:
+            logger.warning("Leader Lease renewal failed", exc_info=True)
+            return False
+
+    def _lease_renewal_loop(self, stop_event: threading.Event) -> None:
+        interval = max(1.0, float(self.reconcile_interval))
+        while not stop_event.wait(interval):
+            if not self._renew_current_lease():
+                self._leadership_lost.set()
+                return
+
+    @contextlib.contextmanager
+    def _renewing_leadership(self) -> Iterator[None]:
+        """Renew the Lease outside the asyncio loop while one pass is running."""
+        stop_event = threading.Event()
+        renewal = threading.Thread(
+            target=self._lease_renewal_loop,
+            args=(stop_event,),
+            name="inference-monitor-lease-renewer",
+            daemon=True,
+        )
+        renewal.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            renewal.join(timeout=max(1.0, float(self.reconcile_interval)))
+
+    def _assert_current_leadership(self) -> None:
+        """Fail closed before mutation when the persisted Lease epoch changed."""
+        if self._leadership_lost.is_set():
+            raise ReconcileFencedError("leader Lease was lost")
+        # Direct method-level unit tests do not enter start(); production does.
+        if self._lease_name is None or self._lease_holder is None or self._leader_epoch is None:
+            return
+        coordination_v1 = client.CoordinationV1Api()
+        try:
+            lease = coordination_v1.read_namespaced_lease(self._lease_name, self.namespace)
+        except Exception as error:
+            self._leadership_lost.set()
+            raise ReconcileFencedError("leader Lease could not be verified") from error
+        if (
+            lease.spec.holder_identity != self._lease_holder
+            or self._lease_annotations(lease).get(_LEADER_EPOCH_ANNOTATION)
+            != self._leader_epoch
+            or self._lease_is_expired(lease, datetime.now(UTC))
+        ):
+            self._leadership_lost.set()
+            raise ReconcileFencedError("leader Lease holder or epoch changed")
+
     def stop(self) -> None:
-        """Stop the reconciliation loop."""
+        """Stop the reconciliation loop and prevent additional mutations."""
         self._running = False
+        self._leadership_lost.set()
         logger.info("Inference monitor stopped")
 
-    async def reconcile(self) -> list[dict[str, Any]]:
-        """
-        Run one reconciliation cycle.
+    @staticmethod
+    def _lifecycle_metadata_complete(endpoint: dict[str, Any]) -> bool:
+        """Return whether an endpoint has complete immutable cleanup metadata."""
+        lifecycle_id = endpoint.get("lifecycle_id")
+        cleanup_regions = endpoint.get("cleanup_regions")
+        region_generations = endpoint.get("region_generations")
+        return (
+            isinstance(lifecycle_id, str)
+            and bool(lifecycle_id)
+            and isinstance(cleanup_regions, list)
+            and isinstance(region_generations, dict)
+            and all(
+                isinstance(region, str)
+                and bool(region)
+                and isinstance(region_generations.get(region), str)
+                and bool(region_generations[region])
+                for region in cleanup_regions
+            )
+        )
 
-        Returns a list of actions taken (for logging/testing).
-        """
+    def _status_write_conditions(
+        self,
+        endpoint: dict[str, Any],
+        *,
+        deleting: bool = False,
+    ) -> RegionStatusConditions:
+        """Return lifecycle/generation predicates for one regional status write."""
+        lifecycle_id = endpoint.get("lifecycle_id")
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            return {}
+        conditions: RegionStatusConditions = {"expected_lifecycle_id": lifecycle_id}
+        if deleting:
+            generation = endpoint.get("deletion_generation")
+            if isinstance(generation, str) and generation:
+                conditions["expected_deletion_generation"] = generation
+            return conditions
+        raw_generations = endpoint.get("region_generations")
+        generations = raw_generations if isinstance(raw_generations, dict) else {}
+        region_generation = generations.get(self.region)
+        if isinstance(region_generation, str) and region_generation:
+            conditions["expected_region_generation"] = region_generation
+        return conditions
+
+    def _authority_from_endpoint(self, endpoint: dict[str, Any]) -> ReconcileAuthority | None:
+        """Build object-level provenance for a production endpoint snapshot."""
+        lifecycle_id = endpoint.get("lifecycle_id")
+        generations = endpoint.get("region_generations")
+        region_generation = generations.get(self.region) if isinstance(generations, dict) else None
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            if isinstance(endpoint.get("updated_at"), str):
+                raise ReconcileFencedError("endpoint snapshot has no lifecycle authority")
+            return None  # Compatibility for isolated method-level fixtures only.
+        if not isinstance(region_generation, str) or not region_generation:
+            if isinstance(endpoint.get("updated_at"), str):
+                raise ReconcileFencedError("endpoint snapshot has no Region generation")
+            return None
+        desired_state = endpoint.get("desired_state")
+        targets = endpoint.get("target_regions")
+        target_regions = targets if isinstance(targets, list) else []
+        deletion_generation = endpoint.get("deletion_generation")
+        return ReconcileAuthority(
+            endpoint_name=str(endpoint.get("endpoint_name", "")),
+            lifecycle_id=lifecycle_id,
+            region_generation=region_generation,
+            leader_epoch=self._leader_epoch or f"direct-{lifecycle_id[:16]}",
+            deletion_generation=(
+                deletion_generation
+                if isinstance(deletion_generation, str) and deletion_generation
+                else None
+            ),
+            deleting=desired_state == "deleted",
+            region_removed=desired_state != "deleted" and self.region not in target_regions,
+        )
+
+    def _strong_authority_matches(self, authority: ReconcileAuthority) -> bool:
+        """Re-read DynamoDB before claiming legacy/previous-epoch objects."""
+        # Unit-level direct calls do not enter start(); production always does.
+        if self._lease_name is None:
+            return True
+        latest = self.store.get_endpoint(authority.endpoint_name, consistent_read=True)
+        if not isinstance(latest, dict) or latest.get("lifecycle_id") != authority.lifecycle_id:
+            return False
+        if authority.deleting:
+            return (
+                latest.get("desired_state") == "deleted"
+                and latest.get("deletion_generation") == authority.deletion_generation
+            )
+        generations = latest.get("region_generations")
+        return (
+            latest.get("desired_state") != "deleted"
+            and isinstance(generations, dict)
+            and generations.get(self.region) == authority.region_generation
+        )
+
+    @staticmethod
+    def _object_metadata(resource: Any) -> tuple[Any, dict[str, str], str | None, str | None]:
+        """Return metadata, annotations, UID, and resourceVersion for typed/dict objects."""
+        if isinstance(resource, dict):
+            metadata = resource.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            annotations = metadata.get("annotations")
+            return (
+                metadata,
+                dict(annotations) if isinstance(annotations, dict) else {},
+                metadata.get("uid") if isinstance(metadata.get("uid"), str) else None,
+                (
+                    metadata.get("resourceVersion")
+                    if isinstance(metadata.get("resourceVersion"), str)
+                    else None
+                ),
+            )
+        metadata = getattr(resource, "metadata", None)
+        annotations = getattr(metadata, "annotations", None)
+        uid = getattr(metadata, "uid", None)
+        resource_version = getattr(metadata, "resource_version", None)
+        return (
+            metadata,
+            dict(annotations) if isinstance(annotations, dict) else {},
+            uid if isinstance(uid, str) else None,
+            resource_version if isinstance(resource_version, str) else None,
+        )
+
+    def _authorize_resource(
+        self,
+        resource: Any,
+        *,
+        kind: str,
+        resource_name: str,
+        patch_metadata: Callable[..., Any] | None = None,
+        read_resource: Callable[[], Any] | None = None,
+        allow_region_mismatch: bool = False,
+    ) -> Any:
+        """Verify lifecycle provenance and CAS-claim the current leader epoch."""
+        authority = self._active_authority
+        if authority is None:
+            return resource
+        self._assert_current_leadership()
+        metadata, annotations, _uid, resource_version = self._object_metadata(resource)
+        observed_lifecycle = annotations.get(_LIFECYCLE_ANNOTATION)
+        if observed_lifecycle not in (None, authority.lifecycle_id):
+            raise ReconcileFencedError(
+                f"{kind} {resource_name} belongs to another endpoint lifecycle"
+            )
+        observed_region = annotations.get(_REGION_GENERATION_ANNOTATION)
+        if (
+            not allow_region_mismatch
+            and observed_region not in (None, authority.region_generation)
+        ):
+            raise ReconcileFencedError(
+                f"{kind} {resource_name} belongs to another Region generation"
+            )
+        expected = authority.annotations
+        if all(annotations.get(key) == value for key, value in expected.items()):
+            return resource
+        if self._lease_name is None and resource_version is None:
+            # Historical method-level fixtures use metadata-less MagicMocks.
+            # Production reconciliation always has a Lease and real metadata.
+            return resource
+        if patch_metadata is None or read_resource is None:
+            raise ReconcileFencedError(
+                f"{kind} {resource_name} lacks current immutable provenance"
+            )
+        if not isinstance(resource_version, str) or not resource_version:
+            raise ReconcileFencedError(
+                f"{kind} {resource_name} has no resourceVersion for authority claim"
+            )
+        if not self._strong_authority_matches(authority):
+            raise ReconcileFencedError("endpoint authority changed before Kubernetes mutation")
+        self._assert_current_leadership()
+        merged = dict(annotations)
+        merged.update(expected)
+        try:
+            patch_metadata(
+                body={
+                    "metadata": {
+                        "resourceVersion": resource_version,
+                        "annotations": merged,
+                    }
+                }
+            )
+        except Exception as error:
+            raise ReconcileFencedError(
+                f"{kind} {resource_name} changed during authority claim"
+            ) from error
+        claimed = read_resource()
+        _metadata, claimed_annotations, _claimed_uid, _claimed_version = self._object_metadata(
+            claimed
+        )
+        if not all(claimed_annotations.get(key) == value for key, value in expected.items()):
+            raise ReconcileFencedError(
+                f"{kind} {resource_name} authority claim could not be verified"
+            )
+        return claimed
+
+    def _provenance_annotations(self) -> dict[str, str] | None:
+        authority = self._active_authority
+        return dict(authority.annotations) if authority is not None else None
+
+    def _assert_mutation_authority(self) -> None:
+        authority = self._active_authority
+        if authority is None:
+            return
+        self._assert_current_leadership()
+        if not self._strong_authority_matches(authority):
+            raise ReconcileFencedError("endpoint authority changed before Kubernetes mutation")
+
+    def _delete_options_for(self, resource: Any, *, kind: str, resource_name: str) -> Any:
+        """Build UID/resourceVersion delete preconditions for one authorized object."""
+        _metadata, _annotations, uid, resource_version = self._object_metadata(resource)
+        if uid and resource_version:
+            return client.V1DeleteOptions(
+                propagation_policy="Foreground",
+                preconditions=client.V1Preconditions(
+                    uid=uid,
+                    resource_version=resource_version,
+                ),
+            )
+        if self._active_authority is None or self._lease_name is None:
+            return client.V1DeleteOptions(
+                propagation_policy="Foreground",
+                preconditions=client.V1Preconditions(uid=uid) if uid else None,
+            )
+        raise ReconcileFencedError(
+            f"{kind} {resource_name} lacks UID/resourceVersion delete authority"
+        )
+
+    async def reconcile(self) -> list[dict[str, Any]]:
+        """Run one reconciliation cycle with generation-fenced deletion."""
         self._reconcile_count += 1
         actions: list[dict[str, Any]] = []
-
-        # Get all endpoints from DynamoDB
         try:
             endpoints = self.store.list_endpoints()
         except Exception as e:
             logger.error("Failed to list endpoints from DynamoDB: %s", e)
             return actions
 
+        # Records written before lifecycle fencing are upgraded from their
+        # DynamoDB snapshot before any Kubernetes mutation. The update is
+        # conditional on ``updated_at``; a concurrent writer wins and this pass
+        # simply retries from the next scan. Direct method-level test fixtures
+        # without a persistence timestamp remain outside this production path.
+        normalized_endpoints: list[dict[str, Any]] = []
         for endpoint in endpoints:
+            if not self._lifecycle_metadata_complete(endpoint) and isinstance(
+                endpoint.get("updated_at"), str
+            ):
+                upgraded = self.store.ensure_lifecycle_metadata(endpoint)
+                if not isinstance(upgraded, dict):
+                    continue
+                endpoint = upgraded
+                actions.append(
+                    {
+                        "action": "initialize_lifecycle",
+                        "endpoint": endpoint.get("endpoint_name", "unknown"),
+                    }
+                )
+            normalized_endpoints.append(endpoint)
+        endpoints = normalized_endpoints
+
+        for endpoint in endpoints:
+            name = endpoint.get("endpoint_name", "unknown")
             try:
                 action = await self._reconcile_endpoint(endpoint)
                 if action:
                     actions.append(action)
             except Exception as e:
-                name = endpoint.get("endpoint_name", "unknown")
                 logger.error("Failed to reconcile endpoint %s: %s", name, e)
                 self._errors_count += 1
+                status_conditions = self._status_write_conditions(
+                    endpoint,
+                    deleting=endpoint.get("desired_state") == "deleted",
+                )
                 self.store.update_region_status(
                     name,
                     self.region,
                     "error",
                     error=str(e),
+                    **status_conditions,
                 )
 
-        # Purge fully-deleted endpoints from DynamoDB to prevent unbounded growth.
-        # An endpoint is fully deleted when desired_state is "deleted" and all
-        # target regions report "deleted" status.
+        # Any monitor may purge, but only from a strong snapshot containing a
+        # fresh terminal acknowledgement for every immutable deletion member.
+        # Each acknowledgement itself represents two child-complete inventory
+        # sweeps, and the delete is conditioned on the same lifecycle,
+        # generation, and updated_at snapshot.
         for endpoint in endpoints:
             if endpoint.get("desired_state") != "deleted":
                 continue
-            region_status = endpoint.get("region_status", {})
-            target_regions = endpoint.get("target_regions", [])
-            if not target_regions:
+            ep_name = endpoint.get("endpoint_name")
+            if not isinstance(ep_name, str):
                 continue
-            all_deleted = all(
-                isinstance(region_status.get(r), dict)
-                and region_status.get(r, {}).get("state") == "deleted"
-                for r in target_regions
-            )
-            if all_deleted:
-                ep_name = endpoint["endpoint_name"]
-                try:
-                    self.store.delete_endpoint(ep_name)
-                    logger.info("Purged fully-deleted endpoint %s from DynamoDB", ep_name)
-                    actions.append({"action": "purge", "endpoint": ep_name})
-                except Exception as e:
-                    logger.warning("Failed to purge endpoint %s: %s", ep_name, e)
-
+            try:
+                latest = self.store.get_endpoint(ep_name, consistent_read=True)
+            except Exception as e:
+                logger.warning("Failed to refresh deleted endpoint %s: %s", ep_name, e)
+                continue
+            if not isinstance(latest, dict) or latest.get("desired_state") != "deleted":
+                continue
+            lifecycle_id = latest.get("lifecycle_id")
+            generation = latest.get("deletion_generation")
+            deletion_regions = latest.get("deletion_regions")
+            updated_at = latest.get("updated_at")
+            if not all(
+                isinstance(value, str) and value for value in (lifecycle_id, generation, updated_at)
+            ):
+                continue
+            if not isinstance(deletion_regions, list) or not deletion_regions:
+                continue
+            cleanup_regions = {
+                region for region in deletion_regions if isinstance(region, str) and region
+            }
+            if len(cleanup_regions) != len(deletion_regions):
+                continue
+            raw_status = latest.get("region_status")
+            region_status = raw_status if isinstance(raw_status, dict) else {}
+            if not all(
+                isinstance(region_status.get(region), dict)
+                and region_status[region].get("state") == "deleted"
+                and region_status[region].get("lifecycle_id") == lifecycle_id
+                and region_status[region].get("deletion_generation") == generation
+                and region_status[region].get("absence_observations", 0) >= 2
+                for region in cleanup_regions
+            ):
+                continue
+            try:
+                deleted = self.store.delete_endpoint(
+                    ep_name,
+                    expected_updated_at=updated_at,
+                    expected_lifecycle_id=lifecycle_id,
+                    expected_deletion_generation=generation,
+                )
+                if not deleted:
+                    continue
+                logger.info(
+                    "Purged endpoint %s lifecycle %s generation %s",
+                    ep_name,
+                    lifecycle_id,
+                    generation,
+                )
+                actions.append({"action": "purge", "endpoint": ep_name})
+            except Exception as e:
+                logger.warning("Failed to purge endpoint %s: %s", ep_name, e)
         return actions
 
+    @staticmethod
+    def _cleanup_ack_is_terminal(endpoint: dict[str, Any], region: str) -> bool:
+        """Return whether this region already durably acknowledged this generation."""
+        raw_statuses = endpoint.get("region_status")
+        statuses = raw_statuses if isinstance(raw_statuses, dict) else {}
+        status = statuses.get(region)
+        if not isinstance(status, dict) or status.get("state") != "deleted":
+            return False
+        lifecycle_id = endpoint.get("lifecycle_id")
+        if status.get("lifecycle_id") != lifecycle_id:
+            return False
+        if endpoint.get("desired_state") == "deleted":
+            return (
+                status.get("deletion_generation") == endpoint.get("deletion_generation")
+                and status.get("absence_observations", 0) >= 2
+            )
+        raw_generations = endpoint.get("region_generations")
+        generations = raw_generations if isinstance(raw_generations, dict) else {}
+        return (
+            status.get("region_generation") == generations.get(region)
+            and status.get("absence_observations", 0) >= 2
+        )
+
+    def _record_cleanup_observation(
+        self,
+        endpoint: dict[str, Any],
+        cleanup: ResourceCleanupResult,
+    ) -> tuple[str, bool]:
+        """Persist one stable-absence observation for the active lifecycle/generation."""
+        lifecycle_id = endpoint.get("lifecycle_id")
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            raise RuntimeError("Endpoint cleanup requires an immutable lifecycle id")
+        deleting = endpoint.get("desired_state") == "deleted"
+        generation = endpoint.get("deletion_generation") if deleting else None
+        raw_region_generations = endpoint.get("region_generations")
+        region_generations = (
+            raw_region_generations if isinstance(raw_region_generations, dict) else {}
+        )
+        region_generation = region_generations.get(self.region) if not deleting else None
+        if deleting and (not isinstance(generation, str) or not generation):
+            raise RuntimeError("Endpoint deletion requires an immutable deletion generation")
+        if not deleting and (not isinstance(region_generation, str) or not region_generation):
+            raise RuntimeError("Endpoint cleanup requires a current Region generation")
+
+        raw_statuses = endpoint.get("region_status")
+        statuses = raw_statuses if isinstance(raw_statuses, dict) else {}
+        previous = statuses.get(self.region)
+        same_generation = (
+            isinstance(previous, dict)
+            and previous.get("lifecycle_id") == lifecycle_id
+            and (
+                previous.get("deletion_generation") == generation
+                if deleting
+                else previous.get("region_generation") == region_generation
+            )
+        )
+        previous_observations = (
+            int(previous.get("absence_observations", 0))
+            if same_generation and isinstance(previous, dict)
+            else 0
+        )
+        observations = previous_observations + 1 if cleanup.complete else 0
+        state = "deleted" if observations >= 2 else "deleting"
+        status_kwargs: dict[str, Any] = {
+            "extra": {"absence_observations": observations},
+            "expected_lifecycle_id": lifecycle_id,
+        }
+        if deleting:
+            status_kwargs["expected_deletion_generation"] = generation
+        else:
+            status_kwargs["expected_region_generation"] = region_generation
+        if cleanup.error_message:
+            status_kwargs["error"] = cleanup.error_message
+        written = self.store.update_region_status(
+            endpoint["endpoint_name"],
+            self.region,
+            state,
+            **status_kwargs,
+        )
+        return state, bool(written)
+
     async def _reconcile_endpoint(self, endpoint: dict[str, Any]) -> dict[str, Any] | None:
-        """Reconcile a single endpoint."""
+        """Reconcile one endpoint under immutable Kubernetes provenance."""
+        authority = self._authority_from_endpoint(endpoint)
+        previous = self._active_authority
+        self._active_authority = authority
+        try:
+            return await self._reconcile_endpoint_authorized(endpoint)
+        finally:
+            self._active_authority = previous
+
+    async def _reconcile_endpoint_authorized(
+        self, endpoint: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Implementation for one endpoint after authority has been installed."""
         name = endpoint["endpoint_name"]
         desired_state = endpoint.get("desired_state", "deploying")
         target_regions = endpoint.get("target_regions", [])
         spec = endpoint.get("spec", {})
         ns = endpoint.get("namespace", self.namespace)
 
-        # Am I a target region?
-        if self.region not in target_regions:
-            # A classic endpoint uses ``name`` while a split endpoint has only
-            # role/proxy Deployments. Check every materialized shape so removing
-            # a region cannot strand Mooncake resources and their GPU nodes.
-            deployment_names = (
-                name,
-                f"{name}-prefill",
-                f"{name}-decode",
-                f"{name}-proxy",
-            )
-            if any(self._deployment_exists(d, ns) for d in deployment_names):
-                logger.info(
-                    "Endpoint %s no longer targets %s, cleaning up",
-                    name,
-                    self.region,
-                )
-                self._delete_resources(name, ns, spec if isinstance(spec, dict) else None)
-                self.store.update_region_status(
-                    name,
-                    self.region,
-                    "deleted",
-                )
-                return {"action": "cleanup", "endpoint": name, "reason": "region_removed"}
-            return None
+        lifecycle_value = endpoint.get("lifecycle_id")
+        lifecycle_id = (
+            lifecycle_value if isinstance(lifecycle_value, str) and lifecycle_value else None
+        )
 
-        # Reconcile based on desired state
+        if desired_state == "deleted":
+            generation = endpoint.get("deletion_generation")
+            deletion_regions = endpoint.get("deletion_regions")
+            if not isinstance(generation, str) or not isinstance(deletion_regions, list):
+                # Upgrade a legacy or interrupted delete transition atomically;
+                # the next pass sees the persisted immutable snapshot.
+                self.store.update_desired_state(
+                    name,
+                    "deleted",
+                    expected_lifecycle_id=lifecycle_id,
+                )
+                return {"action": "initialize_deletion", "endpoint": name}
+            if self.region not in deletion_regions:
+                return None
+            if self._cleanup_ack_is_terminal(endpoint, self.region):
+                # Durable current-generation acknowledgement makes completed
+                # non-target work quiescent: no Kubernetes reads and no DDB write.
+                return None
+            return self._reconcile_deleted(endpoint, ns, spec if isinstance(spec, dict) else None)
+
+        if self.region not in target_regions:
+            cleanup_regions = endpoint.get("cleanup_regions")
+            if not isinstance(cleanup_regions, list) or self.region not in cleanup_regions:
+                return None
+            if self._cleanup_ack_is_terminal(endpoint, self.region):
+                return None
+            cleanup = self._delete_resources(
+                name,
+                ns,
+                spec if isinstance(spec, dict) else None,
+                expected_lifecycle_id=lifecycle_id,
+            )
+            state, written = self._record_cleanup_observation(endpoint, cleanup)
+            return {
+                "action": "cleanup",
+                "endpoint": name,
+                "reason": "region_removed",
+                "cleanup_complete": state == "deleted" and written,
+            }
+
         if desired_state in ("deploying", "running"):
             if not isinstance(spec, dict):
                 error = "endpoint spec must be a mapping"
@@ -1047,15 +1627,22 @@ class InferenceMonitor:
                 error = "endpoint spec cannot combine 'mooncake' and 'canary' blocks"
             else:
                 return await self._reconcile_running(name, ns, spec, endpoint)
-
             logger.error("Rejecting invalid endpoint %s: %s", name, error)
-            self.store.update_region_status(name, self.region, "failed", error=error)
+            self.store.update_region_status(
+                name,
+                self.region,
+                "failed",
+                error=error,
+                **self._status_write_conditions(endpoint),
+            )
             return {"action": "reject", "endpoint": name, "reason": "invalid_spec"}
         if desired_state == "stopped":
-            return self._reconcile_stopped(name, ns)
-        if desired_state == "deleted":
-            return self._reconcile_deleted(name, ns, spec if isinstance(spec, dict) else None)
-
+            return self._reconcile_stopped(
+                name,
+                ns,
+                spec if isinstance(spec, dict) else None,
+                endpoint,
+            )
         return None
 
     async def _reconcile_running(
@@ -1066,6 +1653,7 @@ class InferenceMonitor:
         endpoint: dict[str, Any],
     ) -> dict[str, Any] | None:
         """Ensure the endpoint is running with the correct spec."""
+        status_conditions = self._status_write_conditions(endpoint)
         # Specs carrying a ``mooncake`` block take the disaggregated path. The
         # branch returns ``None`` when no such block is present, so a plain
         # endpoint falls through to the single-Deployment path below unchanged.
@@ -1074,19 +1662,61 @@ class InferenceMonitor:
             return mooncake_action
 
         deployment = self._get_deployment(name, namespace)
+        configured_replicas = spec.get("replicas", 1)
+        raw_autoscaling = spec.get("autoscaling", {})
+        autoscaling = raw_autoscaling if isinstance(raw_autoscaling, dict) else {}
+        autoscaling_enabled = bool(autoscaling.get("enabled"))
 
         if deployment is None:
-            # Create everything
+            # A missing Deployment is still an ownership handoff boundary. Do
+            # not recreate it until every obsolete HPA/KEDA owner is absent.
+            if autoscaling_enabled:
+                ownership = self._reconcile_classic_autoscaler(
+                    name,
+                    namespace,
+                    spec,
+                    apply_desired=False,
+                )
+            else:
+                ownership = self._delete_autoscalers(
+                    (name,),
+                    (name, f"keda-hpa-{name}"),
+                    namespace,
+                )
+            if not ownership.complete:
+                ownership_status_kwargs: dict[str, Any] = {}
+                if ownership.error_message:
+                    ownership_status_kwargs["error"] = ownership.error_message
+                self.store.update_region_status(
+                    name,
+                    self.region,
+                    "updating",
+                    replicas_ready=0,
+                    replicas_desired=0,
+                    **status_conditions,
+                    **ownership_status_kwargs,
+                )
+                return {
+                    "action": "reconcile_autoscaler",
+                    "endpoint": name,
+                    "cleanup_complete": False,
+                }
+
             logger.info("Creating endpoint %s in %s", name, self.region)
             self._create_deployment(name, namespace, spec)
             self._create_service(name, namespace, spec)
-            if spec.get("autoscaling", {}).get("enabled"):
+            if autoscaling_enabled:
                 self._create_or_update_hpa(name, namespace, spec)
             self.store.update_region_status(
                 name,
                 self.region,
                 "creating",
-                replicas_desired=spec.get("replicas", 1),
+                replicas_desired=(
+                    int(autoscaling.get("min_replicas", 1))
+                    if autoscaling_enabled
+                    else configured_replicas
+                ),
+                **status_conditions,
             )
             return {"action": "create", "endpoint": name}
 
@@ -1096,30 +1726,85 @@ class InferenceMonitor:
         # ClusterIP Service.
         self._ensure_service(name, namespace, spec)
 
-        desired_replicas = spec.get("replicas", 1)
-        current_replicas = deployment.spec.replicas or 1
-        ready_replicas = deployment.status.ready_replicas or 0
+        # Once enabled, HPA/KEDA is the sole owner of Deployment
+        # ``spec.replicas``; the static endpoint count must never fight it.
+        # Controller creation/handoff runs after capturing live replica status
+        # below so a pending ownership transition can report useful progress.
 
-        self._check_health_watchdog(
-            name, namespace, ready_replicas, desired_replicas, spec, endpoint
+        observed_desired = getattr(deployment.spec, "replicas", None)
+        live_desired_replicas = (
+            int(observed_desired) if observed_desired is not None else configured_replicas
+        )
+        current_replicas = live_desired_replicas
+        ready_replicas = int(getattr(deployment.status, "ready_replicas", 0) or 0)
+        # During enabled -> disabled handoff the old owner still controls this
+        # observed value. Report it until static reconciliation actually takes
+        # ownership, rather than publishing an aspirational configured count.
+        status_desired_replicas = live_desired_replicas
+        readiness_floor = (
+            int(autoscaling.get("min_replicas", 1)) if autoscaling_enabled else configured_replicas
         )
 
-        if current_replicas != desired_replicas:
-            logger.info(
-                "Scaling endpoint %s: %d → %d replicas",
-                name,
-                current_replicas,
-                desired_replicas,
+        self._check_health_watchdog(
+            name,
+            namespace,
+            ready_replicas,
+            status_desired_replicas,
+            spec,
+            endpoint,
+        )
+
+        autoscaler_cleanup: ResourceCleanupResult
+        if autoscaling_enabled:
+            # Reconcile on every existing-Deployment pass to repair partial
+            # creation and configuration drift. Ownership handoffs remain
+            # updating until the obsolete controller is actually absent.
+            autoscaler_cleanup = self._reconcile_classic_autoscaler(name, namespace, spec)
+        else:
+            # Static ownership is explicit even when the autoscaling block was
+            # removed entirely: stale HPA/KEDA objects must never regain count.
+            autoscaler_cleanup = self._delete_autoscalers(
+                (name,),
+                (name, f"keda-hpa-{name}"),
+                namespace,
             )
-            self._scale_deployment(name, namespace, desired_replicas)
+
+        if not autoscaler_cleanup.complete:
+            status_kwargs: dict[str, Any] = {}
+            if autoscaler_cleanup.error_message:
+                status_kwargs["error"] = autoscaler_cleanup.error_message
             self.store.update_region_status(
                 name,
                 self.region,
                 "updating",
                 replicas_ready=ready_replicas,
-                replicas_desired=desired_replicas,
+                replicas_desired=status_desired_replicas,
+                **status_conditions,
+                **status_kwargs,
             )
-            return {"action": "scale", "endpoint": name, "replicas": desired_replicas}
+            return {
+                "action": "reconcile_autoscaler",
+                "endpoint": name,
+                "cleanup_complete": False,
+            }
+
+        if not autoscaling_enabled and current_replicas != configured_replicas:
+            logger.info(
+                "Scaling endpoint %s: %d → %d replicas",
+                name,
+                current_replicas,
+                configured_replicas,
+            )
+            self._scale_deployment(name, namespace, configured_replicas)
+            self.store.update_region_status(
+                name,
+                self.region,
+                "updating",
+                replicas_ready=ready_replicas,
+                replicas_desired=configured_replicas,
+                **status_conditions,
+            )
+            return {"action": "scale", "endpoint": name, "replicas": configured_replicas}
 
         # Check if image changed
         current_image = self._get_deployment_image(deployment)
@@ -1132,7 +1817,8 @@ class InferenceMonitor:
                 self.region,
                 "updating",
                 replicas_ready=ready_replicas,
-                replicas_desired=desired_replicas,
+                replicas_desired=status_desired_replicas,
+                **status_conditions,
             )
             return {"action": "update_image", "endpoint": name, "image": desired_image}
 
@@ -1146,16 +1832,20 @@ class InferenceMonitor:
         else:
             self._cleanup_canary(name, namespace)
 
-        # Everything is in sync — report status and replace any stale canary
-        # sub-status in the same region-status write.
-        state = "running" if ready_replicas >= desired_replicas else "creating"
+        # For an autoscaled endpoint, readiness means the configured minimum
+        # serving capacity is available. During ordinary scale-out the live HPA
+        # target can temporarily exceed Ready pods without making a healthy
+        # endpoint flap back to "creating". Keep reporting that live target so
+        # status and watchdog diagnostics remain truthful.
+        state = "running" if ready_replicas >= readiness_floor else "creating"
         self.store.update_region_status(
             name,
             self.region,
             state,
             replicas_ready=ready_replicas,
-            replicas_desired=desired_replicas,
+            replicas_desired=status_desired_replicas,
             extra={"canary": canary_status} if canary_status is not None else None,
+            **status_conditions,
         )
 
         # Promote desired state only from live local readiness plus explicit
@@ -1177,7 +1867,14 @@ class InferenceMonitor:
                     all_running = False
                     break
             if all_running:
-                self.store.update_desired_state(name, "running")
+                lifecycle_id = endpoint.get("lifecycle_id")
+                if isinstance(lifecycle_id, str) and lifecycle_id:
+                    self.store.update_desired_state(
+                        name,
+                        "running",
+                        expected_lifecycle_id=lifecycle_id,
+                        expected_desired_state="deploying",
+                    )
 
         return None
 
@@ -1228,36 +1925,52 @@ class InferenceMonitor:
                 name=cm_name,
                 namespace=ns,
                 labels={"app": name, "project": "gco", "gco.io/type": "inference"},
+                annotations=self._provenance_annotations(),
             ),
             data={"mooncake.json": json.dumps(cfg, sort_keys=True)},
         )
+        self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_config_map(
                 ns, config_map, _request_timeout=self._k8s_timeout
             )
             logger.info("Created mooncake config map %s/%s", ns, cm_name)
-        except ApiException as e:
-            if e.status == 409:
-                self.core_v1.patch_namespaced_config_map(
-                    cm_name, ns, config_map, _request_timeout=self._k8s_timeout
-                )
-                logger.info("Updated mooncake config map %s/%s", ns, cm_name)
-            else:
+        except ApiException as error:
+            if error.status != 409:
                 raise
+            existing = self.core_v1.read_namespaced_config_map(
+                cm_name, ns, _request_timeout=self._k8s_timeout
+            )
+            existing = self._authorize_resource(
+                existing,
+                kind="configmap",
+                resource_name=cm_name,
+                patch_metadata=partial(
+                    self.core_v1.patch_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_resource=lambda: self.core_v1.read_namespaced_config_map(
+                    cm_name, ns, _request_timeout=self._k8s_timeout
+                ),
+            )
+            _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
+            config_map.metadata.resource_version = resource_version
+            self._assert_mutation_authority()
+            self.core_v1.patch_namespaced_config_map(
+                cm_name, ns, config_map, _request_timeout=self._k8s_timeout
+            )
+            logger.info("Updated mooncake config map %s/%s", ns, cm_name)
 
     def _ensure_role_deployment(
         self, name: str, ns: str, spec: dict[str, Any], role: str
-    ) -> tuple[int, int]:
-        """Ensure one role Deployment exists at its desired replica count.
+    ) -> tuple[int, int, bool]:
+        """Ensure one role target has its static or restart-seed capacity.
 
-        Creates the role Deployment when absent. When it already exists and an
-        autoscaler does not own its count, the replica count is reconciled to
-        the topology-desired value so a topology change on the spec takes
-        effect. The materialized name is ``{name}`` for the single store role
-        and ``{name}-{role}`` for prefill and decode.
-
-        Returns:
-            The observed ``(ready, desired)`` replica counts after the pass.
+        Existing autoscaled targets normally retain controller ownership, but a
+        manually stopped zero target is seeded to the role minimum before its
+        autoscaler is reapplied. Static roles always converge to topology.
         """
         mooncake = spec.get("mooncake") or {}
         deploy_name = name if role == "single" else f"{name}-{role}"
@@ -1266,14 +1979,18 @@ class InferenceMonitor:
         deployment = self._get_deployment(deploy_name, ns)
         if deployment is None:
             self._create_role_deployment(name, ns, spec, role)
-            return 0, desired
+            return 0, desired, False
 
-        # An autoscaler owns the count for prefill/decode when enabled; leave
-        # the running count untouched in that case.
         autoscaling = mooncake.get("autoscaling") or {}
-        autoscaled = bool(autoscaling.get("enabled")) and role in ("prefill", "decode")
+        role_autoscaling = autoscaling.get(role)
+        autoscaled = (
+            bool(autoscaling.get("enabled"))
+            and role in ("prefill", "decode")
+            and isinstance(role_autoscaling, dict)
+        )
         current = deployment.spec.replicas or 0
-        if not autoscaled and current != desired:
+        restarted = autoscaled and current == 0
+        if (not autoscaled and current != desired) or restarted:
             logger.info(
                 "Scaling role deployment %s/%s: %d → %d",
                 ns,
@@ -1285,7 +2002,7 @@ class InferenceMonitor:
 
         status = getattr(deployment, "status", None)
         ready = int(getattr(status, "ready_replicas", 0) or 0) if status else 0
-        return ready, desired
+        return ready, desired, restarted
 
     def _report_role_status(
         self,
@@ -1293,6 +2010,7 @@ class InferenceMonitor:
         ns: str,
         mooncake: dict[str, Any],
         region_services: dict[str, Any],
+        endpoint: dict[str, Any] | None = None,
     ) -> str:
         """Write the role-keyed region status for a Mooncake endpoint.
 
@@ -1320,25 +2038,33 @@ class InferenceMonitor:
                 if role not in roles:
                     continue
                 deploy_name = f"{name}-{role}"
-                desired = self._replica_count_for_role(mooncake, role)
+                configured_floor = self._replica_count_for_role(mooncake, role)
                 dep = self._get_deployment(deploy_name, ns)
                 status = getattr(dep, "status", None) if dep else None
                 ready = int(getattr(status, "ready_replicas", 0) or 0) if status else 0
+                deployment_spec = getattr(dep, "spec", None) if dep else None
+                observed_desired = getattr(deployment_spec, "replicas", None)
+                desired = (
+                    int(observed_desired) if observed_desired is not None else configured_floor
+                )
                 roles_block[role] = {"ready": ready, "desired": desired}
                 total_ready += ready
                 total_desired += desired
-                if ready < desired:
+                if ready < configured_floor:
                     all_ready = False
             extra["roles"] = roles_block
         else:
             # Store mode runs a single kv_both Deployment under the endpoint name.
-            desired = self._replica_count_for_role(mooncake, "single")
+            configured_floor = self._replica_count_for_role(mooncake, "single")
             dep = self._get_deployment(name, ns)
             status = getattr(dep, "status", None) if dep else None
             ready = int(getattr(status, "ready_replicas", 0) or 0) if status else 0
+            deployment_spec = getattr(dep, "spec", None) if dep else None
+            observed_desired = getattr(deployment_spec, "replicas", None)
+            desired = int(observed_desired) if observed_desired is not None else configured_floor
             total_ready += ready
             total_desired += desired
-            if ready < desired:
+            if ready < configured_floor:
                 all_ready = False
 
         store = mooncake.get("store") or {}
@@ -1352,6 +2078,7 @@ class InferenceMonitor:
                 all_ready = False
 
         state = "running" if all_ready and total_desired > 0 else "creating"
+        status_conditions = self._status_write_conditions(endpoint or {})
         self.store.update_region_status(
             name,
             self.region,
@@ -1359,6 +2086,7 @@ class InferenceMonitor:
             replicas_ready=total_ready,
             replicas_desired=total_desired,
             extra=extra or None,
+            **status_conditions,
         )
         return state
 
@@ -1413,13 +2141,20 @@ class InferenceMonitor:
         if not mooncake:
             return None
 
+        status_conditions = self._status_write_conditions(endpoint)
         mode = mooncake.get("mode")
 
         # Step 1: resolve in-region addresses. A store without an own-region
         # master is left untouched and reported as still coming up.
         services = self._resolve_region_services(name, mooncake)
         if services.render_skipped:
-            self.store.update_region_status(name, self.region, "creating", error=services.error)
+            self.store.update_region_status(
+                name,
+                self.region,
+                "creating",
+                error=services.error,
+                **status_conditions,
+            )
             return {
                 "action": "reconcile_mooncake",
                 "endpoint": name,
@@ -1432,7 +2167,11 @@ class InferenceMonitor:
         scope = self._resolve_regional_scope(name, ns, spec, region_services)
         if not scope.in_region:
             self.store.update_region_status(
-                name, self.region, scope.state or "failed", error=scope.error
+                name,
+                self.region,
+                scope.state or "failed",
+                error=scope.error,
+                **status_conditions,
             )
             return {
                 "action": "reconcile_mooncake",
@@ -1446,7 +2185,11 @@ class InferenceMonitor:
             gate = self._gate_on_mooncake_master(name, ns, spec)
             if not gate.proceed:
                 self.store.update_region_status(
-                    name, self.region, gate.state or "creating", error=gate.error
+                    name,
+                    self.region,
+                    gate.state or "creating",
+                    error=gate.error,
+                    **status_conditions,
                 )
                 return {
                     "action": "reconcile_mooncake",
@@ -1458,16 +2201,106 @@ class InferenceMonitor:
         cfg = render_mooncake_config(mooncake, region_services)
         self._ensure_mooncake_configmap(name, ns, cfg)
 
-        # Step 5: role Deployments, in a stable order.
+        # Steps 5-6: converge ownership before creating/scaling any role
+        # Deployment. This is the same recreate/handoff barrier used by classic
+        # endpoints, extended to prefill/decode and stale topology roles.
         desired_roles = self._desired_roles(mode)
-        for role in desired_roles:
-            self._ensure_role_deployment(name, ns, spec, role)
+        ownership_results = [
+            self._delete_autoscalers(
+                (name,),
+                (name, f"keda-hpa-{name}"),
+                ns,
+            )
+        ]
+        for role in ("prefill", "decode"):
+            role_name = f"{name}-{role}"
+            if role in desired_roles:
+                ownership_results.append(
+                    self._reconcile_role_autoscaler(
+                        name,
+                        ns,
+                        spec,
+                        role,
+                        apply_desired=False,
+                    )
+                )
+            else:
+                ownership_results.append(
+                    self._delete_autoscalers(
+                        (role_name,),
+                        (role_name, f"keda-hpa-{role_name}"),
+                        ns,
+                    )
+                )
+        ownership = self._merge_cleanup_results(*ownership_results)
+        if not ownership.complete:
+            ready_total = 0
+            desired_total = 0
+            for role in desired_roles:
+                deploy_name = name if role == "single" else f"{name}-{role}"
+                deployment = self._get_deployment(deploy_name, ns)
+                deployment_status = getattr(deployment, "status", None)
+                deployment_spec = getattr(deployment, "spec", None)
+                ready_total += int(getattr(deployment_status, "ready_replicas", 0) or 0)
+                desired_total += int(getattr(deployment_spec, "replicas", 0) or 0)
+            status_kwargs: dict[str, Any] = {}
+            if ownership.error_message:
+                status_kwargs["error"] = ownership.error_message
+            self.store.update_region_status(
+                name,
+                self.region,
+                "updating",
+                replicas_ready=ready_total,
+                replicas_desired=desired_total,
+                **status_conditions,
+                **status_kwargs,
+            )
+            return {
+                "action": "reconcile_mooncake_autoscaler",
+                "endpoint": name,
+                "cleanup_complete": False,
+            }
 
-        # Step 6: optional per-role autoscaling.
-        if (mooncake.get("autoscaling") or {}).get("enabled"):
-            for role in ("prefill", "decode"):
-                if role in desired_roles:
-                    self._create_role_hpa(name, ns, spec, role)
+        role_ready_total = 0
+        role_desired_total = 0
+        for role in desired_roles:
+            ready, desired, _restarted = self._ensure_role_deployment(name, ns, spec, role)
+            role_ready_total += ready
+            role_desired_total += desired
+
+        owner_verifications: list[ResourceCleanupResult] = []
+        for role in ("prefill", "decode"):
+            role_config = self._role_autoscaling_config(spec, role)
+            if role not in desired_roles or role_config is None:
+                continue
+            self._create_role_hpa(name, ns, spec, role)
+            target_name = f"{name}-{role}"
+            metrics_config = role_config.get("metrics", [{"type": "cpu", "target": 70}])
+            hpa_name = (
+                f"keda-hpa-{target_name}"
+                if self._metrics_require_keda(metrics_config)
+                else target_name
+            )
+            owner_verifications.append(self._verify_hpa_owner(hpa_name, ns, target_name))
+        verified_owners = self._merge_cleanup_results(*owner_verifications)
+        if not verified_owners.complete:
+            verification_status_kwargs: dict[str, Any] = {}
+            if verified_owners.error_message:
+                verification_status_kwargs["error"] = verified_owners.error_message
+            self.store.update_region_status(
+                name,
+                self.region,
+                "updating",
+                replicas_ready=role_ready_total,
+                replicas_desired=role_desired_total,
+                **status_conditions,
+                **verification_status_kwargs,
+            )
+            return {
+                "action": "reconcile_mooncake_autoscaler",
+                "endpoint": name,
+                "cleanup_complete": False,
+            }
 
         # Step 7: front-end. Disaggregated and both run behind the proxy; store
         # exposes its single Deployment directly.
@@ -1483,7 +2316,13 @@ class InferenceMonitor:
                 self._create_pd_proxy(name, ns, spec, endpoint)
             except AdminApiKeySecretError as e:
                 logger.error("Proxy for endpoint %s in %s not started: %s", name, ns, e)
-                self.store.update_region_status(name, self.region, "failed", error=str(e))
+                self.store.update_region_status(
+                    name,
+                    self.region,
+                    "failed",
+                    error=str(e),
+                    **status_conditions,
+                )
                 return {
                     "action": "reconcile_mooncake",
                     "endpoint": name,
@@ -1493,27 +2332,80 @@ class InferenceMonitor:
             self._create_service(name, ns, spec)
 
         # Step 8: role-keyed status.
-        state = self._report_role_status(name, ns, mooncake, region_services)
+        state = self._report_role_status(
+            name,
+            ns,
+            mooncake,
+            region_services,
+            endpoint,
+        )
         return {"action": "reconcile_mooncake", "endpoint": name, "state": state}
 
-    def _reconcile_stopped(self, name: str, namespace: str) -> dict[str, Any] | None:
-        """Scale deployment to zero."""
-        deployment = self._get_deployment(name, namespace)
-        if deployment is None:
-            return None
-
-        current_replicas = deployment.spec.replicas or 0
-        if current_replicas > 0:
-            logger.info("Stopping endpoint %s (scaling to 0)", name)
-            self._scale_deployment(name, namespace, 0)
+    def _reconcile_stopped(
+        self,
+        name: str,
+        namespace: str,
+        spec: dict[str, Any] | None = None,
+        endpoint: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Remove every possible autoscaler owner before scaling all roles to zero."""
+        mooncake_endpoint = isinstance(spec, dict) and isinstance(spec.get("mooncake"), dict)
+        self._unready_since.pop(name, None)
+        self._master_deferral_since.pop(name, None)
+        status_conditions = self._status_write_conditions(endpoint or {})
+        role_names = (name, f"{name}-prefill", f"{name}-decode")
+        cleanup = self._delete_autoscalers(
+            role_names,
+            (
+                name,
+                f"{name}-prefill",
+                f"{name}-decode",
+                f"keda-hpa-{name}",
+                f"keda-hpa-{name}-prefill",
+                f"keda-hpa-{name}-decode",
+            ),
+            namespace,
+        )
+        deployment_names = (*role_names, f"{name}-proxy") if mooncake_endpoint else (name,)
+        deployments = {
+            deployment_name: self._get_deployment(deployment_name, namespace)
+            for deployment_name in deployment_names
+        }
+        ready_replicas = sum(
+            int(getattr(getattr(deployment, "status", None), "ready_replicas", 0) or 0)
+            for deployment in deployments.values()
+            if deployment is not None
+        )
+        desired_replicas = sum(
+            int(getattr(getattr(deployment, "spec", None), "replicas", 0) or 0)
+            for deployment in deployments.values()
+            if deployment is not None
+        )
+        if not cleanup.complete:
+            status_kwargs: dict[str, Any] = {}
+            if cleanup.error_message:
+                status_kwargs["error"] = cleanup.error_message
             self.store.update_region_status(
                 name,
                 self.region,
-                "stopped",
-                replicas_ready=0,
-                replicas_desired=0,
+                "stopping",
+                replicas_ready=ready_replicas,
+                replicas_desired=desired_replicas,
+                **status_conditions,
+                **status_kwargs,
             )
-            return {"action": "stop", "endpoint": name}
+            return {"action": "stop", "endpoint": name, "cleanup_complete": False}
+
+        scaled = False
+        for deployment_name, deployment in deployments.items():
+            if deployment is None:
+                continue
+            current_replicas = int(getattr(getattr(deployment, "spec", None), "replicas", 0) or 0)
+            if current_replicas <= 0:
+                continue
+            logger.info("Stopping endpoint role %s (scaling to 0)", deployment_name)
+            self._scale_deployment(deployment_name, namespace, 0)
+            scaled = True
 
         self.store.update_region_status(
             name,
@@ -1521,65 +2413,69 @@ class InferenceMonitor:
             "stopped",
             replicas_ready=0,
             replicas_desired=0,
+            **status_conditions,
         )
+        if scaled:
+            return {"action": "stop", "endpoint": name, "cleanup_complete": True}
         return None
 
     def _reconcile_deleted(
         self,
-        name: str,
+        endpoint: dict[str, Any],
         namespace: str,
         spec: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        """Delete all resources for the endpoint."""
-        # Clean up health watchdog tracker
+    ) -> dict[str, Any]:
+        """Converge all parents and generated children to stable absence."""
+        name = endpoint["endpoint_name"]
+        lifecycle_id = endpoint.get("lifecycle_id")
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            raise RuntimeError("Endpoint deletion requires an immutable lifecycle id")
         self._unready_since.pop(name, None)
-        # Clean up the master-readiness deferral tracker
         self._master_deferral_since.pop(name, None)
-
-        # An endpoint is either a single Deployment named ``name`` or a Mooncake
-        # role-split topology (``name-prefill``/``name-decode``/``name-proxy``).
-        # Check all of them so a disaggregated endpoint is actually torn down
-        # rather than skipped (which would orphan its role Deployments — and the
-        # GPU nodes they hold).
-        deployment_names = (
+        logger.info("Reconciling deletion of endpoint %s from %s", name, self.region)
+        cleanup = self._delete_resources(
             name,
-            f"{name}-prefill",
-            f"{name}-decode",
-            f"{name}-proxy",
+            namespace,
+            spec,
+            expected_lifecycle_id=lifecycle_id,
         )
-        if any(self._deployment_exists(d, namespace) for d in deployment_names):
-            logger.info("Deleting endpoint %s from %s", name, self.region)
-            self._delete_resources(name, namespace, spec)
-            self.store.update_region_status(name, self.region, "deleted")
-            return {"action": "delete", "endpoint": name}
-
-        self.store.update_region_status(name, self.region, "deleted")
-        return None
+        state, written = self._record_cleanup_observation(endpoint, cleanup)
+        return {
+            "action": "delete",
+            "endpoint": name,
+            "cleanup_complete": state == "deleted" and written,
+        }
 
     # ------------------------------------------------------------------
     # Kubernetes resource management
     # ------------------------------------------------------------------
 
     def _deployment_exists(self, name: str, namespace: str) -> bool:
-        try:
-            self.apps_v1.read_namespaced_deployment(
-                name, namespace, _request_timeout=self._k8s_timeout
-            )
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return False
-            raise
+        return self._get_deployment(name, namespace) is not None
 
     def _get_deployment(self, name: str, namespace: str) -> V1Deployment | None:
         try:
-            return self.apps_v1.read_namespaced_deployment(
+            deployment = self.apps_v1.read_namespaced_deployment(
                 name, namespace, _request_timeout=self._k8s_timeout
             )
-        except ApiException as e:
-            if e.status == 404:
+        except ApiException as error:
+            if error.status == 404:
                 return None
             raise
+        return self._authorize_resource(
+            deployment,
+            kind="deployment",
+            resource_name=name,
+            patch_metadata=partial(
+                self.apps_v1.patch_namespaced_deployment,
+                name,
+                namespace,
+                _request_timeout=self._k8s_timeout,
+            ),
+            read_resource=lambda: self.apps_v1.read_namespaced_deployment(
+                name, namespace, _request_timeout=self._k8s_timeout
+            ),
+        )
 
     def _get_deployment_image(self, deployment: V1Deployment) -> str | None:
         """Get the image of the first container in a deployment."""
@@ -1717,7 +2613,8 @@ class InferenceMonitor:
 
         param_name = f"{_regional_shared_ssm_parameter_prefix()}/name"
         try:
-            return get_ssm_parameter_optional(param_name, region=self.region)
+            bucket = get_ssm_parameter_optional(param_name, region=self.region)
+            return bucket if isinstance(bucket, str) and bucket else None
         except Exception as e:  # noqa: BLE001 - any read failure means "unresolved"
             logger.warning(
                 "Failed to resolve general-purpose regional bucket for %s: %s",
@@ -2027,6 +2924,7 @@ class InferenceMonitor:
 
         # Create-if-absent: a 409 means the shared master already exists, which
         # is the steady state. Leave it untouched and treat it as success.
+        self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_service(ns, service, _request_timeout=self._k8s_timeout)
             logger.info("Created shared mooncake master service in %s", ns)
@@ -2036,6 +2934,7 @@ class InferenceMonitor:
             else:
                 raise
 
+        self._assert_mutation_authority()
         try:
             self.apps_v1.create_namespaced_stateful_set(
                 ns, stateful_set, _request_timeout=self._k8s_timeout
@@ -2336,6 +3235,7 @@ class InferenceMonitor:
         ]
 
         for rule_name, policy in policies:
+            self._assert_mutation_authority()
             try:
                 self.networking_v1.create_namespaced_network_policy(
                     ns, policy, _request_timeout=self._k8s_timeout
@@ -2365,6 +3265,7 @@ class InferenceMonitor:
             spec=spec,
             replicas=replicas,
         )
+        self._assert_mutation_authority()
         self.apps_v1.create_namespaced_deployment(
             namespace, deployment, _request_timeout=self._k8s_timeout
         )
@@ -2410,16 +3311,17 @@ class InferenceMonitor:
         # Build container
         container_env = [client.V1EnvVar(name=k, value=str(v)) for k, v in env_vars.items()]
 
-        # Inject --root-path for servers that support it (vLLM, TGI).
-        # This tells the server to mount its API at /inference/{name} behind the
-        # shared platform route. We append to existing args (from --extra-args)
-        # rather than replacing them.
+        # Runtime behavior is persisted explicitly by callers that need a
+        # strict adapter. Legacy endpoints without the field retain vLLM image
+        # detection, but TGI is never given vLLM's unsupported --root-path:
+        # the authenticated platform proxy strips /inference/{name} before
+        # forwarding /health, /generate, or /info to the model Service.
         serving_prefix = f"/inference/{name}"
-        root_path_images = ("vllm", "text-generation-inference", "tgi")
-        image_lower = image.lower()
-        if not command and any(tag in image_lower for tag in root_path_images):
+        runtime_framework = spec.get("framework")
+        if runtime_framework not in ("vllm", "tgi"):
+            runtime_framework = "vllm" if "vllm" in image.lower() else None
+        if not command and runtime_framework == "vllm":
             if args:
-                # Append --root-path to user-provided args if not already present
                 if "--root-path" not in args:
                     args = list(args) + ["--root-path", serving_prefix]
             else:
@@ -2547,6 +3449,15 @@ class InferenceMonitor:
             volume_mounts=volume_mounts if volume_mounts else None,
             command=command,
             args=args,
+            startup_probe=(
+                client.V1Probe(
+                    http_get=client.V1HTTPGetAction(path=health_path, port=port),
+                    period_seconds=15,
+                    failure_threshold=80,
+                )
+                if runtime_framework == "tgi"
+                else None
+            ),
             liveness_probe=client.V1Probe(
                 http_get=client.V1HTTPGetAction(path=probe_health, port=port),
                 initial_delay_seconds=120,
@@ -2606,6 +3517,7 @@ class InferenceMonitor:
                 name=deploy_name,
                 namespace=namespace,
                 labels=dict(labels),
+                annotations=self._provenance_annotations(),
             ),
             spec=client.V1DeploymentSpec(
                 replicas=replicas,
@@ -2615,6 +3527,7 @@ class InferenceMonitor:
                 template=client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(
                         labels=dict(labels),
+                        annotations=self._provenance_annotations(),
                     ),
                     spec=client.V1PodSpec(
                         service_account_name="gco-service-account",
@@ -2696,6 +3609,7 @@ class InferenceMonitor:
         # preserving the GPU asks already built into the pod.
         apply_efa_scheduling(mooncake, deployment.spec.template.spec)
 
+        self._assert_mutation_authority()
         self.apps_v1.create_namespaced_deployment(
             ns, deployment, _request_timeout=self._k8s_timeout
         )
@@ -2766,7 +3680,13 @@ class InferenceMonitor:
             # A value that cannot be decoded is unusable as an admin key.
             return False
 
-    def _ensure_admin_api_key_secret(self, name: str, proxy: dict[str, Any], ns: str) -> str:
+    def _ensure_admin_api_key_secret(
+        self,
+        name: str,
+        proxy: dict[str, Any],
+        ns: str,
+        lifecycle_id: str,
+    ) -> str:
         """Return the proxy admin-key Secret name, provisioning one if needed.
 
         The prefill-decode proxy guards a privileged admin path and must never
@@ -2798,9 +3718,14 @@ class InferenceMonitor:
         named = proxy.get("admin_api_key_secret")
         if isinstance(named, str) and named:
             return self._verify_admin_api_key_secret(proxy, ns)
-        return self._provision_admin_api_key_secret(f"{name}-admin", ns)
+        return self._provision_admin_api_key_secret(f"{name}-admin", ns, lifecycle_id)
 
-    def _provision_admin_api_key_secret(self, secret_name: str, ns: str) -> str:
+    def _provision_admin_api_key_secret(
+        self,
+        secret_name: str,
+        ns: str,
+        lifecycle_id: str,
+    ) -> str:
         """Create the auto-managed proxy admin-key Secret if absent.
 
         Uses create-if-absent semantics so the key stays stable across reconcile
@@ -2819,18 +3744,31 @@ class InferenceMonitor:
             The Secret name, ready for a Secret reference.
         """
         try:
-            self.core_v1.read_namespaced_secret(secret_name, ns, _request_timeout=self._k8s_timeout)
-            # Already present: keep the existing key so proxy pods need no churn.
-            return secret_name
+            existing = self.core_v1.read_namespaced_secret(
+                secret_name,
+                ns,
+                _request_timeout=self._k8s_timeout,
+            )
         except ApiException as e:
             if e.status != 404:
                 raise
+        else:
+            self._require_owned_admin_secret(
+                existing,
+                secret_name,
+                ns,
+                lifecycle_id,
+            )
+            return secret_name
 
+        ownership = self._generated_admin_secret_labels(secret_name)
+        annotations = self._provenance_annotations() or {_LIFECYCLE_ANNOTATION: lifecycle_id}
         secret = client.V1Secret(
             metadata=client.V1ObjectMeta(
                 name=secret_name,
                 namespace=ns,
-                labels={"app": secret_name, "project": "gco", "gco.io/type": "inference"},
+                labels=ownership,
+                annotations=annotations,
             ),
             string_data={ADMIN_API_KEY_SECRET_DATA_KEY: secrets.token_hex(32)},
             type="Opaque",
@@ -2839,14 +3777,31 @@ class InferenceMonitor:
         # logger-credential-disclosure rule matches the literal word "Secret" in
         # the message, but only the Secret's name and namespace (%s/%s) are
         # logged here — never the generated key value set above in string_data.
+        self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_secret(ns, secret, _request_timeout=self._k8s_timeout)
             logger.info("Provisioned proxy admin-key Secret %s/%s", ns, secret_name)  # nosemgrep
         except ApiException as e:
-            if e.status == 409:
-                logger.info("Proxy admin-key Secret %s/%s exists", ns, secret_name)  # nosemgrep
-            else:
+            if e.status != 409:
                 raise
+            existing = self.core_v1.read_namespaced_secret(
+                secret_name,
+                ns,
+                _request_timeout=self._k8s_timeout,
+            )
+            try:
+                self._require_owned_admin_secret(
+                    existing,
+                    secret_name,
+                    ns,
+                    lifecycle_id,
+                )
+            except AdminApiKeySecretError as error:
+                raise AdminApiKeySecretError(
+                    secret_name,
+                    "a concurrent conventional Secret lacks matching lifecycle provenance",
+                ) from error
+            logger.info("Proxy admin-key Secret %s/%s exists", ns, secret_name)  # nosemgrep
         return secret_name
 
     def _create_pd_proxy(
@@ -2891,7 +3846,12 @@ class InferenceMonitor:
         mooncake = spec.get("mooncake") or {}
         proxy = mooncake.get("proxy") or {}
         proxy_name = f"{name}-proxy"
-        del endpoint  # Per-endpoint routing metadata is legacy and intentionally ignored.
+        lifecycle_id = endpoint.get("lifecycle_id")
+        if not isinstance(lifecycle_id, str) or not lifecycle_id:
+            raise AdminApiKeySecretError(
+                None,
+                "endpoint record has no immutable lifecycle identity",
+            )
 
         # The proxy fronts a privileged admin path, so it never starts without a
         # usable admin key. When the spec names a Secret it must already exist
@@ -2899,7 +3859,12 @@ class InferenceMonitor:
         # none, a per-endpoint admin-key Secret is auto-provisioned with a
         # generated key. Either way the key reaches the container only by Secret
         # reference.
-        admin_secret_name = self._ensure_admin_api_key_secret(name, proxy, ns)
+        admin_secret_name = self._ensure_admin_api_key_secret(
+            name,
+            proxy,
+            ns,
+            lifecycle_id,
+        )
 
         proxy_env = build_pd_proxy_config(mooncake)
         container_env = [client.V1EnvVar(name=k, value=v) for k, v in proxy_env.items()]
@@ -2982,12 +3947,16 @@ class InferenceMonitor:
                 name=proxy_name,
                 namespace=ns,
                 labels=dict(labels),
+                annotations=self._provenance_annotations(),
             ),
             spec=client.V1DeploymentSpec(
                 replicas=replicas,
                 selector=client.V1LabelSelector(match_labels={"app": proxy_name}),
                 template=client.V1PodTemplateSpec(
-                    metadata=client.V1ObjectMeta(labels=dict(labels)),
+                    metadata=client.V1ObjectMeta(
+                        labels=dict(labels),
+                        annotations=self._provenance_annotations(),
+                    ),
                     spec=client.V1PodSpec(
                         service_account_name="gco-service-account",
                         automount_service_account_token=False,
@@ -3006,18 +3975,51 @@ class InferenceMonitor:
             ),
         )
 
+        self._assert_mutation_authority()
         try:
             self.apps_v1.create_namespaced_deployment(
                 ns, deployment, _request_timeout=self._k8s_timeout
             )
             logger.info("Created proxy deployment %s/%s", ns, proxy_name)
-        except ApiException as e:
-            if e.status == 409:
-                logger.info("Proxy deployment %s/%s already exists", ns, proxy_name)
-            else:
+        except ApiException as error:
+            if error.status != 409:
                 raise
+            existing = self._get_deployment(proxy_name, ns)
+            if existing is None:
+                raise ReconcileFencedError(
+                    "proxy deployment disappeared during reconciliation"
+                ) from error
+            _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
+            deployment.metadata.resource_version = resource_version
+            self._assert_mutation_authority()
+            self.apps_v1.patch_namespaced_deployment(
+                proxy_name,
+                ns,
+                body=deployment,
+                _request_timeout=self._k8s_timeout,
+            )
+            logger.info("Reconciled proxy deployment %s/%s", ns, proxy_name)
 
         self._create_proxy_service(proxy_name, ns)
+
+    def _authorize_existing_service(self, name: str, namespace: str) -> Any:
+        service = self.core_v1.read_namespaced_service(
+            name, namespace, _request_timeout=self._k8s_timeout
+        )
+        return self._authorize_resource(
+            service,
+            kind="service",
+            resource_name=name,
+            patch_metadata=partial(
+                self.core_v1.patch_namespaced_service,
+                name,
+                namespace,
+                _request_timeout=self._k8s_timeout,
+            ),
+            read_resource=lambda: self.core_v1.read_namespaced_service(
+                name, namespace, _request_timeout=self._k8s_timeout
+            ),
+        )
 
     def _create_role_service(self, name: str, ns: str, role: str, port: int = 8000) -> None:
         """Create the ClusterIP Service that fronts one role's pods.
@@ -3040,6 +4042,7 @@ class InferenceMonitor:
                     "gco.io/type": "inference",
                     "gco.io/role": role,
                 },
+                annotations=self._provenance_annotations(),
             ),
             spec=client.V1ServiceSpec(
                 selector={"app": deploy_name},
@@ -3047,14 +4050,15 @@ class InferenceMonitor:
                 type="ClusterIP",
             ),
         )
+        self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_service(ns, service, _request_timeout=self._k8s_timeout)
             logger.info("Created role service %s/%s", ns, deploy_name)
-        except ApiException as e:
-            if e.status == 409:
-                logger.info("Role service %s/%s already exists", ns, deploy_name)
-            else:
+        except ApiException as error:
+            if error.status != 409:
                 raise
+            self._authorize_existing_service(deploy_name, ns)
+            logger.info("Role service %s/%s already exists", ns, deploy_name)
 
     def _ensure_pd_proxy_configmap(self, name: str, ns: str) -> None:
         """Publish the PD proxy program to the pod as a ConfigMap.
@@ -3079,20 +4083,41 @@ class InferenceMonitor:
                     "gco.io/type": "inference",
                     "gco.io/role": PD_PROXY_ROLE_LABEL,
                 },
+                annotations=self._provenance_annotations(),
             ),
             data={PD_PROXY_SCRIPT_FILENAME: script},
         )
+        self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_config_map(ns, body, _request_timeout=self._k8s_timeout)
             logger.info("Created PD proxy ConfigMap %s/%s", ns, cm_name)
-        except ApiException as e:
-            if e.status == 409:
-                self.core_v1.patch_namespaced_config_map(
-                    cm_name, ns, body, _request_timeout=self._k8s_timeout
-                )
-                logger.info("Updated PD proxy ConfigMap %s/%s", ns, cm_name)
-            else:
+        except ApiException as error:
+            if error.status != 409:
                 raise
+            existing = self.core_v1.read_namespaced_config_map(
+                cm_name, ns, _request_timeout=self._k8s_timeout
+            )
+            existing = self._authorize_resource(
+                existing,
+                kind="configmap",
+                resource_name=cm_name,
+                patch_metadata=partial(
+                    self.core_v1.patch_namespaced_config_map,
+                    cm_name,
+                    ns,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_resource=lambda: self.core_v1.read_namespaced_config_map(
+                    cm_name, ns, _request_timeout=self._k8s_timeout
+                ),
+            )
+            _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
+            body.metadata.resource_version = resource_version
+            self._assert_mutation_authority()
+            self.core_v1.patch_namespaced_config_map(
+                cm_name, ns, body, _request_timeout=self._k8s_timeout
+            )
+            logger.info("Updated PD proxy ConfigMap %s/%s", ns, cm_name)
 
     def _create_proxy_service(self, proxy_name: str, namespace: str) -> None:
         """Create the Service that fronts only the proxy pods.
@@ -3111,6 +4136,7 @@ class InferenceMonitor:
                     "gco.io/type": "inference",
                     "gco.io/role": PD_PROXY_ROLE_LABEL,
                 },
+                annotations=self._provenance_annotations(),
             ),
             spec=client.V1ServiceSpec(
                 selector={"app": proxy_name, "gco.io/role": PD_PROXY_ROLE_LABEL},
@@ -3125,16 +4151,17 @@ class InferenceMonitor:
             ),
         )
 
+        self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_service(
                 namespace, service, _request_timeout=self._k8s_timeout
             )
             logger.info("Created proxy service %s/%s", namespace, proxy_name)
-        except ApiException as e:
-            if e.status == 409:
-                logger.info("Proxy service %s/%s already exists", namespace, proxy_name)
-            else:
+        except ApiException as error:
+            if error.status != 409:
                 raise
+            self._authorize_existing_service(proxy_name, namespace)
+            logger.info("Proxy service %s/%s already exists", namespace, proxy_name)
 
     def _create_service(self, name: str, namespace: str, spec: dict[str, Any]) -> None:
         """Create the internal ClusterIP Service for an inference endpoint."""
@@ -3149,6 +4176,7 @@ class InferenceMonitor:
                     "project": "gco",
                     "gco.io/type": "inference",
                 },
+                annotations=self._provenance_annotations(),
             ),
             spec=client.V1ServiceSpec(
                 selector={"app": name},
@@ -3163,25 +4191,24 @@ class InferenceMonitor:
             ),
         )
 
+        self._assert_mutation_authority()
         try:
             self.core_v1.create_namespaced_service(
                 namespace, service, _request_timeout=self._k8s_timeout
             )
             logger.info("Created service %s/%s", namespace, name)
-        except ApiException as e:
-            if e.status == 409:
-                logger.info("Service %s/%s already exists", namespace, name)
-            else:
+        except ApiException as error:
+            if error.status != 409:
                 raise
+            self._authorize_existing_service(name, namespace)
+            logger.info("Service %s/%s already exists", namespace, name)
 
     def _ensure_service(self, name: str, namespace: str, spec: dict[str, Any]) -> None:
-        """Ensure the endpoint's ClusterIP Service exists, recreating it if missing."""
+        """Ensure an owned endpoint Service exists, recreating it if absent."""
         try:
-            self.core_v1.read_namespaced_service(
-                name, namespace, _request_timeout=self._k8s_timeout
-            )
-        except ApiException as e:
-            if e.status == 404:
+            self._authorize_existing_service(name, namespace)
+        except ApiException as error:
+            if error.status == 404:
                 logger.warning("Service %s/%s missing, recreating", namespace, name)
                 self._create_service(name, namespace, spec)
             else:
@@ -3233,24 +4260,40 @@ class InferenceMonitor:
         return threshold_exceeded
 
     def _scale_deployment(self, name: str, namespace: str, replicas: int) -> None:
-        """Scale a deployment to the desired replica count."""
+        """Scale only the exact authorized Deployment resourceVersion."""
+        deployment = self._get_deployment(name, namespace)
+        if deployment is None:
+            raise ReconcileFencedError(f"deployment {name} disappeared before scaling")
+        _metadata, _annotations, _uid, resource_version = self._object_metadata(deployment)
+        self._assert_mutation_authority()
+        body: dict[str, Any] = {"spec": {"replicas": replicas}}
+        if resource_version:
+            body["metadata"] = {"resourceVersion": resource_version}
         self.apps_v1.patch_namespaced_deployment(
             name,
             namespace,
-            body={"spec": {"replicas": replicas}},
+            body=body,
             _request_timeout=self._k8s_timeout,
         )
 
     def _update_deployment_image(self, name: str, namespace: str, image: str) -> None:
-        """Update the container image of a deployment."""
+        """Update only the exact authorized Deployment resourceVersion."""
+        deployment = self._get_deployment(name, namespace)
+        if deployment is None:
+            raise ReconcileFencedError(f"deployment {name} disappeared before image update")
+        _metadata, _annotations, _uid, resource_version = self._object_metadata(deployment)
+        self._assert_mutation_authority()
+        body: dict[str, Any] = {
+            "spec": {
+                "template": {"spec": {"containers": [{"name": "inference", "image": image}]}}
+            }
+        }
+        if resource_version:
+            body["metadata"] = {"resourceVersion": resource_version}
         self.apps_v1.patch_namespaced_deployment(
             name,
             namespace,
-            body={
-                "spec": {
-                    "template": {"spec": {"containers": [{"name": "inference", "image": image}]}}
-                }
-            },
+            body=body,
             _request_timeout=self._k8s_timeout,
         )
 
@@ -3331,141 +4374,758 @@ class InferenceMonitor:
         }
 
     def _cleanup_canary(self, name: str, namespace: str) -> None:
-        """Remove a canary Deployment and Service."""
+        """Remove only canary objects carrying this reconciliation authority."""
         canary_name = f"{name}-canary"
-
-        # Delete canary deployment
+        deployment = self._get_deployment(canary_name, namespace)
+        if deployment is not None:
+            self._assert_mutation_authority()
+            try:
+                self.apps_v1.delete_namespaced_deployment(
+                    canary_name,
+                    namespace,
+                    body=self._delete_options_for(
+                        deployment, kind="deployment", resource_name=canary_name
+                    ),
+                    _request_timeout=self._k8s_timeout,
+                )
+                logger.info("Deleted canary deployment %s", canary_name)
+            except ApiException as error:
+                if error.status != 404:
+                    logger.error("Failed to delete canary deployment %s: %s", canary_name, error)
         try:
-            self.apps_v1.delete_namespaced_deployment(
-                canary_name, namespace, _request_timeout=self._k8s_timeout
-            )
-            logger.info("Deleted canary deployment %s", canary_name)
-        except ApiException as e:
-            if e.status != 404:
-                logger.error("Failed to delete canary deployment %s: %s", canary_name, e)
+            service = self._authorize_existing_service(canary_name, namespace)
+        except ApiException as error:
+            if error.status != 404:
+                logger.error("Failed to read canary service %s: %s", canary_name, error)
+        else:
+            self._assert_mutation_authority()
+            try:
+                self.core_v1.delete_namespaced_service(
+                    canary_name,
+                    namespace,
+                    body=self._delete_options_for(
+                        service, kind="service", resource_name=canary_name
+                    ),
+                    _request_timeout=self._k8s_timeout,
+                )
+                logger.info("Deleted canary service %s", canary_name)
+            except ApiException as error:
+                if error.status != 404:
+                    logger.error("Failed to delete canary service %s: %s", canary_name, error)
 
-        # Delete canary service
+    @staticmethod
+    def _endpoint_resource_inventory(name: str) -> EndpointResourceInventory:
+        """Return every deterministic endpoint-owned resource name.
+
+        The shared ``mooncake-master`` Service/StatefulSet and any Secret named
+        by the user are deliberately excluded.
+        """
+        return EndpointResourceInventory(
+            deployments=(
+                name,
+                f"{name}-canary",
+                f"{name}-prefill",
+                f"{name}-decode",
+                f"{name}-proxy",
+            ),
+            services=(
+                name,
+                f"{name}-canary",
+                f"{name}-prefill",
+                f"{name}-decode",
+                f"{name}-proxy",
+            ),
+            horizontal_pod_autoscalers=(
+                name,
+                f"{name}-prefill",
+                f"{name}-decode",
+                f"keda-hpa-{name}",
+                f"keda-hpa-{name}-prefill",
+                f"keda-hpa-{name}-decode",
+            ),
+            scaled_objects=(
+                name,
+                f"{name}-prefill",
+                f"{name}-decode",
+            ),
+            config_maps=(f"{name}-mooncake", f"{name}-pd-proxy"),
+            legacy_ingresses=(name, f"{name}-canary", f"{name}-proxy"),
+            legacy_http_routes=(name, f"{name}-canary", f"{name}-proxy"),
+            generated_admin_secret=f"{name}-admin",
+        )
+
+    @staticmethod
+    def _cleanup_error(
+        operation: str,
+        kind: str,
+        resource_name: str,
+        error: Exception,
+    ) -> str:
+        """Build a bounded error containing only an endpoint-owned name."""
+        status_value = getattr(error, "status", None)
+        status = f" (status {status_value})" if status_value is not None else ""
+        return f"{operation} {kind} {resource_name} failed{status}"
+
+    def _delete_and_confirm(
+        self,
+        *,
+        kind: str,
+        resource_name: str,
+        delete_call: Callable[..., Any],
+        read_call: Callable[[], Any],
+        patch_metadata: Callable[..., Any] | None,
+        pending: list[str],
+        errors: list[str],
+        observed_resource: Any | None = None,
+    ) -> bool:
+        """Read-authorize-delete one exact UID/resourceVersion, then re-observe."""
+        resource_id = f"{kind}/{resource_name}"
+        if observed_resource is not None:
+            observed = observed_resource
+        else:
+            try:
+                observed = read_call()
+            except ApiException as error:
+                if error.status == 404:
+                    return False
+                errors.append(self._cleanup_error("read", kind, resource_name, error))
+                return False
+            except Exception as error:
+                errors.append(self._cleanup_error("read", kind, resource_name, error))
+                return False
+
+        observed = self._authorize_resource(
+            observed,
+            kind=kind,
+            resource_name=resource_name,
+            patch_metadata=patch_metadata,
+            read_resource=read_call,
+            allow_region_mismatch=bool(
+                self._active_authority and self._active_authority.region_removed
+            ),
+        )
+        _metadata, _annotations, observed_uid, _resource_version = self._object_metadata(observed)
+        self._assert_mutation_authority()
         try:
-            self.core_v1.delete_namespaced_service(
-                canary_name, namespace, _request_timeout=self._k8s_timeout
+            delete_call(
+                body=self._delete_options_for(
+                    observed, kind=kind, resource_name=resource_name
+                )
             )
-            logger.info("Deleted canary service %s", canary_name)
-        except ApiException as e:
-            if e.status != 404:
-                logger.error("Failed to delete canary service %s: %s", canary_name, e)
+        except ApiException as error:
+            if error.status != 404:
+                errors.append(self._cleanup_error("delete", kind, resource_name, error))
+        except Exception as error:
+            errors.append(self._cleanup_error("delete", kind, resource_name, error))
+
+        try:
+            remaining = read_call()
+        except ApiException as error:
+            if error.status == 404:
+                return True
+            errors.append(self._cleanup_error("read", kind, resource_name, error))
+            return True
+        except Exception as error:
+            errors.append(self._cleanup_error("read", kind, resource_name, error))
+            return True
+
+        _metadata, _annotations, remaining_uid, _remaining_version = self._object_metadata(remaining)
+        # A replacement with a different UID is never deleted by this stale
+        # observation. Its continued presence intentionally blocks cleanup.
+        if observed_uid and remaining_uid and remaining_uid != observed_uid:
+            pending.append(f"{resource_id}:replacement")
+        else:
+            pending.append(resource_id)
+        return True
+
+    @staticmethod
+    def _merge_cleanup_results(*results: ResourceCleanupResult) -> ResourceCleanupResult:
+        """Combine independently attempted cleanup groups without losing failures."""
+        return ResourceCleanupResult(
+            pending=tuple(item for result in results for item in result.pending),
+            errors=tuple(item for result in results for item in result.errors),
+            resources_found=any(result.resources_found for result in results),
+        )
+
+    def _delete_scaled_objects(
+        self,
+        names: tuple[str, ...],
+        namespace: str,
+    ) -> ResourceCleanupResult:
+        """Delete and verify the requested KEDA ScaledObjects."""
+        pending: list[str] = []
+        errors: list[str] = []
+        resources_found = False
+        custom_objects = client.CustomObjectsApi()
+        for autoscaler_name in names:
+            resources_found |= self._delete_and_confirm(
+                kind="scaledobject",
+                resource_name=autoscaler_name,
+                delete_call=partial(
+                    custom_objects.delete_namespaced_custom_object,
+                    group=KEDA_API_GROUP,
+                    version=KEDA_API_VERSION,
+                    namespace=namespace,
+                    plural=KEDA_SCALEDOBJECT_PLURAL,
+                    name=autoscaler_name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_call=partial(
+                    custom_objects.get_namespaced_custom_object,
+                    group=KEDA_API_GROUP,
+                    version=KEDA_API_VERSION,
+                    namespace=namespace,
+                    plural=KEDA_SCALEDOBJECT_PLURAL,
+                    name=autoscaler_name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                patch_metadata=partial(
+                    custom_objects.patch_namespaced_custom_object,
+                    group=KEDA_API_GROUP,
+                    version=KEDA_API_VERSION,
+                    namespace=namespace,
+                    plural=KEDA_SCALEDOBJECT_PLURAL,
+                    name=autoscaler_name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                pending=pending,
+                errors=errors,
+            )
+        return ResourceCleanupResult(
+            pending=tuple(pending),
+            errors=tuple(errors),
+            resources_found=resources_found,
+        )
+
+    def _delete_hpas(
+        self,
+        names: tuple[str, ...],
+        namespace: str,
+    ) -> ResourceCleanupResult:
+        """Delete and verify the requested native or KEDA-generated HPAs."""
+        pending: list[str] = []
+        errors: list[str] = []
+        resources_found = False
+        autoscaling_v2 = client.AutoscalingV2Api()
+        for autoscaler_name in names:
+            resources_found |= self._delete_and_confirm(
+                kind="hpa",
+                resource_name=autoscaler_name,
+                delete_call=partial(
+                    autoscaling_v2.delete_namespaced_horizontal_pod_autoscaler,
+                    autoscaler_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_call=partial(
+                    autoscaling_v2.read_namespaced_horizontal_pod_autoscaler,
+                    autoscaler_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                patch_metadata=partial(
+                    autoscaling_v2.patch_namespaced_horizontal_pod_autoscaler,
+                    autoscaler_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                pending=pending,
+                errors=errors,
+            )
+        return ResourceCleanupResult(
+            pending=tuple(pending),
+            errors=tuple(errors),
+            resources_found=resources_found,
+        )
+
+    def _delete_autoscalers(
+        self,
+        scaled_object_names: tuple[str, ...],
+        hpa_names: tuple[str, ...],
+        namespace: str,
+    ) -> ResourceCleanupResult:
+        """Delete every autoscaler owner and wait for all of them to disappear."""
+        # KEDA must stop first; only then is it safe to remove its generated HPA
+        # alongside any native HPA that may remain from a prior configuration.
+        scaled_objects = self._delete_scaled_objects(scaled_object_names, namespace)
+        hpas = self._delete_hpas(hpa_names, namespace)
+        return self._merge_cleanup_results(scaled_objects, hpas)
+
+    @staticmethod
+    def _generated_admin_secret_labels(expected_name: str) -> dict[str, str]:
+        """Return the schema-valid static provenance used by generated Secrets."""
+        return {
+            "app": expected_name,
+            "project": "gco",
+            "gco.io/type": "inference",
+        }
+
+    @classmethod
+    def _is_monitor_owned_admin_secret(
+        cls,
+        secret: Any,
+        expected_name: str,
+        expected_lifecycle_id: str,
+    ) -> bool:
+        """Return whether a generated Secret is bound to this endpoint lifecycle."""
+        metadata = getattr(secret, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        annotations = getattr(metadata, "annotations", None)
+        return (
+            labels == cls._generated_admin_secret_labels(expected_name)
+            and isinstance(annotations, dict)
+            and annotations.get("gco.io/lifecycle-id") == expected_lifecycle_id
+        )
+
+    @classmethod
+    def _is_legacy_monitor_admin_secret(cls, secret: Any, expected_name: str) -> bool:
+        """Recognize only the exact pre-v7 monitor-generated Secret shape."""
+        metadata = getattr(secret, "metadata", None)
+        labels = getattr(metadata, "labels", None)
+        annotations = getattr(metadata, "annotations", None)
+        lifecycle_annotation = (
+            annotations.get("gco.io/lifecycle-id") if isinstance(annotations, dict) else None
+        )
+        secret_type = getattr(secret, "type", None)
+        return (
+            labels == cls._generated_admin_secret_labels(expected_name)
+            and lifecycle_annotation is None
+            and secret_type == "Opaque"
+            and cls._secret_has_admin_api_key(secret)
+        )
+
+    def _adopt_legacy_admin_secret(
+        self,
+        secret: Any,
+        secret_name: str,
+        namespace: str,
+        lifecycle_id: str,
+    ) -> Any:
+        """Patch exact legacy provenance and verify the persisted lifecycle annotation."""
+        if not self._is_legacy_monitor_admin_secret(secret, secret_name):
+            raise AdminApiKeySecretError(
+                secret_name,
+                "the conventional generated Secret has ambiguous ownership",
+            )
+        metadata = getattr(secret, "metadata", None)
+        resource_version = getattr(metadata, "resource_version", None)
+        if not isinstance(resource_version, str) or not resource_version:
+            raise AdminApiKeySecretError(
+                secret_name,
+                "legacy generated Secret has no resource version for safe migration",
+            )
+        annotations = self._provenance_annotations() or {_LIFECYCLE_ANNOTATION: lifecycle_id}
+        self._assert_mutation_authority()
+        try:
+            self.core_v1.patch_namespaced_secret(
+                secret_name,
+                namespace,
+                body={
+                    "metadata": {
+                        "resourceVersion": resource_version,
+                        "annotations": annotations,
+                    }
+                },
+                _request_timeout=self._k8s_timeout,
+            )
+        except Exception as error:
+            raise AdminApiKeySecretError(
+                secret_name,
+                "legacy generated Secret changed during lifecycle migration",
+            ) from error
+        adopted = self.core_v1.read_namespaced_secret(
+            secret_name,
+            namespace,
+            _request_timeout=self._k8s_timeout,
+        )
+        if not self._is_monitor_owned_admin_secret(
+            adopted,
+            secret_name,
+            lifecycle_id,
+        ) or not self._secret_has_admin_api_key(adopted):
+            raise AdminApiKeySecretError(
+                secret_name,
+                "legacy generated Secret migration could not be verified",
+            )
+        return adopted
+
+    def _require_owned_admin_secret(
+        self,
+        secret: Any,
+        secret_name: str,
+        namespace: str,
+        lifecycle_id: str,
+    ) -> Any:
+        """Accept current provenance or safely migrate one exact legacy shape."""
+        if self._is_monitor_owned_admin_secret(
+            secret,
+            secret_name,
+            lifecycle_id,
+        ) and self._secret_has_admin_api_key(secret):
+            return secret
+        if self._is_legacy_monitor_admin_secret(secret, secret_name):
+            return self._adopt_legacy_admin_secret(
+                secret,
+                secret_name,
+                namespace,
+                lifecycle_id,
+            )
+        raise AdminApiKeySecretError(
+            secret_name,
+            "the conventional generated Secret exists without matching lifecycle provenance",
+        )
+
+    @staticmethod
+    def _generated_child_matches(
+        item: Any,
+        kind: str,
+        deployment_names: tuple[str, ...],
+        service_names: tuple[str, ...],
+        replica_set_names: tuple[str, ...] = (),
+    ) -> bool:
+        """Match generated children only through exact parent identity."""
+        metadata = getattr(item, "metadata", None)
+        child_name = getattr(metadata, "name", None)
+        labels = getattr(metadata, "labels", None)
+        labels = labels if isinstance(labels, dict) else {}
+        owner_references = getattr(metadata, "owner_references", None)
+        owners = owner_references if isinstance(owner_references, (list, tuple)) else ()
+
+        if kind in {"replicaset", "pod"}:
+            app_name = labels.get("app")
+            if app_name not in deployment_names:
+                return False
+            if labels.get("project") != "gco" or labels.get("gco.io/type") != "inference":
+                return False
+            if not owners:
+                return True
+            for owner in owners:
+                owner_kind = getattr(owner, "kind", None)
+                owner_name = getattr(owner, "name", None)
+                if owner_kind == "Deployment" and owner_name in deployment_names:
+                    return True
+                if kind == "pod" and owner_kind == "ReplicaSet" and owner_name in replica_set_names:
+                    return True
+            return False
+
+        if kind == "endpoints":
+            return isinstance(child_name, str) and child_name in service_names
+        if kind == "endpointslice":
+            service_name = labels.get("kubernetes.io/service-name")
+            return isinstance(service_name, str) and service_name in service_names
+        return False
+
+    def _observe_generated_children(
+        self,
+        name: str,
+        namespace: str,
+        inventory: EndpointResourceInventory,
+        pending: list[str],
+        errors: list[str],
+    ) -> bool:
+        """Inventory exact endpoint children once per kind and dependency order."""
+        resources_found = False
+        matched_replica_sets: list[str] = []
+        list_calls: tuple[tuple[str, Callable[[], Any]], ...] = (
+            (
+                "replicaset",
+                partial(
+                    self.apps_v1.list_namespaced_replica_set,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            ),
+            (
+                "pod",
+                partial(
+                    self.core_v1.list_namespaced_pod,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            ),
+            (
+                "endpoints",
+                partial(
+                    self.core_v1.list_namespaced_endpoints,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            ),
+            (
+                "endpointslice",
+                partial(
+                    self.discovery_v1.list_namespaced_endpoint_slice,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            ),
+        )
+        for kind, list_call in list_calls:
+            try:
+                response = list_call()
+            except ApiException as error:
+                errors.append(self._cleanup_error("list", kind, name, error))
+                continue
+            except Exception as error:
+                errors.append(self._cleanup_error("list", kind, name, error))
+                continue
+            items = getattr(response, "items", None)
+            if not isinstance(items, (list, tuple)):
+                items = ()
+            for item in items:
+                if not self._generated_child_matches(
+                    item,
+                    kind,
+                    inventory.deployments,
+                    inventory.services,
+                    tuple(matched_replica_sets),
+                ):
+                    continue
+                metadata = getattr(item, "metadata", None)
+                child_name = getattr(metadata, "name", "unknown")
+                if kind == "replicaset" and isinstance(child_name, str):
+                    matched_replica_sets.append(child_name)
+                pending.append(f"{kind}/{child_name}")
+                resources_found = True
+        return resources_found
 
     def _delete_resources(
         self,
         name: str,
         namespace: str,
         spec: dict[str, Any] | None = None,
-    ) -> None:
-        """Delete all Kubernetes resources owned by an endpoint.
+        *,
+        expected_lifecycle_id: str | None = None,
+    ) -> ResourceCleanupResult:
+        """Delete parents and prove all top-level/generated children absent."""
+        inventory = self._endpoint_resource_inventory(name)
+        autoscaler_cleanup = self._delete_autoscalers(
+            inventory.scaled_objects,
+            inventory.horizontal_pod_autoscalers,
+            namespace,
+        )
+        pending = list(autoscaler_cleanup.pending)
+        errors = list(autoscaler_cleanup.errors)
+        resources_found = autoscaler_cleanup.resources_found
 
-        Covers both the single-Deployment endpoint and the Mooncake role-split
-        topology: role/proxy Deployments and Services, native HPAs or KEDA
-        ScaledObjects, transport/proxy ConfigMaps, and the generated proxy admin
-        Secret when the endpoint did not name a user-managed Secret. Each delete
-        is idempotent: a 404 means that object
-        is not used by this endpoint's mode and is ignored. The shared regional
-        ``mooncake-master`` is deliberately NOT deleted because other endpoints
-        may still depend on it.
-        """
-        # Delete canary resources first
-        self._cleanup_canary(name, namespace)
-
-        proxy_name = f"{name}-proxy"
-
-        # Deployments: the single-instance endpoint plus the Mooncake prefill/
-        # decode workers and the PD proxy.
-        for deployment_name in (name, f"{name}-prefill", f"{name}-decode", proxy_name):
-            try:
-                self.apps_v1.delete_namespaced_deployment(
-                    deployment_name, namespace, _request_timeout=self._k8s_timeout
-                )
-                logger.info("Deleted deployment %s/%s", namespace, deployment_name)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.error("Failed to delete deployment %s: %s", deployment_name, e)
-
-        # Services: classic/store, split-role backends, and the PD proxy.
-        for service_name in (name, f"{name}-prefill", f"{name}-decode", proxy_name):
-            try:
-                self.core_v1.delete_namespaced_service(
-                    service_name, namespace, _request_timeout=self._k8s_timeout
-                )
-                logger.info("Deleted service %s/%s", namespace, service_name)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.error("Failed to delete service %s: %s", service_name, e)
-
-        # HPAs: the single-instance endpoint HPA and the per-role Mooncake HPAs.
-        autoscaling_v2 = client.AutoscalingV2Api()
-        for hpa_name in (name, f"{name}-prefill", f"{name}-decode"):
-            try:
-                autoscaling_v2.delete_namespaced_horizontal_pod_autoscaler(hpa_name, namespace)
-                logger.info("Deleted HPA %s/%s", namespace, hpa_name)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.error("Failed to delete HPA %s: %s", hpa_name, e)
-
-        # Per-endpoint Mooncake transport and bundled PD-proxy program. The
-        # shared regional mooncake-master is intentionally left in place.
-        for config_map_name in (f"{name}-mooncake", f"{name}-pd-proxy"):
-            try:
-                self.core_v1.delete_namespaced_config_map(
-                    config_map_name, namespace, _request_timeout=self._k8s_timeout
-                )
-                logger.info("Deleted configmap %s/%s", namespace, config_map_name)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.error("Failed to delete configmap %s: %s", config_map_name, e)
-
-        # GPU metrics use KEDA instead of native HPAs. Remove the classic and
-        # both role-scoped names; absent objects are the common case.
-        custom_objects = client.CustomObjectsApi()
-        for scaled_object_name in (name, f"{name}-prefill", f"{name}-decode"):
-            try:
-                custom_objects.delete_namespaced_custom_object(
-                    group=KEDA_API_GROUP,
-                    version=KEDA_API_VERSION,
-                    namespace=namespace,
-                    plural=KEDA_SCALEDOBJECT_PLURAL,
-                    name=scaled_object_name,
+        for deployment_name in inventory.deployments:
+            resources_found |= self._delete_and_confirm(
+                kind="deployment",
+                resource_name=deployment_name,
+                delete_call=partial(
+                    self.apps_v1.delete_namespaced_deployment,
+                    deployment_name,
+                    namespace,
                     _request_timeout=self._k8s_timeout,
-                )
-                logger.info("Deleted KEDA ScaledObject for %s", scaled_object_name)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.error(
-                        "Failed to delete KEDA ScaledObject for %s: %s",
-                        scaled_object_name,
-                        e,
-                    )
+                ),
+                read_call=partial(
+                    self.apps_v1.read_namespaced_deployment,
+                    deployment_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                patch_metadata=partial(
+                    self.apps_v1.patch_namespaced_deployment,
+                    deployment_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                pending=pending,
+                errors=errors,
+            )
 
-        # Only the unnamed-secret path is monitor-owned. A Secret explicitly
-        # named in the endpoint spec is user-managed and must survive deletion.
+        for service_name in inventory.services:
+            resources_found |= self._delete_and_confirm(
+                kind="service",
+                resource_name=service_name,
+                delete_call=partial(
+                    self.core_v1.delete_namespaced_service,
+                    service_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_call=partial(
+                    self.core_v1.read_namespaced_service,
+                    service_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                patch_metadata=partial(
+                    self.core_v1.patch_namespaced_service,
+                    service_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                pending=pending,
+                errors=errors,
+            )
+
+        for config_map_name in inventory.config_maps:
+            resources_found |= self._delete_and_confirm(
+                kind="configmap",
+                resource_name=config_map_name,
+                delete_call=partial(
+                    self.core_v1.delete_namespaced_config_map,
+                    config_map_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_call=partial(
+                    self.core_v1.read_namespaced_config_map,
+                    config_map_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                patch_metadata=partial(
+                    self.core_v1.patch_namespaced_config_map,
+                    config_map_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                pending=pending,
+                errors=errors,
+            )
+
+        for ingress_name in inventory.legacy_ingresses:
+            resources_found |= self._delete_and_confirm(
+                kind="ingress",
+                resource_name=ingress_name,
+                delete_call=partial(
+                    self.networking_v1.delete_namespaced_ingress,
+                    ingress_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_call=partial(
+                    self.networking_v1.read_namespaced_ingress,
+                    ingress_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                patch_metadata=partial(
+                    self.networking_v1.patch_namespaced_ingress,
+                    ingress_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                pending=pending,
+                errors=errors,
+            )
+
+        custom_objects = client.CustomObjectsApi()
+        for route_name in inventory.legacy_http_routes:
+            resources_found |= self._delete_and_confirm(
+                kind="httproute",
+                resource_name=route_name,
+                delete_call=partial(
+                    custom_objects.delete_namespaced_custom_object,
+                    group="gateway.networking.k8s.io",
+                    version="v1",
+                    namespace=namespace,
+                    plural="httproutes",
+                    name=route_name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_call=partial(
+                    custom_objects.get_namespaced_custom_object,
+                    group="gateway.networking.k8s.io",
+                    version="v1",
+                    namespace=namespace,
+                    plural="httproutes",
+                    name=route_name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                patch_metadata=partial(
+                    custom_objects.patch_namespaced_custom_object,
+                    group="gateway.networking.k8s.io",
+                    version="v1",
+                    namespace=namespace,
+                    plural="httproutes",
+                    name=route_name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                pending=pending,
+                errors=errors,
+            )
+
+        resources_found |= self._observe_generated_children(
+            name,
+            namespace,
+            inventory,
+            pending,
+            errors,
+        )
+
+        # A user-named Secret is external and survives. The conventional name
+        # is auto-managed only when both labels and immutable provenance match;
+        # an ambiguous same-name Secret blocks terminal cleanup.
         mooncake = spec.get("mooncake") if isinstance(spec, dict) else None
         proxy = mooncake.get("proxy") if isinstance(mooncake, dict) else None
         named_secret = proxy.get("admin_api_key_secret") if isinstance(proxy, dict) else None
-        if (
-            isinstance(mooncake, dict)
-            and mooncake.get("mode") in ("disaggregated", "both")
-            and not (isinstance(named_secret, str) and named_secret)
-        ):
-            secret_name = f"{name}-admin"
+        generated_secret = inventory.generated_admin_secret
+        if named_secret != generated_secret:
             try:
-                self.core_v1.delete_namespaced_secret(
-                    secret_name, namespace, _request_timeout=self._k8s_timeout
+                secret = self.core_v1.read_namespaced_secret(
+                    generated_secret,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
                 )
-                logger.info("Deleted generated proxy access resource %s/%s", namespace, secret_name)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.error(
-                        "Failed to delete generated proxy access resource %s: %s",
-                        secret_name,
-                        e,
+            except ApiException as error:
+                if error.status != 404:
+                    errors.append(self._cleanup_error("read", "secret", generated_secret, error))
+            except Exception as error:
+                errors.append(self._cleanup_error("read", "secret", generated_secret, error))
+            else:
+                resources_found = True
+                if isinstance(expected_lifecycle_id, str) and expected_lifecycle_id:
+                    try:
+                        owned_secret = self._require_owned_admin_secret(
+                            secret,
+                            generated_secret,
+                            namespace,
+                            expected_lifecycle_id,
+                        )
+                    except AdminApiKeySecretError:
+                        errors.append(
+                            f"ambiguous secret {generated_secret} is not owned by lifecycle "
+                            f"{expected_lifecycle_id}"
+                        )
+                    else:
+                        resources_found |= self._delete_and_confirm(
+                            kind="secret",
+                            resource_name=generated_secret,
+                            delete_call=partial(
+                                self.core_v1.delete_namespaced_secret,
+                                generated_secret,
+                                namespace,
+                                _request_timeout=self._k8s_timeout,
+                            ),
+                            read_call=partial(
+                                self.core_v1.read_namespaced_secret,
+                                generated_secret,
+                                namespace,
+                                _request_timeout=self._k8s_timeout,
+                            ),
+                            patch_metadata=partial(
+                                self.core_v1.patch_namespaced_secret,
+                                generated_secret,
+                                namespace,
+                                _request_timeout=self._k8s_timeout,
+                            ),
+                            pending=pending,
+                            errors=errors,
+                            observed_resource=owned_secret,
+                        )
+                else:
+                    errors.append(
+                        f"ambiguous secret {generated_secret} is not owned by lifecycle unknown"
                     )
+
+        return ResourceCleanupResult(
+            pending=tuple(sorted(set(pending))),
+            errors=tuple(errors),
+            resources_found=resources_found,
+        )
 
     def _build_hpa_metrics(self, metrics_config: list[dict[str, Any]]) -> list[Any]:
         """Translate a metrics config list into autoscaler metric specs.
@@ -3611,7 +5271,7 @@ class InferenceMonitor:
         already-present ScaledObject of the same name is merge-patched rather
         than duplicated.
         """
-        body = {
+        body: dict[str, Any] = {
             "apiVersion": f"{KEDA_API_GROUP}/{KEDA_API_VERSION}",
             "kind": "ScaledObject",
             "metadata": {
@@ -3622,6 +5282,7 @@ class InferenceMonitor:
                     "project": "gco",
                     "gco.io/type": "inference",
                 },
+                "annotations": self._provenance_annotations() or {},
             },
             "spec": {
                 "scaleTargetRef": {"name": target_name},
@@ -3632,6 +5293,7 @@ class InferenceMonitor:
         }
 
         custom = client.CustomObjectsApi()
+        self._assert_mutation_authority()
         try:
             custom.create_namespaced_custom_object(
                 group=KEDA_API_GROUP,
@@ -3648,20 +5310,52 @@ class InferenceMonitor:
                 min_replicas,
                 max_replicas,
             )
-        except ApiException as e:
-            if e.status == 409:
-                custom.patch_namespaced_custom_object(
+        except ApiException as error:
+            if error.status != 409:
+                raise
+            existing = custom.get_namespaced_custom_object(
+                group=KEDA_API_GROUP,
+                version=KEDA_API_VERSION,
+                namespace=namespace,
+                plural=KEDA_SCALEDOBJECT_PLURAL,
+                name=name,
+                _request_timeout=self._k8s_timeout,
+            )
+            existing = self._authorize_resource(
+                existing,
+                kind="scaledobject",
+                resource_name=name,
+                patch_metadata=partial(
+                    custom.patch_namespaced_custom_object,
                     group=KEDA_API_GROUP,
                     version=KEDA_API_VERSION,
                     namespace=namespace,
                     plural=KEDA_SCALEDOBJECT_PLURAL,
                     name=name,
-                    body=body,
                     _request_timeout=self._k8s_timeout,
-                )
-                logger.info("Updated KEDA ScaledObject %s", name)
-            else:
-                raise
+                ),
+                read_resource=lambda: custom.get_namespaced_custom_object(
+                    group=KEDA_API_GROUP,
+                    version=KEDA_API_VERSION,
+                    namespace=namespace,
+                    plural=KEDA_SCALEDOBJECT_PLURAL,
+                    name=name,
+                    _request_timeout=self._k8s_timeout,
+                ),
+            )
+            _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
+            body["metadata"]["resourceVersion"] = resource_version
+            self._assert_mutation_authority()
+            custom.patch_namespaced_custom_object(
+                group=KEDA_API_GROUP,
+                version=KEDA_API_VERSION,
+                namespace=namespace,
+                plural=KEDA_SCALEDOBJECT_PLURAL,
+                name=name,
+                body=body,
+                _request_timeout=self._k8s_timeout,
+            )
+            logger.info("Updated KEDA ScaledObject %s", name)
 
     def _apply_hpa(
         self,
@@ -3701,6 +5395,7 @@ class InferenceMonitor:
                     "project": "gco",
                     "gco.io/type": "inference",
                 },
+                annotations=self._provenance_annotations(),
             ),
             spec=client.V2HorizontalPodAutoscalerSpec(
                 scale_target_ref=client.V2CrossVersionObjectReference(
@@ -3715,6 +5410,7 @@ class InferenceMonitor:
         )
 
         autoscaling_v2 = client.AutoscalingV2Api()
+        self._assert_mutation_authority()
         try:
             autoscaling_v2.create_namespaced_horizontal_pod_autoscaler(namespace, hpa)
             logger.info(
@@ -3724,12 +5420,131 @@ class InferenceMonitor:
                 min_replicas,
                 max_replicas,
             )
-        except ApiException as e:
-            if e.status == 409:
-                autoscaling_v2.patch_namespaced_horizontal_pod_autoscaler(hpa_name, namespace, hpa)
-                logger.info("Updated HPA %s", hpa_name)
-            else:
+        except ApiException as error:
+            if error.status != 409:
                 raise
+            existing = autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
+                hpa_name, namespace, _request_timeout=self._k8s_timeout
+            )
+            existing = self._authorize_resource(
+                existing,
+                kind="hpa",
+                resource_name=hpa_name,
+                patch_metadata=partial(
+                    autoscaling_v2.patch_namespaced_horizontal_pod_autoscaler,
+                    hpa_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_resource=lambda: autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
+                    hpa_name, namespace, _request_timeout=self._k8s_timeout
+                ),
+            )
+            _metadata, _annotations, _uid, resource_version = self._object_metadata(existing)
+            hpa.metadata.resource_version = resource_version
+            self._assert_mutation_authority()
+            autoscaling_v2.patch_namespaced_horizontal_pod_autoscaler(
+                hpa_name,
+                namespace,
+                hpa,
+                _request_timeout=self._k8s_timeout,
+            )
+            logger.info("Updated HPA %s", hpa_name)
+
+    def _verify_hpa_owner(
+        self,
+        hpa_name: str,
+        namespace: str,
+        target_name: str,
+    ) -> ResourceCleanupResult:
+        """Verify that the exact native/KEDA HPA owns the expected Deployment."""
+        autoscaling_v2 = client.AutoscalingV2Api()
+        try:
+            hpa = autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
+                hpa_name,
+                namespace,
+            )
+        except ApiException as error:
+            if error.status == 404:
+                return ResourceCleanupResult(pending=(f"hpa/{hpa_name}",))
+            return ResourceCleanupResult(
+                errors=(self._cleanup_error("read", "hpa", hpa_name, error),)
+            )
+        except Exception as error:
+            return ResourceCleanupResult(
+                errors=(self._cleanup_error("read", "hpa", hpa_name, error),)
+            )
+        try:
+            hpa = self._authorize_resource(
+                hpa,
+                kind="hpa",
+                resource_name=hpa_name,
+                patch_metadata=partial(
+                    autoscaling_v2.patch_namespaced_horizontal_pod_autoscaler,
+                    hpa_name,
+                    namespace,
+                    _request_timeout=self._k8s_timeout,
+                ),
+                read_resource=lambda: autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
+                    hpa_name, namespace, _request_timeout=self._k8s_timeout
+                ),
+            )
+        except ReconcileFencedError:
+            raise
+        hpa_spec = getattr(hpa, "spec", None)
+        target_ref = getattr(hpa_spec, "scale_target_ref", None)
+        observed_api_version = getattr(target_ref, "api_version", None)
+        observed_kind = getattr(target_ref, "kind", None)
+        observed_target = getattr(target_ref, "name", None)
+        if (
+            observed_api_version != "apps/v1"
+            or observed_kind != "Deployment"
+            or observed_target != target_name
+        ):
+            return ResourceCleanupResult(
+                pending=(f"hpa/{hpa_name}",),
+                resources_found=True,
+            )
+        return ResourceCleanupResult(resources_found=True)
+
+    def _reconcile_classic_autoscaler(
+        self,
+        name: str,
+        namespace: str,
+        spec: dict[str, Any],
+        *,
+        apply_desired: bool = True,
+    ) -> ResourceCleanupResult:
+        """Converge a classic endpoint to exactly one autoscaler owner.
+
+        A stopped target is first restored to a positive minimum, then the
+        desired native/KEDA owner is applied and read back before reconciliation
+        may proceed. Obsolete owners are always confirmed absent first.
+        """
+        autoscaling = spec.get("autoscaling", {})
+        metrics_config = autoscaling.get("metrics", [{"type": "cpu", "target": 70}])
+        keda = self._metrics_require_keda(metrics_config)
+        if keda:
+            cleanup = self._delete_hpas((name,), namespace)
+        else:
+            cleanup = self._merge_cleanup_results(
+                self._delete_scaled_objects((name,), namespace),
+                self._delete_hpas((f"keda-hpa-{name}",), namespace),
+            )
+
+        if cleanup.complete and apply_desired:
+            target = self._get_deployment(name, namespace)
+            current = getattr(getattr(target, "spec", None), "replicas", None)
+            if target is not None and current == 0:
+                minimum = max(1, int(autoscaling.get("min_replicas", 1)))
+                self._scale_deployment(name, namespace, minimum)
+            self._create_or_update_hpa(name, namespace, spec)
+            desired_hpa = f"keda-hpa-{name}" if keda else name
+            return self._merge_cleanup_results(
+                cleanup,
+                self._verify_hpa_owner(desired_hpa, namespace, name),
+            )
+        return cleanup
 
     def _create_or_update_hpa(self, name: str, namespace: str, spec: dict[str, Any]) -> None:
         """Create or update a Horizontal Pod Autoscaler for an inference endpoint."""
@@ -3749,6 +5564,52 @@ class InferenceMonitor:
             max_replicas=max_replicas,
             metrics_config=metrics_config,
         )
+
+    @staticmethod
+    def _role_autoscaling_config(
+        spec: dict[str, Any],
+        role: str,
+    ) -> dict[str, Any] | None:
+        """Return an enabled role config, or ``None`` for static ownership."""
+        mooncake = spec.get("mooncake")
+        if not isinstance(mooncake, dict):
+            return None
+        autoscaling = mooncake.get("autoscaling")
+        if not isinstance(autoscaling, dict) or autoscaling.get("enabled") is not True:
+            return None
+        role_config = autoscaling.get(role)
+        return role_config if isinstance(role_config, dict) else None
+
+    def _reconcile_role_autoscaler(
+        self,
+        name: str,
+        namespace: str,
+        spec: dict[str, Any],
+        role: str,
+        *,
+        apply_desired: bool = True,
+    ) -> ResourceCleanupResult:
+        """Converge one Mooncake role to exactly one or zero replica owners."""
+        target_name = f"{name}-{role}"
+        role_config = self._role_autoscaling_config(spec, role)
+        if role_config is None:
+            return self._delete_autoscalers(
+                (target_name,),
+                (target_name, f"keda-hpa-{target_name}"),
+                namespace,
+            )
+
+        metrics_config = role_config.get("metrics", [{"type": "cpu", "target": 70}])
+        if self._metrics_require_keda(metrics_config):
+            cleanup = self._delete_hpas((target_name,), namespace)
+        else:
+            cleanup = self._merge_cleanup_results(
+                self._delete_scaled_objects((target_name,), namespace),
+                self._delete_hpas((f"keda-hpa-{target_name}",), namespace),
+            )
+        if cleanup.complete and apply_desired:
+            self._create_role_hpa(name, namespace, spec, role)
+        return cleanup
 
     def _create_role_hpa(self, name: str, ns: str, spec: dict[str, Any], role: str) -> None:
         """Create or update one autoscaler for a single Mooncake role.
@@ -3770,13 +5631,8 @@ class InferenceMonitor:
                 the bounds and metrics.
             role: One of ``"prefill"`` or ``"decode"``.
         """
-        mooncake = spec.get("mooncake") or {}
-        autoscaling = mooncake.get("autoscaling") or {}
-        if not autoscaling.get("enabled"):
-            return
-
-        role_cfg = autoscaling.get(role)
-        if not role_cfg:
+        role_cfg = self._role_autoscaling_config(spec, role)
+        if role_cfg is None:
             return
 
         min_replicas = role_cfg.get("min_replicas", 1)

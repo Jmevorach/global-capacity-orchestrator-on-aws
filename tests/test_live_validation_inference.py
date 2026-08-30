@@ -1,0 +1,1765 @@
+"""Credential-free tests for the main live-validation inference action."""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Literal
+
+import pytest
+import yaml
+from botocore.exceptions import ClientError
+from click.testing import CliRunner
+
+from cli.inference import InferenceManager
+from cli.main import cli
+from gco.services.inference_store import InferenceEndpointStore
+from scripts.example_job_validation import kube
+from scripts.live_release_validation.checks import inference as lifecycle_module
+from scripts.live_release_validation.checks import inference_inventory as inventory_module
+from scripts.live_release_validation.checks import inference_runtime as runtime_module
+from scripts.live_release_validation.checks.inference import (
+    KUBERNETES_INVENTORY_KINDS,
+    OWNER_LABEL,
+    EndpointPlan,
+    ManagedInferenceLifecycle,
+    ManagedInferenceValidationError,
+    build_delete_command,
+    build_deploy_command,
+    build_endpoint_plans,
+    build_health_command,
+    build_invoke_command,
+    build_models_command,
+    extract_generated_text,
+    initialize_run_state,
+)
+from scripts.live_release_validation.models import (
+    InferenceRuntimeSpec,
+    RunSettings,
+    ensure_private_run_directory,
+)
+from scripts.live_release_validation.registry import build_action_registry
+from scripts.live_release_validation.runner import LiveValidationRunner
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+VLLM_IMAGE = "registry.example/vllm@sha256:" + "a" * 64
+TGI_IMAGE = "registry.example/tgi@sha256:" + "b" * 64
+VLLM_REVISION = "c" * 40
+TGI_REVISION = "d" * 40
+OWNER_NONCE = "e" * 64
+LIFECYCLE_ID = "f" * 64
+
+
+def _runtime(
+    framework: Literal["vllm", "tgi"],
+    *,
+    image: str | None = None,
+    model_id: str | None = None,
+    revision: str | None = None,
+) -> InferenceRuntimeSpec:
+    if framework == "vllm":
+        return InferenceRuntimeSpec(
+            framework="vllm",
+            image=image or VLLM_IMAGE,
+            model_id=model_id or "test/vllm-model",
+            model_revision=revision or VLLM_REVISION,
+            port=8000,
+        )
+    return InferenceRuntimeSpec(
+        framework="tgi",
+        image=image or TGI_IMAGE,
+        model_id=model_id or "test/tgi-model",
+        model_revision=revision or TGI_REVISION,
+        port=8080,
+    )
+
+
+def _runtime_matrix() -> tuple[InferenceRuntimeSpec, ...]:
+    return (_runtime("vllm"), _runtime("tgi"))
+
+
+def _settings(tmp_path: Path, **changes: Any) -> RunSettings:
+    report_dir = tmp_path / "report"
+    settings = RunSettings(
+        run_id="managed-test",
+        repo_root=REPO_ROOT,
+        report_dir=report_dir,
+        checkpoint_path=report_dir / "checkpoint.json",
+        expected_account="1" * 12,
+        expected_sha="a" * 40,
+        expected_branch="feature/test",
+        profile="configured",
+        requested_actions=("all",),
+        inference_enabled=True,
+        selected_region="us-east-1",
+        inference_runtimes=_runtime_matrix(),
+        poll_interval_seconds=1,
+        command_timeout_seconds=2,
+        readiness_timeout_seconds=2,
+        hpa_timeout_seconds=2,
+        deletion_timeout_seconds=2,
+        monitor_interval_seconds=1,
+        consent=True,
+    )
+    return dataclasses.replace(settings, **changes) if changes else settings
+
+
+class _FakeTable:
+    def __init__(self, item: dict[str, Any] | None = None) -> None:
+        self.item = item
+        self.get_calls: list[dict[str, Any]] = []
+
+    def get_item(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_calls.append(kwargs)
+        return {"Item": self.item} if self.item is not None else {}
+
+
+class _FakeDynamoResource:
+    def __init__(self, table: _FakeTable) -> None:
+        self.table = table
+        self.table_names: list[str] = []
+
+    def Table(self, name: str) -> _FakeTable:
+        self.table_names.append(name)
+        return self.table
+
+
+class _FakeSession:
+    def __init__(self, table: _FakeTable) -> None:
+        self.resource_object = _FakeDynamoResource(table)
+        self.resource_calls: list[tuple[str, str | None]] = []
+
+    def resource(self, service: str, region_name: str | None = None) -> _FakeDynamoResource:
+        self.resource_calls.append((service, region_name))
+        return self.resource_object
+
+
+def _ctx(tmp_path: Path, table: _FakeTable | None = None) -> Any:
+    checkpoint = SimpleNamespace(state={})
+    persisted: list[dict[str, Any]] = []
+    return SimpleNamespace(
+        checkpoint=checkpoint,
+        persist=lambda: persisted.append(dict(checkpoint.state)),
+        session=_FakeSession(table or _FakeTable()),
+        config=SimpleNamespace(project_name="gco", global_region="us-west-2"),
+        persisted=persisted,
+    )
+
+
+def _empty_kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+    return 0, json.dumps({"items": []}), ""
+
+
+def _lifecycle(
+    tmp_path: Path,
+    *,
+    settings: RunSettings | None = None,
+    table: _FakeTable | None = None,
+    kubectl: Any = _empty_kubectl,
+) -> tuple[ManagedInferenceLifecycle, tuple[EndpointPlan, ...], list[dict[str, Any]], Any]:
+    selected_settings = settings or _settings(tmp_path)
+    context = _ctx(tmp_path, table)
+    plans, state = initialize_run_state(context, selected_settings)
+    runner = ManagedInferenceLifecycle(
+        ctx=context,
+        settings=selected_settings,
+        plans=plans,
+        state=state,
+        kubectl=kubectl,
+        kubeconfig_path=selected_settings.kubeconfig_path,
+    )
+    return runner, plans, runner.records, context
+
+
+def _owned_item(
+    settings: RunSettings,
+    plan: EndpointPlan,
+    owner_nonce: str = OWNER_NONCE,
+    lifecycle_id: str = LIFECYCLE_ID,
+) -> dict[str, Any]:
+    runtime = plan.runtime
+    spec: dict[str, Any] = {
+        "image": runtime.image,
+        "framework": runtime.framework,
+        "port": runtime.port,
+        "replicas": plan.replicas,
+        "gpu_count": settings.gpu_count,
+        "health_check_path": settings.health_path,
+        "env": settings.framework_env(runtime),
+        "args": list(settings.deploy_extra_args(runtime)),
+    }
+    if plan.autoscaling:
+        spec["autoscaling"] = {
+            "enabled": True,
+            "min_replicas": settings.hpa_min_replicas,
+            "max_replicas": settings.hpa_max_replicas,
+            "metrics": [{"type": "cpu", "target": settings.hpa_cpu_target}],
+        }
+    return {
+        "endpoint_name": plan.name,
+        "desired_state": "running",
+        "target_regions": [settings.selected_region],
+        "namespace": settings.namespace,
+        "lifecycle_id": lifecycle_id,
+        "labels": {OWNER_LABEL: owner_nonce},
+        "spec": spec,
+        "region_status": {settings.selected_region: {"state": "running"}},
+    }
+
+
+class TestRegistry:
+    def test_inference_is_first_class_after_topology(self) -> None:
+        registry = build_action_registry()
+        names = list(registry)
+        assert names.index("inference") == names.index("topology") + 1
+        assert registry["inference"].dependencies == ("topology",)
+        assert "inference" in LiveValidationRunner._derive_deploy_dependent_actions(registry)
+
+
+class TestStrictSettings:
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("selected_region", "us-west-2"),
+            (
+                "inference_runtimes",
+                (_runtime("vllm", image="registry.example/vllm@sha256:" + "9" * 64), _runtime("tgi")),
+            ),
+            (
+                "inference_runtimes",
+                (_runtime("vllm", model_id="other/model"), _runtime("tgi")),
+            ),
+            (
+                "inference_runtimes",
+                (_runtime("vllm", revision="8" * 40), _runtime("tgi")),
+            ),
+            ("request_prompt", "A different deterministic prompt"),
+            ("gpu_count", 1),
+            ("hpa_cpu_target", 55),
+            ("command_timeout_seconds", 3),
+            ("readiness_timeout_seconds", 3),
+            ("deletion_timeout_seconds", 3),
+            ("monitor_interval_seconds", 2),
+        ],
+    )
+    def test_every_managed_input_changes_resume_identity(
+        self, tmp_path: Path, field: str, value: Any
+    ) -> None:
+        original = _settings(tmp_path)
+        changed = dataclasses.replace(original, **{field: value})
+        assert changed.identity() != original.identity()
+
+    @pytest.mark.parametrize(
+        "image",
+        [
+            "registry.example/validator:latest",
+            "registry.example/validator@sha256:abc",
+            "registry.example/validator@sha256:" + "A" * 64,
+            "registry.example/validator@sha512:" + "a" * 64,
+        ],
+    )
+    def test_digest_pin_is_mandatory_and_strict(self, tmp_path: Path, image: str) -> None:
+        with pytest.raises(ValueError, match="@sha256"):
+            _settings(
+                tmp_path,
+                inference_runtimes=(_runtime("vllm", image=image), _runtime("tgi")),
+            )
+
+    @pytest.mark.parametrize("revision", ["main", "A" * 40, "a" * 39])
+    def test_model_revision_is_full_immutable_commit(
+        self, tmp_path: Path, revision: str
+    ) -> None:
+        with pytest.raises(ValueError, match="model_revision"):
+            _settings(
+                tmp_path,
+                inference_runtimes=(
+                    _runtime("vllm", revision=revision),
+                    _runtime("tgi"),
+                ),
+            )
+
+    def test_exact_four_endpoints_and_fixed_hpa_bounds(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="exactly four"):
+            _settings(tmp_path, endpoint_count=3)
+        with pytest.raises(ValueError, match="min_replicas=max_replicas=2"):
+            _settings(tmp_path, hpa_max_replicas=3)
+
+    def test_explicit_consent_is_required(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="consent"):
+            _settings(tmp_path, consent=False)
+
+    def test_request_contracts_are_literal_and_distinct(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        vllm, tgi = settings.inference_runtimes
+        assert vllm.request_path == "/v1/completions"
+        assert settings.request_body(vllm) == {
+            "max_tokens": 8,
+            "model": "test/vllm-model",
+            "prompt": "Reply with a short deterministic validation response.",
+            "stream": False,
+            "temperature": 0,
+        }
+        assert tgi.request_path == "/generate"
+        assert settings.request_body(tgi) == {
+            "inputs": "Reply with a short deterministic validation response.",
+            "parameters": {"do_sample": False, "max_new_tokens": 8},
+        }
+        identities = settings.identity()["inference"]["runtimes"]
+        assert identities[0]["request_contract"]["body"] == settings.request_body(vllm)
+        assert identities[1]["request_contract"]["body"] == settings.request_body(tgi)
+        assert identities[0]["request_contract"] != identities[1]["request_contract"]
+
+
+class TestNamesAndOwnership:
+    def test_fresh_runs_get_distinct_random_dns_safe_names(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        first_context = _ctx(tmp_path)
+        first_plans, first_state = initialize_run_state(first_context, settings)
+        second_context = _ctx(tmp_path)
+        second_plans, second_state = initialize_run_state(second_context, settings)
+        assert first_state["owner_nonce"] != second_state["owner_nonce"]
+        assert {plan.name for plan in first_plans}.isdisjoint({plan.name for plan in second_plans})
+        for plan in (*first_plans, *second_plans):
+            assert len(plan.name) <= 63
+            assert re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", plan.name)
+
+    def test_plan_and_random_nonce_persist_before_lifecycle(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        context = _ctx(tmp_path)
+        plans, state = initialize_run_state(context, settings)
+        assert len(plans) == 4
+        assert [(plan.runtime.framework, plan.role) for plan in plans] == [
+            ("vllm", "baseline"),
+            ("vllm", "hpa"),
+            ("tgi", "baseline"),
+            ("tgi", "hpa"),
+        ]
+        assert state["phase"] == "planned"
+        assert re.fullmatch(r"[0-9a-f]{64}", state["owner_nonce"])
+        assert [item["name"] for item in state["plan"]] == [plan.name for plan in plans]
+        assert context.persisted
+        resumed_plans, resumed_state = initialize_run_state(context, settings)
+        assert resumed_state["owner_nonce"] == state["owner_nonce"]
+        assert resumed_plans == plans
+
+    def test_resume_refuses_changed_nonce_or_plan(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        context = _ctx(tmp_path)
+        initialize_run_state(context, settings)
+        context.checkpoint.state["inference_validation"]["owner_nonce"] = "other"
+        with pytest.raises(ManagedInferenceValidationError, match="owner nonce"):
+            initialize_run_state(context, settings)
+
+    def test_colliding_ddb_marker_is_refused_before_kubernetes_or_deploy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(tmp_path)
+        plan = build_endpoint_plans(settings, OWNER_NONCE)[0]
+        collision = _owned_item(settings, plan)
+        collision["labels"] = {OWNER_LABEL: "another-run"}
+        kubectl_called = False
+
+        def forbidden_kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            nonlocal kubectl_called
+            kubectl_called = True
+            raise AssertionError("Kubernetes must not be queried after a DDB collision")
+
+        runner, plans, records, context = _lifecycle(
+            tmp_path,
+            settings=settings,
+            table=_FakeTable(collision),
+            kubectl=forbidden_kubectl,
+        )
+        monkeypatch.setattr(
+            runner,
+            "_run_command",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deploy must not run")),
+        )
+        with pytest.raises(ManagedInferenceValidationError, match="collision"):
+            runner.ensure_owned_endpoint(plans[0], records[0])
+        assert kubectl_called is False
+        assert context.session.resource_object.table.get_calls[0]["ConsistentRead"] is True
+
+    def test_cleanup_never_deletes_a_colliding_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(tmp_path)
+        plan = build_endpoint_plans(settings, OWNER_NONCE)[0]
+        collision = _owned_item(settings, plan)
+        collision["labels"] = {OWNER_LABEL: "another-run"}
+        runner, plans, records, _ = _lifecycle(
+            tmp_path, settings=settings, table=_FakeTable(collision)
+        )
+        called: list[str] = []
+        monkeypatch.setattr(
+            runner,
+            "_run_command",
+            lambda *args, **kwargs: called.append("delete") or "",
+        )
+        with pytest.raises(ManagedInferenceValidationError, match="refused"):
+            runner.cleanup_endpoint(plans[0], records[0])
+        assert called == []
+
+
+class TestCommandsAndResponses:
+    def test_commands_are_argument_arrays_with_noninteractive_delete(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        vllm_baseline, vllm_hpa, tgi_baseline, tgi_hpa = build_endpoint_plans(
+            settings, OWNER_NONCE
+        )
+        baseline_command = build_deploy_command(settings, vllm_baseline, OWNER_NONCE)
+        hpa_command = build_deploy_command(settings, vllm_hpa, OWNER_NONCE)
+        tgi_command = build_deploy_command(settings, tgi_baseline, OWNER_NONCE)
+        tgi_hpa_command = build_deploy_command(settings, tgi_hpa, OWNER_NONCE)
+        invoke_command = build_invoke_command(settings, vllm_baseline)
+        health_command = build_health_command(settings, vllm_baseline)
+        models_command = build_models_command(settings, vllm_baseline)
+        delete_command = build_delete_command(
+            settings,
+            vllm_baseline,
+            OWNER_NONCE,
+            LIFECYCLE_ID,
+        )
+
+        for command in (
+            baseline_command,
+            hpa_command,
+            tgi_command,
+            tgi_hpa_command,
+            invoke_command,
+            health_command,
+            models_command,
+            delete_command,
+        ):
+            assert isinstance(command, list)
+            assert all(isinstance(value, str) for value in command)
+        assert baseline_command[:7] == [
+            sys.executable,
+            "-m",
+            "cli.main",
+            "--output",
+            "json",
+            "inference",
+            "deploy",
+        ]
+        assert baseline_command[baseline_command.index("--framework") + 1] == "vllm"
+        assert baseline_command[baseline_command.index("--gpu-count") + 1] == "0"
+        assert "--autoscale-metric" not in baseline_command
+        assert hpa_command[hpa_command.index("--autoscale-metric") + 1] == "cpu:70"
+        assert hpa_command[hpa_command.index("--min-replicas") + 1] == "2"
+        assert hpa_command[hpa_command.index("--max-replicas") + 1] == "2"
+        assert tgi_command[tgi_command.index("--framework") + 1] == "tgi"
+        assert tgi_command[tgi_command.index("--port") + 1] == "8080"
+        assert "MODEL_ID=test/tgi-model" in tgi_command
+        assert f"REVISION={TGI_REVISION}" in tgi_command
+        assert "PORT=8080" in tgi_command
+        assert "HF_MODEL_ID=test/tgi-model" not in tgi_command
+        assert "--root-path" not in tgi_command
+        assert json.loads(invoke_command[invoke_command.index("--data") + 1]) == (
+            settings.request_body(vllm_baseline.runtime)
+        )
+        assert health_command[-2:] == ["--region", settings.selected_region]
+        assert models_command[-2:] == ["--region", settings.selected_region]
+        assert delete_command[-1] == "--yes"
+        assert delete_command[delete_command.index("--expected-owner-label") + 1] == (
+            f"{OWNER_LABEL}={OWNER_NONCE}"
+        )
+        assert delete_command[delete_command.index("--expected-lifecycle-id") + 1] == (LIFECYCLE_ID)
+
+    def test_subprocess_boundary_forces_no_shell_and_kubeconfig(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, _, records, _ = _lifecycle(tmp_path)
+        captured: dict[str, Any] = {}
+
+        def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured["command"] = command
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(command, 0, stdout='{"ok": true}', stderr="")
+
+        monkeypatch.setattr(lifecycle_module.subprocess, "run", fake_run)
+        runner._run_command(records[0], "probe", ["gco", "inference", "list"])
+        assert captured["command"] == ["gco", "inference", "list"]
+        assert captured["shell"] is False
+        assert captured["env"]["KUBECONFIG"] == str(runner.kubeconfig_path)
+
+    @pytest.mark.parametrize(
+        ("framework", "payload", "expected"),
+        [
+            ("vllm", {"choices": [{"text": " generated "}]}, "generated"),
+            ("tgi", {"generated_text": " tgi "}, "tgi"),
+        ],
+    )
+    def test_exact_invoke_response_schemas(
+        self, framework: str, payload: Any, expected: str
+    ) -> None:
+        output = "INFO POST /private/path\n" + json.dumps(payload)
+        assert extract_generated_text(output, framework) == expected
+
+    @pytest.mark.parametrize(
+        ("framework", "payload"),
+        [
+            ("vllm", {"generated_text": "wrong-framework"}),
+            ("vllm", {"choices": [{"message": {"content": "chat"}}]}),
+            ("tgi", {"choices": [{"text": "wrong-framework"}]}),
+            ("tgi", [{"generated_text": "list-is-not-the-selected-contract"}]),
+            ("vllm", {"choices": []}),
+            ("vllm", {"choices": [{"text": "  "}]}),
+            ("tgi", {"generated_text": ""}),
+            ("tgi", {"not_text": "value"}),
+        ],
+    )
+    def test_cross_framework_empty_or_alternate_schemas_are_rejected(
+        self, framework: str, payload: Any
+    ) -> None:
+        with pytest.raises(ManagedInferenceValidationError, match="schema"):
+            extract_generated_text(json.dumps(payload), framework)
+
+    def test_non_json_invoke_output_is_rejected(self) -> None:
+        with pytest.raises(ManagedInferenceValidationError, match="JSON"):
+            extract_generated_text("backend returned plain text", "vllm")
+
+
+class TestSequentialAndFinallyBehavior:
+    def test_endpoints_run_strictly_sequentially_after_prior_absence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, _, records, _ = _lifecycle(tmp_path)
+        events: list[str] = []
+
+        def fake_run(plan: EndpointPlan, record: dict[str, Any]) -> bool:
+            if plan.ordinal > 1:
+                assert records[plan.ordinal - 2]["absence_proven"] is True
+            events.append(f"run-{plan.ordinal}")
+            record["invoke_evidence"] = {"generated_text_non_empty": True}
+            return True
+
+        def fake_cleanup(plan: EndpointPlan, record: dict[str, Any]) -> dict[str, Any]:
+            events.append(f"cleanup-{plan.ordinal}")
+            record["absence_proven"] = True
+            return {"ddb_absent": True, "kubernetes_counts": {}}
+
+        monkeypatch.setattr(runner, "run_endpoint", fake_run)
+        monkeypatch.setattr(runner, "cleanup_endpoint", fake_cleanup)
+        summary = runner.execute()
+        assert events == [
+            *[
+                event
+                for ordinal in range(1, 5)
+                for event in (f"run-{ordinal}", f"cleanup-{ordinal}")
+            ],
+            *[f"cleanup-{ordinal}" for ordinal in range(1, 5)],
+        ]
+        assert summary["execution"] == "strictly-sequential"
+        assert summary["frameworks"] == {
+            "vllm": {"baseline": True, "hpa": True, "invocations": 2, "model_info": 0},
+            "tgi": {"baseline": True, "hpa": True, "invocations": 2, "model_info": 0},
+        }
+        assert summary["all_endpoints_absent"] is True
+        serialized = json.dumps(summary)
+        assert all(plan.name not in serialized for plan in runner.plans)
+
+    @pytest.mark.parametrize(
+        ("failing_method", "failing_ordinal"),
+        [
+            ("ensure_owned_endpoint", 1),
+            ("wait_for_ddb_running", 1),
+            ("wait_for_kubernetes_ready", 1),
+            ("verify_backend_probes", 1),
+            ("invoke", 1),
+            ("verify_hpa_stability", 2),
+        ],
+    )
+    def test_each_phase_failure_runs_inner_and_aggregate_cleanup(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failing_method: str,
+        failing_ordinal: int,
+    ) -> None:
+        runner, _, _, _ = _lifecycle(tmp_path)
+        events: list[str] = []
+
+        def phase_stub(plan: EndpointPlan, record: dict[str, Any]) -> None:
+            events.append(f"{failing_method}-{plan.ordinal}")
+            if plan.ordinal == failing_ordinal:
+                raise RuntimeError("private phase detail")
+
+        for method in (
+            "ensure_owned_endpoint",
+            "wait_for_ddb_running",
+            "wait_for_kubernetes_ready",
+            "verify_backend_probes",
+            "invoke",
+            "verify_hpa_stability",
+        ):
+            monkeypatch.setattr(
+                runner,
+                method,
+                phase_stub if method == failing_method else lambda plan, record: None,
+            )
+
+        def cleanup(plan: EndpointPlan, record: dict[str, Any]) -> dict[str, Any]:
+            events.append(f"cleanup-{plan.ordinal}")
+            record["absence_proven"] = True
+            return {}
+
+        monkeypatch.setattr(runner, "cleanup_endpoint", cleanup)
+        with pytest.raises(ManagedInferenceValidationError, match="all cleanup attempts"):
+            runner.execute()
+        assert f"cleanup-{failing_ordinal}" in events
+        assert all(f"cleanup-{ordinal}" in events for ordinal in range(1, 5))
+
+    def test_cleanup_continues_after_one_cleanup_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, _, _, _ = _lifecycle(tmp_path)
+        cleanup_events: list[int] = []
+
+        monkeypatch.setattr(
+            runner,
+            "run_endpoint",
+            lambda plan, record: (_ for _ in ()).throw(RuntimeError("phase failed")),
+        )
+
+        def cleanup(plan: EndpointPlan, record: dict[str, Any]) -> dict[str, Any]:
+            cleanup_events.append(plan.ordinal)
+            if plan.ordinal == 1:
+                raise RuntimeError("cleanup failed")
+            record["absence_proven"] = True
+            return {}
+
+        monkeypatch.setattr(runner, "cleanup_endpoint", cleanup)
+        with pytest.raises(ManagedInferenceValidationError, match="cleanup failures"):
+            runner.execute()
+        assert cleanup_events[-4:] == [1, 2, 3, 4]
+
+    def test_completed_resume_phase_is_not_recreated_or_reinvoked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        records[0]["validation_complete"] = True
+        calls: list[str] = []
+        monkeypatch.setattr(
+            runner,
+            "prove_absence",
+            lambda record: calls.append("absence") or {"ddb_absent": True},
+        )
+        monkeypatch.setattr(
+            runner,
+            "ensure_owned_endpoint",
+            lambda plan, record: (_ for _ in ()).throw(AssertionError("must not create")),
+        )
+        monkeypatch.setattr(
+            runner,
+            "invoke",
+            lambda plan, record: (_ for _ in ()).throw(AssertionError("must not invoke")),
+        )
+        assert runner.run_endpoint(plans[0], records[0]) is False
+        assert calls == ["absence"]
+
+
+class TestHpaProof:
+    def test_hpa_target_and_bounds_are_exact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        hpa = {
+            "spec": {
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": plans[1].name,
+                },
+                "minReplicas": 2,
+                "maxReplicas": 2,
+                "metrics": [
+                    {
+                        "type": "Resource",
+                        "resource": {
+                            "name": "cpu",
+                            "target": {
+                                "type": "Utilization",
+                                "averageUtilization": 70,
+                            },
+                        },
+                    }
+                ],
+            }
+        }
+        monkeypatch.setattr(runner, "_kubectl_json", lambda *args, **kwargs: hpa)
+        assert runner._hpa_matches(plans[1], records[1]) is True
+        hpa["spec"]["scaleTargetRef"]["name"] = "other"
+        assert runner._hpa_matches(plans[1], records[1]) is False
+
+    def test_two_full_monitor_intervals_require_three_ready_observations(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        observations: list[int] = []
+        sleeps: list[int] = []
+        monkeypatch.setattr(runner, "_hpa_matches", lambda plan, record, **kwargs: True)
+
+        def ready(*args: Any, **kwargs: Any) -> tuple[bool, dict[str, int]]:
+            observations.append(len(observations) + 1)
+            return True, {
+                "desired": 2,
+                "ready": 2,
+                "available": 2,
+                "updated": 2,
+                "ready_pods": 2,
+            }
+
+        monkeypatch.setattr(runner, "_deployment_ready_snapshot", ready)
+        monkeypatch.setattr(
+            runtime_module.time,
+            "sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+        runner.verify_hpa_stability(plans[1], records[1])
+        assert len(observations) == 3
+        assert sleeps == [runner.settings.monitor_interval_seconds] * 2
+        assert records[1]["phase"] == "hpa-stable"
+
+    def test_stability_fails_if_replica_count_drops(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        readiness = iter((True, True, False))
+        monkeypatch.setattr(runner, "_hpa_matches", lambda plan, record, **kwargs: True)
+        monkeypatch.setattr(
+            runner,
+            "_deployment_ready_snapshot",
+            lambda *args, **kwargs: (next(readiness), {"desired": 2}),
+        )
+        monkeypatch.setattr(runtime_module.time, "sleep", lambda seconds: None)
+        with pytest.raises(ManagedInferenceValidationError, match="remain stable"):
+            runner.verify_hpa_stability(plans[1], records[1])
+
+
+def _owned_inventory_item(summary_key: str, endpoint_name: str) -> dict[str, Any]:
+    labels = {"app": endpoint_name, "project": "gco", "gco.io/type": "inference"}
+    if summary_key == "deployments":
+        return {"metadata": {"name": endpoint_name}}
+    if summary_key == "replica_sets":
+        return {
+            "metadata": {
+                "name": f"{endpoint_name}-rs",
+                "labels": labels,
+                "ownerReferences": [{"kind": "Deployment", "name": endpoint_name}],
+            }
+        }
+    if summary_key == "pods":
+        return {"metadata": {"name": f"{endpoint_name}-pod", "labels": labels}}
+    if summary_key in {"services", "endpoints"}:
+        return {"metadata": {"name": endpoint_name}}
+    if summary_key == "endpoint_slices":
+        return {
+            "metadata": {
+                "name": f"{endpoint_name}-slice",
+                "labels": {"kubernetes.io/service-name": endpoint_name},
+            }
+        }
+    if summary_key == "hpas":
+        return {"metadata": {"name": f"keda-hpa-{endpoint_name}"}}
+    if summary_key == "scaled_objects":
+        return {"metadata": {"name": endpoint_name}}
+    if summary_key == "config_maps":
+        return {"metadata": {"name": f"{endpoint_name}-mooncake"}}
+    if summary_key == "generated_admin_secrets":
+        return {"metadata": {"name": f"{endpoint_name}-admin"}}
+    if summary_key in {"legacy_ingresses", "legacy_http_routes"}:
+        return {"metadata": {"name": f"{endpoint_name}-proxy"}}
+    raise AssertionError(f"Unhandled inventory kind: {summary_key}")
+
+
+class TestStrongAbsence:
+    def test_complete_inventory_queries_every_endpoint_owned_kind(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        endpoint_name = ""
+        queried: list[str] = []
+        kind_by_resource = {kind.resource: kind for kind in KUBERNETES_INVENTORY_KINDS}
+
+        def inventory_kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            resource = args[1]
+            queried.append(resource)
+            kind = kind_by_resource[resource]
+            payload = {
+                "items": [
+                    _owned_inventory_item(kind.summary_key, endpoint_name),
+                    _owned_inventory_item(kind.summary_key, f"{endpoint_name}-v2"),
+                    {"metadata": {"name": "mooncake-master"}},
+                ]
+            }
+            return 0, json.dumps(payload), ""
+
+        runner, plans, records, _ = _lifecycle(
+            tmp_path,
+            settings=settings,
+            kubectl=inventory_kubectl,
+        )
+        endpoint_name = plans[0].name
+        inventory = runner.kubernetes_inventory(records[0])
+        assert queried == [kind.resource for kind in KUBERNETES_INVENTORY_KINDS]
+        assert set(inventory) == {kind.summary_key for kind in KUBERNETES_INVENTORY_KINDS}
+        for kind in KUBERNETES_INVENTORY_KINDS:
+            expected_name = _owned_inventory_item(kind.summary_key, endpoint_name)["metadata"][
+                "name"
+            ]
+            assert inventory[kind.summary_key] == [expected_name]
+        assert all("mooncake-master" not in names for names in inventory.values())
+
+    @pytest.mark.parametrize("kind", KUBERNETES_INVENTORY_KINDS, ids=lambda item: item.summary_key)
+    def test_each_owned_kind_blocks_absence(self, tmp_path: Path, kind: Any) -> None:
+        settings = _settings(tmp_path)
+        endpoint_name = ""
+
+        def one_kind(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            items = (
+                [_owned_inventory_item(kind.summary_key, endpoint_name)]
+                if args[1] == kind.resource
+                else []
+            )
+            return 0, json.dumps({"items": items}), ""
+
+        table = _FakeTable()
+        runner, plans, records, context = _lifecycle(
+            tmp_path,
+            settings=settings,
+            table=table,
+            kubectl=one_kind,
+        )
+        endpoint_name = plans[0].name
+        absent, evidence = runner.absence_snapshot(records[0])
+        assert absent is False
+        assert evidence["ddb_absent"] is True
+        assert evidence["kubernetes_counts"][kind.summary_key] == 1
+        assert table.get_calls[-1]["ConsistentRead"] is True
+        assert context.session.resource_calls == [("dynamodb", "us-west-2")]
+
+    def test_ddb_presence_blocks_absence_even_when_kubernetes_is_empty(
+        self, tmp_path: Path
+    ) -> None:
+        table = _FakeTable({"endpoint_name": "present"})
+        runner, _, records, _ = _lifecycle(tmp_path, table=table)
+        absent, evidence = runner.absence_snapshot(records[0])
+        assert absent is False
+        assert evidence["ddb_absent"] is False
+        assert all(count == 0 for count in evidence["kubernetes_counts"].values())
+        assert table.get_calls[-1]["ConsistentRead"] is True
+
+    def test_both_strong_ddb_and_full_kubernetes_absence_pass(self, tmp_path: Path) -> None:
+        table = _FakeTable()
+        runner, _, records, _ = _lifecycle(tmp_path, table=table)
+        absent, evidence = runner.absence_snapshot(records[0])
+        assert absent is True
+        assert evidence["ddb_absent"] is True
+        assert set(evidence["kubernetes_counts"]) == {
+            kind.summary_key for kind in KUBERNETES_INVENTORY_KINDS
+        }
+        assert all(count == 0 for count in evidence["kubernetes_counts"].values())
+
+    def test_optional_missing_crds_count_as_absent_but_builtin_failure_propagates(
+        self, tmp_path: Path
+    ) -> None:
+        optional = {kind.resource for kind in KUBERNETES_INVENTORY_KINDS if kind.optional_api}
+
+        def missing_optional(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            if args[1] in optional:
+                return 1, "", 'error: the server doesn\'t have a resource type "x"'
+            return 0, json.dumps({"items": []}), ""
+
+        runner, _, records, _ = _lifecycle(tmp_path, kubectl=missing_optional)
+        assert runner.kubernetes_inventory(records[0])
+
+        def broken_builtin(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            return 1, "", "forbidden"
+
+        runner, _, records, _ = _lifecycle(tmp_path, kubectl=broken_builtin)
+        with pytest.raises(ManagedInferenceValidationError, match="Kubernetes read failed"):
+            runner.kubernetes_inventory(records[0])
+
+    def test_keda_generated_hpa_uses_only_exact_role_names(self, tmp_path: Path) -> None:
+        endpoint_name = ""
+
+        def keda_inventory(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            items = []
+            if args[1] == "horizontalpodautoscalers.autoscaling":
+                items = [
+                    {"metadata": {"name": f"keda-hpa-{endpoint_name}"}},
+                    {"metadata": {"name": f"keda-hpa-{endpoint_name}-prefill"}},
+                    {"metadata": {"name": f"keda-hpa-{endpoint_name}-decode"}},
+                    {"metadata": {"name": f"keda-hpa-{endpoint_name}-v2"}},
+                ]
+            return 0, json.dumps({"items": items}), ""
+
+        runner, plans, records, _ = _lifecycle(tmp_path, kubectl=keda_inventory)
+        endpoint_name = plans[0].name
+        inventory = runner.kubernetes_inventory(records[0])
+        assert inventory["hpas"] == sorted(
+            [
+                f"keda-hpa-{endpoint_name}",
+                f"keda-hpa-{endpoint_name}-prefill",
+                f"keda-hpa-{endpoint_name}-decode",
+            ]
+        )
+        assert f"keda-hpa-{endpoint_name}-v2" not in inventory["hpas"]
+
+    def test_absence_requires_two_stable_sweeps_and_resets_on_reappearance(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runner, _, records, _ = _lifecycle(tmp_path)
+        outcomes = iter(
+            [
+                (True, {"ddb_absent": True, "kubernetes_counts": {}}),
+                (False, {"ddb_absent": False, "kubernetes_counts": {"pods": 1}}),
+                (True, {"ddb_absent": True, "kubernetes_counts": {}}),
+                (True, {"ddb_absent": True, "kubernetes_counts": {}}),
+            ]
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(runner, "absence_snapshot", lambda *args, **kwargs: next(outcomes))
+        monkeypatch.setattr(inventory_module.time, "sleep", sleeps.append)
+
+        evidence = runner.prove_absence(records[0])
+
+        assert evidence["stable_absence_observations"] == 2
+        assert records[0]["consecutive_absent_observations"] == 2
+        assert sleeps == [1.0, 1.0, 1.0]
+
+
+class TestIsolatedKubeconfig:
+    @staticmethod
+    def _fake_subprocess(
+        kubeconfig_path: Path,
+        calls: list[tuple[list[str], dict[str, Any]]],
+    ) -> Any:
+        def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            calls.append((command, kwargs))
+            if command[:3] == ["aws", "eks", "update-kubeconfig"]:
+                assert command[command.index("--kubeconfig") + 1] == str(kubeconfig_path)
+                config = {
+                    "apiVersion": "v1",
+                    "clusters": [
+                        {
+                            "name": "arn:aws:eks:us-east-1:111111111111:cluster/test-cluster",
+                            "cluster": {
+                                "server": "https://real.eks.amazonaws.com",
+                                "certificate-authority-data": "CA",
+                            },
+                        }
+                    ],
+                    "contexts": [],
+                    "current-context": "",
+                    "kind": "Config",
+                    "preferences": {},
+                    "users": [],
+                }
+                kubeconfig_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+                kubeconfig_path.chmod(0o600)
+            return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+        return fake_run
+
+    @pytest.mark.parametrize("active", [False, True], ids=("public", "tunnel"))
+    def test_isolated_public_and_tunnel_paths_never_use_home_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        active: bool,
+    ) -> None:
+        from cli import cluster_tunnel
+
+        report_dir = tmp_path / "report"
+        report_dir.mkdir(mode=0o700)
+        path = report_dir / "kubeconfig"
+        calls: list[tuple[list[str], dict[str, Any]]] = []
+        monkeypatch.setattr(
+            kube.subprocess,
+            "run",
+            self._fake_subprocess(path, calls),
+        )
+        session = SimpleNamespace(
+            active=active,
+            server="https://localhost:8443" if active else None,
+            tls_server_name="real.eks.amazonaws.com" if active else None,
+        )
+
+        @contextlib.contextmanager
+        def fake_tunnel(*args: Any, **kwargs: Any):
+            yield session
+
+        monkeypatch.setattr(cluster_tunnel, "open_api_server_tunnel", fake_tunnel)
+        with kube.cluster_session(
+            REPO_ROOT,
+            "test-cluster",
+            "us-east-1",
+            kubeconfig_path=path,
+        ) as kubectl:
+            code, _, _ = kubectl("get", "pods")
+            assert code == 0
+
+        access_command, access_kwargs = calls[0]
+        assert access_command == ["gco", "stacks", "access", "--region", "us-east-1"]
+        assert access_kwargs["env"]["KUBECONFIG"] == str(path)
+        aws_command, aws_kwargs = next(
+            (command, kwargs) for command, kwargs in calls if command[0] == "aws"
+        )
+        assert "--kubeconfig" in aws_command
+        assert aws_kwargs["shell"] is False
+        kubectl_command, kubectl_kwargs = calls[-1]
+        assert kubectl_command[:3] == ["kubectl", "--kubeconfig", str(path)]
+        assert kubectl_kwargs["env"]["KUBECONFIG"] == str(path)
+        assert kubectl_kwargs["shell"] is False
+
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        cluster = config["clusters"][0]["cluster"]
+        if active:
+            assert cluster["server"] == "https://localhost:8443"
+            assert cluster["tls-server-name"] == "real.eks.amazonaws.com"
+        else:
+            assert cluster["server"] == "https://real.eks.amazonaws.com"
+            assert "tls-server-name" not in cluster
+        assert stat_mode(path) == 0o600
+
+    def test_access_failure_propagates_before_tunnel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli import cluster_tunnel
+
+        path = tmp_path / "kubeconfig"
+        opened: list[bool] = []
+
+        def failed_access(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="denied")
+
+        @contextlib.contextmanager
+        def forbidden_tunnel(*args: Any, **kwargs: Any):
+            opened.append(True)
+            yield None
+
+        monkeypatch.setattr(kube.subprocess, "run", failed_access)
+        monkeypatch.setattr(cluster_tunnel, "open_api_server_tunnel", forbidden_tunnel)
+        with (
+            pytest.raises(RuntimeError, match="stacks access"),
+            kube.cluster_session(
+                REPO_ROOT,
+                "test-cluster",
+                "us-east-1",
+                kubeconfig_path=path,
+            ),
+        ):
+            pass
+        assert opened == []
+
+    def test_update_kubeconfig_failure_propagates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli import cluster_tunnel
+
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        path = report_dir / "kubeconfig"
+        calls = 0
+
+        def failing_aws(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            nonlocal calls
+            calls += 1
+            if command[0] == "aws":
+                raise subprocess.CalledProcessError(1, command, stderr="failed")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        @contextlib.contextmanager
+        def public_tunnel(*args: Any, **kwargs: Any):
+            yield SimpleNamespace(active=False, server=None, tls_server_name=None)
+
+        monkeypatch.setattr(kube.subprocess, "run", failing_aws)
+        monkeypatch.setattr(cluster_tunnel, "open_api_server_tunnel", public_tunnel)
+        with (
+            pytest.raises(subprocess.CalledProcessError),
+            kube.cluster_session(
+                REPO_ROOT,
+                "test-cluster",
+                "us-east-1",
+                kubeconfig_path=path,
+            ),
+        ):
+            pass
+        assert calls == 2
+
+    def test_main_inference_artifacts_are_allowed_in_private_report_dir(
+        self, tmp_path: Path
+    ) -> None:
+        report_dir = tmp_path / "report"
+        report_dir.mkdir(mode=0o700)
+        for name in (
+            "checkpoint.json",
+            "live-release-validation.json",
+            "live-release-validation.md",
+            "kubeconfig",
+        ):
+            path = report_dir / name
+            path.write_text("{}", encoding="utf-8")
+            path.chmod(0o600)
+        ensure_private_run_directory(report_dir, report_dir / "checkpoint.json")
+
+
+def stat_mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+class TestAtomicOwnedDelete:
+    def test_store_owner_condition_is_atomic_with_desired_state_update(self) -> None:
+        class UpdateTable:
+            def __init__(self) -> None:
+                self.kwargs: dict[str, Any] = {}
+
+            def update_item(self, **kwargs: Any) -> dict[str, Any]:
+                self.kwargs = kwargs
+                return {"Attributes": {"endpoint_name": "ep", "desired_state": "deleted"}}
+
+        table = UpdateTable()
+        store = object.__new__(InferenceEndpointStore)
+        store._table = table
+        result = store.update_desired_state(
+            "ep",
+            "deleted",
+            expected_label=(OWNER_LABEL, OWNER_NONCE),
+            expected_lifecycle_id=LIFECYCLE_ID,
+        )
+        assert result and result["desired_state"] == "deleted"
+        assert table.kwargs["ConditionExpression"] == (
+            "attribute_exists(endpoint_name) AND labels.#expected_label = "
+            ":expected_label_value AND lifecycle_id = :expected_lifecycle_id"
+        )
+        assert table.kwargs["ExpressionAttributeNames"] == {"#expected_label": OWNER_LABEL}
+        values = table.kwargs["ExpressionAttributeValues"]
+        assert values[":expected_label_value"] == OWNER_NONCE
+        assert values[":expected_lifecycle_id"] == LIFECYCLE_ID
+        assert "if_not_exists(deletion_generation" in table.kwargs["UpdateExpression"]
+
+    def test_replacement_race_fails_condition_instead_of_deleting(self) -> None:
+        class ReplacedTable:
+            def update_item(self, **kwargs: Any) -> dict[str, Any]:
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "ConditionalCheckFailedException",
+                            "Message": "owner changed",
+                        }
+                    },
+                    "UpdateItem",
+                )
+
+        store = object.__new__(InferenceEndpointStore)
+        store._table = ReplacedTable()
+        assert (
+            store.update_desired_state(
+                "ep",
+                "deleted",
+                expected_label=(OWNER_LABEL, OWNER_NONCE),
+                expected_lifecycle_id=LIFECYCLE_ID,
+            )
+            is None
+        )
+
+    def test_manager_forwards_owner_and_lifecycle_conditions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, str, tuple[str, str] | None, str | None]] = []
+
+        class Store:
+            def update_desired_state(
+                self,
+                endpoint_name: str,
+                desired_state: str,
+                *,
+                expected_label: tuple[str, str] | None = None,
+                expected_lifecycle_id: str | None = None,
+            ) -> dict[str, Any]:
+                calls.append((endpoint_name, desired_state, expected_label, expected_lifecycle_id))
+                return {"endpoint_name": endpoint_name}
+
+        manager = object.__new__(InferenceManager)
+        monkeypatch.setattr(manager, "_get_store", lambda: Store())
+        condition = (OWNER_LABEL, OWNER_NONCE)
+        assert manager.delete(
+            "ep",
+            expected_owner_label=condition,
+            expected_lifecycle_id=LIFECYCLE_ID,
+        )
+        assert calls == [("ep", "deleted", condition, LIFECYCLE_ID)]
+
+    def test_hidden_cli_option_reaches_manager_without_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, tuple[str, str] | None, str | None]] = []
+
+        class Manager:
+            def delete(
+                self,
+                endpoint_name: str,
+                *,
+                expected_owner_label: tuple[str, str] | None = None,
+                expected_lifecycle_id: str | None = None,
+            ) -> dict[str, Any]:
+                calls.append((endpoint_name, expected_owner_label, expected_lifecycle_id))
+                return {"endpoint_name": endpoint_name}
+
+        monkeypatch.setattr("cli.inference.get_inference_manager", lambda config: Manager())
+        result = CliRunner().invoke(
+            cli,
+            [
+                "inference",
+                "delete",
+                "ep",
+                "--expected-owner-label",
+                f"{OWNER_LABEL}={OWNER_NONCE}",
+                "--expected-lifecycle-id",
+                LIFECYCLE_ID,
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert calls == [("ep", (OWNER_LABEL, OWNER_NONCE), LIFECYCLE_ID)]
+
+
+class TestAdditionalResumeAndDeadlineSafety:
+    @pytest.mark.parametrize(
+        "record_updates",
+        [
+            {
+                "phase": "invoked",
+                "invoke_evidence": {"generated_text_non_empty": True},
+            },
+            {
+                "phase": "invoked",
+                "validation_steps_complete": True,
+                "absence_proven": True,
+                "invoke_evidence": {"generated_text_non_empty": True},
+            },
+        ],
+    )
+    def test_post_invoke_crash_windows_never_recreate_or_reinvoke(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        record_updates: dict[str, Any],
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        records[0].update(record_updates)
+        monkeypatch.setattr(
+            runner,
+            "ensure_owned_endpoint",
+            lambda plan, record: (_ for _ in ()).throw(AssertionError("must not create")),
+        )
+        monkeypatch.setattr(
+            runner,
+            "invoke",
+            lambda plan, record: (_ for _ in ()).throw(AssertionError("must not invoke")),
+        )
+        assert runner.run_endpoint(plans[0], records[0]) is False
+        assert records[0]["validation_steps_complete"] is True
+        assert records[0]["phase"] == "validation-complete-resume"
+
+    def test_deletion_deadline_bounds_serial_inventory_commands(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(
+            tmp_path,
+            command_timeout_seconds=300,
+            deletion_timeout_seconds=1,
+        )
+        clock = SimpleNamespace(now=0.0)
+        observed_timeouts: list[float] = []
+
+        def monotonic() -> float:
+            return float(clock.now)
+
+        def slow_kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            timeout = float(kwargs["timeout"])
+            observed_timeouts.append(timeout)
+            clock.now += timeout
+            return 0, json.dumps({"items": []}), ""
+
+        runner, _, records, _ = _lifecycle(
+            tmp_path,
+            settings=settings,
+            kubectl=slow_kubectl,
+        )
+        monkeypatch.setattr(inventory_module.time, "monotonic", monotonic)
+        with pytest.raises(ManagedInferenceValidationError, match="deadline|timeout"):
+            runner.prove_absence(records[0])
+        assert observed_timeouts == [1.0]
+        assert clock.now == 1.0
+
+    def test_kubernetes_collision_prevents_deploy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(tmp_path)
+        endpoint_name = ""
+
+        def colliding_kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            items = (
+                [
+                    {
+                        "metadata": {
+                            "name": f"{endpoint_name}-replica",
+                            "labels": {
+                                "app": endpoint_name,
+                                "project": "gco",
+                                "gco.io/type": "inference",
+                            },
+                            "ownerReferences": [{"kind": "Deployment", "name": endpoint_name}],
+                        }
+                    }
+                ]
+                if args[1] == "replicasets.apps"
+                else []
+            )
+            return 0, json.dumps({"items": items}), ""
+
+        runner, plans, records, _ = _lifecycle(
+            tmp_path,
+            settings=settings,
+            kubectl=colliding_kubectl,
+        )
+        endpoint_name = plans[0].name
+        monkeypatch.setattr(
+            runner,
+            "_run_command",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deploy must not run")),
+        )
+        with pytest.raises(ManagedInferenceValidationError, match="name collision"):
+            runner.ensure_owned_endpoint(plans[0], records[0])
+
+
+class TestWireContractAndHpaDeadline:
+    @pytest.mark.parametrize("framework", ["vllm", "tgi"])
+    def test_real_invoke_cli_sends_exact_identity_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        framework: str,
+    ) -> None:
+        settings = _settings(tmp_path)
+        plan = next(
+            plan
+            for plan in build_endpoint_plans(settings, OWNER_NONCE)
+            if plan.runtime.framework == framework and plan.role == "baseline"
+        )
+        captured: dict[str, Any] = {}
+
+        class Manager:
+            def get_endpoint(self, endpoint_name: str) -> dict[str, Any]:
+                return {
+                    "endpoint_name": endpoint_name,
+                    "ingress_path": f"/inference/{endpoint_name}",
+                    "spec": {
+                        "image": plan.runtime.image,
+                        "framework": plan.runtime.framework,
+                    },
+                }
+
+        class Response:
+            ok = True
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json() -> Any:
+                if framework == "tgi":
+                    return {"generated_text": "ok"}
+                return {"choices": [{"text": "ok"}]}
+
+        class Client:
+            def make_authenticated_request(self, **kwargs: Any) -> Response:
+                captured.update(kwargs)
+                return Response()
+
+        monkeypatch.setattr("cli.inference.get_inference_manager", lambda config: Manager())
+        monkeypatch.setattr("cli.aws_client.get_aws_client", lambda config: Client())
+        command = build_invoke_command(settings, plan)
+        assert "--no-stream" not in command
+        result = CliRunner().invoke(cli, command[3:])
+        assert result.exit_code == 0, result.output
+        assert captured["body"] == settings.request_body(plan.runtime)
+        assert captured["stream"] is False
+
+    def test_hpa_stability_refuses_intervals_that_do_not_fit_deadline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(
+            tmp_path,
+            hpa_timeout_seconds=3,
+            monitor_interval_seconds=1,
+            hpa_stability_intervals=2,
+        )
+        runner, plans, records, _ = _lifecycle(tmp_path, settings=settings)
+        clock = SimpleNamespace(now=0.0)
+        snapshots: list[int] = []
+
+        monkeypatch.setattr(
+            runtime_module.time,
+            "monotonic",
+            lambda: float(clock.now),
+        )
+        monkeypatch.setattr(
+            runtime_module.time,
+            "sleep",
+            lambda seconds: setattr(clock, "now", clock.now + float(seconds)),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_hpa_matches",
+            lambda plan, record, **kwargs: True,
+        )
+
+        def near_deadline(*args: Any, **kwargs: Any) -> tuple[bool, dict[str, int]]:
+            snapshots.append(len(snapshots) + 1)
+            if len(snapshots) == 1:
+                clock.now = 1.5
+            return True, {"desired": 2, "ready": 2, "ready_pods": 2}
+
+        monkeypatch.setattr(runner, "_deployment_ready_snapshot", near_deadline)
+        with pytest.raises(ManagedInferenceValidationError, match="phase deadline"):
+            runner.verify_hpa_stability(plans[1], records[1])
+        assert snapshots == [1, 2]
+        assert clock.now == 2.5
+
+
+class TestBackendProbeContracts:
+    def test_vllm_requires_healthy_response_and_configured_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        stages: list[str] = []
+
+        def run_command(record: dict[str, Any], stage: str, command: list[str]) -> str:
+            del record, command
+            stages.append(stage)
+            if stage == "health":
+                return json.dumps({"status": "healthy", "http_status": 200})
+            return json.dumps({"data": [{"id": plans[0].runtime.model_id}]})
+
+        monkeypatch.setattr(runner, "_run_command", run_command)
+        runner.verify_backend_probes(plans[0], records[0])
+
+        assert stages == ["health", "model-info"]
+        assert records[0]["backend_probe_evidence"] == {
+            "health": {
+                "healthy": True,
+                "http_status": 200,
+                "path": "/health",
+            },
+            "model_info": {
+                "path": "/v1/models",
+                "configured_model_present": True,
+                "model_revision_pinned": True,
+                "model_count": 1,
+            },
+        }
+
+    def test_tgi_requires_health_and_exact_info_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(tmp_path)
+        runner, plans, records, _ = _lifecycle(tmp_path, settings=settings)
+        plan = plans[2]
+        record = records[2]
+        stages: list[str] = []
+
+        def run_command(checkpoint: dict[str, Any], stage: str, command: list[str]) -> str:
+            del checkpoint, command
+            stages.append(stage)
+            if stage == "health":
+                return json.dumps({"status": "healthy", "http_status": 204})
+            return json.dumps(
+                {
+                    "model_id": plan.runtime.model_id,
+                    "model_sha": plan.runtime.model_revision,
+                }
+            )
+
+        monkeypatch.setattr(runner, "_run_command", run_command)
+        runner.verify_backend_probes(plan, record)
+
+        assert stages == ["health", "model-info"]
+        assert record["backend_probe_evidence"]["model_info"] == {
+            "path": "/info",
+            "configured_model_present": True,
+            "configured_revision_present": True,
+        }
+
+    def test_unhealthy_probe_fails_before_inference_invocation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        monkeypatch.setattr(
+            runner,
+            "_run_command",
+            lambda record, stage, command: json.dumps({"status": "unhealthy", "http_status": 503}),
+        )
+
+        with pytest.raises(ManagedInferenceValidationError, match="health/model"):
+            runner.verify_backend_probes(plans[0], records[0])
+
+
+class TestDefaultKubeconfigCompatibility:
+    def test_default_cluster_session_preserves_historical_command_shapes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli import cluster_tunnel
+
+        calls: list[tuple[list[str], dict[str, Any]]] = []
+
+        def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+        @contextlib.contextmanager
+        def public_tunnel(*args: Any, **kwargs: Any):
+            yield SimpleNamespace(active=False, server=None, tls_server_name=None)
+
+        monkeypatch.setattr(kube.subprocess, "run", fake_run)
+        monkeypatch.setattr(cluster_tunnel, "open_api_server_tunnel", public_tunnel)
+
+        with kube.cluster_session(REPO_ROOT, "test-cluster", "us-east-1") as kubectl:
+            assert kubectl("get", "pods")[0] == 0
+
+        access_command, access_kwargs = calls[0]
+        assert access_command == ["gco", "stacks", "access", "--region", "us-east-1"]
+        assert access_kwargs["env"] is None
+        aws_command, aws_kwargs = calls[1]
+        assert aws_command == [
+            "aws",
+            "eks",
+            "update-kubeconfig",
+            "--name",
+            "test-cluster",
+            "--region",
+            "us-east-1",
+        ]
+        assert aws_kwargs["env"] is None
+        kubectl_command, kubectl_kwargs = calls[2]
+        assert kubectl_command == ["kubectl", "get", "pods"]
+        assert kubectl_kwargs["env"] is None
+        assert all(kwargs["shell"] is False for _, kwargs in calls)
+
+
+class TestMainInferenceActionIntegration:
+    def test_main_run_settings_execute_without_sibling_settings_type(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from scripts.live_release_validation.actions import inference as action_module
+
+        settings = _settings(tmp_path)
+        context = _ctx(tmp_path)
+        context.settings = settings
+        context.deployment_regions = (settings.selected_region,)
+        context.config = SimpleNamespace(
+            project_name="gco",
+            global_region="us-west-2",
+        )
+        plans, state = initialize_run_state(context, settings)
+
+        @contextlib.contextmanager
+        def cluster_session(*args: Any, **kwargs: Any):
+            assert kwargs["gco_command"] == (sys.executable, "-m", "cli.main")
+            yield _empty_kubectl
+
+        lifecycle = SimpleNamespace(
+            verify_shared_proxy_autoscaling=lambda state: state.update(
+                {"shared_proxy_autoscaling": {"phase": "verified"}}
+            ),
+            execute=lambda: {"all_endpoints_absent": True},
+        )
+        monkeypatch.setattr(action_module, "initialize_run_state", lambda ctx, cfg: (plans, state))
+        monkeypatch.setattr(action_module.kube, "cluster_session", cluster_session)
+        monkeypatch.setattr(
+            action_module,
+            "ManagedInferenceLifecycle",
+            lambda **kwargs: lifecycle,
+        )
+
+        assert action_module.action_inference(context) == {"all_endpoints_absent": True}
+
+
+class TestIncarnationRotation:
+    def test_cleaned_preinvoke_resume_archives_and_rotates_lifecycle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        record = records[0]
+        record.update(
+            {
+                "lifecycle_id": LIFECYCLE_ID,
+                "phase": "kubernetes-ready",
+                "cleanup_phase": "absent",
+                "absence_proven": True,
+            }
+        )
+        evidence = {
+            "ddb_absent": True,
+            "kubernetes_counts": {},
+            "stable_absence_observations": 2,
+        }
+        monkeypatch.setattr(runner, "prove_absence", lambda checkpoint: evidence)
+
+        runner._prepare_incarnation_for_resume(plans[0], record)
+
+        assert record["incarnation"] == 2
+        assert record["lifecycle_id"] is None
+        assert record["cleanup_phase"] == "not-started"
+        assert record["closed_incarnations"] == [
+            {
+                "number": 1,
+                "lifecycle_id": LIFECYCLE_ID,
+                "invoked": False,
+                "cleanup_phase": "absent",
+                "absence_evidence": evidence,
+                "commands": [],
+                "cleanup_attempts": [],
+                "failures": [],
+            }
+        ]
+
+    def test_closed_lifecycle_is_never_readopted_and_new_lifecycle_binds(
+        self, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        runner, plans, records, _ = _lifecycle(tmp_path, settings=settings)
+        plan = plans[0]
+        record = records[0]
+        record["closed_incarnations"] = [{"number": 1, "lifecycle_id": LIFECYCLE_ID}]
+        record["incarnation"] = 2
+        record["lifecycle_id"] = None
+
+        with pytest.raises(ManagedInferenceValidationError, match="closed lifecycle"):
+            runner._verify_item_contract(
+                plan,
+                _owned_item(settings, plan, lifecycle_id=LIFECYCLE_ID),
+                record,
+            )
+
+        replacement_id = "1" * 64
+        runner._verify_item_contract(
+            plan,
+            _owned_item(settings, plan, lifecycle_id=replacement_id),
+            record,
+        )
+        assert record["lifecycle_id"] == replacement_id
+
+
+class TestSharedProxyAutoscalingProof:
+    @staticmethod
+    def _deployment(cpu_request: str = "100m") -> dict[str, Any]:
+        return {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "api-tls-proxy",
+                                "resources": {"requests": {"cpu": cpu_request}},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    @staticmethod
+    def _hpa(*, target: int = 70, active: bool = True) -> dict[str, Any]:
+        return {
+            "metadata": {"generation": 4},
+            "spec": {
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "inference-proxy",
+                },
+                "metrics": [
+                    {
+                        "type": "ContainerResource",
+                        "containerResource": {
+                            "name": "cpu",
+                            "container": "api-tls-proxy",
+                            "target": {
+                                "type": "Utilization",
+                                "averageUtilization": target,
+                            },
+                        },
+                    }
+                ],
+            },
+            "status": {
+                "observedGeneration": 4,
+                "conditions": [
+                    {
+                        "type": "ScalingActive",
+                        "status": "True" if active else "False",
+                        "reason": "ValidMetricFound" if active else "FailedGetResourceMetric",
+                    }
+                ],
+                "currentMetrics": [
+                    {
+                        "type": "ContainerResource",
+                        "containerResource": {
+                            "name": "cpu",
+                            "container": "api-tls-proxy",
+                            "current": {"averageUtilization": 42},
+                        },
+                    }
+                ],
+            },
+        }
+
+    def test_exact_tls_sidecar_request_and_active_metric_are_required(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, _, _, _ = _lifecycle(tmp_path)
+
+        def kubectl_json(record: dict[str, Any], *args: str, **kwargs: Any) -> Any:
+            del record, kwargs
+            return self._deployment() if args[1] == "deployment" else self._hpa()
+
+        monkeypatch.setattr(runner, "_kubectl_json", kubectl_json)
+        runner.verify_shared_proxy_autoscaling(runner.state)
+        evidence = runner.state["shared_proxy_autoscaling"]
+        assert evidence["phase"] == "verified"
+        assert evidence["last_observed"]["tls_cpu_request"] == "100m"
+        assert evidence["last_observed"]["tls_cpu_target"] == 70
+        assert evidence["last_observed"]["scaling_active"] is True
+        assert evidence["last_observed"]["active_tls_metric_count"] == 1
+
+    def test_inactive_or_wrong_tls_metric_times_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(tmp_path, hpa_timeout_seconds=1, poll_interval_seconds=1)
+        runner, _, _, _ = _lifecycle(tmp_path, settings=settings)
+        clock = SimpleNamespace(now=0.0)
+
+        def kubectl_json(record: dict[str, Any], *args: str, **kwargs: Any) -> Any:
+            del record, kwargs
+            return self._deployment() if args[1] == "deployment" else self._hpa(
+                target=85, active=False
+            )
+
+        monkeypatch.setattr(runner, "_kubectl_json", kubectl_json)
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: float(clock.now))
+        monkeypatch.setattr(
+            runtime_module.time,
+            "sleep",
+            lambda seconds: setattr(clock, "now", clock.now + float(seconds)),
+        )
+        with pytest.raises(ManagedInferenceValidationError, match="TLS autoscaling"):
+            runner.verify_shared_proxy_autoscaling(runner.state)

@@ -229,7 +229,11 @@ class TestInferenceEndpointStore:
         with pytest.raises(ValueError, match="already exists"):
             store.create_endpoint(endpoint_name="llm-a", spec=spec, target_regions=["us-east-1"])
 
-        updated = store.update_desired_state("llm-a", "stopped")
+        updated = store.update_desired_state(
+            "llm-a",
+            "stopped",
+            expected_lifecycle_id=fetched["lifecycle_id"],
+        )
         assert updated is not None and updated["desired_state"] == "stopped"
 
         assert store.delete_endpoint("llm-a") is True

@@ -355,5 +355,5 @@ class TestInferenceStoreExtended:
         store._table.update_item.side_effect = ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem"
         )
-        result = store.scale_endpoint("nonexistent", 3)
+        result = store.scale_endpoint("nonexistent", 3, expected_lifecycle_id="missing-life")
         assert result is None

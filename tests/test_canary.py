@@ -20,6 +20,18 @@ from click.testing import CliRunner
 
 from cli.inference import InferenceManager
 
+
+def _store_mock() -> MagicMock:
+    """Return a store double that performs the legacy lifecycle backfill."""
+    store = MagicMock()
+    store.ensure_lifecycle_metadata.side_effect = lambda endpoint: {
+        **endpoint,
+        "lifecycle_id": endpoint.get("lifecycle_id", "life-test"),
+        "updated_at": endpoint.get("updated_at", "snapshot"),
+    }
+    return store
+
+
 # =============================================================================
 # InferenceManager Canary Tests
 # =============================================================================
@@ -35,7 +47,7 @@ class TestCanaryDeploy:
             "replicas": 2,
             "env": {"MODEL_REVISION": "stable"},
         }
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "desired_state": "running",
@@ -70,7 +82,7 @@ class TestCanaryDeploy:
 
     @patch("cli.inference.get_aws_client")
     def test_canary_deploy_not_found(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = None
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -114,7 +126,7 @@ class TestCanaryDeploy:
 
     @patch("cli.inference.get_aws_client")
     def test_canary_deploy_stopped_endpoint(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "desired_state": "stopped",
@@ -133,7 +145,7 @@ class TestCanaryDeploy:
 
     @patch("cli.inference.get_aws_client")
     def test_canary_deploy_custom_replicas(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "desired_state": "running",
@@ -159,7 +171,7 @@ class TestCanaryDeploy:
             "image": "old:v1",
             "mooncake": {"mode": "store", "store": {"enabled": True}},
         }
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "desired_state": "running",
@@ -194,7 +206,7 @@ class TestPromoteCanary:
             "env": {"MODEL_REVISION": "stable"},
             "canary": {"image": " new:v2 ", "weight": 10, "replicas": 1},
         }
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "spec": original_spec,
@@ -224,7 +236,7 @@ class TestPromoteCanary:
 
     @patch("cli.inference.get_aws_client")
     def test_promote_not_found(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = None
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -238,7 +250,7 @@ class TestPromoteCanary:
 
     @patch("cli.inference.get_aws_client")
     def test_promote_no_canary(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "spec": {"image": "old:v1"},
@@ -256,7 +268,7 @@ class TestPromoteCanary:
 
     @patch("cli.inference.get_aws_client")
     def test_promote_rejects_mooncake_endpoint(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "spec": {
@@ -283,7 +295,7 @@ class TestPromoteCanary:
 
     @patch("cli.inference.get_aws_client")
     def test_promote_rejects_invalid_canary_image(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "spec": {"image": "old:v1", "canary": {"image": "   "}},
@@ -312,7 +324,7 @@ class TestRollbackCanary:
             "mooncake": {"mode": "store", "store": {"enabled": True}},
             "canary": {"image": "new:v2", "weight": 10},
         }
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "spec": original_spec,
@@ -340,7 +352,7 @@ class TestRollbackCanary:
 
     @patch("cli.inference.get_aws_client")
     def test_rollback_not_found(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = None
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -354,7 +366,7 @@ class TestRollbackCanary:
 
     @patch("cli.inference.get_aws_client")
     def test_rollback_no_canary(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "my-llm",
             "spec": {"image": "old:v1"},
@@ -369,6 +381,39 @@ class TestRollbackCanary:
             pytest.raises(ValueError, match="no active canary"),
         ):
             manager.rollback_canary("my-llm")
+
+
+class TestDeletedCanaryTerminality:
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("canary_deploy", ("new:v2",)),
+            ("promote_canary", ()),
+            ("rollback_canary", ()),
+        ],
+    )
+    def test_deleted_endpoint_rejects_canary_mutations(self, method_name, args):
+        mock_store = _store_mock()
+        mock_store.get_endpoint.return_value = {
+            "endpoint_name": "my-llm",
+            "lifecycle_id": "life-deleted",
+            "desired_state": "deleted",
+            "spec": {
+                "image": "old:v1",
+                "canary": {"image": "new:v2", "weight": 10, "replicas": 1},
+            },
+        }
+        manager = InferenceManager.__new__(InferenceManager)
+        manager.config = MagicMock()
+        manager._aws_client = MagicMock()
+
+        with (
+            patch.object(manager, "_get_store", return_value=mock_store),
+            pytest.raises(ValueError, match="deleted.*redeploy"),
+        ):
+            getattr(manager, method_name)("my-llm", *args)
+
+        mock_store.update_spec.assert_not_called()
 
 
 # =============================================================================
@@ -688,7 +733,7 @@ class TestInferenceManagerDeploy:
 
     @patch("cli.inference.get_aws_client")
     def test_deploy_basic(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.create_endpoint.return_value = {
             "endpoint_name": "test-ep",
             "target_regions": ["us-east-1"],
@@ -708,7 +753,7 @@ class TestInferenceManagerDeploy:
 
     @patch("cli.inference.get_aws_client")
     def test_deploy_with_capacity_type(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.create_endpoint.return_value = {"endpoint_name": "test-ep"}
         mock_aws.return_value.discover_regional_stacks.return_value = {"us-east-1": {}}
 
@@ -740,7 +785,7 @@ class TestInferenceManagerList:
 
     @patch("cli.inference.get_aws_client")
     def test_list_endpoints(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.list_endpoints.return_value = [
             {"endpoint_name": "ep1"},
             {"endpoint_name": "ep2"},
@@ -761,7 +806,12 @@ class TestInferenceManagerScale:
 
     @patch("cli.inference.get_aws_client")
     def test_scale(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
+        mock_store.get_endpoint.return_value = {
+            "endpoint_name": "ep1",
+            "lifecycle_id": "life-1",
+            "spec": {"replicas": 1},
+        }
         mock_store.scale_endpoint.return_value = {"endpoint_name": "ep1", "spec": {"replicas": 3}}
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -772,7 +822,7 @@ class TestInferenceManagerScale:
             result = manager.scale("ep1", 3)
 
         assert result is not None
-        mock_store.scale_endpoint.assert_called_once_with("ep1", 3)
+        mock_store.scale_endpoint.assert_called_once_with("ep1", 3, expected_lifecycle_id="life-1")
 
 
 class TestInferenceManagerStopStart:
@@ -780,7 +830,12 @@ class TestInferenceManagerStopStart:
 
     @patch("cli.inference.get_aws_client")
     def test_stop(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
+        mock_store.get_endpoint.return_value = {
+            "endpoint_name": "ep1",
+            "desired_state": "running",
+            "lifecycle_id": "life-1",
+        }
         mock_store.update_desired_state.return_value = {"desired_state": "stopped"}
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -790,13 +845,15 @@ class TestInferenceManagerStopStart:
         with patch.object(manager, "_get_store", return_value=mock_store):
             result = manager.stop("ep1")
 
-        mock_store.update_desired_state.assert_called_once_with("ep1", "stopped")
+        mock_store.update_desired_state.assert_called_once_with(
+            "ep1", "stopped", expected_lifecycle_id="life-1"
+        )
         assert result is not None
 
     @patch("cli.inference.get_aws_client")
     def test_start(self, mock_aws):
-        mock_store = MagicMock()
-        mock_store.update_desired_state.return_value = {"desired_state": "running"}
+        mock_store = _store_mock()
+        mock_store.start_endpoint.return_value = {"desired_state": "running"}
 
         manager = InferenceManager.__new__(InferenceManager)
         manager.config = MagicMock()
@@ -805,11 +862,21 @@ class TestInferenceManagerStopStart:
         with patch.object(manager, "_get_store", return_value=mock_store):
             manager.start("ep1")
 
-        mock_store.update_desired_state.assert_called_once_with("ep1", "running")
+        mock_store.start_endpoint.assert_called_once_with("ep1")
 
     @patch("cli.inference.get_aws_client")
     def test_delete(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
+        endpoint = {
+            "endpoint_name": "ep1",
+            "lifecycle_id": "life-1",
+            "target_regions": ["us-east-1"],
+            "cleanup_regions": ["us-east-1"],
+            "region_generations": {"us-east-1": "region-1"},
+            "updated_at": "before",
+        }
+        mock_store.get_endpoint.return_value = endpoint
+        mock_store.ensure_lifecycle_metadata.return_value = endpoint
         mock_store.update_desired_state.return_value = {"desired_state": "deleted"}
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -819,7 +886,9 @@ class TestInferenceManagerStopStart:
         with patch.object(manager, "_get_store", return_value=mock_store):
             manager.delete("ep1")
 
-        mock_store.update_desired_state.assert_called_once_with("ep1", "deleted")
+        mock_store.update_desired_state.assert_called_once_with(
+            "ep1", "deleted", expected_lifecycle_id="life-1"
+        )
 
 
 class TestInferenceManagerUpdateImage:
@@ -827,7 +896,7 @@ class TestInferenceManagerUpdateImage:
 
     @patch("cli.inference.get_aws_client")
     def test_update_image(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep1",
             "spec": {"image": "old:v1"},
@@ -845,7 +914,7 @@ class TestInferenceManagerUpdateImage:
 
     @patch("cli.inference.get_aws_client")
     def test_update_image_not_found(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = None
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -863,7 +932,7 @@ class TestInferenceManagerGetEndpoint:
 
     @patch("cli.inference.get_aws_client")
     def test_get_endpoint(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {"endpoint_name": "ep1", "spec": {"image": "img"}}
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -878,7 +947,7 @@ class TestInferenceManagerGetEndpoint:
 
     @patch("cli.inference.get_aws_client")
     def test_get_endpoint_not_found(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = None
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -896,7 +965,7 @@ class TestInferenceManagerDeployOptions:
 
     @patch("cli.inference.get_aws_client")
     def test_deploy_with_all_options(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.create_endpoint.return_value = {"endpoint_name": "ep1"}
         mock_aws.return_value.discover_regional_stacks.return_value = {"us-east-1": {}}
 
@@ -927,7 +996,7 @@ class TestInferenceManagerDeployOptions:
 
     @patch("cli.inference.get_aws_client")
     def test_deploy_with_explicit_regions(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.create_endpoint.return_value = {"endpoint_name": "ep1"}
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -946,9 +1015,11 @@ class TestInferenceManagerRegions:
 
     @patch("cli.inference.get_aws_client")
     def test_add_region(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep1",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1"],
         }
         mock_store._table.update_item.return_value = {
@@ -966,7 +1037,7 @@ class TestInferenceManagerRegions:
 
     @patch("cli.inference.get_aws_client")
     def test_add_region_not_found(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = None
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -980,9 +1051,11 @@ class TestInferenceManagerRegions:
 
     @patch("cli.inference.get_aws_client")
     def test_remove_region(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep1",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1", "us-west-2"],
         }
         mock_store._table.update_item.return_value = {
@@ -1000,7 +1073,7 @@ class TestInferenceManagerRegions:
 
     @patch("cli.inference.get_aws_client")
     def test_remove_region_not_found(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = None
 
         manager = InferenceManager.__new__(InferenceManager)
@@ -1014,12 +1087,14 @@ class TestInferenceManagerRegions:
 
     @patch("cli.inference.get_aws_client")
     def test_remove_region_error(self, mock_aws):
-        mock_store = MagicMock()
+        mock_store = _store_mock()
         mock_store.get_endpoint.return_value = {
             "endpoint_name": "ep1",
+            "lifecycle_id": "life-1",
+            "updated_at": "2026-01-01T00:00:00+00:00",
             "target_regions": ["us-east-1"],
         }
-        mock_store._table.update_item.side_effect = Exception("DynamoDB error")
+        mock_store.update_target_regions.side_effect = Exception("DynamoDB error")
 
         manager = InferenceManager.__new__(InferenceManager)
         manager.config = MagicMock()
