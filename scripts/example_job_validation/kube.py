@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,6 +22,95 @@ import yaml
 #: How the harness invokes kubectl; a function taking kubectl args and
 #: returning (exit_code, stdout, stderr).
 KubectlRunner = Callable[..., tuple[int, str, str]]
+
+_CLUSTER_API_READY_TIMEOUT_SECONDS = 45.0
+_CLUSTER_API_PROBE_TIMEOUT_SECONDS = 8
+_CLUSTER_API_RETRY_SECONDS = 1.0
+_PERMANENT_API_STARTUP_MARKERS = (
+    "certificate signed by unknown authority",
+    "error loading config file",
+    "exec plugin: invalid apiversion",
+    "forbidden",
+    "invalid configuration",
+    "no configuration has been provided",
+    "the server has asked for the client to provide credentials",
+    "tls: failed to verify certificate",
+    "unauthorized",
+    "x509:",
+)
+
+
+def _is_permanent_api_startup_error(detail: str) -> bool:
+    normalized = detail.casefold()
+    return any(marker in normalized for marker in _PERMANENT_API_STARTUP_MARKERS)
+
+
+def _wait_for_cluster_api(
+    kubectl: KubectlRunner,
+    *,
+    tunnel_process: subprocess.Popen[bytes] | None,
+    timeout_seconds: float = _CLUSTER_API_READY_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = _CLUSTER_API_RETRY_SECONDS,
+) -> None:
+    """Wait until the tunnel can carry an authenticated Kubernetes API request."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be positive")
+
+    from cli import ssm_tunnel
+
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    last_error = "probe was not attempted"
+    while True:
+        if tunnel_process is not None and (
+            detail := ssm_tunnel.exited_api_tunnel_detail(tunnel_process)
+        ):
+            raise RuntimeError(
+                "SSM tunnel exited before the Kubernetes API became ready: " + detail
+            )
+
+        remaining = deadline - time.monotonic()
+        if attempts and remaining <= 0:
+            raise RuntimeError(
+                "Kubernetes API did not become ready through the SSM tunnel within "
+                f"{timeout_seconds:.1f}s after {attempts} attempt(s). "
+                f"Last transient error: {last_error[:1000]}"
+            )
+        command_timeout = max(
+            1,
+            min(_CLUSTER_API_PROBE_TIMEOUT_SECONDS, int(max(remaining, 0.0)) + 1),
+        )
+        request_timeout = min(command_timeout, 5)
+        attempts += 1
+        try:
+            returncode, stdout, stderr = kubectl(
+                f"--request-timeout={request_timeout}s",
+                "get",
+                "--raw=/readyz",
+                timeout=command_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            detail = f"kubectl readiness probe timed out after {exc.timeout}s"
+        else:
+            if returncode == 0:
+                return
+            detail = (stderr or stdout).strip() or f"kubectl exited with status {returncode}"
+            if _is_permanent_api_startup_error(detail):
+                raise RuntimeError(
+                    "Kubernetes API readiness probe failed with a permanent error: " + detail[:1000]
+                )
+        last_error = detail
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "Kubernetes API did not become ready through the SSM tunnel within "
+                f"{timeout_seconds:.1f}s after {attempts} attempt(s). "
+                f"Last transient error: {last_error[:1000]}"
+            )
+        time.sleep(min(poll_interval_seconds, remaining))
 
 
 class _QuietFormatter:
@@ -214,4 +304,9 @@ def cluster_session(
             )
             return result.returncode, result.stdout, result.stderr
 
+        if session.active:
+            _wait_for_cluster_api(
+                kubectl,
+                tunnel_process=getattr(session, "process", None),
+            )
         yield kubectl

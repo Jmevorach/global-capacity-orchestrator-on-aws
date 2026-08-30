@@ -44,6 +44,7 @@ from scripts.live_release_validation.checks import topology as checks_topology
 from scripts.live_release_validation.cleanup import ecr as cleanup_ecr
 from scripts.live_release_validation.cleanup import log_groups as cleanup_log_groups
 from scripts.live_release_validation.cleanup import workloads as cleanup_workloads_module
+from scripts.live_release_validation.inventory import ecr as inventory_ecr
 from scripts.live_release_validation.inventory import scanners as inventory_scanners
 from scripts.live_release_validation.ownership import dynamodb_streams as ownership_streams
 from scripts.live_release_validation.ownership import ecr as ownership_ecr
@@ -2609,6 +2610,46 @@ class TestEcrOwnershipCleanup:
         "artifact_media_type": "",
         "manifest": {"schemaVersion": 2},
     }
+    _DOCKER_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
+
+    @staticmethod
+    def _manifest_record(
+        media_type: str,
+        manifest: object,
+        *,
+        digest: str = "sha256:abc",
+        tag: str | None = None,
+    ) -> dict[str, object]:
+        image_id = {"imageDigest": digest}
+        if tag is not None:
+            image_id["imageTag"] = tag
+        return {
+            "imageId": image_id,
+            "imageManifestMediaType": media_type,
+            "imageManifest": json.dumps(manifest, sort_keys=True),
+        }
+
+    def _ecr_session_with_records(
+        self,
+        records: list[dict[str, object]],
+        *,
+        native_media_type: str | None = None,
+    ) -> tuple[MagicMock, MagicMock]:
+        media_type = native_media_type or str(self._IDENTITY["manifest_media_type"])
+        ecr = MagicMock()
+        ecr.describe_images.return_value = {
+            "imageDetails": [
+                {
+                    "imageDigest": "sha256:abc",
+                    "imageTags": ["run-tag"],
+                    "imageManifestMediaType": media_type,
+                }
+            ]
+        }
+        ecr.batch_get_image.return_value = {"images": records, "failures": []}
+        session = MagicMock()
+        session.client.return_value = ecr
+        return ecr, session
 
     def test_describe_tag_captures_exact_manifest(self) -> None:
         ecr = MagicMock()
@@ -2646,7 +2687,102 @@ class TestEcrOwnershipCleanup:
             repositoryName="baseline/repository",
             imageIds=[{"imageTag": "run-tag"}],
         )
-        ecr.batch_get_image.assert_called_once()
+        ecr.batch_get_image.assert_called_once_with(
+            repositoryName="baseline/repository",
+            imageIds=[{"imageDigest": "sha256:abc"}],
+            acceptedMediaTypes=list(inventory_ecr._ECR_MANIFEST_MEDIA_TYPES),
+        )
+
+    def test_describe_tag_collapses_exact_duplicate_manifest_records(self) -> None:
+        record = self._manifest_record(
+            str(self._IDENTITY["manifest_media_type"]),
+            self._IDENTITY["manifest"],
+            tag="first-tag",
+        )
+        duplicate = self._manifest_record(
+            str(self._IDENTITY["manifest_media_type"]),
+            self._IDENTITY["manifest"],
+            tag="second-tag",
+        )
+        _ecr, session = self._ecr_session_with_records([record, duplicate])
+
+        result = inventory.describe_ecr_image_by_tag(
+            session,
+            region="us-east-1",
+            repository_name="baseline/repository",
+            tag="run-tag",
+        )
+
+        assert ownership_ecr._ecr_image_identity(result or {}) == self._IDENTITY
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_describe_tag_selects_native_manifest_independent_of_order(self, reverse: bool) -> None:
+        native_manifest = {"schemaVersion": 2, "annotations": {"representation": "native"}}
+        translated_manifest = {
+            "schemaVersion": 2,
+            "annotations": {"representation": "translated"},
+        }
+        native = self._manifest_record(str(self._IDENTITY["manifest_media_type"]), native_manifest)
+        translated = self._manifest_record(self._DOCKER_MEDIA_TYPE, translated_manifest)
+        records = [native, translated]
+        if reverse:
+            records.reverse()
+        _ecr, session = self._ecr_session_with_records(records)
+
+        result = inventory.describe_ecr_image_by_tag(
+            session,
+            region="us-east-1",
+            repository_name="baseline/repository",
+            tag="run-tag",
+        )
+
+        assert result is not None
+        assert result["manifest_media_type"] == self._IDENTITY["manifest_media_type"]
+        assert result["manifest"] == native_manifest
+
+    def test_describe_tag_rejects_conflicting_native_manifests(self) -> None:
+        media_type = str(self._IDENTITY["manifest_media_type"])
+        first = self._manifest_record(media_type, {"schemaVersion": 2, "variant": 1})
+        second = self._manifest_record(media_type, {"schemaVersion": 2, "variant": 2})
+        _ecr, session = self._ecr_session_with_records([first, second])
+
+        with pytest.raises(RuntimeError, match="2 unique native record"):
+            inventory.describe_ecr_image_by_tag(
+                session,
+                region="us-east-1",
+                repository_name="baseline/repository",
+                tag="run-tag",
+            )
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_bulk_inventory_uses_same_native_manifest_resolver(self, reverse: bool) -> None:
+        native_manifest = {"schemaVersion": 2, "kind": "native"}
+        native = self._manifest_record(str(self._IDENTITY["manifest_media_type"]), native_manifest)
+        translated = self._manifest_record(
+            self._DOCKER_MEDIA_TYPE,
+            {"schemaVersion": 2, "kind": "translated"},
+        )
+        records = [native, translated]
+        if reverse:
+            records.reverse()
+        ecr, _session = self._ecr_session_with_records(records)
+        ecr.get_paginator.return_value.paginate.return_value = [
+            {
+                "imageDetails": [
+                    {
+                        "imageDigest": "sha256:abc",
+                        "imageTags": ["run-tag"],
+                        "imageManifestMediaType": self._IDENTITY["manifest_media_type"],
+                    }
+                ]
+            }
+        ]
+
+        images = inventory_ecr._collect_repository_images(ecr, "baseline/repository")
+
+        assert len(images) == 1
+        assert images[0]["manifest_media_type"] == self._IDENTITY["manifest_media_type"]
+        assert images[0]["manifest"] == native_manifest
 
     @pytest.mark.parametrize(
         "error_code",

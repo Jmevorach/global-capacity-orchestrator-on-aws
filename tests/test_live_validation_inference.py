@@ -1078,7 +1078,7 @@ class TestIsolatedKubeconfig:
         )
         session = SimpleNamespace(
             active=active,
-            server="https://localhost:8443" if active else None,
+            server="https://127.0.0.1:8443" if active else None,
             tls_server_name="real.eks.amazonaws.com" if active else None,
         )
 
@@ -1112,12 +1112,124 @@ class TestIsolatedKubeconfig:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
         cluster = config["clusters"][0]["cluster"]
         if active:
-            assert cluster["server"] == "https://localhost:8443"
+            assert cluster["server"] == "https://127.0.0.1:8443"
             assert cluster["tls-server-name"] == "real.eks.amazonaws.com"
         else:
             assert cluster["server"] == "https://real.eks.amazonaws.com"
             assert "tls-server-name" not in cluster
         assert stat_mode(path) == 0o600
+
+    def test_tunnel_session_waits_for_api_before_yield(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli import cluster_tunnel
+
+        report_dir = tmp_path / "report"
+        report_dir.mkdir(mode=0o700)
+        path = report_dir / "kubeconfig"
+        calls: list[tuple[list[str], dict[str, Any]]] = []
+        base_run = self._fake_subprocess(path, calls)
+        probe_attempts = 0
+
+        def delayed_api(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            nonlocal probe_attempts
+            result = base_run(command, **kwargs)
+            if command[0] == "kubectl" and "--raw=/readyz" in command:
+                probe_attempts += 1
+                if probe_attempts == 1:
+                    return subprocess.CompletedProcess(
+                        command, 1, stdout="", stderr="Unable to connect: EOF"
+                    )
+                if probe_attempts == 2:
+                    return subprocess.CompletedProcess(
+                        command, 1, stdout="", stderr="dial tcp 127.0.0.1:8443: connection refused"
+                    )
+                if probe_attempts == 3:
+                    return subprocess.CompletedProcess(
+                        command,
+                        1,
+                        stdout="[+]ping ok\n[-]etcd failed: HTTP 500",
+                        stderr="Error from server (InternalError)",
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+            return result
+
+        class _Process:
+            @staticmethod
+            def poll() -> None:
+                return None
+
+        session = SimpleNamespace(
+            active=True,
+            server="https://127.0.0.1:8443",
+            tls_server_name="real.eks.amazonaws.com",
+            process=_Process(),
+        )
+
+        @contextlib.contextmanager
+        def fake_tunnel(*args: Any, **kwargs: Any):
+            yield session
+
+        monkeypatch.setattr(kube.subprocess, "run", delayed_api)
+        monkeypatch.setattr(kube.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(cluster_tunnel, "open_api_server_tunnel", fake_tunnel)
+
+        with kube.cluster_session(
+            REPO_ROOT,
+            "test-cluster",
+            "us-east-1",
+            kubeconfig_path=path,
+        ) as kubectl:
+            assert probe_attempts == 4
+            assert kubectl("get", "pods")[0] == 0
+
+        probe_commands = [command for command, _kwargs in calls if "--raw=/readyz" in command]
+        assert len(probe_commands) == 4
+        assert all("--request-timeout=5s" in command for command in probe_commands)
+        assert calls[-1][0][-2:] == ["get", "pods"]
+
+    def test_api_readiness_rejects_permanent_error(self) -> None:
+        attempts = 0
+
+        def forbidden(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            nonlocal attempts
+            attempts += 1
+            return 1, "", "Error from server (Forbidden): forbidden"
+
+        with pytest.raises(RuntimeError, match="permanent.*Forbidden"):
+            kube._wait_for_cluster_api(forbidden, tunnel_process=None)
+        assert attempts == 1
+
+    def test_api_readiness_deadline_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = iter((0.0, 0.0, 2.0))
+        monkeypatch.setattr(kube.time, "monotonic", lambda: next(clock))
+
+        def refused(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            return 1, "", "dial tcp 127.0.0.1:8443: connection refused"
+
+        with pytest.raises(RuntimeError, match=r"within 1\.0s after 1 attempt"):
+            kube._wait_for_cluster_api(
+                refused,
+                tunnel_process=None,
+                timeout_seconds=1,
+                poll_interval_seconds=0.1,
+            )
+
+    def test_api_readiness_surfaces_tunnel_exit(self) -> None:
+        class _Process:
+            @staticmethod
+            def poll() -> int:
+                return 42
+
+            @staticmethod
+            def communicate(timeout: float | None = None) -> tuple[bytes, bytes]:
+                return b"", b"Session Manager channel closed"
+
+        def must_not_probe(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            raise AssertionError("kubectl must not run after the tunnel exits")
+
+        with pytest.raises(RuntimeError, match="exit code 42.*Session Manager channel closed"):
+            kube._wait_for_cluster_api(must_not_probe, tunnel_process=_Process())
 
     def test_access_failure_propagates_before_tunnel(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

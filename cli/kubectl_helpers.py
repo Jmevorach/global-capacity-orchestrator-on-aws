@@ -172,7 +172,7 @@ def build_port_forward_command(
     ``target`` is a ``kind/name`` reference (e.g. ``svc/kube-prometheus-stack-grafana``).
     ``server`` / ``tls_server_name`` override the API endpoint and its TLS SNI —
     used when tunnelling to a private endpoint through an SSM local port, where
-    kubectl talks to ``https://localhost:<port>`` but must present the real EKS
+    kubectl talks to ``https://127.0.0.1:<port>`` but must present the real EKS
     hostname for certificate validation.
     """
     if not _NAMESPACE_RE.match(namespace):

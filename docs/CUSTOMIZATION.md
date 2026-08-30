@@ -416,7 +416,7 @@ inbound ports) and tears it down on exit:
 gco cluster tunnel --region us-east-1 --via-ssm auto
 
 # In another shell, kubectl through the tunnel:
-kubectl --server https://localhost:8443 --tls-server-name <endpoint-host> apply -f job.yaml
+kubectl --server https://127.0.0.1:8443 --tls-server-name <endpoint-host> apply -f job.yaml
 
 # Prefer to run it yourself? Print the exact commands (no changes made):
 gco cluster tunnel --region us-east-1 --print

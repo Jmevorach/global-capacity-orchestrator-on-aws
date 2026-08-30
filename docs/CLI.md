@@ -4346,7 +4346,7 @@ command.
 gco cluster tunnel --region us-east-1 --via-ssm auto
 
 # In another shell, run kubectl through the tunnel:
-kubectl --server https://localhost:8443 \
+kubectl --server https://127.0.0.1:8443 \
     --tls-server-name <endpoint-host> get nodes
 
 # Or just print the connection plan (no changes made, JSON for scripting):
