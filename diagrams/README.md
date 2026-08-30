@@ -15,15 +15,19 @@ other's way:
 | Catalogue | What it shows | Canonical generator |
 |-----------|---------------|---------------------|
 | [`infra_diagrams/`](infra_diagrams/README.md) | Per-stack and whole-architecture [CloudFormation](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/Welcome.html) topologies synthesised from the [CDK](https://docs.aws.amazon.com/cdk/v2/guide/home.html) app ([cdk-dia](https://github.com/pistazie/cdk-dia)). PNG outputs for embedding in READMEs. | `python diagrams/generate.py --infra-only` |
-| [`code_diagrams/`](code_diagrams/README.md) | Per-function control-flow charts for [Lambda](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) handlers, CLI entry points, and CDK stack constructors (pyflowchart + Playwright). Interactive HTML + rasterised PNG. | `SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only` |
+| [`code_diagrams/`](code_diagrams/README.md) | Per-function control-flow charts for [Lambda](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) handlers, CLI entry points, and CDK stack constructors (pyflowchart + Playwright). Interactive HTML + rasterised PNG. | `SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only` |
 
-Use `SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py` to reconcile
+Use `SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py` to reconcile
 both catalogues in one run, or `python diagrams/generate.py --check` for the
-read-only artifact, index, marker, and timestamp contract. Canonical code
-generation requires a fixed integer timestamp so unchanged source does not
-produce metadata-only churn. Code artifacts also display a source-flow digest,
-forcing paired PNG freshness even when the renderer collapses a changed flow to
-the same SVG. A fixed timestamp does not imply byte-identical Chromium or
+read-only artifact, index, marker, timestamp, and source-commit contract.
+Canonical code generation requires a fixed integer timestamp and an explicit
+clean source commit. Commit substantive source changes first, generate from
+that SHA, then commit derived artifacts separately; embedding the SHA of the
+same commit that contains an artifact would be self-referential. The generator
+compares every marker-stripped charted source with the supplied commit before
+rendering. Code artifacts also display a source-flow digest, forcing paired PNG
+freshness even when the renderer collapses a changed flow to the same SVG. A
+fixed timestamp does not imply byte-identical Chromium or Graphviz
 Graphviz rasterization across platforms; the contract is structural,
 and `tests/test_diagram_artifact_contract.py` uses Pillow to verify that each
 committed PNG is valid with nonzero dimensions. Output files are committed so
@@ -34,14 +38,18 @@ from repository files.
 ## Quick reference
 
 ```bash
-# Canonical full regeneration at the reviewed timestamp
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+# Canonical full regeneration from a clean, committed source revision
+SOURCE_DATE_EPOCH=1788091200 \
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
+python diagrams/generate.py
 
 # Read-only committed-tree contract
 python diagrams/generate.py --check
 
 # Reconcile just one catalogue
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py --code-only
+SOURCE_DATE_EPOCH=1788091200 \
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
+python diagrams/generate.py --code-only
 python diagrams/generate.py --infra-only
 
 # Direct code-generator maintenance operations
@@ -70,10 +78,10 @@ pip install -e '.[diagrams]'
 playwright install chromium
 ```
 
-The aggregate driver requires one UTC timestamp for canonical code outputs and
-places the same value in HTML, PNG pixels, the generated index, and source
-markers. Keep the reviewed epoch stable when source has not changed, and always
-run the read-only contract after generation.
+The aggregate driver requires one UTC timestamp and one exact source commit for
+canonical code outputs and places both values in HTML, PNG pixels, the generated
+index, and source markers. Keep the reviewed epoch and source SHA stable when
+source has not changed, and always run the read-only contract after generation.
 
 See each catalogue's own README for the full reference, including
 the list of stacks / targets each one chart.

@@ -17,7 +17,9 @@ _HEADER = """\
 # GCO Code Flowcharts
 
 <!-- Generated at (UTC): __GENERATED_AT__ -->
+<!-- Generated from Git commit: __SOURCE_COMMIT__ -->
 *Generated at (UTC): `__GENERATED_AT__`.*
+*Generated from Git commit: `__SOURCE_COMMIT__`.*
 
 This directory holds auto-generated control-flow diagrams for the
 Python source files listed below. Each target produces an interactive
@@ -40,13 +42,17 @@ Use the aggregate driver for canonical committed output:
 
 ```bash
 # Full code + infrastructure catalogues at the reviewed timestamp
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+SOURCE_DATE_EPOCH=1788091200 \
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
+python diagrams/generate.py
 
 # Read-only artifact/index/marker/PNG contract
 python diagrams/generate.py --check
 
 # One catalogue only
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py --code-only
+SOURCE_DATE_EPOCH=1788091200 \
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
+python diagrams/generate.py --code-only
 python diagrams/generate.py --infra-only
 
 # A single target for local diagnosis
@@ -81,12 +87,17 @@ playwright install chromium
 Without Playwright's browser, direct code-generator runs still write HTML and
 remove any older PNG for the selected targets so mixed generation times are
 impossible. Canonical aggregate generation requires ``SOURCE_DATE_EPOCH`` and
-records that one UTC timestamp in HTML, PNG pixels, the catalogue, and source
-markers. Each HTML/PNG pair also displays a deterministic digest of the
-pre-annotation flow HTML, so source-flow changes remain visible even when
-flowchart.js collapses them into the same SVG shape. Fixing the timestamp
-prevents metadata-only churn; neither mechanism promises byte-identical
-Chromium or Graphviz rasterization across toolchain versions or platforms.
+``GCO_DIAGRAM_SOURCE_COMMIT``. Commit substantive source changes first, then
+supply that clean source commit while generating and commit the derived
+artifacts separately; this avoids an impossible self-referential commit SHA.
+The generator verifies every marker-stripped charted source against the supplied
+commit. It records one UTC timestamp and source commit in HTML, PNG pixels, the
+catalogue, and source markers. Each HTML/PNG pair also displays a deterministic
+digest of the pre-annotation flow HTML, so source-flow changes remain visible
+even when flowchart.js collapses them into the same SVG shape. Fixing the
+timestamp prevents metadata-only churn; none of these mechanisms promises
+byte-identical Chromium or Graphviz rasterization across toolchain versions or
+platforms.
 ``python diagrams/generate.py --check`` enforces structural
 contracts; ``tests/test_diagram_artifact_contract.py`` also verifies every PNG
 with Pillow.
@@ -110,7 +121,14 @@ def render_readme(
     if len(generated_at_values) > 1:
         raise ValueError("README results must share one generation timestamp")
     generated_at = next(iter(generated_at_values), "unknown")
-    lines = [_HEADER.replace("__GENERATED_AT__", generated_at).rstrip()]
+    source_commits = {result.source_commit for result in results}
+    if len(source_commits) > 1:
+        raise ValueError("README results must share one Git source commit")
+    source_commit = next(iter(source_commits), "unknown")
+    header = _HEADER.replace("__GENERATED_AT__", generated_at).replace(
+        "__SOURCE_COMMIT__", source_commit
+    )
+    lines = [header.rstrip()]
     for top, dir_groups in sections.items():
         lines.append("")
         lines.append(f"### `{top}/`")

@@ -31,6 +31,8 @@ class RenderedTarget:
     """``None`` if PNG rendering was skipped or failed."""
     generated_at: str
     """Invocation-wide ISO-8601 UTC generation timestamp."""
+    source_commit: str
+    """Exact Git commit containing the marker-stripped charted source."""
 
 
 def render_all(
@@ -40,6 +42,7 @@ def render_all(
     output_dir: Path,
     render_png: bool,
     generated_at: str,
+    source_commit: str,
 ) -> list[RenderedTarget]:
     """Render every target, returning where each output landed."""
     _require_pyflowchart()
@@ -53,6 +56,7 @@ def render_all(
                 output_dir=output_dir,
                 renderer=renderer,
                 generated_at=generated_at,
+                source_commit=source_commit,
             )
             results.append(result)
         return results
@@ -68,6 +72,7 @@ def _render_one(
     output_dir: Path,
     renderer: _PlaywrightRenderer | None,
     generated_at: str,
+    source_commit: str,
 ) -> RenderedTarget:
     """Render a single target and return its output paths."""
     from pyflowchart import Flowchart, output_html  # local import: optional dep
@@ -94,6 +99,7 @@ def _render_one(
     html = _annotate_generated_html(
         html_path.read_text(encoding="utf-8"),
         generated_at=generated_at,
+        source_commit=source_commit,
     )
     html_path.write_text(
         "\n".join(line.rstrip() for line in html.splitlines()) + "\n",
@@ -117,12 +123,14 @@ def _render_one(
                 html_path=html_path,
                 png_path=png_path,
                 generated_at=generated_at,
+                source_commit=source_commit,
             )
         return RenderedTarget(
             target=target,
             html_path=html_path,
             png_path=None,
             generated_at=generated_at,
+            source_commit=source_commit,
         )
 
     # ``--skip-png`` or Playwright unavailable. The stale artifact was removed
@@ -132,10 +140,11 @@ def _render_one(
         html_path=html_path,
         png_path=None,
         generated_at=generated_at,
+        source_commit=source_commit,
     )
 
 
-def _annotate_generated_html(html: str, *, generated_at: str) -> str:
+def _annotate_generated_html(html: str, *, generated_at: str, source_commit: str) -> str:
     """Add visible timestamp and deterministic flow-content metadata.
 
     The visible wrapper intentionally contains the flowchart canvas so the
@@ -154,15 +163,20 @@ def _annotate_generated_html(html: str, *, generated_at: str) -> str:
     meta = "\n".join(
         [
             f'        <meta name="gco-generated-at" content="{generated_at}">',
+            f'        <meta name="gco-source-commit" content="{source_commit}">',
             f'        <meta name="gco-flow-digest" content="{flow_digest}">',
         ]
     )
     artifact = "\n".join(
         [
             f"        <!-- Generated at (UTC): {generated_at} -->",
+            f"        <!-- Generated from Git commit: {source_commit} -->",
             '        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">',
             '          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">',
             f'            Generated at (UTC): <time datetime="{generated_at}">{generated_at}</time>',
+            "          </p>",
+            '          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">',
+            f"            Source commit: <code>{source_commit}</code>",
             "          </p>",
             '          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">',
             f"            Flow content SHA-256: <code>{flow_digest}</code>",

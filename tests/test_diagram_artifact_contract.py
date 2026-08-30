@@ -53,10 +53,11 @@ def test_code_only_check_has_no_cdk_or_site_package_dependency() -> None:
 def test_source_marker_contract_rejects_wrong_or_missing_artifact_pointers() -> None:
     source = """# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-30T12:00:00Z
+# Generated from Git commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # Flowchart(s) generated from this file:
 #   * ``Thing.run`` -> ``diagrams/code_diagrams/thing.Thing_run.html``
 #     (PNG: ``diagrams/code_diagrams/thing.Thing_run.png``)
-# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 """
     expected = {

@@ -834,16 +834,22 @@ per-function code flowcharts. Refresh both catalogues whenever architecture or
 a charted flow changes, then run the read-only contract:
 
 ```bash
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+SOURCE_DATE_EPOCH=1788091200 \
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
+python diagrams/generate.py
 python diagrams/generate.py --check
 ```
 
-Use `--code-only` or `--infra-only` only when the other catalogue is known to be
-unchanged. Canonical code generation records one fixed UTC timestamp across
-HTML metadata and visible content, PNG pixels, the generated README, and source
-markers. A visible digest of the pre-annotation flow HTML makes source-flow
-changes appear in the paired PNG even when flowchart.js renders the same SVG
-shape. The fixed epoch prevents timestamp-only churn; it does not guarantee
+Commit substantive source changes first and use that clean commit SHA for
+`GCO_DIAGRAM_SOURCE_COMMIT`; commit generated artifacts separately so the
+provenance is not self-referential. The generator compares marker-stripped
+charted source with the supplied commit before rendering. Use `--code-only` or
+`--infra-only` only when the other catalogue is known to be unchanged.
+Canonical code generation records one fixed UTC timestamp and source commit
+across HTML metadata and visible content, PNG pixels, the generated README, and
+source markers. A visible digest of the pre-annotation flow HTML makes
+source-flow changes appear in the paired PNG even when flowchart.js renders the
+same SVG shape. The fixed epoch prevents timestamp-only churn; it does not guarantee
 byte-identical Graphviz/Chromium output across platforms. The structural check
 requires exact artifact/index/marker symmetry, and
 `tests/test_diagram_artifact_contract.py` verifies every committed PNG with

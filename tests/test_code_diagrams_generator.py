@@ -33,6 +33,7 @@ import hashlib
 import importlib.util
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -86,6 +87,7 @@ strip_all_markers = source_marker_mod.strip_all_markers
 _ruff_format = source_marker_mod._ruff_format
 render_readme = readme_mod.render_readme
 generation_timestamp_utc = timestamp_mod.generation_timestamp_utc
+generation_source_commit = timestamp_mod.generation_source_commit
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +229,18 @@ class TestGenerationTimestamp:
         with pytest.raises(ValueError, match="integer Unix timestamp"):
             generation_timestamp_utc()
 
+    def test_source_commit_is_exact_and_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GCO_DIAGRAM_SOURCE_COMMIT", "A" * 40)
+        assert generation_source_commit() == "a" * 40
+
+    @pytest.mark.parametrize("value", ("", "abc", "g" * 40, "a" * 39))
+    def test_invalid_source_commit_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("GCO_DIAGRAM_SOURCE_COMMIT", value)
+        with pytest.raises(ValueError, match="exact 40-character Git commit SHA"):
+            generation_source_commit()
+
     def test_html_only_render_removes_stale_png_and_stamps_html(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -262,6 +276,7 @@ class TestGenerationTimestamp:
         monkeypatch.setattr(pyflowchart, "Flowchart", FakeFlowchart)
         monkeypatch.setattr(pyflowchart, "output_html", fake_output_html)
         generated_at = "2026-07-16T12:00:00Z"
+        source_commit = "a" * 40
 
         result = _render_one(
             target=target,
@@ -269,6 +284,7 @@ class TestGenerationTimestamp:
             output_dir=output_dir,
             renderer=None,
             generated_at=generated_at,
+            source_commit=source_commit,
         )
 
         assert result.png_path is None
@@ -277,6 +293,10 @@ class TestGenerationTimestamp:
         assert f'<meta name="gco-generated-at" content="{generated_at}">' in html
         assert f"<!-- Generated at (UTC): {generated_at} -->" in html
         assert f'<time datetime="{generated_at}">{generated_at}</time>' in html
+        assert f'<meta name="gco-source-commit" content="{source_commit}">' in html
+        assert f"Generated from Git commit: {source_commit}" in html
+        assert f"Source commit: <code>{source_commit}</code>" in html
+        assert result.source_commit == source_commit
         assert '<meta name="gco-flow-digest" content="' in html
         assert "Flow content SHA-256: <code>" in html
 
@@ -288,8 +308,17 @@ class TestGenerationTimestamp:
         generated_at = "2026-07-16T12:00:00Z"
         first_input = template.replace("FLOW", "first flow")
         second_input = template.replace("FLOW", "second flow")
-        first = _annotate_generated_html(first_input, generated_at=generated_at)
-        second = _annotate_generated_html(second_input, generated_at=generated_at)
+        source_commit = "b" * 40
+        first = _annotate_generated_html(
+            first_input,
+            generated_at=generated_at,
+            source_commit=source_commit,
+        )
+        second = _annotate_generated_html(
+            second_input,
+            generated_at=generated_at,
+            source_commit=source_commit,
+        )
         first_digest = hashlib.sha256(first_input.encode()).hexdigest()[:16]
         second_digest = hashlib.sha256(second_input.encode()).hexdigest()[:16]
         assert first_digest != second_digest
@@ -324,6 +353,7 @@ def _make_rendered(
         html_path=html,
         png_path=png,
         generated_at="2026-07-16T12:00:00Z",
+        source_commit="a" * 40,
     )
 
 
@@ -366,6 +396,7 @@ class TestUpsertMarkers:
         updated = src_path.read_text(encoding="utf-8")
         assert SENTINEL in updated, "Expected marker sentinel to be inserted"
         assert "# Generated at (UTC): 2026-07-16T12:00:00Z" in updated
+        assert f"# Generated from Git commit: {'a' * 40}" in updated
         # Marker must sit *below* the docstring + imports and *above*
         # the first real statement (``def f``).
         docstring_end = updated.index('"""Handler docstring."""') + len('"""Handler docstring."""')
@@ -590,6 +621,8 @@ class TestRenderReadme:
         rendered = render_readme(results, output_dir=output_dir)
         assert "<!-- Generated at (UTC): 2026-07-16T12:00:00Z -->" in rendered
         assert "*Generated at (UTC): `2026-07-16T12:00:00Z`.*" in rendered
+        assert f"<!-- Generated from Git commit: {'a' * 40} -->" in rendered
+        assert f"*Generated from Git commit: `{'a' * 40}`.*" in rendered
 
         # Top-level groups are alphabetized, which places ``cli/`` before
         # ``lambda/`` — deterministic ordering matters for stable diffs.
@@ -636,6 +669,55 @@ class TestRenderReadme:
 
 generate_mod = _load("_cd_generate", _CD_DIR / "generate.py")
 _sync_shared_lambda_copies = generate_mod._sync_shared_lambda_copies
+_verify_targets_match_source_commit = generate_mod._verify_targets_match_source_commit
+
+
+class TestSourceCommitVerification:
+    def test_generated_markers_do_not_change_source_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "example.py"
+        source.write_text(
+            "# <pyflowchart-code-diagram> BEGIN - generated\n"
+            "# metadata\n"
+            "# <pyflowchart-code-diagram> END\n"
+            "def f():\n    return True\n",
+            encoding="utf-8",
+        )
+        run = lambda *args, **kwargs: SimpleNamespace(  # noqa: E731
+            returncode=0,
+            stdout="def f():\n    return True\n",
+            stderr="",
+        )
+        monkeypatch.setattr(generate_mod.subprocess, "run", run)
+
+        _verify_targets_match_source_commit(
+            project_root=tmp_path,
+            targets=[Target(source="example.py", function="f")],
+            source_commit="a" * 40,
+        )
+
+    def test_uncommitted_charted_source_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "example.py"
+        source.write_text("def f():\n    return False\n", encoding="utf-8")
+        monkeypatch.setattr(
+            generate_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=0,
+                stdout="def f():\n    return True\n",
+                stderr="",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Commit substantive source changes first"):
+            _verify_targets_match_source_commit(
+                project_root=tmp_path,
+                targets=[Target(source="example.py", function="f")],
+                source_commit="a" * 40,
+            )
 
 
 class TestSyncSharedLambdaCopies:

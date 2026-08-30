@@ -16,10 +16,13 @@ sys.path.insert(0, str(ROOT))
 from diagrams.code_diagrams._renderer import _output_stem_for  # noqa: E402
 from diagrams.code_diagrams._source_marker import SENTINEL  # noqa: E402
 from diagrams.code_diagrams._targets import TARGETS  # noqa: E402
+from diagrams.code_diagrams.generate import _verify_targets_match_source_commit  # noqa: E402
 from diagrams.infra_diagrams._catalog import INFRA_DIAGRAM_NAMES  # noqa: E402
 from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS  # noqa: E402
 
 _TIMESTAMP_RE = re.compile(r"Generated at \(UTC\):[^\n]*?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")
+_SOURCE_COMMIT_RE = re.compile(r"Generated from Git commit:[^\n]*?([0-9a-f]{40})")
+_HTML_SOURCE_COMMIT_RE = re.compile(r'<meta name="gco-source-commit" content="([0-9a-f]{40})">')
 _FLOW_DIGEST_RE = re.compile(r'<meta name="gco-flow-digest" content="([0-9a-f]{16})">')
 _MARKER_BLOCK_RE = re.compile(
     rf"(?s)# <{re.escape(SENTINEL)}> BEGIN[^\n]*\n(.*?)# <{re.escape(SENTINEL)}> END"
@@ -30,10 +33,12 @@ _MARKER_ENTRY_RE = re.compile(
 )
 _MARKER_BODY_RE = re.compile(
     r"# Generated at \(UTC\): \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\n"
+    r"# Generated from Git commit: [0-9a-f]{40}\n"
     r"# Flowchart\(s\) generated from this file:\n"
     r"(?:#   \* ``[^`]+`` -> ``[^`]+\.html``\n"
     r"#     \(PNG: ``[^`]+\.png``\)\n)+"
     r"# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> "
+    r"GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> "
     r"python diagrams/generate\.py --code-only``\.\n?\Z"
 )
 MarkerPointer = tuple[str, str, str | None]
@@ -103,8 +108,12 @@ def _code_artifact_contract(project_root: Path) -> list[str]:
     readme = (output_dir / "README.md").read_text(encoding="utf-8")
     readme_timestamps = set(_TIMESTAMP_RE.findall(readme))
     timestamps = set(readme_timestamps)
+    readme_source_commits = set(_SOURCE_COMMIT_RE.findall(readme))
+    source_commits = set(readme_source_commits)
     if len(readme_timestamps) != 1:
         issues.append(f"code index timestamp invalid: {sorted(readme_timestamps)}")
+    if len(readme_source_commits) != 1:
+        issues.append(f"code index source commit invalid: {sorted(readme_source_commits)}")
     expected_index_links: set[str] = set()
     checked_sources: set[str] = set()
     for target in TARGETS:
@@ -134,11 +143,18 @@ def _code_artifact_contract(project_root: Path) -> list[str]:
                 )
             issues.extend(_marker_pointer_issues(source, expected_pointers, target.source))
             source_timestamps = set(_TIMESTAMP_RE.findall(source))
+            marker_source_commits = set(_SOURCE_COMMIT_RE.findall(source))
             if len(source_timestamps) != 1:
                 issues.append(
                     f"source marker timestamp invalid: {target.source}: {sorted(source_timestamps)}"
                 )
+            if len(marker_source_commits) != 1:
+                issues.append(
+                    f"source marker commit invalid: {target.source}: "
+                    f"{sorted(marker_source_commits)}"
+                )
             timestamps.update(source_timestamps)
+            source_commits.update(marker_source_commits)
         if f"``{target.function}``" not in source:
             issues.append(f"source marker omitted: {target.source}:{target.function}")
 
@@ -154,6 +170,17 @@ def _code_artifact_contract(project_root: Path) -> list[str]:
                 f"code artifact timestamp invalid: {html.relative_to(project_root)}: "
                 f"{sorted(html_timestamps)}"
             )
+        html_source_commits = set(_HTML_SOURCE_COMMIT_RE.findall(html_text))
+        if len(html_source_commits) != 1:
+            issues.append(
+                f"code artifact source commit invalid: {html.relative_to(project_root)}: "
+                f"{sorted(html_source_commits)}"
+            )
+        elif f"<code>{next(iter(html_source_commits))}</code>" not in html_text:
+            issues.append(
+                f"code artifact visible source commit omitted: {html.relative_to(project_root)}"
+            )
+        source_commits.update(html_source_commits)
         flow_digests = set(_FLOW_DIGEST_RE.findall(html_text))
         if len(flow_digests) != 1:
             issues.append(
@@ -167,6 +194,17 @@ def _code_artifact_contract(project_root: Path) -> list[str]:
         timestamps.update(html_timestamps)
     if len(timestamps) != 1:
         issues.append(f"code diagram timestamps disagree: {sorted(timestamps)}")
+    if len(source_commits) != 1:
+        issues.append(f"code diagram source commits disagree: {sorted(source_commits)}")
+    else:
+        try:
+            _verify_targets_match_source_commit(
+                project_root=project_root,
+                targets=TARGETS,
+                source_commit=next(iter(source_commits)),
+            )
+        except RuntimeError as exc:
+            issues.append(str(exc))
 
     allowed_marker_sources = {target.source for target in TARGETS}
     for source, copies in LAMBDA_SHARED_SOURCE_TARGETS.items():
@@ -246,6 +284,8 @@ def main() -> None:
 
     if code and "SOURCE_DATE_EPOCH" not in os.environ:
         parser.error("canonical code generation requires integer SOURCE_DATE_EPOCH")
+    if code and "GCO_DIAGRAM_SOURCE_COMMIT" not in os.environ:
+        parser.error("canonical code generation requires 40-character GCO_DIAGRAM_SOURCE_COMMIT")
     if code:
         subprocess.run(
             [sys.executable, "diagrams/code_diagrams/generate.py", "--require-png"],

@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
@@ -48,11 +49,49 @@ from diagrams.code_diagrams._renderer import (  # noqa: E402
 )
 from diagrams.code_diagrams._source_marker import (  # noqa: E402
     strip_all_markers,
+    strip_markers_from,
     upsert_markers,
 )
 from diagrams.code_diagrams._targets import TARGETS, Target  # noqa: E402
-from diagrams.code_diagrams._timestamp import generation_timestamp_utc  # noqa: E402
+from diagrams.code_diagrams._timestamp import (  # noqa: E402
+    generation_source_commit,
+    generation_timestamp_utc,
+)
 from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS  # noqa: E402
+
+
+def _verify_targets_match_source_commit(
+    *, project_root: Path, targets: list[Target], source_commit: str
+) -> None:
+    """Require marker-stripped target sources to equal ``source_commit``.
+
+    Generated marker blocks are intentionally excluded because generation
+    rewrites them with provenance. Every executable/charted source byte must
+    already exist in the named commit, making the provenance statement true.
+    """
+    mismatches: list[str] = []
+    for source in sorted({target.source for target in targets}):
+        result = subprocess.run(  # noqa: S603 — fixed Git command and catalog paths
+            ["git", "show", f"{source_commit}:{source}"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"cannot read {source} from GCO_DIAGRAM_SOURCE_COMMIT "
+                f"{source_commit}: {result.stderr.strip()}"
+            )
+        current = (project_root / source).read_text(encoding="utf-8")
+        if strip_markers_from(current) != strip_markers_from(result.stdout):
+            mismatches.append(source)
+    if mismatches:
+        raise RuntimeError(
+            "charted source differs from GCO_DIAGRAM_SOURCE_COMMIT after "
+            f"marker removal: {mismatches}. Commit substantive source changes "
+            "first, then regenerate from that commit."
+        )
 
 
 def main() -> None:
@@ -120,6 +159,12 @@ def main() -> None:
     targets = _filter_targets(TARGETS, args.target)
     full_catalog = args.target is None
     generated_at = generation_timestamp_utc()
+    source_commit = generation_source_commit()
+    _verify_targets_match_source_commit(
+        project_root=project_root,
+        targets=targets,
+        source_commit=source_commit,
+    )
 
     print("🧭 GCO Code Flowchart Generator")
     print("=" * 50)
@@ -127,6 +172,7 @@ def main() -> None:
     print(f"   Output dir   : {output_dir}")
     print(f"   Targets      : {len(targets)}")
     print(f"   Generated at : {generated_at}")
+    print(f"   Source commit: {source_commit}")
 
     results = render_all(
         targets=targets,
@@ -134,6 +180,7 @@ def main() -> None:
         output_dir=output_dir,
         render_png=not args.skip_png,
         generated_at=generated_at,
+        source_commit=source_commit,
     )
     if args.require_png:
         missing_pngs = [

@@ -194,7 +194,12 @@ def _format_block(
     statement).
     """
     lines = ["", f"# <{SENTINEL}> BEGIN - auto-inserted, do not edit"]
+    source_commits = {result.source_commit for result in results}
+    if len(source_commits) != 1:
+        raise ValueError("source marker results must share one Git source commit")
+    source_commit = next(iter(source_commits))
     lines.append(f"# Generated at (UTC): {results[0].generated_at}")
+    lines.append(f"# Generated from Git commit: {source_commit}")
     lines.append("# Flowchart(s) generated from this file:")
     for result in results:
         html_rel = result.html_path.relative_to(project_root)
@@ -204,6 +209,7 @@ def _format_block(
             lines.append(f"#     (PNG: ``{png_rel}``)")
     lines.append(
         "# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> "
+        "GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> "
         "python diagrams/generate.py --code-only``.",
     )
     lines.append(f"# <{SENTINEL}> END")

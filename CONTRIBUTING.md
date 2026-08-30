@@ -623,9 +623,15 @@ human index in the same change. Run `tests/test_documentation_consistency.py`,
 before pushing. Generated diagrams use the canonical aggregate command:
 
 ```bash
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+SOURCE_DATE_EPOCH=1788091200 \
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
+python diagrams/generate.py
 python diagrams/generate.py --check
 ```
+
+Commit substantive charted-source changes first, use that clean commit for
+`GCO_DIAGRAM_SOURCE_COMMIT`, and commit the generated artifacts separately.
+The generator fails if marker-stripped target source differs from that commit.
 
 ### Developing the wiki
 
