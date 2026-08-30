@@ -29,6 +29,7 @@ covered by the pyflowchart import in the renderer's unit tests below.
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import subprocess
 from pathlib import Path
@@ -74,6 +75,7 @@ timestamp_mod = _load("_cd_timestamp", _CD_DIR / "_timestamp.py")
 Target = targets_mod.Target
 TARGETS = targets_mod.TARGETS
 _output_stem_for = renderer_mod._output_stem_for
+_annotate_generated_html = renderer_mod._annotate_generated_html
 _render_one = renderer_mod._render_one
 _screenshot_scale = renderer_mod._screenshot_scale
 RenderedTarget = renderer_mod.RenderedTarget
@@ -275,6 +277,25 @@ class TestGenerationTimestamp:
         assert f'<meta name="gco-generated-at" content="{generated_at}">' in html
         assert f"<!-- Generated at (UTC): {generated_at} -->" in html
         assert f'<time datetime="{generated_at}">{generated_at}</time>' in html
+        assert '<meta name="gco-flow-digest" content="' in html
+        assert "Flow content SHA-256: <code>" in html
+
+    def test_visible_flow_digest_changes_with_pre_annotation_content(self) -> None:
+        template = (
+            '<html>\n<head>\n        <meta charset="utf-8">\n</head>\n'
+            '<body>FLOW\n        <div id="canvas"></div>\n</body>\n</html>\n'
+        )
+        generated_at = "2026-07-16T12:00:00Z"
+        first_input = template.replace("FLOW", "first flow")
+        second_input = template.replace("FLOW", "second flow")
+        first = _annotate_generated_html(first_input, generated_at=generated_at)
+        second = _annotate_generated_html(second_input, generated_at=generated_at)
+        first_digest = hashlib.sha256(first_input.encode()).hexdigest()[:16]
+        second_digest = hashlib.sha256(second_input.encode()).hexdigest()[:16]
+        assert first_digest != second_digest
+        assert f'<meta name="gco-flow-digest" content="{first_digest}">' in first
+        assert f"Flow content SHA-256: <code>{first_digest}</code>" in first
+        assert f'<meta name="gco-flow-digest" content="{second_digest}">' in second
 
 
 # ---------------------------------------------------------------------------

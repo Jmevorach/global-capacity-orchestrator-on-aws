@@ -8,6 +8,7 @@ makes it easy to unit-test the path math without importing Playwright.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import sys
 import warnings
 from dataclasses import dataclass
@@ -135,25 +136,36 @@ def _render_one(
 
 
 def _annotate_generated_html(html: str, *, generated_at: str) -> str:
-    """Add machine-readable and visible generation metadata to HTML.
+    """Add visible timestamp and deterministic flow-content metadata.
 
     The visible wrapper intentionally contains the flowchart canvas so the
-    Playwright screenshot includes the same timestamp as the interactive
-    artifact. The HTML comment keeps the value easy to inspect without
-    rendering JavaScript.
+    Playwright screenshot includes both the timestamp and a digest of the
+    pre-annotation pyflowchart HTML. Even when flowchart.js collapses changed
+    source into an otherwise identical SVG node, the paired PNG visibly changes
+    with the source-derived digest. The digest is a freshness marker, not a
+    cross-platform PNG byte-reproducibility claim.
     """
     charset = '        <meta charset="utf-8">'
     canvas = '        <div id="canvas"></div>'
     if charset not in html or canvas not in html:
         raise RuntimeError("pyflowchart HTML template no longer matches the annotator")
 
-    meta = f'        <meta name="gco-generated-at" content="{generated_at}">'
+    flow_digest = hashlib.sha256(html.encode("utf-8")).hexdigest()[:16]
+    meta = "\n".join(
+        [
+            f'        <meta name="gco-generated-at" content="{generated_at}">',
+            f'        <meta name="gco-flow-digest" content="{flow_digest}">',
+        ]
+    )
     artifact = "\n".join(
         [
             f"        <!-- Generated at (UTC): {generated_at} -->",
             '        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">',
-            '          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">',
+            '          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">',
             f'            Generated at (UTC): <time datetime="{generated_at}">{generated_at}</time>',
+            "          </p>",
+            '          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">',
+            f"            Flow content SHA-256: <code>{flow_digest}</code>",
             "          </p>",
             '          <div id="canvas"></div>',
             "        </div>",

@@ -3,11 +3,10 @@
 Covered here, each through the production handler module with the session
 environment pointing boto3 at the emulator:
 
-* ``lambda/capacity-poller`` — a full ``lambda_handler`` run writing a real
-  DynamoDB item. The emulator's EC2 rejects the three capacity probes with
-  ``ClientError`` (probed; documented in docs/FLOCI_TESTING.md), which
-  exercises the poller's degraded-signal path for real: the snapshot must
-  still be written with the spot fields absent and the block counters zero.
+* ``lambda/capacity-poller`` — a full ``lambda_handler`` run against a real
+  DynamoDB table. The emulator's EC2 rejects the three capacity probes with
+  ``ClientError`` (probed; documented in docs/FLOCI_TESTING.md), which proves
+  the poller reports one error and writes no false zero-capacity snapshot.
 * ``lambda/image-lookup`` — adopt-or-create against real ECR repositories.
   ``CreateRepository`` fails under a finch-hosted emulator (documented
   docker-socket gap) but works on the GitHub runners; the fixture skips
@@ -29,7 +28,6 @@ partition change would.
 from __future__ import annotations
 
 import uuid
-from decimal import Decimal
 
 import boto3
 import pytest
@@ -74,37 +72,22 @@ class TestCapacityPoller:
         # emulator runs; CI's fresh emulator per job masked this).
         dynamodb.delete_table(TableName=table_name)
 
-    def test_poll_writes_degraded_snapshot_when_capacity_apis_reject(
+    def test_poll_reports_error_without_false_snapshot_when_capacity_apis_reject(
         self, history_table, monkeypatch
     ):
         # The emulator's EC2 rejects get_spot_placement_scores,
-        # describe_spot_price_history, and describe_capacity_block_offerings
-        # with ClientError — exactly the degradation the poller must absorb.
+        # describe_spot_price_history, and describe_capacity_block_offerings.
+        # No authoritative signal means no history item: failure must never be
+        # persisted as a confirmed zero-capacity observation.
         monkeypatch.setenv("CAPACITY_HISTORY_TABLE_NAME", history_table)
         monkeypatch.setenv("WATCH_INSTANCE_TYPES", "g4dn.xlarge")
         monkeypatch.setenv("ENABLED_REGIONS", "us-east-1")
         handler = load_lambda_module("capacity-poller")
 
         result = handler.lambda_handler({}, None)
-        assert result["written"] == 1
-        assert result["errors"] == 0, (
-            "per-signal API failures must degrade the snapshot, not error the poll"
-        )
-
-        items = boto3.resource("dynamodb").Table(history_table).scan()["Items"]
-        assert len(items) == 1
-        item = items[0]
-        assert item["pk"] == "g4dn.xlarge#us-east-1"
-        assert item["sk"] == item["timestamp"]
-        assert isinstance(item["ttl"], Decimal | int)
-        assert item["capacity_blocks_available"] == 0
-        assert item["capacity_blocks_total"] == 0
-        assert item["capacity_blocks_long_available"] == 0
-        for absent in ("spot_score", "spot_price", "az_count"):
-            assert absent not in item, (
-                f"{absent} must be omitted (not zeroed) when its API is unavailable, "
-                "so the history store reads it as absent"
-            )
+        assert result["written"] == 0
+        assert result["errors"] == 1
+        assert boto3.resource("dynamodb").Table(history_table).scan()["Items"] == []
 
     def test_disabling_the_long_probe_omits_the_long_tier(self, history_table, monkeypatch):
         monkeypatch.setenv("CAPACITY_HISTORY_TABLE_NAME", history_table)

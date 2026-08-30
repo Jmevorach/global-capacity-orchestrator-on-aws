@@ -21,8 +21,10 @@ Use `SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py` to reconcile
 both catalogues in one run, or `python diagrams/generate.py --check` for the
 read-only artifact, index, marker, and timestamp contract. Canonical code
 generation requires a fixed integer timestamp so unchanged source does not
-produce metadata-only churn. A fixed timestamp does not imply byte-identical
-Chromium or Graphviz rasterization across platforms; the contract is structural,
+produce metadata-only churn. Code artifacts also display a source-flow digest,
+forcing paired PNG freshness even when the renderer collapses a changed flow to
+the same SVG. A fixed timestamp does not imply byte-identical Chromium or
+Graphviz rasterization across platforms; the contract is structural,
 and `tests/test_diagram_artifact_contract.py` uses Pillow to verify that each
 committed PNG is valid with nonzero dimensions. Output files are committed so
 GitHub's Markdown renderer can embed them in docs and pull requests. Interactive

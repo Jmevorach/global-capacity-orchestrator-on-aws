@@ -82,9 +82,12 @@ Without Playwright's browser, direct code-generator runs still write HTML and
 remove any older PNG for the selected targets so mixed generation times are
 impossible. Canonical aggregate generation requires ``SOURCE_DATE_EPOCH`` and
 records that one UTC timestamp in HTML, PNG pixels, the catalogue, and source
-markers. Fixing the timestamp prevents metadata-only churn; it does not promise
-byte-identical Chromium or Graphviz rasterization across toolchain versions or
-platforms. ``python diagrams/generate.py --check`` enforces structural
+markers. Each HTML/PNG pair also displays a deterministic digest of the
+pre-annotation flow HTML, so source-flow changes remain visible even when
+flowchart.js collapses them into the same SVG shape. Fixing the timestamp
+prevents metadata-only churn; neither mechanism promises byte-identical
+Chromium or Graphviz rasterization across toolchain versions or platforms.
+``python diagrams/generate.py --check`` enforces structural
 contracts; ``tests/test_diagram_artifact_contract.py`` also verifies every PNG
 with Pillow.
 

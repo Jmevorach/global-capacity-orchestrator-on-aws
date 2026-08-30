@@ -33,9 +33,9 @@ Control flow is phased because the signals have different shapes:
         for at most ``SPS_MAX_ATTEMPTS`` total passes so a persistent refusal
         can never run the function toward its timeout.
     Phase 3 — per-region metrics and write. Spot price, AZ count, and
-        Capacity Block offerings are inherently per-region and unchanged from
-        the pre-pool poller: one EC2 client per region, one DynamoDB item per
-        watched (instance_type, region) pair.
+        Capacity Block offerings are inherently per-region. Failed probes stay
+        absent rather than becoming zero; when every signal for a pair fails,
+        no history item is written and the summary records an error.
 
 ``MaxConfigLimitExceeded`` (the account has asked SPS about too many distinct
 configurations in the rolling window) is detected by error code, logged at
@@ -422,8 +422,8 @@ def _collect_spot_placement_scores(
     return scores, counters
 
 
-def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int]:
-    """Return (mean latest price across AZs, AZ count) from recent spot history."""
+def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int | None]:
+    """Return (mean latest price, AZ count), preserving probe failure as None."""
     end = datetime.now(UTC)
     start = end - timedelta(days=SPOT_PRICE_LOOKBACK_DAYS)
     try:
@@ -435,7 +435,7 @@ def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int
         )
     except Exception as exc:
         logger.warning("spot price history failed for %s: %s", instance_type, exc)
-        return None, 0
+        return None, None
     latest_by_az: dict[str, float] = {}
     for item in resp.get("SpotPriceHistory", []):
         az = item.get("AvailabilityZone")
@@ -448,11 +448,13 @@ def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int
 
 def _capacity_block_summary(
     ec2: Any, instance_type: str, duration_hours: int = DEFAULT_BLOCK_DURATION_HOURS
-) -> tuple[int, int]:
-    """Return (offering count, total instance count) for available capacity blocks.
+) -> tuple[int | None, int | None]:
+    """Return offering/instance counts, or ``(None, None)`` on probe failure.
 
     ``duration_hours`` is the Capacity Block duration to probe; the poller calls
-    this once for the short tier and once for the long tier.
+    this once for the short tier and once for the long tier. A successful empty
+    response is ``(0, 0)``; failure stays absent so it cannot become false
+    zero-capacity history.
     """
     try:
         resp = ec2.describe_capacity_block_offerings(
@@ -467,7 +469,7 @@ def _capacity_block_summary(
             duration_hours,
             exc,
         )
-        return 0, 0
+        return None, None
     offerings = resp.get("CapacityBlockOfferings", [])
     total = sum(int(o.get("InstanceCount", 0)) for o in offerings)
     return len(offerings), total
@@ -481,9 +483,9 @@ def _build_item(
     spot_scores: dict[str, int],
     spot_pool: str | None,
     spot_price: float | None,
-    az_count: int,
-    blocks_available: int,
-    blocks_total: int,
+    az_count: int | None,
+    blocks_available: int | None,
+    blocks_total: int | None,
     long_blocks_available: int | None = None,
     long_blocks_total: int | None = None,
 ) -> dict[str, Any]:
@@ -493,7 +495,9 @@ def _build_item(
     the pooled score value; ``spot_pool`` names the pool those scores were
     requested for and is recorded only when at least one score was obtained,
     so refused or unpooled snapshots carry neither the fields nor a dangling
-    attribution.
+    attribution. Per-Region probe values remain optional: ``None`` means the
+    API call failed and the field is omitted, while a successful empty
+    Capacity Block response is recorded as a real zero.
     """
     ts = now.isoformat()
     item: dict[str, Any] = {
@@ -510,10 +514,12 @@ def _build_item(
         item["spot_pool"] = spot_pool
     if spot_price is not None:
         item["spot_price"] = _to_decimal(spot_price)
-    if az_count:
+    if az_count is not None:
         item["az_count"] = az_count
-    item["capacity_blocks_available"] = blocks_available
-    item["capacity_blocks_total"] = blocks_total
+    if blocks_available is not None:
+        item["capacity_blocks_available"] = blocks_available
+    if blocks_total is not None:
+        item["capacity_blocks_total"] = blocks_total
     # Long-duration tier is omitted entirely when the long probe is disabled
     # (CAPACITY_BLOCK_LONG_DURATION_HOURS=0), so the store treats it as absent
     # rather than recording a misleading zero.
@@ -629,6 +635,26 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                         long_available, long_total = _capacity_block_summary(
                             ec2, instance_type, long_block_duration_hours
                         )
+                signal_obtained = bool(spot_scores) or any(
+                    value is not None
+                    for value in (
+                        spot_price,
+                        az_count,
+                        blocks_available,
+                        blocks_total,
+                        long_available,
+                        long_total,
+                    )
+                )
+                if not signal_obtained:
+                    errors += 1
+                    logger.warning(
+                        "all capacity probes failed for %s/%s; skipping history write "
+                        "rather than recording false zero capacity",
+                        instance_type,
+                        region,
+                    )
+                    continue
                 item = _build_item(
                     instance_type,
                     region,

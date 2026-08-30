@@ -20,6 +20,7 @@ from diagrams.infra_diagrams._catalog import INFRA_DIAGRAM_NAMES  # noqa: E402
 from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS  # noqa: E402
 
 _TIMESTAMP_RE = re.compile(r"Generated at \(UTC\):[^\n]*?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")
+_FLOW_DIGEST_RE = re.compile(r'<meta name="gco-flow-digest" content="([0-9a-f]{16})">')
 _MARKER_BLOCK_RE = re.compile(
     rf"(?s)# <{re.escape(SENTINEL)}> BEGIN[^\n]*\n(.*?)# <{re.escape(SENTINEL)}> END"
 )
@@ -146,11 +147,22 @@ def _code_artifact_contract(project_root: Path) -> list[str]:
         issues.append(f"orphan code index entry: {relative}")
 
     for html in expected_html & actual_html:
-        html_timestamps = set(_TIMESTAMP_RE.findall(html.read_text(encoding="utf-8")))
+        html_text = html.read_text(encoding="utf-8")
+        html_timestamps = set(_TIMESTAMP_RE.findall(html_text))
         if len(html_timestamps) != 1:
             issues.append(
                 f"code artifact timestamp invalid: {html.relative_to(project_root)}: "
                 f"{sorted(html_timestamps)}"
+            )
+        flow_digests = set(_FLOW_DIGEST_RE.findall(html_text))
+        if len(flow_digests) != 1:
+            issues.append(
+                f"code artifact flow digest invalid: {html.relative_to(project_root)}: "
+                f"{sorted(flow_digests)}"
+            )
+        elif f"<code>{next(iter(flow_digests))}</code>" not in html_text:
+            issues.append(
+                f"code artifact visible flow digest omitted: {html.relative_to(project_root)}"
             )
         timestamps.update(html_timestamps)
     if len(timestamps) != 1:
