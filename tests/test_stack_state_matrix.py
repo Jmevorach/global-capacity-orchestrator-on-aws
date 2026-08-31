@@ -671,6 +671,93 @@ class TestStrictChangeSetExecution:
         with pytest.raises(RuntimeError, match="Could not inspect"):
             self._execute(manager, cfn)
 
+    def test_fresh_create_retries_stack_style_absence_before_checkpoint(
+        self, manager: StackManager
+    ) -> None:
+        cfn = MagicMock()
+        cfn.describe_change_set.side_effect = [
+            _error("ValidationError", "stack does not exist", "DescribeChangeSet"),
+            _change_set(),
+        ]
+        review_target = (REGION, cfn, _stack("REVIEW_IN_PROGRESS"))
+        with (
+            patch("cli.stacks.time.sleep") as sleep,
+            patch.object(manager, "_describe_stack_target", return_value=review_target),
+            patch.object(manager, "_wait_for_stack_settle", return_value="CREATE_COMPLETE"),
+        ):
+            assert self._execute(manager, cfn, expected_stack_id=None) is True
+
+        assert cfn.describe_change_set.call_count == 2
+        sleep.assert_called_once_with(2.0)
+        cfn.execute_change_set.assert_called_once_with(ChangeSetName=CHANGE_ID)
+
+    def test_fresh_create_absence_retry_is_bounded_and_fails_closed(
+        self, manager: StackManager
+    ) -> None:
+        cfn = MagicMock()
+        cfn.describe_change_set.side_effect = _error(
+            "ValidationError", "stack does not exist", "DescribeChangeSet"
+        )
+        with (
+            patch("cli.stacks.time.sleep") as sleep,
+            pytest.raises(RuntimeError, match="did not create"),
+        ):
+            self._execute(manager, cfn, expected_stack_id=None)
+
+        assert cfn.describe_change_set.call_count == 16
+        assert sleep.call_count == 15
+        cfn.execute_change_set.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("expected_stack_id", "history"),
+        [
+            (STACK_ID, {}),
+            (None, _prepared("CREATE")),
+        ],
+    )
+    def test_absence_retry_requires_fresh_uncheckpointed_create(
+        self,
+        manager: StackManager,
+        expected_stack_id: str | None,
+        history: dict[str, dict[str, str]],
+    ) -> None:
+        cfn = MagicMock()
+        cfn.describe_change_set.side_effect = _error(
+            "ValidationError", "stack does not exist", "DescribeChangeSet"
+        )
+        with (
+            patch("cli.stacks.time.sleep") as sleep,
+            pytest.raises(RuntimeError, match="Could not inspect"),
+        ):
+            self._execute(
+                manager,
+                cfn,
+                expected_stack_id=expected_stack_id,
+                history=history,
+            )
+
+        cfn.describe_change_set.assert_called_once()
+        sleep.assert_not_called()
+        cfn.execute_change_set.assert_not_called()
+
+    def test_fresh_create_retry_honors_cancellation_before_sleep(
+        self, manager: StackManager
+    ) -> None:
+        cfn = MagicMock()
+        cfn.describe_change_set.side_effect = _error(
+            "ValidationError", "stack does not exist", "DescribeChangeSet"
+        )
+        manager._cdk_cancel_event.set()
+        with (
+            patch("cli.stacks.time.sleep") as sleep,
+            pytest.raises(RuntimeError, match="cancelled before ownership checkpoint"),
+        ):
+            self._execute(manager, cfn, expected_stack_id=None)
+
+        cfn.describe_change_set.assert_called_once()
+        sleep.assert_not_called()
+        cfn.execute_change_set.assert_not_called()
+
     @pytest.mark.parametrize(
         ("change", "message"),
         [

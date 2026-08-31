@@ -130,6 +130,13 @@ _CLOUDFORMATION_DELETE_TIMEOUT_SECONDS = 7200.0
 _CLOUDFORMATION_DELETE_POLL_SECONDS = 15.0
 _CLOUDFORMATION_DELETE_HEARTBEAT_SECONDS = 60.0
 _BOOTSTRAP_HEALTHY_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE"})
+# CDK's ``prepare-change-set`` mode can return before a fresh CREATE change set
+# is visible through CloudFormation's read path. Poll only that authoritative
+# fresh-create absence window; every access, identity, tag, and ownership error
+# still fails immediately. Sixteen reads at two-second intervals bound the
+# eventual-consistency allowance to 30 seconds after the first attempt.
+_STRICT_CHANGE_SET_INSPECTION_ATTEMPTS = 16
+_STRICT_CHANGE_SET_INSPECTION_RETRY_SECONDS = 2.0
 _LIVE_VALIDATION_PROVIDER_LOG_CONTEXT = "gco_live_validation_retain_provider_log_groups"
 
 # LAMBDA_SHARED_SOURCE_TARGETS is imported from the dependency-light inventory
@@ -3453,35 +3460,55 @@ class StackManager:
         if not region:
             raise RuntimeError(f"Could not resolve deploy Region for {stack_name}")
         cfn = boto3.client("cloudformation", region_name=region)
-        try:
-            change_set = cfn.describe_change_set(
-                ChangeSetName=change_set_name,
-                StackName=stack_name,
-            )
-        except ClientError as exc:
-            if not self._change_set_missing(exc):
-                raise RuntimeError(
-                    f"Could not inspect strict change set {change_set_name} for {stack_name}"
-                ) from exc
-            if allow_noop and expected_stack_id:
-                target = self._describe_stack_target(
-                    stack_name,
-                    expected_stack_id=expected_stack_id,
-                    require_expected_identity=True,
+        change_set: dict[str, Any] = {}
+        inspection_attempts = (
+            _STRICT_CHANGE_SET_INSPECTION_ATTEMPTS
+            if expected_stack_id is None and not prepared_change_sets
+            else 1
+        )
+        for inspection_attempt in range(inspection_attempts):
+            try:
+                change_set = cfn.describe_change_set(
+                    ChangeSetName=change_set_name,
+                    StackName=stack_name,
                 )
-                if target is not None:
-                    stack = target[2]
-                    status = str(stack.get("StackStatus") or "")
-                    if status in _BOOTSTRAP_HEALTHY_STATUSES:
-                        if authorize_stack is None:
-                            raise RuntimeError(
-                                f"Strict no-op for {stack_name} lacks exact authorization"
-                            ) from exc
-                        authorize_stack(stack_name, region, expected_stack_id)
-                        return True
-            raise RuntimeError(
-                f"CDK did not create the strict change set {change_set_name} for {stack_name}"
-            ) from exc
+                break
+            except ClientError as exc:
+                fresh_create_not_visible = bool(
+                    expected_stack_id is None
+                    and not prepared_change_sets
+                    and (self._change_set_missing(exc) or self._stack_missing(exc))
+                )
+                if fresh_create_not_visible and inspection_attempt + 1 < inspection_attempts:
+                    if self._cdk_cancel_event.is_set():
+                        raise RuntimeError(
+                            "Strict change-set inspection cancelled before ownership checkpoint"
+                        ) from exc
+                    time.sleep(_STRICT_CHANGE_SET_INSPECTION_RETRY_SECONDS)
+                    continue
+                if not self._change_set_missing(exc) and not fresh_create_not_visible:
+                    raise RuntimeError(
+                        f"Could not inspect strict change set {change_set_name} for {stack_name}"
+                    ) from exc
+                if allow_noop and expected_stack_id:
+                    target = self._describe_stack_target(
+                        stack_name,
+                        expected_stack_id=expected_stack_id,
+                        require_expected_identity=True,
+                    )
+                    if target is not None:
+                        stack = target[2]
+                        status = str(stack.get("StackStatus") or "")
+                        if status in _BOOTSTRAP_HEALTHY_STATUSES:
+                            if authorize_stack is None:
+                                raise RuntimeError(
+                                    f"Strict no-op for {stack_name} lacks exact authorization"
+                                ) from exc
+                            authorize_stack(stack_name, region, expected_stack_id)
+                            return True
+                raise RuntimeError(
+                    f"CDK did not create the strict change set {change_set_name} for {stack_name}"
+                ) from exc
 
         change_set_id = str(change_set.get("ChangeSetId") or "")
         observed_change_set_name = str(change_set.get("ChangeSetName") or "")
