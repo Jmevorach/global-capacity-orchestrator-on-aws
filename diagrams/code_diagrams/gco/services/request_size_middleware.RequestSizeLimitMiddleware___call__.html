@@ -2,9 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-31T04:39:13Z">
-        <meta name="gco-source-commit" content="60339b8cdb299c90a338930b9fa72f3410600205">
-        <meta name="gco-flow-digest" content="a181be2c5375c23d">
+        <meta name="gco-generated-at" content="2026-08-31T13:28:12Z">
+        <meta name="gco-source-commit" content="b3e8e68506f0876844b61ba1bd1458011767df3e">
+        <meta name="gco-flow-digest" content="01c40dc9664ea148">
         <title>Request-size trust boundary (declared/streamed limits and exact replay)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -208,62 +208,62 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">cond8393=>condition: if scope['type'] != 'http'
-op8397=>operation: await self.app(scope, receive, send)
-e8400=>end: end function return
-cond8407=>condition: if self._declared_size_exceeds_limit(scope)
-op8411=>operation: await self._too_large_response()(scope, receive, send)
-e8414=>end: end function return
-op8420=>operation: buffered_messages: deque[Message] = deque()
-op8422=>operation: received_bytes = 0
-cond8425=>condition: while True
-op8429=>operation: message = await receive()
-op8431=>operation: message_type = message['type']
-cond8434=>condition: if message_type == 'http.request'
-op8438=>operation: received_bytes += len(message.get('body', b''))
-cond8441=>condition: if received_bytes > self.max_body_bytes
-op8445=>operation: await self._too_large_response()(scope, receive, send)
-e8448=>end: end function return
-sub8454=>subroutine: buffered_messages.append(message)
-cond8457=>operation: break if  not message.get('more_body', False)
-sub8469=>subroutine: buffered_messages.append(message)
-cond8472=>operation: break if  message_type == 'http.disconnect'
-st8486=>start: start replay_receive
-io8488=>inputoutput: input:
-cond8492=>condition: if buffered_messages
-io8499=>inputoutput: output: buffered_messages.popleft()
-e8497=>end: end function return
-io8508=>inputoutput: output: await receive()
-e8506=>end: end function return
+        <div><textarea id="code" style="width: 100%;" rows="11">cond8395=>condition: if scope['type'] != 'http'
+op8399=>operation: await self.app(scope, receive, send)
+e8402=>end: end function return
+cond8409=>condition: if self._declared_size_exceeds_limit(scope)
+op8413=>operation: await self._too_large_response()(scope, receive, send)
+e8416=>end: end function return
+op8422=>operation: buffered_messages: deque[Message] = deque()
+op8424=>operation: received_bytes = 0
+cond8427=>condition: while True
+op8431=>operation: message = await receive()
+op8433=>operation: message_type = message['type']
+cond8436=>condition: if message_type == 'http.request'
+op8440=>operation: received_bytes += len(message.get('body', b''))
+cond8443=>condition: if received_bytes > self.max_body_bytes
+op8447=>operation: await self._too_large_response()(scope, receive, send)
+e8450=>end: end function return
+sub8456=>subroutine: buffered_messages.append(message)
+cond8459=>operation: break if  not message.get('more_body', False)
+sub8471=>subroutine: buffered_messages.append(message)
+cond8474=>operation: break if  message_type == 'http.disconnect'
+st8488=>start: start replay_receive
+io8490=>inputoutput: input:
+cond8494=>condition: if buffered_messages
+io8501=>inputoutput: output: buffered_messages.popleft()
+e8499=>end: end function return
+io8510=>inputoutput: output: await receive()
+e8508=>end: end function return
 
-cond8393(yes)->op8397
-op8397->e8400
-cond8393(no)->cond8407
-cond8407(yes)->op8411
-op8411->e8414
-cond8407(no)->op8420
-op8420->op8422
-op8422->cond8425
-cond8425(yes)->op8429
-op8429->op8431
-op8431->cond8434
-cond8434(yes)->op8438
-op8438->cond8441
-cond8441(yes)->op8445
-op8445->e8448
-cond8441(no)->sub8454
-sub8454->cond8457
-cond8457->cond8425
-cond8434(no)->sub8469
-sub8469->cond8472
-cond8472->cond8425
-cond8425(no)->st8486
-st8486->io8488
-io8488->cond8492
-cond8492(yes)->io8499
-io8499->e8497
-cond8492(no)->io8508
-io8508->e8506
+cond8395(yes)->op8399
+op8399->e8402
+cond8395(no)->cond8409
+cond8409(yes)->op8413
+op8413->e8416
+cond8409(no)->op8422
+op8422->op8424
+op8424->cond8427
+cond8427(yes)->op8431
+op8431->op8433
+op8433->cond8436
+cond8436(yes)->op8440
+op8440->cond8443
+cond8443(yes)->op8447
+op8447->e8450
+cond8443(no)->sub8456
+sub8456->cond8459
+cond8459->cond8427
+cond8436(no)->sub8471
+sub8471->cond8474
+cond8474->cond8427
+cond8427(no)->st8488
+st8488->io8490
+io8490->cond8494
+cond8494(yes)->io8501
+io8501->e8499
+cond8494(no)->io8510
+io8510->e8508
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -273,17 +273,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-31T04:39:13Z -->
-        <!-- Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205 -->
+        <!-- Generated at (UTC): 2026-08-31T13:28:12Z -->
+        <!-- Generated from Git commit: b3e8e68506f0876844b61ba1bd1458011767df3e -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-31T04:39:13Z">2026-08-31T04:39:13Z</time>
+            Generated at (UTC): <time datetime="2026-08-31T13:28:12Z">2026-08-31T13:28:12Z</time>
           </p>
           <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
-            Source commit: <code>60339b8cdb299c90a338930b9fa72f3410600205</code>
+            Source commit: <code>b3e8e68506f0876844b61ba1bd1458011767df3e</code>
           </p>
           <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
-            Flow content SHA-256: <code>a181be2c5375c23d</code>
+            Flow content SHA-256: <code>01c40dc9664ea148</code>
           </p>
           <div id="canvas"></div>
         </div>

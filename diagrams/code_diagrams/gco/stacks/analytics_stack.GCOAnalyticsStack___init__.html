@@ -2,9 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-31T04:39:13Z">
-        <meta name="gco-source-commit" content="60339b8cdb299c90a338930b9fa72f3410600205">
-        <meta name="gco-flow-digest" content="dd6570648466d719">
+        <meta name="gco-generated-at" content="2026-08-31T13:28:12Z">
+        <meta name="gco-source-commit" content="b3e8e68506f0876844b61ba1bd1458011767df3e">
+        <meta name="gco-flow-digest" content="d0bbca854fc87e83">
         <title>Analytics stack constructor (KMS, VPC, EFS, Studio, EMR, Cognito)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -208,31 +208,30 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">sub3011=>subroutine: super().__init__(scope, construct_id, **kwargs)
-op3013=>operation: self.config = config
-op3015=>operation: self.project_name = config.get_project_name()
-op3017=>operation: self.api_gateway_secret_arn = api_gateway_secret_arn
-op3019=>operation: cfg = config.get_analytics_config()
-op3021=>operation: self.hyperpod_enabled: bool = bool(cfg['hyperpod']['enabled'])
-op3023=>operation: self.canvas_enabled: bool = bool(cfg['canvas']['enabled'])
-op3025=>operation: self.efs_removal: RemovalPolicy = _parse_removal(cfg['efs']['removal_policy'])
-op3027=>operation: self.cognito_removal: RemovalPolicy = _parse_removal(cfg['cognito']['removal_policy'])
-op3029=>operation: self._cognito_domain_prefix_override: str | None = cfg['cognito'].get('domain_prefix')
-sub3031=>subroutine: self._create_kms_key()
-sub3033=>subroutine: self._create_vpc_and_endpoints()
-sub3035=>subroutine: self._create_access_logs_bucket()
-sub3037=>subroutine: self._create_studio_only_bucket()
-sub3039=>subroutine: self._create_studio_efs()
-sub3041=>subroutine: self._create_execution_role_and_grants()
-sub3043=>subroutine: self._grant_sagemaker_role_on_cluster_shared_bucket()
-sub3045=>subroutine: self._create_studio_domain()
-sub3047=>subroutine: self._create_emr_app()
-sub3049=>subroutine: self._create_cognito_pool()
-sub3051=>subroutine: self._create_presigned_url_lambda()
-sub3053=>subroutine: self._apply_nag_suppressions()
+        <div><textarea id="code" style="width: 100%;" rows="11">sub3013=>subroutine: super().__init__(scope, construct_id, **kwargs)
+op3015=>operation: self.config = config
+op3017=>operation: self.project_name = config.get_project_name()
+op3019=>operation: self.api_gateway_secret_arn = api_gateway_secret_arn
+op3021=>operation: cfg = config.get_analytics_config()
+op3023=>operation: self.hyperpod_enabled: bool = bool(cfg['hyperpod']['enabled'])
+op3025=>operation: self.canvas_enabled: bool = bool(cfg['canvas']['enabled'])
+op3027=>operation: self.efs_removal: RemovalPolicy = _parse_removal(cfg['efs']['removal_policy'])
+op3029=>operation: self.cognito_removal: RemovalPolicy = _parse_removal(cfg['cognito']['removal_policy'])
+op3031=>operation: self._cognito_domain_prefix_override: str | None = cfg['cognito'].get('domain_prefix')
+sub3033=>subroutine: self._create_kms_key()
+sub3035=>subroutine: self._create_vpc_and_endpoints()
+sub3037=>subroutine: self._create_access_logs_bucket()
+sub3039=>subroutine: self._create_studio_only_bucket()
+sub3041=>subroutine: self._create_studio_efs()
+sub3043=>subroutine: self._create_execution_role_and_grants()
+sub3045=>subroutine: self._grant_sagemaker_role_on_cluster_shared_bucket()
+sub3047=>subroutine: self._create_studio_domain()
+sub3049=>subroutine: self._create_emr_app()
+sub3051=>subroutine: self._create_cognito_pool()
+sub3053=>subroutine: self._create_presigned_url_lambda()
+sub3055=>subroutine: self._apply_nag_suppressions()
 
-sub3011->op3013
-op3013->op3015
+sub3013->op3015
 op3015->op3017
 op3017->op3019
 op3019->op3021
@@ -240,8 +239,8 @@ op3021->op3023
 op3023->op3025
 op3025->op3027
 op3027->op3029
-op3029->sub3031
-sub3031->sub3033
+op3029->op3031
+op3031->sub3033
 sub3033->sub3035
 sub3035->sub3037
 sub3037->sub3039
@@ -252,6 +251,7 @@ sub3045->sub3047
 sub3047->sub3049
 sub3049->sub3051
 sub3051->sub3053
+sub3053->sub3055
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -261,17 +261,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-31T04:39:13Z -->
-        <!-- Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205 -->
+        <!-- Generated at (UTC): 2026-08-31T13:28:12Z -->
+        <!-- Generated from Git commit: b3e8e68506f0876844b61ba1bd1458011767df3e -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-31T04:39:13Z">2026-08-31T04:39:13Z</time>
+            Generated at (UTC): <time datetime="2026-08-31T13:28:12Z">2026-08-31T13:28:12Z</time>
           </p>
           <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
-            Source commit: <code>60339b8cdb299c90a338930b9fa72f3410600205</code>
+            Source commit: <code>b3e8e68506f0876844b61ba1bd1458011767df3e</code>
           </p>
           <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
-            Flow content SHA-256: <code>dd6570648466d719</code>
+            Flow content SHA-256: <code>d0bbca854fc87e83</code>
           </p>
           <div id="canvas"></div>
         </div>

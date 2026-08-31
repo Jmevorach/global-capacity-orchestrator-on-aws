@@ -2,9 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-31T04:39:13Z">
-        <meta name="gco-source-commit" content="60339b8cdb299c90a338930b9fa72f3410600205">
-        <meta name="gco-flow-digest" content="1614720ce8ac9894">
+        <meta name="gco-generated-at" content="2026-08-31T13:28:12Z">
+        <meta name="gco-source-commit" content="b3e8e68506f0876844b61ba1bd1458011767df3e">
+        <meta name="gco-flow-digest" content="5afb893ac7ac93e5">
         <title>Mooncake prefill/decode dispatch (admin gate, KV handoff, streaming decode)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -208,41 +208,41 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op8590=>operation: 'Disaggregate one serving request: prime prefill, then stream decode.'
-op8592=>operation: path = request.url.path
-cond8595=>condition: if path.endswith(ADMIN_PATH)
-io8602=>inputoutput: output: await _admin_add(request)
-e8600=>end: end function return
-op8608=>operation: raw = await request.body()
-op8613=>operation: body = json.loads(raw or b'{}')
-cond8610=>condition: exception raised?
-cond8615=>condition: except ValueError
-io8622=>inputoutput: output: JSONResponse({'error': 'invalid JSON body'}, status_code=400)
-e8620=>end: end function return
-cond8629=>condition: if not _is_serving_path(path)
-io8636=>inputoutput: output: await _stream_decode(path, body)
-e8634=>end: end function return
-op8642=>operation: prefill_kv_params = await _prime_prefill(path, body)
-io8647=>inputoutput: output: await _stream_decode(path, _decode_body(body, prefill_kv_params))
-e8645=>end: end function return
+        <div><textarea id="code" style="width: 100%;" rows="11">op8592=>operation: 'Disaggregate one serving request: prime prefill, then stream decode.'
+op8594=>operation: path = request.url.path
+cond8597=>condition: if path.endswith(ADMIN_PATH)
+io8604=>inputoutput: output: await _admin_add(request)
+e8602=>end: end function return
+op8610=>operation: raw = await request.body()
+op8615=>operation: body = json.loads(raw or b'{}')
+cond8612=>condition: exception raised?
+cond8617=>condition: except ValueError
+io8624=>inputoutput: output: JSONResponse({'error': 'invalid JSON body'}, status_code=400)
+e8622=>end: end function return
+cond8631=>condition: if not _is_serving_path(path)
+io8638=>inputoutput: output: await _stream_decode(path, body)
+e8636=>end: end function return
+op8644=>operation: prefill_kv_params = await _prime_prefill(path, body)
+io8649=>inputoutput: output: await _stream_decode(path, _decode_body(body, prefill_kv_params))
+e8647=>end: end function return
 
-op8590->op8592
-op8592->cond8595
-cond8595(yes)->io8602
-io8602->e8600
-cond8595(no)->op8608
-op8608->op8613
-op8613->cond8610
-cond8610(yes)->cond8615
-cond8615(yes)->io8622
-io8622->e8620
-cond8615(no)->cond8629
-cond8629(yes)->io8636
-io8636->e8634
-cond8629(no)->op8642
-op8642->io8647
-io8647->e8645
-cond8610(no)->cond8629
+op8592->op8594
+op8594->cond8597
+cond8597(yes)->io8604
+io8604->e8602
+cond8597(no)->op8610
+op8610->op8615
+op8615->cond8612
+cond8612(yes)->cond8617
+cond8617(yes)->io8624
+io8624->e8622
+cond8617(no)->cond8631
+cond8631(yes)->io8638
+io8638->e8636
+cond8631(no)->op8644
+op8644->io8649
+io8649->e8647
+cond8612(no)->cond8631
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -252,17 +252,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-31T04:39:13Z -->
-        <!-- Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205 -->
+        <!-- Generated at (UTC): 2026-08-31T13:28:12Z -->
+        <!-- Generated from Git commit: b3e8e68506f0876844b61ba1bd1458011767df3e -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-31T04:39:13Z">2026-08-31T04:39:13Z</time>
+            Generated at (UTC): <time datetime="2026-08-31T13:28:12Z">2026-08-31T13:28:12Z</time>
           </p>
           <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
-            Source commit: <code>60339b8cdb299c90a338930b9fa72f3410600205</code>
+            Source commit: <code>b3e8e68506f0876844b61ba1bd1458011767df3e</code>
           </p>
           <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
-            Flow content SHA-256: <code>1614720ce8ac9894</code>
+            Flow content SHA-256: <code>5afb893ac7ac93e5</code>
           </p>
           <div id="canvas"></div>
         </div>

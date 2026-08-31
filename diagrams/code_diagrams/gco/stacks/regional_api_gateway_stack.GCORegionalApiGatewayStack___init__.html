@@ -2,9 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-31T04:39:13Z">
-        <meta name="gco-source-commit" content="60339b8cdb299c90a338930b9fa72f3410600205">
-        <meta name="gco-flow-digest" content="0603d4b49a828900">
+        <meta name="gco-generated-at" content="2026-08-31T13:28:12Z">
+        <meta name="gco-source-commit" content="b3e8e68506f0876844b61ba1bd1458011767df3e">
+        <meta name="gco-flow-digest" content="2fc9fefd42037d3d">
         <title>Regional API Gateway stack constructor (private access)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -208,23 +208,22 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">sub2937=>subroutine: super().__init__(scope, construct_id, **kwargs)
-op2939=>operation: self.config = config
-op2941=>operation: self.deployment_region = region
-op2943=>operation: self.vpc = vpc
-op2945=>operation: self.alb_dns_name = alb_dns_name
-op2947=>operation: supports_global_accelerator = getattr(config, 'supports_global_accelerator', None)
-op2949=>operation: self.global_accelerator_enabled = bool(supports_global_accelerator()) if callable(supports_global_accelerator) else True
-op2951=>operation: self.auth_secret_arn = auth_secret_arn
-op2953=>operation: self.aggregator_role_arn = aggregator_role_arn
-op2955=>operation: self.proxy_lambda = self._create_vpc_proxy_lambda()
-op2957=>operation: self.inference_proxy_lambda = self._create_inference_proxy_lambda()
-op2959=>operation: self.api = self._create_api_gateway()
-sub2961=>subroutine: self._create_outputs()
-sub2963=>subroutine: self._apply_nag_suppressions()
+        <div><textarea id="code" style="width: 100%;" rows="11">sub2939=>subroutine: super().__init__(scope, construct_id, **kwargs)
+op2941=>operation: self.config = config
+op2943=>operation: self.deployment_region = region
+op2945=>operation: self.vpc = vpc
+op2947=>operation: self.alb_dns_name = alb_dns_name
+op2949=>operation: supports_global_accelerator = getattr(config, 'supports_global_accelerator', None)
+op2951=>operation: self.global_accelerator_enabled = bool(supports_global_accelerator()) if callable(supports_global_accelerator) else True
+op2953=>operation: self.auth_secret_arn = auth_secret_arn
+op2955=>operation: self.aggregator_role_arn = aggregator_role_arn
+op2957=>operation: self.proxy_lambda = self._create_vpc_proxy_lambda()
+op2959=>operation: self.inference_proxy_lambda = self._create_inference_proxy_lambda()
+op2961=>operation: self.api = self._create_api_gateway()
+sub2963=>subroutine: self._create_outputs()
+sub2965=>subroutine: self._apply_nag_suppressions()
 
-sub2937->op2939
-op2939->op2941
+sub2939->op2941
 op2941->op2943
 op2943->op2945
 op2945->op2947
@@ -234,8 +233,9 @@ op2951->op2953
 op2953->op2955
 op2955->op2957
 op2957->op2959
-op2959->sub2961
-sub2961->sub2963
+op2959->op2961
+op2961->sub2963
+sub2963->sub2965
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -245,17 +245,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-31T04:39:13Z -->
-        <!-- Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205 -->
+        <!-- Generated at (UTC): 2026-08-31T13:28:12Z -->
+        <!-- Generated from Git commit: b3e8e68506f0876844b61ba1bd1458011767df3e -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-31T04:39:13Z">2026-08-31T04:39:13Z</time>
+            Generated at (UTC): <time datetime="2026-08-31T13:28:12Z">2026-08-31T13:28:12Z</time>
           </p>
           <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
-            Source commit: <code>60339b8cdb299c90a338930b9fa72f3410600205</code>
+            Source commit: <code>b3e8e68506f0876844b61ba1bd1458011767df3e</code>
           </p>
           <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
-            Flow content SHA-256: <code>0603d4b49a828900</code>
+            Flow content SHA-256: <code>2fc9fefd42037d3d</code>
           </p>
           <div id="canvas"></div>
         </div>

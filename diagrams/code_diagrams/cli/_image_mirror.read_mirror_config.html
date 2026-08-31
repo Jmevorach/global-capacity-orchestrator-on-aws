@@ -2,9 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-31T04:39:13Z">
-        <meta name="gco-source-commit" content="60339b8cdb299c90a338930b9fa72f3410600205">
-        <meta name="gco-flow-digest" content="75649c03e67d00a8">
+        <meta name="gco-generated-at" content="2026-08-31T13:28:12Z">
+        <meta name="gco-source-commit" content="b3e8e68506f0876844b61ba1bd1458011767df3e">
+        <meta name="gco-flow-digest" content="28a16d15fd4d27f2">
         <title>Volcano image-mirror config read (project-scoped ECR namespace default, #139)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -208,30 +208,30 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op6275=>operation: 'Return ``{enabled, ecr_namespace}`` from cdk.json ``volcano_image_mirror``.\n\n    Defaults to disabled / ``<project_name>/dockerhub`` (``gco/dockerhub`` for\n    the stock project) when the block is absent, so a second deployment mirrors\n    into its own ECR namespace (#139).\n    Used by the deploy path to decide whether to auto-mirror. (The cdk.json key\n    is still named ``volcano_image_mirror`` — Volcano is the only consumer today\n    — but the mirror itself is general; see :func:`collect_source_refs`.)\n    '
-op6280=>operation: with open(cdk_json_path, encoding='utf-8') as f:
+        <div><textarea id="code" style="width: 100%;" rows="11">op6277=>operation: 'Return ``{enabled, ecr_namespace}`` from cdk.json ``volcano_image_mirror``.\n\n    Defaults to disabled / ``<project_name>/dockerhub`` (``gco/dockerhub`` for\n    the stock project) when the block is absent, so a second deployment mirrors\n    into its own ECR namespace (#139).\n    Used by the deploy path to decide whether to auto-mirror. (The cdk.json key\n    is still named ``volcano_image_mirror`` — Volcano is the only consumer today\n    — but the mirror itself is general; see :func:`collect_source_refs`.)\n    '
+op6282=>operation: with open(cdk_json_path, encoding='utf-8') as f:
     ctx = json.load(f).get('context', {}) or {}
-cond6277=>condition: exception raised?
-cond6282=>condition: except (OSError, json.JSONDecodeError)
-io6289=>inputoutput: output: {'enabled': False, 'ecr_namespace': _DEFAULT_NAMESPACE}
-e6287=>end: end function return
-op6295=>operation: default_namespace = f"{ctx.get('project_name') or 'gco'}/dockerhub"
-op6297=>operation: block = ctx.get('volcano_image_mirror') or {}
-op6299=>operation: namespace = str(block.get('ecr_namespace', default_namespace)).strip('/') or default_namespace
-io6304=>inputoutput: output: {'enabled': bool(block.get('enabled', False)), 'ecr_namespace': namespace}
-e6302=>end: end function return
+cond6279=>condition: exception raised?
+cond6284=>condition: except (OSError, json.JSONDecodeError)
+io6291=>inputoutput: output: {'enabled': False, 'ecr_namespace': _DEFAULT_NAMESPACE}
+e6289=>end: end function return
+op6297=>operation: default_namespace = f"{ctx.get('project_name') or 'gco'}/dockerhub"
+op6299=>operation: block = ctx.get('volcano_image_mirror') or {}
+op6301=>operation: namespace = str(block.get('ecr_namespace', default_namespace)).strip('/') or default_namespace
+io6306=>inputoutput: output: {'enabled': bool(block.get('enabled', False)), 'ecr_namespace': namespace}
+e6304=>end: end function return
 
-op6275->op6280
-op6280->cond6277
-cond6277(yes)->cond6282
-cond6282(yes)->io6289
-io6289->e6287
-cond6282(no)->op6295
-op6295->op6297
+op6277->op6282
+op6282->cond6279
+cond6279(yes)->cond6284
+cond6284(yes)->io6291
+io6291->e6289
+cond6284(no)->op6297
 op6297->op6299
-op6299->io6304
-io6304->e6302
-cond6277(no)->op6295
+op6299->op6301
+op6301->io6306
+io6306->e6304
+cond6279(no)->op6297
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -241,17 +241,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-31T04:39:13Z -->
-        <!-- Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205 -->
+        <!-- Generated at (UTC): 2026-08-31T13:28:12Z -->
+        <!-- Generated from Git commit: b3e8e68506f0876844b61ba1bd1458011767df3e -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-31T04:39:13Z">2026-08-31T04:39:13Z</time>
+            Generated at (UTC): <time datetime="2026-08-31T13:28:12Z">2026-08-31T13:28:12Z</time>
           </p>
           <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
-            Source commit: <code>60339b8cdb299c90a338930b9fa72f3410600205</code>
+            Source commit: <code>b3e8e68506f0876844b61ba1bd1458011767df3e</code>
           </p>
           <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
-            Flow content SHA-256: <code>75649c03e67d00a8</code>
+            Flow content SHA-256: <code>28a16d15fd4d27f2</code>
           </p>
           <div id="canvas"></div>
         </div>

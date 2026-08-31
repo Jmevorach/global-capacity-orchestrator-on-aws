@@ -2,9 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-31T04:39:13Z">
-        <meta name="gco-source-commit" content="60339b8cdb299c90a338930b9fa72f3410600205">
-        <meta name="gco-flow-digest" content="d927ca67f736b96f">
+        <meta name="gco-generated-at" content="2026-08-31T13:28:12Z">
+        <meta name="gco-source-commit" content="b3e8e68506f0876844b61ba1bd1458011767df3e">
+        <meta name="gco-flow-digest" content="39d4ecc974d4bd85">
         <title>Helm release-set validation (charts.yaml expected set, deployed vs absent)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -208,28 +208,28 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op7292=>operation: 'Validate exact Helm state and Kubernetes convergence for every release.'
-op7294=>operation: configurations, enabled_releases = _release_configurations(event)
-op7296=>operation: release_evidence: list[dict[str, Any]] = []
-op7298=>operation: failures: list[str] = []
-op7300=>operation: expected_resources = 0
-op7302=>operation: validated_resources = 0
-op7304=>operation: validated_releases = 0
-op7306=>operation: deadline = time.monotonic() + HELM_VALIDATION_TOTAL_TIMEOUT_SECONDS
-op7308=>operation: gateway_crd_evidence: list[dict[str, Any]] = []
-cond7311=>condition: if LBC_CHART_NAME in enabled_releases
-op7318=>operation: gateway_crd_evidence = _validate_gateway_crds(kubeconfig, deadline)
-cond7315=>condition: exception raised?
-cond7320=>condition: except _ValidationTimeout
-sub7324=>subroutine: raise
-cond7326=>condition: except Exception as exc
-sub7330=>subroutine: raise RuntimeError(f'pinned Gateway CRD validation failed: {_bounded_diagnostic(exc, 800)}') from exc
-op7335=>operation: gateway_resource_count = sum((item['object_count'] for item in gateway_crd_evidence))
-op7337=>operation: expected_resources += gateway_resource_count
-op7339=>operation: validated_resources += gateway_resource_count
-cond7345=>condition: for release, config in configurations
-op7349=>operation: enabled = release in enabled_releases
-op7352=>operation: chart, version, namespace = _release_metadata(release, config)
+        <div><textarea id="code" style="width: 100%;" rows="11">op7294=>operation: 'Validate exact Helm state and Kubernetes convergence for every release.'
+op7296=>operation: configurations, enabled_releases = _release_configurations(event)
+op7298=>operation: release_evidence: list[dict[str, Any]] = []
+op7300=>operation: failures: list[str] = []
+op7302=>operation: expected_resources = 0
+op7304=>operation: validated_resources = 0
+op7306=>operation: validated_releases = 0
+op7308=>operation: deadline = time.monotonic() + HELM_VALIDATION_TOTAL_TIMEOUT_SECONDS
+op7310=>operation: gateway_crd_evidence: list[dict[str, Any]] = []
+cond7313=>condition: if LBC_CHART_NAME in enabled_releases
+op7320=>operation: gateway_crd_evidence = _validate_gateway_crds(kubeconfig, deadline)
+cond7317=>condition: exception raised?
+cond7322=>condition: except _ValidationTimeout
+sub7326=>subroutine: raise
+cond7328=>condition: except Exception as exc
+sub7332=>subroutine: raise RuntimeError(f'pinned Gateway CRD validation failed: {_bounded_diagnostic(exc, 800)}') from exc
+op7337=>operation: gateway_resource_count = sum((item['object_count'] for item in gateway_crd_evidence))
+op7339=>operation: expected_resources += gateway_resource_count
+op7341=>operation: validated_resources += gateway_resource_count
+cond7347=>condition: for release, config in configurations
+op7351=>operation: enabled = release in enabled_releases
+op7354=>operation: chart, version, namespace = _release_metadata(release, config)
 if enabled:
     resource_count = _validate_enabled_release(release, chart, version, namespace, kubeconfig, deadline)
     state = 'deployed'
@@ -241,21 +241,20 @@ else:
     state = 'absent'
 release_evidence.append({'release': release, 'namespace': namespace, 'chart': chart, 'version': version, 'enabled': enabled, 'status': state, 'resource_count': resource_count})
 validated_releases += 1
-cond7351=>condition: exception raised?
-cond7354=>condition: except _ValidationTimeout as exc
-sub7358=>subroutine: failures.append(f'{release}: {_bounded_diagnostic(exc, 600)}')
-sub7360=>subroutine: break
-cond7362=>condition: except Exception as exc
-sub7366=>subroutine: failures.append(f'{release}: {_bounded_diagnostic(exc, 600)}')
-cond7374=>condition: if failures
-op7378=>operation: shown = failures[:8]
-cond7381=>operation: shown.append(f'... and {len(failures) - len(shown)} more failure(s)') if  len(failures) > len(shown)
-op7391=>operation: summary = f'validated {validated_releases}/{len(configurations)} releases; ' + '; '.join(shown)
-sub7393=>subroutine: raise RuntimeError(_bounded_diagnostic(summary))
-io7401=>inputoutput: output: {'status': 'validated', 'DeploymentToken': event.get('DeploymentToken'), 'expected_release_count': len(configurations), 'validated_release_count': validated_releases, 'expected_resource_count': expected_resources, 'validated_resource_count': validated_resources, 'enabled_release_count': len(enabled_releases), 'disabled_release_count': len(configurations) - len(enabled_releases), 'gateway_crd_bundles': gateway_crd_evidence, 'releases': release_evidence}
-e7399=>end: end function return
+cond7353=>condition: exception raised?
+cond7356=>condition: except _ValidationTimeout as exc
+sub7360=>subroutine: failures.append(f'{release}: {_bounded_diagnostic(exc, 600)}')
+sub7362=>subroutine: break
+cond7364=>condition: except Exception as exc
+sub7368=>subroutine: failures.append(f'{release}: {_bounded_diagnostic(exc, 600)}')
+cond7376=>condition: if failures
+op7380=>operation: shown = failures[:8]
+cond7383=>operation: shown.append(f'... and {len(failures) - len(shown)} more failure(s)') if  len(failures) > len(shown)
+op7393=>operation: summary = f'validated {validated_releases}/{len(configurations)} releases; ' + '; '.join(shown)
+sub7395=>subroutine: raise RuntimeError(_bounded_diagnostic(summary))
+io7403=>inputoutput: output: {'status': 'validated', 'DeploymentToken': event.get('DeploymentToken'), 'expected_release_count': len(configurations), 'validated_release_count': validated_releases, 'expected_resource_count': expected_resources, 'validated_resource_count': validated_resources, 'enabled_release_count': len(enabled_releases), 'disabled_release_count': len(configurations) - len(enabled_releases), 'gateway_crd_bundles': gateway_crd_evidence, 'releases': release_evidence}
+e7401=>end: end function return
 
-op7292->op7294
 op7294->op7296
 op7296->op7298
 op7298->op7300
@@ -263,37 +262,38 @@ op7300->op7302
 op7302->op7304
 op7304->op7306
 op7306->op7308
-op7308->cond7311
-cond7311(yes)->op7318
-op7318->cond7315
-cond7315(yes)->cond7320
-cond7320(yes)->sub7324
-cond7320(no)->cond7326
-cond7326(yes)->sub7330
-cond7326(no)->op7335
-op7335->op7337
+op7308->op7310
+op7310->cond7313
+cond7313(yes)->op7320
+op7320->cond7317
+cond7317(yes)->cond7322
+cond7322(yes)->sub7326
+cond7322(no)->cond7328
+cond7328(yes)->sub7332
+cond7328(no)->op7337
 op7337->op7339
-op7339->cond7345
-cond7345(yes)->op7349
-op7349->op7352
-op7352->cond7351
-cond7351(yes)->cond7354
-cond7354(yes)->sub7358
-sub7358->sub7360
-cond7354(no)->cond7362
-cond7362(yes)->sub7366
-sub7366->cond7345
-cond7362(no)->cond7345
-cond7351(no)->cond7345
-cond7345(no)->cond7374
-cond7374(yes)->op7378
-op7378->cond7381
-cond7381->op7391
-op7391->sub7393
-cond7374(no)->io7401
-io7401->e7399
-cond7315(no)->op7335
-cond7311(no)->cond7345
+op7339->op7341
+op7341->cond7347
+cond7347(yes)->op7351
+op7351->op7354
+op7354->cond7353
+cond7353(yes)->cond7356
+cond7356(yes)->sub7360
+sub7360->sub7362
+cond7356(no)->cond7364
+cond7364(yes)->sub7368
+sub7368->cond7347
+cond7364(no)->cond7347
+cond7353(no)->cond7347
+cond7347(no)->cond7376
+cond7376(yes)->op7380
+op7380->cond7383
+cond7383->op7393
+op7393->sub7395
+cond7376(no)->io7403
+io7403->e7401
+cond7317(no)->op7337
+cond7313(no)->cond7347
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -303,17 +303,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-31T04:39:13Z -->
-        <!-- Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205 -->
+        <!-- Generated at (UTC): 2026-08-31T13:28:12Z -->
+        <!-- Generated from Git commit: b3e8e68506f0876844b61ba1bd1458011767df3e -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-31T04:39:13Z">2026-08-31T04:39:13Z</time>
+            Generated at (UTC): <time datetime="2026-08-31T13:28:12Z">2026-08-31T13:28:12Z</time>
           </p>
           <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
-            Source commit: <code>60339b8cdb299c90a338930b9fa72f3410600205</code>
+            Source commit: <code>b3e8e68506f0876844b61ba1bd1458011767df3e</code>
           </p>
           <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
-            Flow content SHA-256: <code>d927ca67f736b96f</code>
+            Flow content SHA-256: <code>39d4ecc974d4bd85</code>
           </p>
           <div id="canvas"></div>
         </div>
