@@ -620,8 +620,8 @@ class SwarmRunner:
             writer.finish(state="cancelled")
             raise
         except Exception as exc:  # noqa: BLE001 — a driver bug must not kill the swarm
-            current = self._backend.load_session(child_id)
-            consumed = len(current.get("iterations", [])) if current is not None else 0
+            # Persist the standard abort transition before settling the slot.
+            consumed = self._terminate_child_session(child_id)
             self._settle_slot(slot, consumed=consumed, status="failed")
             writer.finish(state="failed", error=str(exc))
 

@@ -392,8 +392,10 @@ class BedrockCapacityAdvisor:
                 try:
                     stats = store.get_statistics(instance_type, region)
                 except Exception as e:
-                    logger.debug("Historical stats lookup failed: %s", e)
-                    return context
+                    logger.debug(
+                        "Historical stats lookup failed for %s in %s: %s", instance_type, region, e
+                    )
+                    continue
                 spot_stats = stats.get("metrics", {}).get("spot_score")
                 if not spot_stats:
                     continue
@@ -567,7 +569,7 @@ IMPORTANT DISCLAIMERS:
                     details.append(f"spot availability {entry['spot_placement_score']:.0%}")
                 if entry.get("spot_price_ratio") is not None:
                     details.append(f"spot/on-demand price ratio {entry['spot_price_ratio']:.2f}")
-                if entry.get("capacity_block_trend"):
+                if entry.get("capacity_block_trend") is not None:
                     details.append(f"block trend {entry['capacity_block_trend']:+.2f}")
                 details.append(f"queue depth {entry.get('queue_depth', 'N/A')}")
                 gpu_util = entry.get("gpu_utilization")

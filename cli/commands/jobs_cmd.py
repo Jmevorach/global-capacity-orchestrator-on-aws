@@ -75,12 +75,18 @@ def submit_job(
     formatter = get_output_formatter(config)
     job_manager = get_job_manager(config)
 
-    # Parse labels
+    # Parse and validate labels at the CLI boundary. Silently dropping a
+    # malformed value would submit a differently labelled workload than the
+    # operator requested; values may still contain additional ``=`` bytes.
     labels = {}
     for lbl in label:
-        if "=" in lbl:
-            k, v = lbl.split("=", 1)
-            labels[k] = v
+        key, separator, value = lbl.partition("=")
+        if not separator or not key:
+            raise click.BadParameter(
+                "labels must use key=value with a non-empty key",
+                param_hint="--label",
+            )
+        labels[key] = value
 
     if check_policy:
         _run_pre_submit_policy_check(
@@ -191,12 +197,18 @@ def submit_job_direct(
     formatter = get_output_formatter(config)
     job_manager = get_job_manager(config)
 
-    # Parse labels
+    # Parse and validate labels at the CLI boundary. Silently dropping a
+    # malformed value would submit a differently labelled workload than the
+    # operator requested; values may still contain additional ``=`` bytes.
     labels = {}
     for lbl in label:
-        if "=" in lbl:
-            k, v = lbl.split("=", 1)
-            labels[k] = v
+        key, separator, value = lbl.partition("=")
+        if not separator or not key:
+            raise click.BadParameter(
+                "labels must use key=value with a non-empty key",
+                param_hint="--label",
+            )
+        labels[key] = value
 
     try:
         formatter.print_info(f"Submitting directly to cluster in {region} via kubectl...")
@@ -282,12 +294,18 @@ def submit_job_sqs(
     formatter = get_output_formatter(config)
     job_manager = get_job_manager(config)
 
-    # Parse labels
+    # Parse and validate labels at the CLI boundary. Silently dropping a
+    # malformed value would submit a differently labelled workload than the
+    # operator requested; values may still contain additional ``=`` bytes.
     labels = {}
     for lbl in label:
-        if "=" in lbl:
-            k, v = lbl.split("=", 1)
-            labels[k] = v
+        key, separator, value = lbl.partition("=")
+        if not separator or not key:
+            raise click.BadParameter(
+                "labels must use key=value with a non-empty key",
+                param_hint="--label",
+            )
+        labels[key] = value
 
     try:
         # Auto-select region if requested
@@ -1397,7 +1415,13 @@ def check_policy(
 @click.argument("manifest_path", type=click.Path(exists=True))
 @click.option("--region", "-r", required=True, help="Target region for job execution")
 @click.option("--namespace", "-n", default="gco-jobs", help="Kubernetes namespace")
-@click.option("--priority", "-p", default=0, help="Job priority (0-100, higher = more important)")
+@click.option(
+    "--priority",
+    "-p",
+    type=click.IntRange(0, 100),
+    default=0,
+    help="Job priority (0-100, higher = more important)",
+)
 @click.option("--label", "-l", multiple=True, help="Add labels (key=value)")
 @pass_config
 def submit_job_queue(
@@ -1428,12 +1452,18 @@ def submit_job_queue(
 
     formatter = get_output_formatter(config)
 
-    # Parse labels
+    # Parse and validate labels at the CLI boundary. Silently dropping a
+    # malformed value would submit a differently labelled workload than the
+    # operator requested; values may still contain additional ``=`` bytes.
     labels = {}
     for lbl in label:
-        if "=" in lbl:
-            k, v = lbl.split("=", 1)
-            labels[k] = v
+        key, separator, value = lbl.partition("=")
+        if not separator or not key:
+            raise click.BadParameter(
+                "labels must use key=value with a non-empty key",
+                param_hint="--label",
+            )
+        labels[key] = value
 
     try:
         # Load manifest

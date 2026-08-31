@@ -411,8 +411,8 @@ class ImageManager:
         df_path = (ctx / dockerfile).resolve()
         if not df_path.exists() or not df_path.is_file():
             raise FileNotFoundError(f"Dockerfile not found: {df_path} (relative to {ctx})")
-        # Confine the Dockerfile to the build context.
-        if not str(df_path).startswith(str(ctx)):
+        # Use path components: /tmp/app-evil has the string prefix /tmp/app.
+        if not df_path.is_relative_to(ctx):
             raise ValueError(f"Dockerfile must live inside the build context: {df_path}")
 
         runtime = self._runtime_or_error()

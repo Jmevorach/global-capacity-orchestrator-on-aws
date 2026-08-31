@@ -1413,7 +1413,7 @@ def _make_tool_wrapper(
         args = dict(kwargs)
         started = time.monotonic()
         try:
-            result = await tool_dispatcher(tool_name, args, ctx)
+            result = await tool_dispatcher(tool_name, dict(args), ctx)
         except Exception as exc:
             duration_ms = max(int((time.monotonic() - started) * 1000), 0)
             error_message = f"{type(exc).__name__}: {exc}"[:200]
