@@ -56,13 +56,16 @@ python diagrams/generate.py --code-only
 python diagrams/generate.py --infra-only
 
 # A single target for local diagnosis
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \\
 python diagrams/code_diagrams/generate.py \\
     --target lambda/analytics-presigned-url/handler.py:lambda_handler
 
 # HTML only (skip Playwright and remove older PNGs for selected targets)
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \\
 python diagrams/code_diagrams/generate.py --skip-png
 
 # Don't insert/refresh the ``# Flowchart:`` markers in source files
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \\
 python diagrams/code_diagrams/generate.py --skip-marker
 
 # Remove every existing marker from the source tree and exit

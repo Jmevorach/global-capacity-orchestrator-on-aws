@@ -352,7 +352,7 @@ Regenerate the full architecture and every per-stack view with [`python diagrams
 
 </details>
 
-Flowcharts of Lambda handlers, CLI commands, stack constructors, and MCP control paths live under [`diagrams/code_diagrams/`](diagrams/code_diagrams/README.md). They can be generated with [`python diagrams/code_diagrams/generate.py`](./diagrams/code_diagrams/generate.py). New functions in scripts can have diagrams generated for them by appending to [`diagrams/code_diagrams/_targets.py`](./diagrams/code_diagrams/_targets.py).
+Flowcharts of Lambda handlers, CLI commands, stack constructors, and MCP control paths live under [`diagrams/code_diagrams/`](diagrams/code_diagrams/README.md). Regenerate them through the [canonical two-commit workflow](diagrams/README.md#quick-reference), which records an exact source commit without creating a self-referential SHA. Add newly charted functions to [`diagrams/code_diagrams/_targets.py`](./diagrams/code_diagrams/_targets.py).
 
 > A regional stack can be deployed to any CloudFormation Region known to the installed AWS SDK. Add or remove Regions in `deployment_regions.regional`; all configured Regions must belong to one AWS partition, and GCO imposes no count limit.
 

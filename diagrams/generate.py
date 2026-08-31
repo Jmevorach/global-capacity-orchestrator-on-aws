@@ -44,6 +44,26 @@ _MARKER_BODY_RE = re.compile(
 MarkerPointer = tuple[str, str, str | None]
 
 
+def _shared_source_copy_issues(project_root: Path, target_sources: set[str]) -> list[str]:
+    """Require every checked-in shared Lambda copy to equal its target source."""
+    issues: list[str] = []
+    for source, copies in LAMBDA_SHARED_SOURCE_TARGETS.items():
+        if source not in target_sources:
+            continue
+        canonical_path = project_root / source
+        if not canonical_path.is_file():
+            issues.append(f"missing canonical shared source: {source}")
+            continue
+        canonical = canonical_path.read_bytes()
+        for copy in copies:
+            copy_path = project_root / copy
+            if not copy_path.is_file():
+                issues.append(f"missing shared source copy: {copy}")
+            elif copy_path.read_bytes() != canonical:
+                issues.append(f"shared source copy drifted: {copy} != {source}")
+    return issues
+
+
 def _marker_pointer_issues(
     source: str,
     expected: set[MarkerPointer],
@@ -207,6 +227,7 @@ def _code_artifact_contract(project_root: Path) -> list[str]:
             issues.append(str(exc))
 
     allowed_marker_sources = {target.source for target in TARGETS}
+    issues.extend(_shared_source_copy_issues(project_root, allowed_marker_sources))
     for source, copies in LAMBDA_SHARED_SOURCE_TARGETS.items():
         if source in allowed_marker_sources:
             allowed_marker_sources.update(copies)

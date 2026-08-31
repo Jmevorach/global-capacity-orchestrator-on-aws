@@ -23,7 +23,7 @@ CDK views or invent a draw.io/PowerPoint/SVG provenance when refreshing them.
 | [gco_ref_architecture_part2.png](gco_ref_architecture_part2.png) | Regional EKS architecture | Curated rendered PNG; editable source unavailable in this repository |
 | [gco_ref_architecture_part3.png](gco_ref_architecture_part3.png) | Security controls and request flow | Curated rendered PNG; editable source unavailable in this repository |
 | [`diagrams/infra_diagrams/`](../diagrams/infra_diagrams/README.md) | CDK-derived stack and aggregate topology | Reproducible structure via `python diagrams/generate.py --infra-only` |
-| [`diagrams/code_diagrams/`](../diagrams/code_diagrams/README.md) | Per-function control flow | Regenerate with a fixed `SOURCE_DATE_EPOCH` through `diagrams/generate.py` |
+| [`diagrams/code_diagrams/`](../diagrams/code_diagrams/README.md) | Per-function control flow | Regenerate with fixed `SOURCE_DATE_EPOCH` and exact `GCO_DIAGRAM_SOURCE_COMMIT` through `diagrams/generate.py` |
 
 ## MCP Server Screenshots
 

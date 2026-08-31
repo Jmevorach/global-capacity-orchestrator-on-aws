@@ -53,6 +53,7 @@ python diagrams/generate.py --code-only
 python diagrams/generate.py --infra-only
 
 # Direct code-generator maintenance operations
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
 python diagrams/code_diagrams/generate.py --skip-png
 python diagrams/code_diagrams/generate.py --strip-markers
 ```

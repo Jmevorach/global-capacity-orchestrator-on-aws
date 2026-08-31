@@ -28,6 +28,7 @@ partition change would.
 from __future__ import annotations
 
 import uuid
+from unittest.mock import patch
 
 import boto3
 import pytest
@@ -96,8 +97,16 @@ class TestCapacityPoller:
         monkeypatch.setenv("CAPACITY_BLOCK_LONG_DURATION_HOURS", "0")
         handler = load_lambda_module("capacity-poller")
 
-        assert handler.lambda_handler({}, None)["written"] == 1
+        # Floci rejects every EC2 capacity API. Inject one authoritative empty
+        # Spot History response so this integration test can still exercise the
+        # real DynamoDB write while isolating the long-probe toggle contract.
+        with patch.object(handler, "_spot_price_summary", return_value=(None, 0)):
+            result = handler.lambda_handler({}, None)
+
+        assert result["written"] == 1
+        assert result["errors"] == 0
         (item,) = boto3.resource("dynamodb").Table(history_table).scan()["Items"]
+        assert item["az_count"] == 0
         assert "capacity_blocks_long_available" not in item
         assert "capacity_blocks_long_total" not in item
 

@@ -1068,7 +1068,9 @@ class TestDeliverWebhookEdgeCases:
         def handler(status: int):
             async def receive(reader, writer):
                 request = await reader.readuntil(b"\r\n\r\n")
-                requests.append(request.decode("ascii"))
+                requests.append(  # nosemgrep: python.django.security.injection.ssrf.ssrf-injection-requests.ssrf-injection-requests -- test-only loopback TLS server captures its own request
+                    request.decode("ascii")
+                )
                 reason = "OK" if status == 200 else "Service Unavailable"
                 body = b"ok"
                 writer.write(

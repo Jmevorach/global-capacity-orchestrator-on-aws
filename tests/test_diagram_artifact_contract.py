@@ -7,8 +7,13 @@ from pathlib import Path
 from PIL import Image
 
 from diagrams.code_diagrams._targets import TARGETS
-from diagrams.generate import _marker_pointer_issues, check_diagram_contract
+from diagrams.generate import (
+    _marker_pointer_issues,
+    _shared_source_copy_issues,
+    check_diagram_contract,
+)
 from diagrams.infra_diagrams._catalog import INFRA_DIAGRAM_NAMES
+from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -93,6 +98,24 @@ def test_source_marker_contract_rejects_wrong_or_missing_artifact_pointers() -> 
         expected,
         "thing.py",
     )
+
+
+def test_shared_copy_provenance_is_part_of_standalone_contract(tmp_path: Path) -> None:
+    source = "lambda/proxy-shared/proxy_utils.py"
+    copies = LAMBDA_SHARED_SOURCE_TARGETS[source]
+    canonical = tmp_path / source
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"canonical marker and source\n")
+    for copy in copies:
+        copy_path = tmp_path / copy
+        copy_path.parent.mkdir(parents=True, exist_ok=True)
+        copy_path.write_bytes(canonical.read_bytes())
+
+    assert _shared_source_copy_issues(tmp_path, {source}) == []
+    (tmp_path / copies[0]).write_bytes(b"drifted provenance\n")
+    assert _shared_source_copy_issues(tmp_path, {source}) == [
+        f"shared source copy drifted: {copies[0]} != {source}"
+    ]
 
 
 def test_required_high_value_code_flows_remain_catalogued() -> None:

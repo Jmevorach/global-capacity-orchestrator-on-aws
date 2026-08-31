@@ -24,21 +24,22 @@ with a hierarchical, grouped-by-top-level-directory index so the
 listing reflects the actual project layout.
 
 Usage:
-    python diagrams/code_diagrams/generate.py           # all targets
-    python diagrams/code_diagrams/generate.py --target lambda/analytics-presigned-url/handler.py:lambda_handler
-    python diagrams/code_diagrams/generate.py --skip-png
-    python diagrams/code_diagrams/generate.py --skip-marker  # don't touch source files
+    GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/code_diagrams/generate.py
+    GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/code_diagrams/generate.py --target lambda/analytics-presigned-url/handler.py:lambda_handler
+    GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/code_diagrams/generate.py --skip-png
+    GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/code_diagrams/generate.py --skip-marker
+    python diagrams/code_diagrams/generate.py --strip-markers
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-# Add project root to path so this script can be run standalone
-# (``python diagrams/code_diagrams/generate.py``) without a prior
+# Add project root to path so direct script invocation works without a prior
 # ``pip install -e .``. The project root is two parents up.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -48,8 +49,8 @@ from diagrams.code_diagrams._renderer import (  # noqa: E402
     write_readme,
 )
 from diagrams.code_diagrams._source_marker import (  # noqa: E402
+    SENTINEL,
     strip_all_markers,
-    strip_markers_from,
     upsert_markers,
 )
 from diagrams.code_diagrams._targets import TARGETS, Target  # noqa: E402
@@ -59,38 +60,58 @@ from diagrams.code_diagrams._timestamp import (  # noqa: E402
 )
 from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS  # noqa: E402
 
+_MARKER_BYTES_RE = re.compile(
+    rb"(?:\r?\n)?# <" + re.escape(SENTINEL.encode()) + rb"> BEGIN[^\r\n]*\r?\n.*?"
+    rb"# <" + re.escape(SENTINEL.encode()) + rb"> END(?:\r?\n){2}",
+    re.DOTALL,
+)
+
+
+def _without_generated_marker(source: bytes) -> bytes:
+    """Remove only the generated marker bytes; preserve every other byte."""
+    return _MARKER_BYTES_RE.sub(b"", source)
+
 
 def _verify_targets_match_source_commit(
     *, project_root: Path, targets: list[Target], source_commit: str
 ) -> None:
-    """Require marker-stripped target sources to equal ``source_commit``.
+    """Require marker-excluded target bytes to equal a real Git commit."""
+    object_type = subprocess.run(  # noqa: S603 — fixed Git command, hex-only ref
+        ["git", "cat-file", "-t", source_commit],
+        cwd=project_root,
+        capture_output=True,
+        check=False,
+    )
+    if object_type.returncode != 0:
+        detail = object_type.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"GCO_DIAGRAM_SOURCE_COMMIT {source_commit} does not resolve: {detail}")
+    if object_type.stdout.strip() != b"commit":
+        actual_type = object_type.stdout.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"GCO_DIAGRAM_SOURCE_COMMIT {source_commit} is a {actual_type}, not a commit"
+        )
 
-    Generated marker blocks are intentionally excluded because generation
-    rewrites them with provenance. Every executable/charted source byte must
-    already exist in the named commit, making the provenance statement true.
-    """
     mismatches: list[str] = []
     for source in sorted({target.source for target in targets}):
         result = subprocess.run(  # noqa: S603 — fixed Git command and catalog paths
             ["git", "show", f"{source_commit}:{source}"],
             cwd=project_root,
             capture_output=True,
-            text=True,
             check=False,
         )
         if result.returncode != 0:
+            detail = result.stderr.decode(errors="replace").strip()
             raise RuntimeError(
-                f"cannot read {source} from GCO_DIAGRAM_SOURCE_COMMIT "
-                f"{source_commit}: {result.stderr.strip()}"
+                f"cannot read {source} from GCO_DIAGRAM_SOURCE_COMMIT {source_commit}: {detail}"
             )
-        current = (project_root / source).read_text(encoding="utf-8")
-        if strip_markers_from(current) != strip_markers_from(result.stdout):
+        current = (project_root / source).read_bytes()
+        if _without_generated_marker(current) != _without_generated_marker(result.stdout):
             mismatches.append(source)
     if mismatches:
         raise RuntimeError(
-            "charted source differs from GCO_DIAGRAM_SOURCE_COMMIT after "
-            f"marker removal: {mismatches}. Commit substantive source changes "
-            "first, then regenerate from that commit."
+            "charted source bytes differ from GCO_DIAGRAM_SOURCE_COMMIT after "
+            f"removing only generated markers: {mismatches}. Commit substantive "
+            "source changes first, then regenerate from that commit."
         )
 
 

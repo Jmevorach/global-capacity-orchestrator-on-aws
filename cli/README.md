@@ -96,5 +96,6 @@ under [`diagrams/code_diagrams/cli/`](../diagrams/code_diagrams/README.md).
 | `srp_authenticate` ([Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/what-is-amazon-cognito.html) SRP auth for Studio login) | [HTML](../diagrams/code_diagrams/cli/analytics_user_mgmt.srp_authenticate.html) · [PNG](../diagrams/code_diagrams/cli/analytics_user_mgmt.srp_authenticate.png) |
 | `fetch_studio_url` (`/studio/login` presigned-URL poll) | [HTML](../diagrams/code_diagrams/cli/analytics_user_mgmt.fetch_studio_url.html) · [PNG](../diagrams/code_diagrams/cli/analytics_user_mgmt.fetch_studio_url.png) |
 
-Regenerate with `python diagrams/code_diagrams/generate.py` after
-editing any of the charted functions' control flow.
+Regenerate through the
+[canonical two-commit diagram workflow](../diagrams/README.md#quick-reference)
+after editing any charted control flow.

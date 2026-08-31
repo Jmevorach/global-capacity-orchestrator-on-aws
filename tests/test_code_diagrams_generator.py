@@ -85,6 +85,7 @@ upsert_markers = source_marker_mod.upsert_markers
 strip_markers_from = source_marker_mod.strip_markers_from
 strip_all_markers = source_marker_mod.strip_all_markers
 _ruff_format = source_marker_mod._ruff_format
+_update_marker_file = source_marker_mod._update_file
 render_readme = readme_mod.render_readme
 generation_timestamp_utc = timestamp_mod.generation_timestamp_utc
 generation_source_commit = timestamp_mod.generation_source_commit
@@ -670,26 +671,55 @@ class TestRenderReadme:
 generate_mod = _load("_cd_generate", _CD_DIR / "generate.py")
 _sync_shared_lambda_copies = generate_mod._sync_shared_lambda_copies
 _verify_targets_match_source_commit = generate_mod._verify_targets_match_source_commit
+_without_generated_marker = generate_mod._without_generated_marker
 
 
 class TestSourceCommitVerification:
+    @staticmethod
+    def _fake_git_run(committed: bytes, *, object_type: bytes = b"commit") -> object:
+        def run(args, **_kwargs):
+            if args[1:3] == ["cat-file", "-t"]:
+                return SimpleNamespace(returncode=0, stdout=object_type + b"\n", stderr=b"")
+            assert args[1] == "show"
+            return SimpleNamespace(returncode=0, stdout=committed, stderr=b"")
+
+        return run
+
+    def test_markerless_source_round_trips_byte_for_byte(self, tmp_path: Path) -> None:
+        original = b"import os\n\n\ndef f():\n    return True\n"
+        source = tmp_path / "example.py"
+        source.write_bytes(original)
+        stem = tmp_path / "diagrams" / "code_diagrams" / "example.f"
+        rendered = RenderedTarget(
+            target=Target(source="example.py", function="f"),
+            html_path=stem.with_suffix(".html"),
+            png_path=stem.with_suffix(".png"),
+            generated_at="2026-08-30T12:00:00Z",
+            source_commit="a" * 40,
+        )
+
+        assert _update_marker_file(
+            source_path=source,
+            results=[rendered],
+            project_root=tmp_path,
+        )
+        assert _without_generated_marker(source.read_bytes()) == original
+
     def test_generated_markers_do_not_change_source_identity(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        committed = "# café\ndef f():\n    return True\n".encode()
         source = tmp_path / "example.py"
-        source.write_text(
-            "# <pyflowchart-code-diagram> BEGIN - generated\n"
-            "# metadata\n"
-            "# <pyflowchart-code-diagram> END\n"
-            "def f():\n    return True\n",
-            encoding="utf-8",
+        source.write_bytes(
+            b"# <pyflowchart-code-diagram> BEGIN - generated\n"
+            b"# metadata\n"
+            b"# <pyflowchart-code-diagram> END\n\n" + committed
         )
-        run = lambda *args, **kwargs: SimpleNamespace(  # noqa: E731
-            returncode=0,
-            stdout="def f():\n    return True\n",
-            stderr="",
+        monkeypatch.setattr(
+            generate_mod.subprocess,
+            "run",
+            self._fake_git_run(committed),
         )
-        monkeypatch.setattr(generate_mod.subprocess, "run", run)
 
         _verify_targets_match_source_commit(
             project_root=tmp_path,
@@ -697,22 +727,54 @@ class TestSourceCommitVerification:
             source_commit="a" * 40,
         )
 
-    def test_uncommitted_charted_source_is_rejected(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("committed", "working"),
+        (
+            (
+                b"def f():\n    return True\n\ndef g():\n    return True\n",
+                b"def f():\n    return True\n\n\ndef g():\n    return True\n",
+            ),
+            (
+                b"def f():\n    return True\n",
+                b"def f():\r\n    return True\r\n",
+            ),
+            (
+                b"def f():\n    return True\n",
+                b"def f():\n    return False\n",
+            ),
+        ),
+    )
+    def test_any_uncommitted_source_byte_is_rejected(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        committed: bytes,
+        working: bytes,
     ) -> None:
         source = tmp_path / "example.py"
-        source.write_text("def f():\n    return False\n", encoding="utf-8")
+        source.write_bytes(working)
         monkeypatch.setattr(
             generate_mod.subprocess,
             "run",
-            lambda *args, **kwargs: SimpleNamespace(
-                returncode=0,
-                stdout="def f():\n    return True\n",
-                stderr="",
-            ),
+            self._fake_git_run(committed),
         )
 
         with pytest.raises(RuntimeError, match="Commit substantive source changes first"):
+            _verify_targets_match_source_commit(
+                project_root=tmp_path,
+                targets=[Target(source="example.py", function="f")],
+                source_commit="a" * 40,
+            )
+
+    def test_non_commit_git_object_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            generate_mod.subprocess,
+            "run",
+            self._fake_git_run(b"", object_type=b"tree"),
+        )
+        with pytest.raises(RuntimeError, match="is a tree, not a commit"):
             _verify_targets_match_source_commit(
                 project_root=tmp_path,
                 targets=[Target(source="example.py", function="f")],

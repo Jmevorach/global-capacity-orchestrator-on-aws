@@ -97,5 +97,6 @@ JavaScript can't run.
 | `tls-certificate-manager` | [HTML](../diagrams/code_diagrams/lambda/tls-certificate-manager/handler.lambda_handler.html) · [PNG](../diagrams/code_diagrams/lambda/tls-certificate-manager/handler.lambda_handler.png) |
 | `tls-shared.get_backend_http_pool` | [HTML](../diagrams/code_diagrams/lambda/tls-shared/backend_tls.get_backend_http_pool.html) · [PNG](../diagrams/code_diagrams/lambda/tls-shared/backend_tls.get_backend_http_pool.png) |
 
-Regenerate with `python diagrams/code_diagrams/generate.py` after
-editing a handler's control flow.
+Regenerate through the
+[canonical two-commit diagram workflow](../diagrams/README.md#quick-reference)
+after editing a handler's control flow.

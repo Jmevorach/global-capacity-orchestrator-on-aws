@@ -694,15 +694,12 @@ process.
     `python diagrams/infra_diagrams/generate.py` to refresh.
   - `diagrams/code_diagrams/` — per-function control-flow charts
     (Lambda handlers, CLI entry points) rendered with pyflowchart +
-    Playwright. Run `python diagrams/code_diagrams/generate.py` to
-    refresh; the script auto-inserts a generated marker block at the
-    top of every source file it charts with both the flowchart path and
-    the invocation-wide UTC generation timestamp. The same timestamp
-    appears in HTML metadata/visible content, PNG pixels, and the
-    generated README. A normal run intentionally refreshes that wall-clock
-    metadata even when source is unchanged; set a fixed integer
-    `SOURCE_DATE_EPOCH` for byte-reproducible output. Add new targets by
-    editing `diagrams/code_diagrams/_targets.py`.
+    Playwright. Use the [canonical two-commit workflow](diagrams/README.md#quick-reference):
+    commit charted source first, regenerate with a fixed `SOURCE_DATE_EPOCH`
+    and exact `GCO_DIAGRAM_SOURCE_COMMIT`, then commit derived artifacts.
+    Generated marker blocks, HTML/PNG, and the index carry both values plus a
+    flow-content digest. Add new targets by editing
+    `diagrams/code_diagrams/_targets.py`.
 - Keep it up-to-date with code changes
 
 ## Code Review Guidelines
