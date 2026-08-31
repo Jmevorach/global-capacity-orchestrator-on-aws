@@ -2060,8 +2060,8 @@ class TestGCOAWSClientCallApi:
     """Tests for call_api method with improved error handling."""
 
     def test_max_attempts_one_surfaces_first_504(self):
-        """call_api forwards a one-attempt budget and surfaces the first 504."""
-        from cli.aws_client import ApiEndpoint, GCOAWSClient
+        """call_api forwards a one-attempt budget and preserves the first 504."""
+        from cli.aws_client import ApiEndpoint, APIRequestError, GCOAWSClient
 
         with patch("cli.aws_client.get_config") as mock_config:
             mock_config.return_value = MagicMock(cache_ttl_seconds=300)
@@ -2078,7 +2078,7 @@ class TestGCOAWSClientCallApi:
                     reason="Gateway Timeout",
                     text="",
                 )
-                mock_504.json.return_value = {}
+                mock_504.json.return_value = {"message": "Endpoint request timed out"}
                 mock_200 = MagicMock(status_code=200, ok=True)
                 mock_200.json.return_value = {"data": "test"}
                 mock_request.side_effect = [mock_504, mock_200]
@@ -2091,13 +2091,14 @@ class TestGCOAWSClientCallApi:
                 )
                 client._cache_timestamp = time.time()
 
-                with pytest.raises(RuntimeError, match="504 Gateway Timeout"):
+                with pytest.raises(APIRequestError, match="Endpoint request timed out") as error:
                     client.call_api(
                         "GET",
                         "/api/v1/test",
                         max_attempts=1,
                     )
 
+                assert error.value.status_code == 504
                 assert mock_request.call_count == 1
 
     def test_call_api_success(self):

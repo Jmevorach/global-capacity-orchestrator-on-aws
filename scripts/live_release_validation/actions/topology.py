@@ -10,6 +10,7 @@ from ..checks.topology import (
     _bounded_topology_evidence,
     _converge_region_addons,
     _health_stability_samples,
+    _health_warmup_samples,
     _metrics_reachability_samples,
     _queue_counts,
 )
@@ -136,6 +137,11 @@ def action_topology(ctx: RunContext) -> dict[str, Any]:
                 raise RuntimeError(f"Direct regional API endpoint is absent in {region}")
             regional_urls[region] = endpoint_url
 
+    health_warmup_samples = _health_warmup_samples(
+        ctx,
+        global_url=global_url,
+        regional_urls=regional_urls,
+    )
     health_samples = _health_stability_samples(
         ctx,
         global_url=global_url,
@@ -199,6 +205,7 @@ def action_topology(ctx: RunContext) -> dict[str, Any]:
         "clusters": clusters,
         "convergence": convergence,
         "alb_https_targets": alb_https_targets,
+        "health_warmup_samples": health_warmup_samples,
         "health_samples": health_samples,
         "metrics_samples": metrics_samples,
         "global_api": global_api,

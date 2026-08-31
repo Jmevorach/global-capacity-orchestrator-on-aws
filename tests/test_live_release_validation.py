@@ -1820,32 +1820,195 @@ class TestDeterministicTopologyReadiness:
 
         environment.ctx.aws_client.call_api.assert_not_called()
 
-    def test_first_504_fails_without_consuming_lucky_second_response(self) -> None:
+    def test_first_504_is_checkpointed_as_warmup_before_strict_rounds(self) -> None:
+        from cli.aws_client import APIRequestError
+
         environment = self._environment()
-        healthy = {
-            "status": "healthy",
+        default_call = environment.ctx.aws_client.call_api.side_effect
+        failed_once = False
+
+        def call_api(*, method: str, path: str, region: str | None, max_attempts: int):
+            nonlocal failed_once
+            if path == "/api/v1/health" and region is None and not failed_once:
+                failed_once = True
+                raise APIRequestError(504, "Endpoint request timed out")
+            return default_call(
+                method=method,
+                path=path,
+                region=region,
+                max_attempts=max_attempts,
+            )
+
+        environment.ctx.aws_client.call_api.side_effect = call_api
+
+        result = self._invoke(environment)
+
+        health_calls = [
+            call
+            for call in environment.ctx.aws_client.call_api.call_args_list
+            if call.kwargs["path"] == "/api/v1/health"
+        ]
+        assert len(health_calls) == 9
+        assert all(call.kwargs["max_attempts"] == 1 for call in health_calls)
+        warmup = environment.ctx.checkpoint.state["topology_health_warmup_samples"]
+        assert len(warmup) == 3
+        assert warmup[0]["scope"] == "global"
+        assert warmup[0]["payload"] is None
+        assert warmup[0]["status_code"] == 504
+        assert "Endpoint request timed out" in warmup[0]["error"]
+        assert warmup[1]["scope"] == "global" and warmup[1]["error"] is None
+        assert warmup[2]["scope"] == "regional" and warmup[2]["error"] is None
+        assert len(result["health_samples"]) == 6
+
+    def test_warmup_resume_preserves_evidence_and_remaining_budget(self) -> None:
+        environment = self._environment()
+        previous = {
+            "scope": "global",
+            "region": None,
+            "endpoint": "https://global.example.test",
+            "attempt": 1,
             "timestamp": "2026-07-18T00:00:00+00:00",
-            "region": "us-east-1",
-            "cluster_id": "gco-live-us-east-1",
+            "latency_seconds": 28.0,
+            "payload": None,
+            "error": "APIRequestError: API request failed: Endpoint request timed out",
+            "status_code": 504,
+            "retryable": True,
         }
-        environment.ctx.aws_client.call_api.side_effect = [
-            RuntimeError("API request failed: 504 Gateway Timeout"),
-            healthy,
+        environment.ctx.checkpoint.state["topology_health_warmup_samples"] = [previous]
+
+        result = self._invoke(environment)
+
+        warmup = environment.ctx.checkpoint.state["topology_health_warmup_samples"]
+        assert warmup[0] == previous
+        global_attempts = [sample["attempt"] for sample in warmup if sample["scope"] == "global"]
+        assert global_attempts == [1, 2]
+        assert len(result["health_samples"]) == 6
+
+    def test_exhausted_checkpointed_warmup_budget_is_not_reset(self) -> None:
+        environment = self._environment()
+        environment.ctx.checkpoint.state["topology_health_warmup_samples"] = [
+            {
+                "scope": "global",
+                "region": None,
+                "endpoint": "https://global.example.test",
+                "attempt": attempt,
+                "timestamp": "2026-07-18T00:00:00+00:00",
+                "latency_seconds": 28.0,
+                "payload": None,
+                "error": "APIRequestError: API request failed: Gateway timeout",
+                "status_code": 504,
+                "retryable": True,
+            }
+            for attempt in range(1, 4)
         ]
 
-        with pytest.raises(RuntimeError, match="504 Gateway Timeout"):
+        with pytest.raises(RuntimeError, match="attempt budget is exhausted"):
             self._invoke(environment)
 
-        environment.ctx.aws_client.call_api.assert_called_once_with(
-            method="GET",
-            path="/api/v1/health",
-            region=None,
-            max_attempts=1,
+        environment.ctx.aws_client.call_api.assert_not_called()
+        assert len(environment.ctx.checkpoint.state["topology_health_warmup_samples"]) == 3
+
+    def test_strict_round_still_fails_after_successful_warmup(self) -> None:
+        environment = self._environment()
+        default_call = environment.ctx.aws_client.call_api.side_effect
+        health_calls = 0
+
+        def call_api(*, method: str, path: str, region: str | None, max_attempts: int):
+            nonlocal health_calls
+            if path == "/api/v1/health":
+                health_calls += 1
+                if health_calls == 3:
+                    raise RuntimeError("API request failed: 504 Gateway Timeout")
+            return default_call(
+                method=method,
+                path=path,
+                region=region,
+                max_attempts=max_attempts,
+            )
+
+        environment.ctx.aws_client.call_api.side_effect = call_api
+
+        with pytest.raises(RuntimeError, match="Health stability call failed.*round 1"):
+            self._invoke(environment)
+
+        warmup = environment.ctx.checkpoint.state["topology_health_warmup_samples"]
+        assert len(warmup) == 2 and all(sample["error"] is None for sample in warmup)
+        strict = environment.ctx.checkpoint.state["topology_health_samples"]
+        assert len(strict) == 1
+        assert strict[0]["scope"] == "global" and "504" in strict[0]["error"]
+        assert not any(event.startswith("metrics:") for event in environment.events)
+
+    def test_health_warmup_exhaustion_fails_before_stability_samples(self) -> None:
+        environment = self._environment()
+        environment.ctx.aws_client.call_api.side_effect = [
+            RuntimeError("API request failed: 504 Gateway Timeout"),
+            RuntimeError("API request failed: 504 Gateway Timeout"),
+            RuntimeError("API request failed: 504 Gateway Timeout"),
+        ]
+
+        with pytest.raises(RuntimeError, match="Health warm-up call failed.*attempt 3"):
+            self._invoke(environment)
+
+        warmup = environment.ctx.checkpoint.state["topology_health_warmup_samples"]
+        assert len(warmup) == 3
+        assert all("504" in sample["error"] for sample in warmup)
+        assert "topology_health_samples" not in environment.ctx.checkpoint.state
+
+    def test_nonretryable_health_warmup_error_fails_once(self) -> None:
+        environment = self._environment()
+        environment.ctx.aws_client.call_api.side_effect = RuntimeError(
+            "API request failed: 403 Forbidden"
         )
-        samples = environment.ctx.checkpoint.state["topology_health_samples"]
-        assert len(samples) == 1
-        assert samples[0]["payload"] is None
-        assert "504" in samples[0]["error"]
+
+        with pytest.raises(RuntimeError, match="Health warm-up call failed.*attempt 1"):
+            self._invoke(environment)
+
+        assert environment.ctx.aws_client.call_api.call_count == 1
+        warmup = environment.ctx.checkpoint.state["topology_health_warmup_samples"]
+        assert len(warmup) == 1
+        assert "403" in warmup[0]["error"]
+
+    def test_structured_nonretryable_status_overrides_transient_body_text(self) -> None:
+        from cli.aws_client import APIRequestError
+
+        environment = self._environment()
+        environment.ctx.aws_client.call_api.side_effect = APIRequestError(
+            403, "Service unavailable"
+        )
+
+        with pytest.raises(RuntimeError, match="Health warm-up call failed.*attempt 1"):
+            self._invoke(environment)
+
+        assert environment.ctx.aws_client.call_api.call_count == 1
+        sample = environment.ctx.checkpoint.state["topology_health_warmup_samples"][0]
+        assert sample["status_code"] == 403
+        assert sample["retryable"] is False
+
+    def test_malformed_checkpoint_outcome_cannot_skip_warmup(self) -> None:
+        environment = self._environment()
+        environment.ctx.checkpoint.state["topology_health_warmup_samples"] = [
+            {
+                "scope": "global",
+                "region": None,
+                "endpoint": "https://global.example.test",
+                "attempt": 1,
+                "timestamp": "2026-07-18T00:00:00+00:00",
+                "latency_seconds": 1.0,
+                "payload": {
+                    "status": "healthy",
+                    "timestamp": "2026-07-18T00:00:00+00:00",
+                    "region": "us-east-1",
+                    "cluster_id": "gco-live-us-east-1",
+                },
+                "status_code": 200,
+                "retryable": False,
+            }
+        ]
+
+        with pytest.raises(RuntimeError, match="checkpoint outcome is incomplete"):
+            self._invoke(environment)
+
+        environment.ctx.aws_client.call_api.assert_not_called()
 
     def test_malformed_200_fails_immediately_and_is_checkpointed(self) -> None:
         environment = self._environment()
@@ -1857,11 +2020,11 @@ class TestDeterministicTopologyReadiness:
             "cluster_id": "gco-live-us-east-1",
         }
 
-        with pytest.raises(RuntimeError, match="Malformed health response"):
+        with pytest.raises(RuntimeError, match="Malformed health warm-up response"):
             self._invoke(environment)
 
         assert environment.ctx.aws_client.call_api.call_count == 1
-        sample = environment.ctx.checkpoint.state["topology_health_samples"][0]
+        sample = environment.ctx.checkpoint.state["topology_health_warmup_samples"][0]
         assert sample["payload"]["timestamp"] == "not-a-timestamp"
         assert "timestamp" in sample["error"]
 
@@ -1873,8 +2036,11 @@ class TestDeterministicTopologyReadiness:
 
         calls = environment.ctx.aws_client.call_api.call_args_list
         health_calls = [item for item in calls if item.kwargs["path"] == "/api/v1/health"]
-        assert len(health_calls) == 9
+        assert len(health_calls) == 12
         assert [item.kwargs["region"] for item in health_calls] == [
+            None,
+            "us-east-1",
+            "us-west-2",
             None,
             "us-east-1",
             "us-west-2",
