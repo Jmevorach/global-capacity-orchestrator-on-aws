@@ -637,7 +637,12 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
         record: dict[str, Any],
     ) -> dict[str, Any]:
         deadline = time.monotonic() + self.settings.readiness_timeout_seconds
+        heartbeat_at = float("-inf")
         while True:
+            if time.monotonic() >= deadline:
+                raise ManagedInferenceValidationError(
+                    "managed inference endpoint ownership did not appear before timeout"
+                )
             item = self._strong_get(record)
             if item is not None:
                 if not self._is_owned(item):
@@ -648,16 +653,17 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
                 record["owned"] = True
                 self._set_phase(record, "ownership-confirmed")
                 return item
-            if time.monotonic() >= deadline:
+            heartbeat_at = self.keep_cluster_tunnel_alive(
+                record,
+                heartbeat_at,
+                deadline=deadline,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise ManagedInferenceValidationError(
                     "managed inference endpoint ownership did not appear before timeout"
                 )
-            time.sleep(
-                min(
-                    float(self.settings.poll_interval_seconds),
-                    max(0.0, deadline - time.monotonic()),
-                )
-            )
+            time.sleep(min(float(self.settings.poll_interval_seconds), remaining))
 
     def ensure_owned_endpoint(
         self,

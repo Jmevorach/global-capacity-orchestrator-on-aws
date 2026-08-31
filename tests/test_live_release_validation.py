@@ -16,6 +16,7 @@ import sys
 import threading
 import uuid
 import zlib
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +49,7 @@ from scripts.live_release_validation.inventory import ecr as inventory_ecr
 from scripts.live_release_validation.inventory import scanners as inventory_scanners
 from scripts.live_release_validation.ownership import dynamodb_streams as ownership_streams
 from scripts.live_release_validation.ownership import ecr as ownership_ecr
+from scripts.live_release_validation.ownership import efs_automatic_backups as ownership_efs_backups
 from scripts.live_release_validation.ownership import log_groups as ownership_log_groups
 from scripts.live_release_validation.ownership import stacks as ownership_stacks
 from tests._live_validation_patching import patch_live_validation_helper
@@ -4221,6 +4223,7 @@ class TestFinalInventoryReconciliation:
             "regional": {},
             "global_accelerators": [],
         }
+        accepted_efs = [{"recovery_point_arn": "accepted"}]
 
         with (
             patch_live_validation_helper("_verify_target_stack_absence", return_value=residual),
@@ -4241,6 +4244,11 @@ class TestFinalInventoryReconciliation:
                 "_strip_expected_pending_kms",
                 return_value=(project_inventory, []),
             ),
+            patch.object(
+                actions_final_inventory,
+                "_strip_accepted_efs_automatic_backup_recovery_points",
+                return_value=(project_inventory, accepted_efs),
+            ),
             patch_live_validation_helper("summarize_project_resources", return_value={}),
             patch_live_validation_helper("project_resources_are_absent", return_value=True),
             pytest.raises(RuntimeError, match="Target stacks remain after teardown"),
@@ -4248,6 +4256,10 @@ class TestFinalInventoryReconciliation:
             actions_final_inventory.action_final_inventory(ctx)
 
         assert ctx.report.final_inventory["stack_absence"] == residual
+        assert (
+            ctx.report.final_inventory["accepted_efs_automatic_backup_recovery_points"]
+            == accepted_efs
+        )
         assert ctx.checkpoint.state["final_inventory"]["stack_absence"] == residual
         assert ctx.checkpoint.destroyed is False
         assert "destroy" not in ctx.checkpoint.completed_actions
@@ -4792,7 +4804,11 @@ class TestLocalOnlyRuntime:
 
         assert isinstance(settings, RunSettings)
         assert settings.inference_enabled is True
-        identity = settings.identity()["inference"]
+        full_identity = settings.identity()
+        assert full_identity["extra_cdk_context"] == {
+            "gco_live_validation_disable_efs_automatic_backups": "true"
+        }
+        identity = full_identity["inference"]
         assert identity["selected_region"] == "us-east-1"
         assert [runtime["framework"] for runtime in identity["runtimes"]] == ["vllm", "tgi"]
         assert identity["runtimes"][0]["image"].endswith("b" * 64)
@@ -5543,6 +5559,322 @@ class TestStripExpiredTableStreams:
         assert inventory == snapshot
 
 
+class TestAcceptedEfsAutomaticBackupRecoveryPoints:
+    _REGION = "us-east-1"
+    _ACCOUNT = "123456789012"
+    _PROJECT = "gco-live"
+    _VAULT = "aws/efs/automatic-backup-vault"
+    _VAULT_ARN = "arn:aws:backup:us-east-1:123456789012:backup-vault:aws/efs/automatic-backup-vault"
+    _POINT_ARN = (
+        "arn:aws:backup:us-east-1:123456789012:recovery-point:11111111-2222-3333-4444-555555555555"
+    )
+    _EFS_ARN = "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-1234567890abcdef0"
+
+    def _ctx_and_clients(
+        self,
+        *,
+        source_exists: bool = False,
+        policy_effect: str = "Deny",
+        vault_name: str | None = None,
+        efs_error_code: str = "FileSystemNotFound",
+    ):
+        selected_vault = vault_name or self._VAULT
+        vault_arn = (
+            self._VAULT_ARN
+            if selected_vault == self._VAULT
+            else f"arn:aws:backup:{self._REGION}:{self._ACCOUNT}:backup-vault:{selected_vault}"
+        )
+        backup = MagicMock()
+        backup.describe_recovery_point.return_value = {
+            "RecoveryPointArn": self._POINT_ARN,
+            "BackupVaultName": selected_vault,
+            "BackupVaultArn": vault_arn,
+            "SourceBackupVaultArn": vault_arn,
+            "ResourceType": "EFS",
+            "ResourceName": f"{self._PROJECT}-efs-{self._REGION}",
+            "ResourceArn": self._EFS_ARN,
+            "Status": "COMPLETED",
+            "CalculatedLifecycle": {"DeleteAt": datetime.now(UTC) + timedelta(days=35)},
+        }
+        backup.describe_backup_vault.return_value = {
+            "BackupVaultName": selected_vault,
+            "BackupVaultArn": vault_arn,
+        }
+        backup.get_backup_vault_access_policy.return_value = {
+            "Policy": json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": policy_effect,
+                            "Principal": "*",
+                            "Action": "backup:DeleteRecoveryPoint",
+                            "Resource": "*",
+                        }
+                    ]
+                }
+            )
+        }
+        backup.list_tags.return_value = {"Tags": {constants._RUN_STACK_TAG: "prior-validation-run"}}
+        efs = MagicMock()
+        if source_exists:
+            efs.describe_file_systems.return_value = {
+                "FileSystems": [{"FileSystemId": "fs-1234567890abcdef0"}]
+            }
+        else:
+            efs.describe_file_systems.side_effect = ClientError(
+                {"Error": {"Code": efs_error_code, "Message": "gone"}},
+                "DescribeFileSystems",
+            )
+        ctx = _context()
+        ctx.config.project_name = self._PROJECT
+        ctx.session = MagicMock()
+        ctx.session.get_partition_for_region.return_value = "aws"
+        ctx.session.client.side_effect = lambda service, region_name=None: {
+            "backup": backup,
+            "efs": efs,
+        }[service]
+        return ctx, backup, efs
+
+    def _inventory(
+        self,
+        *,
+        duplicate: bool = False,
+        point_arn: str | None = None,
+    ) -> dict[str, object]:
+        selected_arn = point_arn or self._POINT_ARN
+        points = [selected_arn, selected_arn] if duplicate else [selected_arn]
+        return {
+            "regional": {
+                self._REGION: {
+                    "backup_recovery_points": points,
+                    "tagged_resources": [
+                        {"arn": selected_arn, "tags": {"gco:project": self._PROJECT}}
+                    ],
+                    "dynamodb_tables": [],
+                }
+            }
+        }
+
+    def test_exact_automatic_backup_is_stripped_with_evidence(self):
+        ctx, backup, efs = self._ctx_and_clients()
+        inventory = self._inventory()
+        snapshot = json.loads(json.dumps(inventory))
+
+        cleaned, accepted = (
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, inventory
+            )
+        )
+
+        assert cleaned == {"regional": {}}
+        assert inventory == snapshot
+        assert len(accepted) == 1
+        assert accepted[0]["recovery_point_arn"] == self._POINT_ARN
+        assert accepted[0]["source_file_system_absent"] is True
+        assert accepted[0]["vault_policy_unconditional_delete_deny"] is True
+        assert accepted[0]["validation_run_tag"] == "prior-validation-run"
+        backup.describe_recovery_point.assert_called_once_with(
+            BackupVaultName=self._VAULT,
+            RecoveryPointArn=self._POINT_ARN,
+        )
+        efs.describe_file_systems.assert_called_once_with(FileSystemId="fs-1234567890abcdef0")
+
+    def test_project_owned_resource_name_is_sufficient_when_aws_drops_tags(self):
+        ctx, backup, _efs = self._ctx_and_clients()
+        backup.list_tags.return_value = {"Tags": {}}
+
+        cleaned, accepted = (
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory()
+            )
+        )
+
+        assert cleaned == {"regional": {}}
+        assert accepted[0]["validation_run_tag"] is None
+
+    @pytest.mark.parametrize(
+        ("source_exists", "policy_effect", "vault_name"),
+        [
+            (True, "Deny", None),
+            (False, "Allow", None),
+            (False, "Deny", "other-vault"),
+        ],
+        ids=["live-source", "no-delete-deny", "wrong-vault"],
+    )
+    def test_unproven_shapes_remain_residual(
+        self,
+        source_exists: bool,
+        policy_effect: str,
+        vault_name: str | None,
+    ):
+        ctx, _backup, _efs = self._ctx_and_clients(
+            source_exists=source_exists,
+            policy_effect=policy_effect,
+            vault_name=vault_name,
+        )
+
+        cleaned, accepted = (
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory()
+            )
+        )
+
+        assert accepted == []
+        assert cleaned["regional"][self._REGION]["backup_recovery_points"] == [self._POINT_ARN]
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("RecoveryPointArn", "arn:aws:backup:us-east-1:123456789012:recovery-point:other"),
+            ("BackupVaultArn", "arn:aws:backup:us-east-1:123456789012:backup-vault:other"),
+            ("SourceBackupVaultArn", "arn:aws:backup:us-east-1:123456789012:backup-vault:other"),
+            ("ResourceType", "EC2"),
+            ("Status", "CREATING"),
+            (
+                "ResourceArn",
+                "arn:aws:elasticfilesystem:us-west-2:123456789012:file-system/fs-1234567890abcdef0",
+            ),
+            ("ResourceName", "another-project-efs"),
+        ],
+    )
+    def test_authoritative_identity_mismatches_remain_residual(self, field: str, value: str):
+        ctx, backup, _efs = self._ctx_and_clients()
+        backup.describe_recovery_point.return_value[field] = value
+
+        cleaned, accepted = (
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory()
+            )
+        )
+
+        assert accepted == []
+        assert cleaned["regional"][self._REGION]["backup_recovery_points"] == [self._POINT_ARN]
+
+    @pytest.mark.parametrize(
+        "point_arn",
+        [
+            "arn:aws-us-gov:backup:us-east-1:123456789012:recovery-point:x",
+            "arn:aws:backup:us-west-2:123456789012:recovery-point:x",
+            "arn:aws:backup:us-east-1:999999999999:recovery-point:x",
+        ],
+    )
+    def test_candidate_arn_scope_mismatches_never_trigger_acceptance_calls(self, point_arn: str):
+        ctx, backup, _efs = self._ctx_and_clients()
+
+        cleaned, accepted = (
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory(point_arn=point_arn)
+            )
+        )
+
+        assert accepted == []
+        assert cleaned["regional"][self._REGION]["backup_recovery_points"] == [point_arn]
+        backup.describe_recovery_point.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "delete_at",
+        [None, "2030-01-01T00:00:00Z", datetime(2030, 1, 1)],
+        ids=["missing", "string", "naive"],
+    )
+    def test_scheduled_deletion_requires_an_aware_datetime(self, delete_at):
+        ctx, backup, _efs = self._ctx_and_clients()
+        backup.describe_recovery_point.return_value["CalculatedLifecycle"] = {"DeleteAt": delete_at}
+
+        cleaned, accepted = (
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory()
+            )
+        )
+
+        assert accepted == []
+        assert cleaned["regional"][self._REGION]["backup_recovery_points"] == [self._POINT_ARN]
+
+    def test_malformed_validation_run_tag_remains_residual(self):
+        ctx, backup, _efs = self._ctx_and_clients()
+        backup.list_tags.return_value = {"Tags": {constants._RUN_STACK_TAG: " bad tag "}}
+
+        cleaned, accepted = (
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory()
+            )
+        )
+
+        assert accepted == []
+        assert cleaned["regional"][self._REGION]["backup_recovery_points"] == [self._POINT_ARN]
+
+    def test_unexpected_backup_error_propagates(self):
+        ctx, backup, _efs = self._ctx_and_clients()
+        backup.describe_recovery_point.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+            "DescribeRecoveryPoint",
+        )
+        with pytest.raises(ClientError):
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory()
+            )
+
+    def test_unexpected_efs_error_propagates(self):
+        ctx, _backup, _efs = self._ctx_and_clients(efs_error_code="AccessDeniedException")
+        with pytest.raises(ClientError):
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory()
+            )
+
+    def test_duplicate_candidate_fails_closed(self):
+        ctx, _backup, _efs = self._ctx_and_clients()
+        with pytest.raises(RuntimeError, match="Duplicate or empty"):
+            ownership_efs_backups._strip_accepted_efs_automatic_backup_recovery_points(
+                ctx, self._inventory(duplicate=True)
+            )
+
+    def test_vault_policy_must_be_an_unconditional_exact_delete_deny(self):
+        valid = {
+            "Statement": {
+                "Effect": "Deny",
+                "Principal": {"AWS": "*"},
+                "Action": ["backup:DeleteRecoveryPoint"],
+                "Resource": [self._POINT_ARN],
+            }
+        }
+        assert ownership_efs_backups._policy_has_unconditional_delete_deny(
+            json.dumps(valid), self._POINT_ARN
+        )
+
+        conditional = json.loads(json.dumps(valid))
+        conditional["Statement"]["Condition"] = {"Bool": {"aws:SecureTransport": "false"}}
+        assert not ownership_efs_backups._policy_has_unconditional_delete_deny(
+            json.dumps(conditional), self._POINT_ARN
+        )
+        wildcard_action = json.loads(json.dumps(valid))
+        wildcard_action["Statement"]["Action"] = "backup:*"
+        assert not ownership_efs_backups._policy_has_unconditional_delete_deny(
+            json.dumps(wildcard_action), self._POINT_ARN
+        )
+        scoped_principal = json.loads(json.dumps(valid))
+        scoped_principal["Statement"]["Principal"] = {"AWS": "arn:aws:iam::123456789012:root"}
+        assert not ownership_efs_backups._policy_has_unconditional_delete_deny(
+            json.dumps(scoped_principal), self._POINT_ARN
+        )
+        wrong_resource = json.loads(json.dumps(valid))
+        wrong_resource["Statement"]["Resource"] = (
+            "arn:aws:backup:us-east-1:123:recovery-point:other"
+        )
+        assert not ownership_efs_backups._policy_has_unconditional_delete_deny(
+            json.dumps(wrong_resource), self._POINT_ARN
+        )
+        not_action = json.loads(json.dumps(valid))
+        not_action["Statement"]["NotAction"] = "backup:StartRestoreJob"
+        assert not ownership_efs_backups._policy_has_unconditional_delete_deny(
+            json.dumps(not_action), self._POINT_ARN
+        )
+
+    def test_duplicate_policy_keys_fail_closed(self):
+        with pytest.raises(RuntimeError, match="invalid JSON"):
+            ownership_efs_backups._policy_has_unconditional_delete_deny(
+                '{"Statement": [], "Statement": []}', self._POINT_ARN
+            )
+
+
 class TestActionBaselineCheckpointPurity:
     """``action_baseline`` — report enrichment must not leak into the checkpoint.
 
@@ -5583,13 +5915,18 @@ class TestActionBaselineCheckpointPurity:
         ctx.settings.protected_stack_names = ("CDKToolkit",)
         return ctx
 
-    def _run(self, ctx, inventory):
+    def _run(self, ctx, inventory, *, accepted_efs=None):
         from scripts.live_release_validation.actions import baseline as actions_baseline
 
         with (
             patch.object(actions_baseline, "capture_baseline", return_value=dict(self._BASELINE)),
             patch.object(actions_baseline, "collect_project_resources", return_value=inventory),
             patch.object(actions_baseline, "_topology_regions", return_value=["us-east-1"]),
+            patch.object(
+                actions_baseline,
+                "_strip_accepted_efs_automatic_backup_recovery_points",
+                side_effect=lambda _ctx, candidate: (candidate, list(accepted_efs or [])),
+            ),
         ):
             return actions_baseline.action_baseline(ctx)
 
@@ -5622,6 +5959,25 @@ class TestActionBaselineCheckpointPurity:
         assert "accepted_expired_dynamodb_streams" not in ctx.checkpoint.baseline
         ctx.persist.assert_called()
 
+    def test_accepted_efs_backup_rides_result_not_checkpoint(self):
+        ctx = self._ctx()
+        evidence = {"recovery_point_arn": "arn:aws:backup:us-east-1:123:recovery-point:x"}
+
+        result = self._run(ctx, self._inventory(), accepted_efs=[evidence])
+
+        assert result["accepted_efs_automatic_backup_recovery_points"] == [evidence]
+        assert ctx.checkpoint.baseline == self._BASELINE
+        assert "accepted_efs_automatic_backup_recovery_points" not in ctx.checkpoint.baseline
+        assert ctx.checkpoint.state["baseline_accepted_efs_automatic_backup_recovery_points"] == [
+            evidence
+        ]
+
+        from scripts.live_release_validation.actions import baseline as actions_baseline
+
+        resumed = actions_baseline.action_baseline(ctx)
+        assert resumed["reused_checkpoint_baseline"] is True
+        assert resumed["accepted_efs_automatic_backup_recovery_points"] == [evidence]
+
     def test_live_table_stream_still_fails_the_gate(self):
         """A stream whose parent table exists is genuine residue: hard fail."""
         ctx = self._ctx()
@@ -5647,6 +6003,7 @@ class TestActionBaselineCheckpointPurity:
     def test_clean_account_returns_empty_acceptance(self):
         ctx = self._ctx()
         result = self._run(ctx, self._inventory())
+        assert result["accepted_efs_automatic_backup_recovery_points"] == []
         assert result["accepted_expired_dynamodb_streams"] == []
         assert ctx.checkpoint.baseline == self._BASELINE
 

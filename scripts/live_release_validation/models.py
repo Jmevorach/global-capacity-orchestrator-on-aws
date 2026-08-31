@@ -55,6 +55,8 @@ __all__ = [
 SCHEMA_VERSION = 2
 ActionStatus = Literal["passed", "failed", "skipped"]
 
+_LIVE_VALIDATION_DISABLE_EFS_BACKUPS_CONTEXT = "gco_live_validation_disable_efs_automatic_backups"
+
 
 def utc_now() -> str:
     """Return an RFC 3339-compatible UTC timestamp."""
@@ -177,9 +179,10 @@ class RunSettings:
 
     def extra_cdk_context(self) -> dict[str, str]:
         """Extra ``--context`` pairs every CDK invocation of this run must carry."""
+        context = {_LIVE_VALIDATION_DISABLE_EFS_BACKUPS_CONTEXT: "true"}
         if self.optional_schedulers:
-            return {"helm_enabled_overrides": ",".join(self.optional_schedulers)}
-        return {}
+            context["helm_enabled_overrides"] = ",".join(self.optional_schedulers)
+        return context
 
     def identity(self) -> dict[str, Any]:
         """Return fields that must remain identical across resume attempts."""
@@ -194,6 +197,7 @@ class RunSettings:
             "protected_stack_names": list(self.protected_stack_names),
             "confirm_kms_key_deletion": self.confirm_kms_key_deletion,
             "optional_schedulers": list(self.optional_schedulers),
+            "extra_cdk_context": self.extra_cdk_context(),
         }
         if self.inference_enabled:
             identity["inference"] = self._inference_identity_fields()

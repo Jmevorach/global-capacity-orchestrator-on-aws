@@ -774,6 +774,151 @@ class TestSequentialAndFinallyBehavior:
         assert runner.run_endpoint(plans[0], records[0]) is False
         assert calls == ["absence"]
 
+    def test_ddb_running_wait_keeps_idle_cluster_tunnel_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+        def kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            calls.append((args, kwargs))
+            return 0, "ok\n", ""
+
+        settings = _settings(tmp_path, readiness_timeout_seconds=5, poll_interval_seconds=1)
+        runner, plans, records, _ = _lifecycle(tmp_path, settings=settings, kubectl=kubectl)
+        waiting = _owned_item(settings, plans[0], runner.owner_nonce)
+        waiting["region_status"] = {settings.selected_region: {"state": "pending"}}
+        running = _owned_item(settings, plans[0], runner.owner_nonce)
+        observations = iter((waiting, running))
+        monkeypatch.setattr(runner, "_strong_get", lambda record: next(observations))
+        clock = SimpleNamespace(now=1.0)
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: float(clock.now))
+        monkeypatch.setattr(
+            runtime_module.time,
+            "sleep",
+            lambda seconds: setattr(clock, "now", clock.now + float(seconds)),
+        )
+
+        runner.wait_for_ddb_running(plans[0], records[0])
+
+        assert calls == [
+            (
+                ("--request-timeout=5s", "get", "--raw=/readyz"),
+                {"timeout": 5.0},
+            )
+        ]
+        assert clock.now == 2.0
+        assert records[0]["phase"] == "ddb-running"
+        assert records[0]["tunnel_heartbeats"][0]["healthy"] is True
+
+    def test_owned_record_wait_keeps_idle_cluster_tunnel_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+        def kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            calls.append((args, kwargs))
+            return 0, "ok\n", ""
+
+        settings = _settings(tmp_path, readiness_timeout_seconds=5, poll_interval_seconds=1)
+        runner, plans, records, _ = _lifecycle(tmp_path, settings=settings, kubectl=kubectl)
+        owned = _owned_item(settings, plans[0], runner.owner_nonce)
+        observations = iter((None, owned))
+        monkeypatch.setattr(runner, "_strong_get", lambda record: next(observations))
+        clock = SimpleNamespace(now=1.0)
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: float(clock.now))
+        monkeypatch.setattr(
+            runtime_module.time,
+            "sleep",
+            lambda seconds: setattr(clock, "now", clock.now + float(seconds)),
+        )
+
+        result = runner._wait_for_owned_record(plans[0], records[0])
+
+        assert result is owned
+        assert calls == [
+            (
+                ("--request-timeout=5s", "get", "--raw=/readyz"),
+                {"timeout": 5.0},
+            )
+        ]
+        assert clock.now == 2.0
+        assert records[0]["phase"] == "ownership-confirmed"
+        assert records[0]["tunnel_heartbeats"][0]["healthy"] is True
+
+    @pytest.mark.parametrize("waiter", ["ddb-running", "owned-record"])
+    def test_ddb_only_waits_never_exceed_their_deadline(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        waiter: str,
+    ) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def kubectl(*args: str, **kwargs: Any) -> tuple[int, str, str]:
+            del args
+            calls.append(kwargs)
+            return 0, "ok\n", ""
+
+        settings = _settings(tmp_path, readiness_timeout_seconds=2, poll_interval_seconds=10)
+        runner, plans, records, _ = _lifecycle(tmp_path, settings=settings, kubectl=kubectl)
+        pending = _owned_item(settings, plans[0], runner.owner_nonce)
+        pending["region_status"] = {settings.selected_region: {"state": "pending"}}
+        monkeypatch.setattr(
+            runner,
+            "_strong_get",
+            (lambda record: pending) if waiter == "ddb-running" else (lambda record: None),
+        )
+        clock = SimpleNamespace(now=1.0)
+        sleeps: list[float] = []
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: float(clock.now))
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(float(seconds))
+            clock.now += float(seconds)
+
+        monkeypatch.setattr(runtime_module.time, "sleep", sleep)
+
+        with pytest.raises(ManagedInferenceValidationError, match="before timeout"):
+            if waiter == "ddb-running":
+                runner.wait_for_ddb_running(plans[0], records[0])
+            else:
+                runner._wait_for_owned_record(plans[0], records[0])
+
+        assert calls == [{"timeout": 2.0}]
+        assert sleeps == [2.0]
+        assert clock.now == 3.0
+
+    @pytest.mark.parametrize("waiter", ["ddb-running", "owned-record"])
+    def test_ddb_only_waits_propagate_cancellation_without_sleeping(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        waiter: str,
+    ) -> None:
+        runner, plans, records, _ = _lifecycle(tmp_path)
+        pending = _owned_item(runner.settings, plans[0], runner.owner_nonce)
+        pending["region_status"] = {runner.settings.selected_region: {"state": "pending"}}
+        monkeypatch.setattr(
+            runner,
+            "_strong_get",
+            (lambda record: pending) if waiter == "ddb-running" else (lambda record: None),
+        )
+        monkeypatch.setattr(
+            runner,
+            "keep_cluster_tunnel_alive",
+            lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(runtime_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+        with pytest.raises(KeyboardInterrupt):
+            if waiter == "ddb-running":
+                runner.wait_for_ddb_running(plans[0], records[0])
+            else:
+                runner._wait_for_owned_record(plans[0], records[0])
+
+        assert sleeps == []
+
 
 class TestHpaProof:
     def test_hpa_target_and_bounds_are_exact(
