@@ -2,9 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-30T12:00:00Z">
-        <meta name="gco-source-commit" content="4b55e87c06d00e1d4830ae6a5eb5ed659838513d">
-        <meta name="gco-flow-digest" content="be7de74e1e40612f">
+        <meta name="gco-generated-at" content="2026-08-31T01:51:51Z">
+        <meta name="gco-source-commit" content="5ce0aa3e2158e9e3d73400436774f535794c7525">
+        <meta name="gco-flow-digest" content="40a8474b2b524654">
         <title>gco images build — context validation, login, build, push</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -214,7 +214,7 @@ op4849=>operation: validated_name = self._validate_name(name)
 op4851=>operation: validated_tag = self._validate_tag(tag if tag is not None else self._default_tag())
 op4853=>operation: df_path = (ctx / dockerfile).resolve()
 cond4856=>operation: raise FileNotFoundError(f'Dockerfile not found: {df_path} (relative to {ctx})') if  not df_path.exists() or not df_path.is_file()
-cond4867=>operation: raise ValueError(f'Dockerfile must live inside the build context: {df_path}') if  not str(df_path).startswith(str(ctx))
+cond4867=>operation: raise ValueError(f'Dockerfile must live inside the build context: {df_path}') if  not df_path.is_relative_to(ctx)
 op4877=>operation: runtime = self._runtime_or_error()
 sub4879=>subroutine: self.init(name, retain=retain)
 sub4881=>subroutine: self._check_tag_immutable_collision(validated_name, validated_tag)
@@ -267,17 +267,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
-        <!-- Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d -->
+        <!-- Generated at (UTC): 2026-08-31T01:51:51Z -->
+        <!-- Generated from Git commit: 5ce0aa3e2158e9e3d73400436774f535794c7525 -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
           <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-30T12:00:00Z">2026-08-30T12:00:00Z</time>
+            Generated at (UTC): <time datetime="2026-08-31T01:51:51Z">2026-08-31T01:51:51Z</time>
           </p>
           <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
-            Source commit: <code>4b55e87c06d00e1d4830ae6a5eb5ed659838513d</code>
+            Source commit: <code>5ce0aa3e2158e9e3d73400436774f535794c7525</code>
           </p>
           <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
-            Flow content SHA-256: <code>be7de74e1e40612f</code>
+            Flow content SHA-256: <code>40a8474b2b524654</code>
           </p>
           <div id="canvas"></div>
         </div>
