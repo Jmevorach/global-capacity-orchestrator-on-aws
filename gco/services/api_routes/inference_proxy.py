@@ -27,8 +27,8 @@ from fastapi.responses import StreamingResponse
 from gco.services.inference_store import InferenceEndpointStore, get_inference_endpoint_store
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-31T01:51:51Z
-# Generated from Git commit: 5ce0aa3e2158e9e3d73400436774f535794c7525
+# Generated at (UTC): 2026-08-31T04:39:13Z
+# Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205
 # Flowchart(s) generated from this file:
 #   * ``_resolve_upstream`` -> ``diagrams/code_diagrams/gco/services/api_routes/inference_proxy._resolve_upstream.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/api_routes/inference_proxy._resolve_upstream.png``)

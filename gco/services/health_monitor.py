@@ -38,8 +38,8 @@ from gco.models import HealthStatus, RequestedResources, ResourceThresholds, Res
 from gco.services.structured_logging import configure_structured_logging
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-31T01:51:51Z
-# Generated from Git commit: 5ce0aa3e2158e9e3d73400436774f535794c7525
+# Generated at (UTC): 2026-08-31T04:39:13Z
+# Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205
 # Flowchart(s) generated from this file:
 #   * ``HealthMonitor.get_health_status`` -> ``diagrams/code_diagrams/gco/services/health_monitor.HealthMonitor_get_health_status.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/health_monitor.HealthMonitor_get_health_status.png``)

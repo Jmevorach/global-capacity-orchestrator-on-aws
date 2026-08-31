@@ -98,8 +98,8 @@ from gco.services.manifest_processor import (
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-31T01:51:51Z
-# Generated from Git commit: 5ce0aa3e2158e9e3d73400436774f535794c7525
+# Generated at (UTC): 2026-08-31T04:39:13Z
+# Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205
 # Flowchart(s) generated from this file:
 #   * ``validate_manifest`` -> ``diagrams/code_diagrams/gco/services/queue_processor.validate_manifest.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/queue_processor.validate_manifest.png``)

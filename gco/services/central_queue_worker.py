@@ -23,8 +23,8 @@ from gco.services.structured_logging import sanitize_log_value
 from gco.services.template_store import JobStatus, JobStore
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-31T01:51:51Z
-# Generated from Git commit: 5ce0aa3e2158e9e3d73400436774f535794c7525
+# Generated at (UTC): 2026-08-31T04:39:13Z
+# Generated from Git commit: 60339b8cdb299c90a338930b9fa72f3410600205
 # Flowchart(s) generated from this file:
 #   * ``process_queued_jobs_once`` -> ``diagrams/code_diagrams/gco/services/central_queue_worker.process_queued_jobs_once.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/central_queue_worker.process_queued_jobs_once.png``)
