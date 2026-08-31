@@ -151,7 +151,19 @@ def test_workflow_uses_three_nonempty_shards(workflow: dict[str, Any]) -> None:
     assert job["strategy"]["matrix"]["shard"] == [1, 2, 3]
 
 
-def test_shard_one_owns_whole_repository_policy_checks(workflow: dict[str, Any]) -> None:
+def test_shard_checkout_contains_diagram_source_history(workflow: dict[str, Any]) -> None:
+    """Provenance checks need the recorded source commit, not a depth-1 clone."""
+    checkout = next(
+        step
+        for step in _shard_job(workflow)["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout.get("with", {}).get("fetch-depth") == 0
+
+
+def test_shard_one_owns_whole_repository_policy_checks(
+    workflow: dict[str, Any],
+) -> None:
     """The accelerator policy runs once, independently of pytest sharding."""
     step = next(
         item

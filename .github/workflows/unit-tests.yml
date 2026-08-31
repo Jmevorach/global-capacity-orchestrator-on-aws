@@ -123,7 +123,13 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
       AWS_REGION: us-east-1
     steps:
+      # Diagram provenance tests resolve the exact source commit recorded in
+      # generated markers/artifacts. The default depth-1 checkout contains only
+      # the PR head and cannot prove an older source commit, so this test job
+      # intentionally fetches complete history.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
       # Reclaim ~20-30 GB before the coverage run. Without this the runner's
       # ~14 GB root volume can fill mid-test, and coverage.py's SQLite flush
       # then raises "database or disk is full", which xdist reports as an
