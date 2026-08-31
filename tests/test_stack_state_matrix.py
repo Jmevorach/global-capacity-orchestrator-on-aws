@@ -306,11 +306,11 @@ class TestCloudFormationObservation:
         statuses = MagicMock(side_effect=["UPDATE_IN_PROGRESS", "UPDATE_COMPLETE"])
         with (
             patch.object(manager, "_get_stack_status", statuses),
-            patch("cli.stacks.time.monotonic", side_effect=[0.0, 0.1]),
+            patch("cli.stacks.time.monotonic", side_effect=[0.0, 0.1, 0.2]),
             patch("cli.stacks.time.sleep") as sleep,
         ):
             assert (
-                manager._wait_for_stack_settle(STACK_NAME, timeout=10, stack_identifier=STACK_ID)
+                manager._wait_for_stack_settle(STACK_NAME, timeout=30, stack_identifier=STACK_ID)
                 == "UPDATE_COMPLETE"
             )
         sleep.assert_called_once_with(15.0)

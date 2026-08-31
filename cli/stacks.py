@@ -129,6 +129,8 @@ _CDK_ASSET_CONSUMER_MAX_ATTEMPTS = 3
 _CLOUDFORMATION_DELETE_TIMEOUT_SECONDS = 7200.0
 _CLOUDFORMATION_DELETE_POLL_SECONDS = 15.0
 _CLOUDFORMATION_DELETE_HEARTBEAT_SECONDS = 60.0
+_CLOUDFORMATION_SETTLE_UNKNOWN_TIMEOUT_SECONDS = 60.0
+_CLOUDFORMATION_SETTLE_UNKNOWN_POLL_SECONDS = 5.0
 _BOOTSTRAP_HEALTHY_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE"})
 # CDK's ``prepare-change-set`` mode can return before a fresh CREATE change set
 # is visible through CloudFormation's read path. Poll only that authoritative
@@ -2644,35 +2646,40 @@ class StackManager:
         timeout: float | None = None,
         stack_identifier: str | None = None,
     ) -> str | None:
-        """Poll CloudFormation until ``stack_name`` leaves a ``*_IN_PROGRESS`` state.
-
-        When ``cdk deploy`` dies on a transient client-side error (e.g. a
-        ``read EADDRNOTAVAIL`` socket failure) the CloudFormation operation it
-        started usually keeps running server-side. ``deploy()`` reconciles
-        against CloudFormation, but a single status read taken the instant cdk
-        exits can catch the stack mid-flight (``CREATE_IN_PROGRESS``) and give
-        up only seconds before it would have reached ``CREATE_COMPLETE``. This
-        helper waits out the in-progress window so the reconcile judges the
-        *terminal* state instead of a transient one.
-
-        Returns the terminal status string, the last status seen on timeout, or
-        ``None`` if the status could not be read (so callers treat the unknown
-        case as 'cdk's verdict stands').
-        """
+        """Poll CloudFormation until a stack settles, retrying transient unknown reads."""
         import time
 
         if timeout is None:
             timeout = float(os.environ.get("GCO_CDK_SETTLE_TIMEOUT_SECONDS", "1200"))
         deadline = time.monotonic() + timeout
+        unknown_started: float | None = None
         status = self._get_stack_status(stack_name, stack_identifier)
-        while status is not None and status.endswith("_IN_PROGRESS"):
+        while True:
+            now = time.monotonic()
             if self._cdk_cancel_event.is_set():
                 return status
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(15.0)
+            if status is None:
+                if unknown_started is None:
+                    unknown_started = now
+                unknown_deadline = min(
+                    deadline,
+                    unknown_started + _CLOUDFORMATION_SETTLE_UNKNOWN_TIMEOUT_SECONDS,
+                )
+                if now >= unknown_deadline:
+                    return None
+                time.sleep(
+                    min(
+                        _CLOUDFORMATION_SETTLE_UNKNOWN_POLL_SECONDS,
+                        unknown_deadline - now,
+                    )
+                )
+                status = self._get_stack_status(stack_name, stack_identifier)
+                continue
+            unknown_started = None
+            if not status.endswith("_IN_PROGRESS") or now >= deadline:
+                return status
+            time.sleep(min(15.0, deadline - now))
             status = self._get_stack_status(stack_name, stack_identifier)
-        return status
 
     def _get_latest_stack_event(
         self,
