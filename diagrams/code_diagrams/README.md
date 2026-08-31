@@ -1,7 +1,9 @@
 # GCO Code Flowcharts
 
 <!-- Generated at (UTC): 2026-08-30T12:00:00Z -->
+<!-- Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d -->
 *Generated at (UTC): `2026-08-30T12:00:00Z`.*
+*Generated from Git commit: `4b55e87c06d00e1d4830ae6a5eb5ed659838513d`.*
 
 This directory holds auto-generated control-flow diagrams for the
 Python source files listed below. Each target produces an interactive
@@ -24,23 +26,26 @@ Use the aggregate driver for canonical committed output:
 
 ```bash
 # Full code + infrastructure catalogues at the reviewed timestamp
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py
+SOURCE_DATE_EPOCH=1788091200 GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py
 
 # Read-only artifact/index/marker/PNG contract
 python diagrams/generate.py --check
 
 # One catalogue only
-SOURCE_DATE_EPOCH=1788091200 python diagrams/generate.py --code-only
+SOURCE_DATE_EPOCH=1788091200 GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only
 python diagrams/generate.py --infra-only
 
 # A single target for local diagnosis
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
 python diagrams/code_diagrams/generate.py \
     --target lambda/analytics-presigned-url/handler.py:lambda_handler
 
 # HTML only (skip Playwright and remove older PNGs for selected targets)
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
 python diagrams/code_diagrams/generate.py --skip-png
 
 # Don't insert/refresh the ``# Flowchart:`` markers in source files
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
 python diagrams/code_diagrams/generate.py --skip-marker
 
 # Remove every existing marker from the source tree and exit
@@ -65,12 +70,17 @@ playwright install chromium
 Without Playwright's browser, direct code-generator runs still write HTML and
 remove any older PNG for the selected targets so mixed generation times are
 impossible. Canonical aggregate generation requires ``SOURCE_DATE_EPOCH`` and
-records that one UTC timestamp in HTML, PNG pixels, the catalogue, and source
-markers. Each HTML/PNG pair also displays a deterministic digest of the
-pre-annotation flow HTML, so source-flow changes remain visible even when
-flowchart.js collapses them into the same SVG shape. Fixing the timestamp
-prevents metadata-only churn; neither mechanism promises byte-identical
-Chromium or Graphviz rasterization across toolchain versions or platforms.
+``GCO_DIAGRAM_SOURCE_COMMIT``. Commit substantive source changes first, then
+supply that clean source commit while generating and commit the derived
+artifacts separately; this avoids an impossible self-referential commit SHA.
+The generator verifies every marker-stripped charted source against the supplied
+commit. It records one UTC timestamp and source commit in HTML, PNG pixels, the
+catalogue, and source markers. Each HTML/PNG pair also displays a deterministic
+digest of the pre-annotation flow HTML, so source-flow changes remain visible
+even when flowchart.js collapses them into the same SVG shape. Fixing the
+timestamp prevents metadata-only churn; none of these mechanisms promises
+byte-identical Chromium or Graphviz rasterization across toolchain versions or
+platforms.
 ``python diagrams/generate.py --check`` enforces structural
 contracts; ``tests/test_diagram_artifact_contract.py`` also verifies every PNG
 with Pillow.

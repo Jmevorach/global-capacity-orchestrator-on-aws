@@ -58,6 +58,7 @@ from gco.stacks.nag_suppressions import apply_all_suppressions
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-30T12:00:00Z
+# Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d
 # Flowchart(s) generated from this file:
 #   * ``GCOAnalyticsStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/analytics_stack.GCOAnalyticsStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/analytics_stack.GCOAnalyticsStack___init__.png``)
@@ -65,7 +66,7 @@ from gco.stacks.nag_suppressions import apply_all_suppressions
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/analytics_stack.GCOAnalyticsStack__create_execution_role_and_grants.png``)
 #   * ``GCOAnalyticsStack._create_studio_domain`` -> ``diagrams/code_diagrams/gco/stacks/analytics_stack.GCOAnalyticsStack__create_studio_domain.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/analytics_stack.GCOAnalyticsStack__create_studio_domain.png``)
-# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

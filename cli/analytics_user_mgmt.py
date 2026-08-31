@@ -19,12 +19,13 @@ from typing import Any
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-30T12:00:00Z
+# Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d
 # Flowchart(s) generated from this file:
 #   * ``srp_authenticate`` -> ``diagrams/code_diagrams/cli/analytics_user_mgmt.srp_authenticate.html``
 #     (PNG: ``diagrams/code_diagrams/cli/analytics_user_mgmt.srp_authenticate.png``)
 #   * ``fetch_studio_url`` -> ``diagrams/code_diagrams/cli/analytics_user_mgmt.fetch_studio_url.html``
 #     (PNG: ``diagrams/code_diagrams/cli/analytics_user_mgmt.fetch_studio_url.png``)
-# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

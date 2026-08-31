@@ -25,12 +25,13 @@ from botocore.exceptions import ClientError
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-30T12:00:00Z
+# Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d
 # Flowchart(s) generated from this file:
 #   * ``on_event`` -> ``diagrams/code_diagrams/lambda/helm-installer/teardown_provider.on_event.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/helm-installer/teardown_provider.on_event.png``)
 #   * ``is_complete`` -> ``diagrams/code_diagrams/lambda/helm-installer/teardown_provider.is_complete.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/helm-installer/teardown_provider.is_complete.png``)
-# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

@@ -21,6 +21,7 @@ from .config import GCOConfig, get_config
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-30T12:00:00Z
+# Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d
 # Flowchart(s) generated from this file:
 #   * ``JobManager.submit_job`` -> ``diagrams/code_diagrams/cli/jobs.JobManager_submit_job.html``
 #     (PNG: ``diagrams/code_diagrams/cli/jobs.JobManager_submit_job.png``)
@@ -28,7 +29,7 @@ from .config import GCOConfig, get_config
 #     (PNG: ``diagrams/code_diagrams/cli/jobs.JobManager_submit_job_sqs.png``)
 #   * ``JobManager.get_job_logs`` -> ``diagrams/code_diagrams/cli/jobs.JobManager_get_job_logs.html``
 #     (PNG: ``diagrams/code_diagrams/cli/jobs.JobManager_get_job_logs.png``)
-# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

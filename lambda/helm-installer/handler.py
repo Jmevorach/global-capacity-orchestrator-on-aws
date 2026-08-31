@@ -43,6 +43,7 @@ import yaml
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-30T12:00:00Z
+# Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d
 # Flowchart(s) generated from this file:
 #   * ``lambda_handler`` -> ``diagrams/code_diagrams/lambda/helm-installer/handler.lambda_handler.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/helm-installer/handler.lambda_handler.png``)
@@ -50,7 +51,7 @@ import yaml
 #     (PNG: ``diagrams/code_diagrams/lambda/helm-installer/handler.handle_task.png``)
 #   * ``validate_releases`` -> ``diagrams/code_diagrams/lambda/helm-installer/handler.validate_releases.html``
 #     (PNG: ``diagrams/code_diagrams/lambda/helm-installer/handler.validate_releases.png``)
-# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

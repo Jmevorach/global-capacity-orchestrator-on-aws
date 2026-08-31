@@ -72,10 +72,11 @@ from gco.services.template_store import WebhookStore, get_webhook_store
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-30T12:00:00Z
+# Generated from Git commit: 4b55e87c06d00e1d4830ae6a5eb5ed659838513d
 # Flowchart(s) generated from this file:
 #   * ``WebhookDispatcher._deliver_webhook`` -> ``diagrams/code_diagrams/gco/services/webhook_dispatcher.WebhookDispatcher__deliver_webhook.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/webhook_dispatcher.WebhookDispatcher__deliver_webhook.png``)
-# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> python diagrams/generate.py --code-only``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 
