@@ -8,6 +8,7 @@
 import hashlib
 import io
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -368,12 +369,90 @@ class TestDefaultsAgreeWithCdkJson:
 
 
 class TestDemoCorpus:
-    def test_demo_corpus_is_the_checkouts_docs(self):
+    def test_demo_corpus_is_the_checkouts_docs(self, monkeypatch):
+        monkeypatch.chdir(PROJECT_ROOT)
         paths = demo_corpus_paths()
         assert paths, "a source checkout always carries docs/*.md"
         assert all(path.suffix == ".md" for path in paths)
         assert paths == sorted(paths)
         assert all(path.parent == PROJECT_ROOT / "docs" for path in paths)
+
+    def test_demo_corpus_uses_checkout_cwd_when_module_is_installed(self, monkeypatch):
+        monkeypatch.chdir(PROJECT_ROOT)
+        monkeypatch.setattr(
+            vector_store_module,
+            "__file__",
+            "/venv/lib/python3.14/site-packages/cli/vector_store.py",
+        )
+
+        paths = demo_corpus_paths()
+
+        assert paths
+        assert all(path.parent == PROJECT_ROOT / "docs" for path in paths)
+
+    def test_demo_corpus_rejects_unrelated_git_checkout(self, monkeypatch, tmp_path):
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "demo.md").write_text("demo", encoding="utf-8")
+        for marker in ("cdk.json", "app.py"):
+            (tmp_path / marker).touch()
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "not-gco"\n', encoding="utf-8")
+        subprocess.run(
+            ["git", "init", "--quiet"],
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
+        )
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(VectorStoreError, match="run from a GCO source checkout"):
+            demo_corpus_paths()
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            pytest.param(b'project = "gco-cli"\n', id="project-not-table"),
+            pytest.param(b"\xff", id="non-utf8"),
+        ],
+    )
+    def test_demo_corpus_rejects_invalid_project_metadata(self, monkeypatch, tmp_path, metadata):
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "demo.md").write_text("demo", encoding="utf-8")
+        for marker in ("cdk.json", "app.py"):
+            (tmp_path / marker).touch()
+        (tmp_path / "pyproject.toml").write_bytes(metadata)
+        subprocess.run(
+            ["git", "init", "--quiet"],
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
+        )
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(VectorStoreError, match="run from a GCO source checkout"):
+            demo_corpus_paths()
+
+    def test_demo_corpus_rejects_symlink_escape(self, monkeypatch, tmp_path):
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "external.md").write_text("external", encoding="utf-8")
+        (checkout / "docs").symlink_to(outside, target_is_directory=True)
+        for marker in ("cdk.json", "app.py"):
+            (checkout / marker).touch()
+        (checkout / "pyproject.toml").write_text('[project]\nname = "gco-cli"\n', encoding="utf-8")
+        subprocess.run(
+            ["git", "init", "--quiet"],
+            cwd=checkout,
+            capture_output=True,
+            check=True,
+        )
+        monkeypatch.chdir(checkout)
+
+        with pytest.raises(VectorStoreError, match="regular docs/.* files inside"):
+            demo_corpus_paths()
 
 
 class TestTitanContractAcrossImplementations:
