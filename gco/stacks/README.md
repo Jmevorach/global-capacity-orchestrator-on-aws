@@ -83,5 +83,6 @@ the analytics stack, feature flags inside the regional stack).
 `app.py::main` wires these stacks together — the
 [app.py flowchart](../../diagrams/code_diagrams/app.main.html)
 shows the overall dependency order and the analytics sub-toggle
-gate. Regenerate all of these with
-`python diagrams/code_diagrams/generate.py`.
+gate. Regenerate through the
+[canonical two-commit diagram workflow](../../diagrams/README.md#quick-reference)
+so the generated artifacts record the exact charted-source commit.

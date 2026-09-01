@@ -52,6 +52,16 @@ from ..autopilot import (
 from ..config import GCOConfig
 from ..output import get_output_formatter
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
+# Flowchart(s) generated from this file:
+#   * ``_plan`` -> ``diagrams/code_diagrams/cli/commands/autopilot_cmd._plan.html``
+#     (PNG: ``diagrams/code_diagrams/cli/commands/autopilot_cmd._plan.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
+
 #: claude's own session-resumption flags. When one of these appears in the
 #: passthrough args (after ``--``), the caller has already made a resume
 #: choice and autopilot neither prompts nor injects its own flags.

@@ -96,10 +96,50 @@ class InferenceRuntimeMixin:
             )
         return time.monotonic()
 
+    def _wait_for_owned_record(
+        self,
+        plan: Any,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Wait for the run-owned DDB record while keeping the tunnel active."""
+        deadline = time.monotonic() + self.settings.readiness_timeout_seconds
+        heartbeat_at = float("-inf")
+        while True:
+            if time.monotonic() >= deadline:
+                raise ManagedInferenceValidationError(
+                    "managed inference endpoint ownership did not appear before timeout"
+                )
+            item = self._strong_get(record)
+            if item is not None:
+                if not self._is_owned(item):
+                    raise ManagedInferenceValidationError(
+                        "managed inference endpoint collision detected; refusing ownership"
+                    )
+                self._verify_item_contract(plan, item, record)
+                record["owned"] = True
+                self._set_phase(record, "ownership-confirmed")
+                return item
+            heartbeat_at = self.keep_cluster_tunnel_alive(
+                record,
+                heartbeat_at,
+                deadline=deadline,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ManagedInferenceValidationError(
+                    "managed inference endpoint ownership did not appear before timeout"
+                )
+            time.sleep(min(float(self.settings.poll_interval_seconds), remaining))
+
     def wait_for_ddb_running(self, plan: Any, record: dict[str, Any]) -> None:
         """Require this run's exact DDB record and running regional observation."""
         deadline = time.monotonic() + self.settings.readiness_timeout_seconds
+        heartbeat_at = float("-inf")
         while True:
+            if time.monotonic() >= deadline:
+                raise ManagedInferenceValidationError(
+                    "managed inference DDB running state was not observed before timeout"
+                )
             item = self._strong_get(record)
             if item is not None:
                 if not self._is_owned(item):
@@ -120,16 +160,17 @@ class InferenceRuntimeMixin:
                 ):
                     self._set_phase(record, "ddb-running")
                     return
-            if time.monotonic() >= deadline:
+            heartbeat_at = self.keep_cluster_tunnel_alive(
+                record,
+                heartbeat_at,
+                deadline=deadline,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise ManagedInferenceValidationError(
                     "managed inference DDB running state was not observed before timeout"
                 )
-            time.sleep(
-                min(
-                    float(self.settings.poll_interval_seconds),
-                    max(0.0, deadline - time.monotonic()),
-                )
-            )
+            time.sleep(min(float(self.settings.poll_interval_seconds), remaining))
 
     @staticmethod
     def _ready_condition(container_statuses: Any) -> bool:

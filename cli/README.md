@@ -35,22 +35,32 @@ Click command definitions that wire CLI flags to the business logic above.
 
 | File | Commands |
 |------|----------|
+| `analytics_cmd.py` | `gco analytics ...` |
 | `autopilot_cmd.py` | `gco autopilot` |
-| `capacity_cmd.py` | `gco capacity check`, `status`, `recommend`, `ai-recommend` |
-| `config_cmd.py` | `gco config show`, `set` |
-| `costs_cmd.py` | `gco costs summary`, `regions`, `trend`, `workloads`, `forecast` |
-| `dag_cmd.py` | `gco dag run`, `status` |
-| `files_cmd.py` | `gco files ls`, `download` |
-| `inference_cmd.py` | `gco inference deploy`, `list`, `status`, `scale`, `invoke`, `canary`, etc. |
-| `jobs_cmd.py` | `gco jobs submit`, `submit-sqs`, `submit-direct`, `list`, `logs`, `delete` |
-| `models_cmd.py` | `gco models upload`, `list`, `uri`, `delete` |
-| `storage_cmd.py` | `gco storage list`, `sync` |
-| `nodepools_cmd.py` | `gco nodepools list`, `describe` |
-| `queue_cmd.py` | `gco queue submit`, `list`, `get`, `stats` |
-| `stacks_cmd.py` | `gco stacks deploy`, `deploy-all`, `destroy-all`, `list`, `bootstrap` |
+| `capacity_cmd.py` | `gco capacity ...` |
+| `cluster_cmd.py` | `gco cluster ...` |
+| `config_cmd.py` | `gco config-cmd init`, `show`, `get` |
+| `costs_cmd.py` | `gco costs ...` |
+| `dag_cmd.py` | `gco dag ...` |
+| `examples_cmd.py` | `gco examples ...` |
+| `files_cmd.py` | `gco files ...` |
+| `images_cmd.py` | `gco images ...` |
+| `inference_cmd.py` | `gco inference ...` |
+| `jobs_cmd.py` | `gco jobs ...` |
+| `mission_cmd.py` | `gco mission ...` |
+| `models_cmd.py` | `gco models ...` |
+| `monitoring_cmd.py` | `gco monitoring ...` |
+| `nodepools_cmd.py` | `gco nodepools ...` |
+| `queue_cmd.py` | `gco queue ...` |
+| `release_cmd.py` | `gco release ...` |
+| `stacks_cmd.py` | `gco stacks ...` |
 | `status_cmd.py` | `gco status` |
-| `templates_cmd.py` | `gco templates list`, `get`, `create`, `delete` |
-| `webhooks_cmd.py` | `gco webhooks list`, `create`, `delete`, `test` |
+| `storage_cmd.py` | `gco storage ...` |
+| `swarm_cmd.py` | `gco swarm ...` |
+| `tasks_cmd.py` | `gco tasks ...` |
+| `templates_cmd.py` | `gco templates ...` |
+| `vector_cmd.py` | `gco vector ...` |
+| `webhooks_cmd.py` | `gco webhooks ...` |
 
 ### capacity/
 
@@ -86,5 +96,6 @@ under [`diagrams/code_diagrams/cli/`](../diagrams/code_diagrams/README.md).
 | `srp_authenticate` ([Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/what-is-amazon-cognito.html) SRP auth for Studio login) | [HTML](../diagrams/code_diagrams/cli/analytics_user_mgmt.srp_authenticate.html) · [PNG](../diagrams/code_diagrams/cli/analytics_user_mgmt.srp_authenticate.png) |
 | `fetch_studio_url` (`/studio/login` presigned-URL poll) | [HTML](../diagrams/code_diagrams/cli/analytics_user_mgmt.fetch_studio_url.html) · [PNG](../diagrams/code_diagrams/cli/analytics_user_mgmt.fetch_studio_url.png) |
 
-Regenerate with `python diagrams/code_diagrams/generate.py` after
-editing any of the charted functions' control flow.
+Regenerate through the
+[canonical two-commit diagram workflow](../diagrams/README.md#quick-reference)
+after editing any charted control flow.

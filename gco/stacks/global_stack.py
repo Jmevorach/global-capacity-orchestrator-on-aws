@@ -41,13 +41,14 @@ from gco.stacks.constants import (
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
 # Flowchart(s) generated from this file:
 #   * ``GCOGlobalStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/global_stack.GCOGlobalStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/global_stack.GCOGlobalStack___init__.png``)
 #   * ``GCOGlobalStack._create_image_replication_rule`` -> ``diagrams/code_diagrams/gco/stacks/global_stack.GCOGlobalStack__create_image_replication_rule.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/global_stack.GCOGlobalStack__create_image_replication_rule.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 
@@ -601,10 +602,11 @@ class GCOGlobalStack(Stack):
                     "ec2:DescribeCapacityBlockOfferings",
                     "ec2:DescribeCapacityReservations",
                     "ec2:DescribeAvailabilityZones",
-                    # The poller's region-enablement pre-check probes each
-                    # configured region with a single-region DescribeRegions
-                    # call. Discovered live: without this grant the probe
-                    # fails with UnauthorizedOperation for every region.
+                    # The poller's region-enablement pre-check uses
+                    # DescribeRegions(AllRegions=True, RegionNames=[region])
+                    # from the Lambda's default-Region client. Discovered live:
+                    # without this grant the probe fails with
+                    # UnauthorizedOperation for every configured Region.
                     "ec2:DescribeRegions",
                 ],
                 resources=["*"],

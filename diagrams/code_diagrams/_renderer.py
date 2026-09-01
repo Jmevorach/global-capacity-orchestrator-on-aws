@@ -8,6 +8,7 @@ makes it easy to unit-test the path math without importing Playwright.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import sys
 import warnings
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ class RenderedTarget:
     """``None`` if PNG rendering was skipped or failed."""
     generated_at: str
     """Invocation-wide ISO-8601 UTC generation timestamp."""
+    source_commit: str
+    """Exact Git commit containing the marker-stripped charted source."""
 
 
 def render_all(
@@ -39,6 +42,7 @@ def render_all(
     output_dir: Path,
     render_png: bool,
     generated_at: str,
+    source_commit: str,
 ) -> list[RenderedTarget]:
     """Render every target, returning where each output landed."""
     _require_pyflowchart()
@@ -52,6 +56,7 @@ def render_all(
                 output_dir=output_dir,
                 renderer=renderer,
                 generated_at=generated_at,
+                source_commit=source_commit,
             )
             results.append(result)
         return results
@@ -67,6 +72,7 @@ def _render_one(
     output_dir: Path,
     renderer: _PlaywrightRenderer | None,
     generated_at: str,
+    source_commit: str,
 ) -> RenderedTarget:
     """Render a single target and return its output paths."""
     from pyflowchart import Flowchart, output_html  # local import: optional dep
@@ -93,6 +99,7 @@ def _render_one(
     html = _annotate_generated_html(
         html_path.read_text(encoding="utf-8"),
         generated_at=generated_at,
+        source_commit=source_commit,
     )
     html_path.write_text(
         "\n".join(line.rstrip() for line in html.splitlines()) + "\n",
@@ -116,12 +123,14 @@ def _render_one(
                 html_path=html_path,
                 png_path=png_path,
                 generated_at=generated_at,
+                source_commit=source_commit,
             )
         return RenderedTarget(
             target=target,
             html_path=html_path,
             png_path=None,
             generated_at=generated_at,
+            source_commit=source_commit,
         )
 
     # ``--skip-png`` or Playwright unavailable. The stale artifact was removed
@@ -131,29 +140,46 @@ def _render_one(
         html_path=html_path,
         png_path=None,
         generated_at=generated_at,
+        source_commit=source_commit,
     )
 
 
-def _annotate_generated_html(html: str, *, generated_at: str) -> str:
-    """Add machine-readable and visible generation metadata to HTML.
+def _annotate_generated_html(html: str, *, generated_at: str, source_commit: str) -> str:
+    """Add visible timestamp and deterministic flow-content metadata.
 
     The visible wrapper intentionally contains the flowchart canvas so the
-    Playwright screenshot includes the same timestamp as the interactive
-    artifact. The HTML comment keeps the value easy to inspect without
-    rendering JavaScript.
+    Playwright screenshot includes both the timestamp and a digest of the
+    pre-annotation pyflowchart HTML. Even when flowchart.js collapses changed
+    source into an otherwise identical SVG node, the paired PNG visibly changes
+    with the source-derived digest. The digest is a freshness marker, not a
+    cross-platform PNG byte-reproducibility claim.
     """
     charset = '        <meta charset="utf-8">'
     canvas = '        <div id="canvas"></div>'
     if charset not in html or canvas not in html:
         raise RuntimeError("pyflowchart HTML template no longer matches the annotator")
 
-    meta = f'        <meta name="gco-generated-at" content="{generated_at}">'
+    flow_digest = hashlib.sha256(html.encode("utf-8")).hexdigest()[:16]
+    meta = "\n".join(
+        [
+            f'        <meta name="gco-generated-at" content="{generated_at}">',
+            f'        <meta name="gco-source-commit" content="{source_commit}">',
+            f'        <meta name="gco-flow-digest" content="{flow_digest}">',
+        ]
+    )
     artifact = "\n".join(
         [
             f"        <!-- Generated at (UTC): {generated_at} -->",
+            f"        <!-- Generated from Git commit: {source_commit} -->",
             '        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">',
-            '          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">',
+            '          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">',
             f'            Generated at (UTC): <time datetime="{generated_at}">{generated_at}</time>',
+            "          </p>",
+            '          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">',
+            f"            Source commit: <code>{source_commit}</code>",
+            "          </p>",
+            '          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">',
+            f"            Flow content SHA-256: <code>{flow_digest}</code>",
             "          </p>",
             '          <div id="canvas"></div>',
             "        </div>",
@@ -236,6 +262,17 @@ def _require_pyflowchart() -> None:
         )
 
 
+def _screenshot_scale(width: float, height: float) -> float:
+    """Bound Chromium screenshots by both dimension and total pixel area."""
+    max_css_dimension = 8_000
+    max_css_area = 20_000_000
+    return min(
+        1.0,
+        max_css_dimension / max(width, height),
+        (max_css_area / (width * height)) ** 0.5,
+    )
+
+
 class _PlaywrightRenderer:
     """Thin wrapper that keeps a single Playwright browser alive.
 
@@ -283,13 +320,8 @@ class _PlaywrightRenderer:
             # the SVG viewport itself. The viewBox preserves all chart content.
             # The area cap also avoids allocating several hundred megapixels
             # for unusually wide-and-tall control-flow charts.
-            if box is not None and max(box["width"], box["height"]) > 15_000:
-                max_css_dimension = 8_000
-                max_css_area = 25_000_000
-                factor = min(
-                    max_css_dimension / max(box["width"], box["height"]),
-                    (max_css_area / (box["width"] * box["height"])) ** 0.5,
-                )
+            factor = _screenshot_scale(box["width"], box["height"]) if box is not None else 1.0
+            if factor < 1.0:
                 locator.evaluate(
                     """(svg, size) => {
                         if (!svg.hasAttribute('viewBox')) {

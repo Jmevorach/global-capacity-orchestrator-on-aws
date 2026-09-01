@@ -2,7 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-31T15:58:29Z">
+        <meta name="gco-source-commit" content="d5eebeaf363afd3a3979dfa66723d298eb5f54d1">
+        <meta name="gco-flow-digest" content="ff8df1b219293292">
         <title>Mission criteria scaffolder (Bedrock sampling + retry + autofix pipeline)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,73 +208,73 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op5972=>operation: 'Drive a sampling backend to produce a validated criteria list.\n\n    Builds the prompt, calls ``backend.sample(prompt_str)``, parses\n    the JSON, validates through :func:`validate_criteria`, and on\n    rejection retries up to ``retries`` times with feedback. Returns\n    the validated list (with private ``_parsed_ast`` keys stripped so\n    the result is JSON-safe). Raises :class:`ScaffoldSamplingError`\n    when every attempt was rejected, and propagates\n    :class:`gco.bedrock.BedrockFTUFormNotAcceptedError` unwrapped so a\n    missing Anthropic first-time-use form is reported rather than\n    silently downgraded to deterministic criteria.\n\n    The backend is duck-typed against the ``SamplingBackend`` protocol\n    on purpose — tests can substitute a stub object whose ``sample``\n    method returns canned strings without bringing in a transport.\n    '
-op5974=>operation: feedback: str | None = None
-op5976=>operation: last_reason = 'no_attempts'
-cond5979=>condition: for attempt in range(retries + 1)
-op5983=>operation: prompt_str = build_scaffold_prompt(directive, allowlist=allowlist, max_criteria=max_criteria, feedback=feedback)
-op5988=>operation: raw = await _call_backend(backend, prompt_str)
-cond5985=>condition: exception raised?
-cond5990=>condition: except BedrockFTUFormNotAcceptedError
-sub5994=>subroutine: raise
-cond5996=>condition: except Exception as exc
-sub6000=>subroutine: raise ScaffoldSamplingError('transport_error', message=f'sampling backend raised {type(exc).__name__}: {exc}') from exc
-op6008=>operation: parsed = _parse_response(raw)
-cond6005=>condition: exception raised?
-cond6010=>condition: except (ValueError, json.JSONDecodeError) as exc
-op6014=>operation: last_reason = 'json_parse'
-op6016=>operation: feedback = f'Your previous response could not be parsed as a JSON array. Return a single JSON array, no prose, no markdown fences. ({exc})'
-sub6018=>subroutine: continue
-cond6024=>operation: parsed = parsed[:max_criteria] if  len(parsed) > max_criteria
-op6034=>operation: parsed = [_normalize_kind_name(c) for c in parsed]
-op6036=>operation: parsed = [_normalize_metric_path(c) for c in parsed]
-op6038=>operation: parsed = [_autofix_predicate(c) for c in parsed]
-op6043=>operation: validated = _validation.validate_criteria(parsed)
-cond6040=>condition: exception raised?
-cond6045=>condition: except MissionValidationError as exc
-op6049=>operation: details = exc.details or {}
-op6051=>operation: last_reason = str(details.get('reason') or exc.code)
-op6053=>operation: feedback = f'Your previous response was rejected by the validator. Rejection reason: {last_reason}. Details: {details!r}. Re-emit a corrected JSON array.'
-sub6055=>subroutine: continue
-op6060=>operation: del attempt
-io6065=>inputoutput: output: [{k: v for k, v in entry.items() if not str(k).startswith('_')} for entry in validated]
-e6063=>end: end function return
-sub6070=>subroutine: raise ScaffoldSamplingError(last_reason)
+        <div><textarea id="code" style="width: 100%;" rows="11">op6129=>operation: 'Drive a sampling backend to produce a validated criteria list.\n\n    Builds the prompt, calls ``backend.sample(prompt_str)``, parses\n    the JSON, validates through :func:`validate_criteria`, and on\n    rejection retries up to ``retries`` times with feedback. Returns\n    the validated list (with private ``_parsed_ast`` keys stripped so\n    the result is JSON-safe). Raises :class:`ScaffoldSamplingError`\n    when every attempt was rejected, and propagates\n    :class:`gco.bedrock.BedrockFTUFormNotAcceptedError` unwrapped so a\n    missing Anthropic first-time-use form is reported rather than\n    silently downgraded to deterministic criteria.\n\n    The backend is duck-typed against the ``SamplingBackend`` protocol\n    on purpose — tests can substitute a stub object whose ``sample``\n    method returns canned strings without bringing in a transport.\n    '
+op6131=>operation: feedback: str | None = None
+op6133=>operation: last_reason = 'no_attempts'
+cond6136=>condition: for attempt in range(retries + 1)
+op6140=>operation: prompt_str = build_scaffold_prompt(directive, allowlist=allowlist, max_criteria=max_criteria, feedback=feedback)
+op6145=>operation: raw = await _call_backend(backend, prompt_str)
+cond6142=>condition: exception raised?
+cond6147=>condition: except BedrockFTUFormNotAcceptedError
+sub6151=>subroutine: raise
+cond6153=>condition: except Exception as exc
+sub6157=>subroutine: raise ScaffoldSamplingError('transport_error', message=f'sampling backend raised {type(exc).__name__}: {exc}') from exc
+op6165=>operation: parsed = _parse_response(raw)
+cond6162=>condition: exception raised?
+cond6167=>condition: except (ValueError, json.JSONDecodeError) as exc
+op6171=>operation: last_reason = 'json_parse'
+op6173=>operation: feedback = f'Your previous response could not be parsed as a JSON array. Return a single JSON array, no prose, no markdown fences. ({exc})'
+sub6175=>subroutine: continue
+cond6181=>operation: parsed = parsed[:max_criteria] if  len(parsed) > max_criteria
+op6191=>operation: parsed = [_normalize_kind_name(c) for c in parsed]
+op6193=>operation: parsed = [_normalize_metric_path(c) for c in parsed]
+op6195=>operation: parsed = [_autofix_predicate(c) for c in parsed]
+op6200=>operation: validated = _validation.validate_criteria(parsed)
+cond6197=>condition: exception raised?
+cond6202=>condition: except MissionValidationError as exc
+op6206=>operation: details = exc.details or {}
+op6208=>operation: last_reason = str(details.get('reason') or exc.code)
+op6210=>operation: feedback = f'Your previous response was rejected by the validator. Rejection reason: {last_reason}. Details: {details!r}. Re-emit a corrected JSON array.'
+sub6212=>subroutine: continue
+op6217=>operation: del attempt
+io6222=>inputoutput: output: [{k: v for k, v in entry.items() if not str(k).startswith('_')} for entry in validated]
+e6220=>end: end function return
+sub6227=>subroutine: raise ScaffoldSamplingError(last_reason)
 
-op5972->op5974
-op5974->op5976
-op5976->cond5979
-cond5979(yes)->op5983
-op5983->op5988
-op5988->cond5985
-cond5985(yes)->cond5990
-cond5990(yes)->sub5994
-cond5990(no)->cond5996
-cond5996(yes)->sub6000
-cond5996(no)->op6008
-op6008->cond6005
-cond6005(yes)->cond6010
-cond6010(yes)->op6014
-op6014->op6016
-op6016->sub6018
-cond6010(no)->cond6024
-cond6024->op6034
-op6034->op6036
-op6036->op6038
-op6038->op6043
-op6043->cond6040
-cond6040(yes)->cond6045
-cond6045(yes)->op6049
-op6049->op6051
-op6051->op6053
-op6053->sub6055
-cond6045(no)->op6060
-op6060->io6065
-io6065->e6063
-cond6040(no)->op6060
-cond6005(no)->cond6024
-cond5985(no)->op6008
-cond5979(no)->sub6070
+op6129->op6131
+op6131->op6133
+op6133->cond6136
+cond6136(yes)->op6140
+op6140->op6145
+op6145->cond6142
+cond6142(yes)->cond6147
+cond6147(yes)->sub6151
+cond6147(no)->cond6153
+cond6153(yes)->sub6157
+cond6153(no)->op6165
+op6165->cond6162
+cond6162(yes)->cond6167
+cond6167(yes)->op6171
+op6171->op6173
+op6173->sub6175
+cond6167(no)->cond6181
+cond6181->op6191
+op6191->op6193
+op6193->op6195
+op6195->op6200
+op6200->cond6197
+cond6197(yes)->cond6202
+cond6202(yes)->op6206
+op6206->op6208
+op6208->op6210
+op6210->sub6212
+cond6202(no)->op6217
+op6217->io6222
+io6222->e6220
+cond6197(no)->op6217
+cond6162(no)->cond6181
+cond6142(no)->op6165
+cond6136(no)->sub6227
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -282,10 +284,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-31T15:58:29Z -->
+        <!-- Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1 -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
-          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-08-31T15:58:29Z">2026-08-31T15:58:29Z</time>
+          </p>
+          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
+            Source commit: <code>d5eebeaf363afd3a3979dfa66723d298eb5f54d1</code>
+          </p>
+          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
+            Flow content SHA-256: <code>ff8df1b219293292</code>
           </p>
           <div id="canvas"></div>
         </div>

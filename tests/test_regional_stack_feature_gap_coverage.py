@@ -84,10 +84,12 @@ def _app_context(
     *,
     feature_rich: bool,
     retain_provider_log_groups: bool = False,
+    disable_efs_automatic_backups: bool = False,
 ) -> dict:
     helm_enabled = feature_rich
     return {
         rs._LIVE_VALIDATION_PROVIDER_LOG_CONTEXT: retain_provider_log_groups,
+        rs._LIVE_VALIDATION_DISABLE_EFS_BACKUPS_CONTEXT: disable_efs_automatic_backups,
         f"availability-zones:account={_ACCOUNT}:region={_REGION}": _AZS,
         "drift_detection": {"enabled": False},
         "mcp_server": {"enabled": False},
@@ -168,11 +170,13 @@ def _synthesize(
     global_accelerator: bool,
     logical_name: str,
     retain_provider_log_groups: bool = False,
+    disable_efs_automatic_backups: bool = False,
 ):
     app = cdk.App(
         context=_app_context(
             feature_rich=feature_rich,
             retain_provider_log_groups=retain_provider_log_groups,
+            disable_efs_automatic_backups=disable_efs_automatic_backups,
         )
     )
     cdk.Tags.of(app).add("Project", "GCO")
@@ -221,6 +225,7 @@ def live_validation_feature_stack():
         global_accelerator=True,
         logical_name="regional-feature-gap-live-validation",
         retain_provider_log_groups=True,
+        disable_efs_automatic_backups=True,
     )
 
 
@@ -981,6 +986,32 @@ def test_provider_log_retention_is_scoped_to_live_validation(
         )
         assert log_group["DeletionPolicy"] == "Retain"
         assert log_group["UpdateReplacePolicy"] == "Retain"
+
+
+def test_efs_automatic_backups_are_live_validation_only(
+    feature_stack,
+    live_validation_feature_stack,
+):
+    _normal_stack, normal_template = feature_stack
+    _live_stack, live_template = live_validation_feature_stack
+    _, normal_efs = _single_resource(normal_template, "AWS::EFS::FileSystem", "GCOEfs")
+    _, live_efs = _single_resource(live_template, "AWS::EFS::FileSystem", "GCOEfs")
+
+    assert normal_efs["Properties"]["BackupPolicy"] == {"Status": "ENABLED"}
+    assert live_efs["Properties"]["BackupPolicy"] == {"Status": "DISABLED"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, False), (False, False), (True, True), ("false", False), ("TRUE", True)],
+)
+def test_explicit_context_bool_parser(raw, expected):
+    assert rs._explicit_context_bool(raw, key="test") is expected
+
+
+def test_explicit_context_bool_parser_rejects_ambiguous_values():
+    with pytest.raises(ValueError, match="must be true or false"):
+        rs._explicit_context_bool("enabled", key="test")
 
 
 def test_non_ga_partition_omits_registration_and_tears_down_directly(ga_disabled_stack):

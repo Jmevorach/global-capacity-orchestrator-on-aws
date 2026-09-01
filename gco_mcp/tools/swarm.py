@@ -448,6 +448,8 @@ if is_enabled(FLAG_SWARM):
                     )
                 except swarm_scaffold.SwarmScaffoldError as err:
                     fallback_reason = err.last_reason
+            else:
+                fallback_reason = "sampling_backend_unavailable"
         if plan is None:
             try:
                 plan = swarm_scaffold.generate_deterministic_plan(

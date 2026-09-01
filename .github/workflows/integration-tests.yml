@@ -101,7 +101,10 @@ jobs:
           set -euo pipefail
           archive="${RUNNER_TEMP}/helm.tar.gz"
           install_dir="${RUNNER_TEMP}/helm-install"
-          curl --fail --show-error --location --retry 3 \
+          curl --fail --show-error --location \
+            --connect-timeout 15 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --remove-on-error \
             --output "${archive}" \
             "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
           echo "${HELM_SHA256}  ${archive}" | sha256sum -c -
@@ -142,7 +145,10 @@ jobs:
           set -euo pipefail
           archive="${RUNNER_TEMP}/kubeconform.tar.gz"
           install_dir="${RUNNER_TEMP}/kubeconform-install"
-          curl --fail --show-error --location --retry 3 \
+          curl --fail --show-error --location \
+            --connect-timeout 15 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --remove-on-error \
             --output "${archive}" \
             "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
           echo "${KUBECONFORM_SHA256}  ${archive}" | sha256sum -c -
@@ -1256,6 +1262,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Reclaim runner disk space before Kind image builds
         uses: ./.github/actions/free-disk-space
+      - name: Pre-pull Kind bootstrap images with retry
+        # kind-action otherwise pulls the node image implicitly with no retry,
+        # and the NetworkPolicy probes would leave BusyBox to kubelet backoff.
+        # Pull both through the repository's bounded registry retry helper;
+        # the probe image is loaded into the node immediately after creation.
+        uses: ./.github/actions/docker-pull-with-retry
+        with:
+          images: |
+            ${{ env.KIND_NODE_IMAGE }}
+            busybox:1.38.0
       - name: Create kind cluster (no default CNI)
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1.14.0
         with:
@@ -1268,6 +1284,8 @@ jobs:
           # the control-plane cannot go Ready without a CNI; the next step
           # installs Calico and waits for Ready via `kubectl rollout status`.
           wait: "0s"
+      - name: Load pinned probe image into Kind
+        run: kind load docker-image busybox:1.38.0 --name gco-ci
       - name: Install Calico for NetworkPolicy enforcement
         # kind's default kindnet does not enforce NetworkPolicy. Calico does,
         # so 03-network-policies.yaml is actually exercised here.
@@ -1293,7 +1311,10 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="${RUNNER_TEMP}/calico.yaml"
-          curl --fail --show-error --location --retry 3 \
+          curl --fail --show-error --location \
+            --connect-timeout 15 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --remove-on-error \
             --output "${calico_manifest}" \
             "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
           echo "${CALICO_SHA256}  ${calico_manifest}" | sha256sum -c -
@@ -1335,7 +1356,10 @@ jobs:
         run: |
           set -euo pipefail
           metrics_manifest="${RUNNER_TEMP}/metrics-server.yaml"
-          curl --fail --show-error --location --retry 3 \
+          curl --fail --show-error --location \
+            --connect-timeout 15 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --remove-on-error \
             --output "${metrics_manifest}" \
             "https://github.com/kubernetes-sigs/metrics-server/releases/download/${METRICS_SERVER_VERSION}/components.yaml"
           echo "${METRICS_SERVER_SHA256}  ${metrics_manifest}" | sha256sum -c -
@@ -1875,8 +1899,12 @@ jobs:
     # store) and transits the runner docker daemon AND the kind node, so the
     # job starts with the free-disk-space reclaim and drops the runner-side
     # copy right after `kind load`.
+    # Read-only chart pulls have bounded retries before cluster creation. Give
+    # the real chart/probe/TrainJob workload enough outer headroom even if a
+    # public registry needs every retry; deterministic failures still fail at
+    # their own bounded gate.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       # Helm pin (version + checksum) is derived at runtime from
       # lambda/helm-installer/Dockerfile by the derive step below — the same
@@ -1890,6 +1918,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Reclaim runner disk space before large image pulls
         uses: ./.github/actions/free-disk-space
+      - name: Pre-pull Kind node image with retry
+        # kind-action's implicit pull has no retry or attributed diagnostics.
+        # A warm local image makes cluster creation independent of a single
+        # Docker Hub registry/token endpoint blip.
+        uses: ./.github/actions/docker-pull-with-retry
+        with:
+          images: ${{ env.KIND_NODE_IMAGE }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
@@ -1914,7 +1949,10 @@ jobs:
           set -euo pipefail
           archive="${RUNNER_TEMP}/helm.tar.gz"
           install_dir="${RUNNER_TEMP}/helm-install"
-          curl --fail --show-error --location --retry 3 \
+          curl --fail --show-error --location \
+            --connect-timeout 15 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --remove-on-error \
             --output "${archive}" \
             "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
           echo "${HELM_SHA256}  ${archive}" | sha256sum -c -
@@ -1925,6 +1963,68 @@ jobs:
           rm -f "${archive}" "${install_dir}/helm"
           rmdir "${install_dir}"
           helm version --short
+      - name: Prefetch pinned Kind charts with retry
+        # Keep public-registry retries on read-only `helm pull` operations.
+        # Every install/upgrade below consumes one local archive exactly once,
+        # so a Kubernetes/chart failure stays fail-fast and the trainer's
+        # idempotency check reuses byte-identical chart content.
+        run: |
+          set -euo pipefail
+          pull_chart() {
+            local chart_name env_name ref version _namespace repo_url pull_dir
+            local attempt delay archive success
+            local -a pull_args archives
+            chart_name="$1"
+            env_name="$2"
+            read -r ref version _namespace repo_url < <(
+              python3 .github/scripts/validate_helm_charts.py --emit-ref "${chart_name}"
+            )
+            pull_dir="${RUNNER_TEMP}/kind-charts/${chart_name}"
+            mkdir -p "${pull_dir}"
+            if [[ "${ref}" == oci://* ]]; then
+              pull_args=("${ref}")
+            else
+              pull_args=("${ref#*/}" --repo "${repo_url}")
+            fi
+
+            success=0
+            for attempt in 1 2 3 4; do
+              rm -f "${pull_dir}"/*.tgz
+              echo "::group::helm pull ${chart_name} (attempt ${attempt}/4)"
+              if timeout 60s helm pull "${pull_args[@]}" --version "${version}" \
+                  --destination "${pull_dir}"; then
+                success=1
+                echo "::endgroup::"
+                break
+              fi
+              echo "::endgroup::"
+              if [ "${attempt}" -lt 4 ]; then
+                delay=$((2 ** attempt))
+                echo "::warning::Chart pull failed; retrying in ${delay}s."
+                sleep "${delay}"
+              fi
+            done
+            if [ "${success}" -ne 1 ]; then
+              echo "::error::Failed to pull ${chart_name} ${version} after 4 attempts."
+              return 1
+            fi
+
+            shopt -s nullglob
+            archives=("${pull_dir}"/*.tgz)
+            shopt -u nullglob
+            if [ "${#archives[@]}" -ne 1 ]; then
+              echo "::error::Expected one ${chart_name} archive, found ${#archives[@]}."
+              return 1
+            fi
+            archive="${archives[0]}"
+            echo "${env_name}=${archive}" >> "${GITHUB_ENV}"
+            echo "Pinned ${chart_name} archive: ${archive}"
+          }
+
+          pull_chart kube-prometheus-stack KPS_CHART_ARCHIVE
+          pull_chart cert-manager CERT_MANAGER_CHART_ARCHIVE
+          pull_chart kubeflow-trainer TRAINER_CHART_ARCHIVE
+          pull_chart mlflow MLFLOW_CHART_ARCHIVE
       - name: Create kind cluster (no default CNI)
         # kind/node pins come from the workflow-level env block (shared with
         # integration:kind:cluster-e2e; tracked by the dependency drift
@@ -1951,7 +2051,10 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="${RUNNER_TEMP}/calico.yaml"
-          curl --fail --show-error --location --retry 3 \
+          curl --fail --show-error --location \
+            --connect-timeout 15 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-max-time 180 \
+            --remove-on-error \
             --output "${calico_manifest}" \
             "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
           echo "${CALICO_SHA256}  ${calico_manifest}" | sha256sum -c -
@@ -2070,14 +2173,11 @@ jobs:
         # client-side last-applied annotation.
         run: |
           set -euo pipefail
-          read -r _ref version _namespace repo_url < <(
+          read -r _ref version _namespace _repo_url < <(
             python3 .github/scripts/validate_helm_charts.py --emit-ref kube-prometheus-stack
           )
-          pull_dir="${RUNNER_TEMP}/kps-chart"
-          mkdir -p "${pull_dir}"
-          helm pull kube-prometheus-stack --repo "${repo_url}" \
-            --version "${version}" --destination "${pull_dir}"
-          tar -xzf "${pull_dir}"/kube-prometheus-stack-*.tgz -C "${pull_dir}"
+          pull_dir="$(dirname "${KPS_CHART_ARCHIVE}")"
+          tar -xzf "${KPS_CHART_ARCHIVE}" -C "${pull_dir}"
           crd=$(find "${pull_dir}/kube-prometheus-stack" -name 'crd-servicemonitors*' -print -quit)
           if [ -z "${crd}" ]; then
             echo "::error::ServiceMonitor CRD not found in kube-prometheus-stack ${version}"
@@ -2111,14 +2211,12 @@ jobs:
         # and values come from charts.yaml like every other chart here.
         run: |
           set -euo pipefail
-          read -r ref version namespace repo_url < <(
+          read -r _ref _version namespace _repo_url < <(
             python3 .github/scripts/validate_helm_charts.py --emit-ref cert-manager
           )
           python3 .github/scripts/validate_helm_charts.py --emit-values cert-manager \
             > "${RUNNER_TEMP}/cert-manager-values.yaml"
-          helm repo add jetstack "${repo_url}"
-          helm repo update jetstack
-          helm install cert-manager "${ref}" --version "${version}" \
+          helm install cert-manager "${CERT_MANAGER_CHART_ARCHIVE}" \
             --namespace "${namespace}" --create-namespace \
             --values "${RUNNER_TEMP}/cert-manager-values.yaml" \
             --wait --timeout 5m
@@ -2130,12 +2228,12 @@ jobs:
         # charts.yaml (wait: true / 8m for this entry).
         run: |
           set -euo pipefail
-          read -r ref version namespace _repo_url < <(
+          read -r _ref _version namespace _repo_url < <(
             python3 .github/scripts/validate_helm_charts.py --emit-ref kubeflow-trainer
           )
           python3 .github/scripts/validate_helm_charts.py --emit-values kubeflow-trainer \
             > "${RUNNER_TEMP}/trainer-values.yaml"
-          helm install kubeflow-trainer "${ref}" --version "${version}" \
+          helm install kubeflow-trainer "${TRAINER_CHART_ARCHIVE}" \
             --namespace "${namespace}" --create-namespace \
             --values "${RUNNER_TEMP}/trainer-values.yaml" \
             --wait --timeout 8m
@@ -2158,10 +2256,10 @@ jobs:
         # Lambda performs, which is an upgrade the second time around.
         run: |
           set -euo pipefail
-          read -r ref version namespace _repo_url < <(
+          read -r _ref _version namespace _repo_url < <(
             python3 .github/scripts/validate_helm_charts.py --emit-ref kubeflow-trainer
           )
-          if ! helm upgrade kubeflow-trainer "${ref}" --version "${version}" \
+          if ! helm upgrade kubeflow-trainer "${TRAINER_CHART_ARCHIVE}" \
               --namespace "${namespace}" \
               --values "${RUNNER_TEMP}/trainer-values.yaml" \
               --wait --timeout 8m; then
@@ -2209,12 +2307,12 @@ jobs:
         # here.
         run: |
           set -euo pipefail
-          read -r ref version namespace _repo_url < <(
+          read -r _ref _version namespace _repo_url < <(
             python3 .github/scripts/validate_helm_charts.py --emit-ref mlflow
           )
           python3 .github/scripts/validate_helm_charts.py --emit-values mlflow \
             > "${RUNNER_TEMP}/mlflow-values.yaml"
-          helm install mlflow "${ref}" --version "${version}" \
+          helm install mlflow "${MLFLOW_CHART_ARCHIVE}" \
             --namespace "${namespace}" --create-namespace \
             --values "${RUNNER_TEMP}/mlflow-values.yaml"
       - name: Apply the post-Helm mlflow network policies

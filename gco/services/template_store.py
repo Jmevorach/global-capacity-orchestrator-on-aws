@@ -41,13 +41,14 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
 # Flowchart(s) generated from this file:
 #   * ``JobStore.claim_job`` -> ``diagrams/code_diagrams/gco/services/template_store.JobStore_claim_job.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/template_store.JobStore_claim_job.png``)
 #   * ``JobStore.transition_job`` -> ``diagrams/code_diagrams/gco/services/template_store.JobStore_transition_job.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/template_store.JobStore_transition_job.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

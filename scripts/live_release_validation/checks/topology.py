@@ -67,6 +67,15 @@ _ADDON_CONVERGENCE_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 _HEALTH_STABILITY_ROUNDS = 3
+_HEALTH_WARMUP_ATTEMPTS = 3
+_RETRYABLE_HEALTH_WARMUP_STATUS_CODES = frozenset({429, 502, 503, 504})
+_RETRYABLE_HEALTH_WARMUP_ERROR = re.compile(
+    r"(?:API request failed: (?:429|502|503|504)\b|gateway timeout|service unavailable)",
+    re.IGNORECASE,
+)
+_RETRYABLE_HEALTH_WARMUP_EXCEPTIONS = frozenset(
+    {"ConnectTimeout", "ConnectionError", "ReadTimeout", "Timeout"}
+)
 
 
 _MAX_TOPOLOGY_EVIDENCE_CHARS = 2048
@@ -565,6 +574,177 @@ def _validate_health_payload(
             f"{payload.get('cluster_id')!r}"
         )
     return payload
+
+
+def _health_warmup_samples(
+    ctx: RunContext,
+    *,
+    global_url: str,
+    regional_urls: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Warm each endpoint with a checkpointed, resume-bounded attempt budget."""
+    probes: list[dict[str, Any]] = [
+        {"scope": "global", "region": None, "endpoint": global_url},
+        *(
+            {"scope": "regional", "region": region, "endpoint": regional_urls[region]}
+            for region in ctx.deployment_regions
+            if region in regional_urls
+        ),
+    ]
+    raw_samples = ctx.checkpoint.state.get("topology_health_warmup_samples")
+    if raw_samples is None:
+        samples: list[dict[str, Any]] = []
+        ctx.checkpoint.state["topology_health_warmup_samples"] = samples
+        ctx.persist()
+    elif isinstance(raw_samples, list) and all(isinstance(sample, dict) for sample in raw_samples):
+        samples = raw_samples
+    else:
+        raise RuntimeError("Topology health warm-up checkpoint is malformed")
+
+    probes_by_key = {(probe["scope"], probe["region"]): probe for probe in probes}
+    histories: dict[tuple[Any, Any], list[dict[str, Any]]] = {key: [] for key in probes_by_key}
+    for sample in samples:
+        required_fields = {
+            "scope",
+            "region",
+            "endpoint",
+            "attempt",
+            "timestamp",
+            "latency_seconds",
+            "payload",
+            "error",
+            "status_code",
+            "retryable",
+        }
+        if not required_fields.issubset(sample):
+            raise RuntimeError("Topology health warm-up checkpoint outcome is incomplete")
+        latency = sample["latency_seconds"]
+        status_code = sample["status_code"]
+        error = sample["error"]
+        retryable = sample["retryable"]
+        if (
+            not isinstance(sample["timestamp"], str)
+            or not sample["timestamp"]
+            or isinstance(latency, bool)
+            or not isinstance(latency, (int, float))
+            or latency < 0
+            or not isinstance(retryable, bool)
+            or (
+                status_code is not None
+                and (isinstance(status_code, bool) or not isinstance(status_code, int))
+            )
+        ):
+            raise RuntimeError("Topology health warm-up checkpoint outcome is malformed")
+        if error is None:
+            if (
+                not isinstance(sample["payload"], dict)
+                or status_code != 200
+                or retryable is not False
+            ):
+                raise RuntimeError("Topology health warm-up checkpoint success is malformed")
+        elif not isinstance(error, str) or not error or sample["payload"] is not None:
+            raise RuntimeError("Topology health warm-up checkpoint failure is malformed")
+
+        key = (sample.get("scope"), sample.get("region"))
+        probe = probes_by_key.get(key)
+        if probe is None or sample.get("endpoint") != probe["endpoint"]:
+            raise RuntimeError("Topology health warm-up checkpoint identity changed")
+        histories[key].append(sample)
+    for history in histories.values():
+        attempts = [sample.get("attempt") for sample in history]
+        if attempts != list(range(1, len(history) + 1)) or len(history) > _HEALTH_WARMUP_ATTEMPTS:
+            raise RuntimeError("Topology health warm-up checkpoint ordering is invalid")
+        successes = [sample for sample in history if sample.get("error") is None]
+        if len(successes) > 1 or (successes and history[-1] is not successes[0]):
+            raise RuntimeError("Topology health warm-up checkpoint success is inconsistent")
+
+    interval = min(max(0.0, float(ctx.settings.poll_interval_seconds)), 5.0)
+    for probe in probes:
+        key = (probe["scope"], probe["region"])
+        history = histories[key]
+        if history and history[-1].get("error") is None:
+            continue
+        if history and history[-1].get("retryable") is not True:
+            raise RuntimeError(
+                f"Health warm-up previously failed for {probe['endpoint']}: "
+                f"{history[-1].get('error')}"
+            )
+        if len(history) >= _HEALTH_WARMUP_ATTEMPTS:
+            raise RuntimeError(
+                f"Health warm-up attempt budget is exhausted for {probe['endpoint']}: "
+                f"{history[-1].get('error')}"
+            )
+
+        for attempt in range(len(history) + 1, _HEALTH_WARMUP_ATTEMPTS + 1):
+            started = time.monotonic()
+            try:
+                payload = ctx.aws_client.call_api(
+                    method="GET",
+                    path="/api/v1/health",
+                    region=probe["region"],
+                    max_attempts=1,
+                )
+            except Exception as exc:
+                call_error = _bounded_topology_evidence(f"{type(exc).__name__}: {exc}")
+                status_code = getattr(exc, "status_code", None)
+                has_structured_status = isinstance(status_code, int) and not isinstance(
+                    status_code, bool
+                )
+                retryable = (
+                    status_code in _RETRYABLE_HEALTH_WARMUP_STATUS_CODES
+                    if has_structured_status
+                    else (
+                        type(exc).__name__ in _RETRYABLE_HEALTH_WARMUP_EXCEPTIONS
+                        or _RETRYABLE_HEALTH_WARMUP_ERROR.search(call_error) is not None
+                    )
+                )
+                sample = {
+                    **probe,
+                    "attempt": attempt,
+                    "timestamp": utc_now(),
+                    "latency_seconds": round(max(0.0, time.monotonic() - started), 6),
+                    "payload": None,
+                    "error": call_error,
+                    "status_code": status_code,
+                    "retryable": retryable,
+                }
+                samples.append(sample)
+                history.append(sample)
+                ctx.persist()
+                if retryable and attempt < _HEALTH_WARMUP_ATTEMPTS:
+                    if interval > 0:
+                        time.sleep(interval)
+                    continue
+                raise RuntimeError(
+                    f"Health warm-up call failed for {probe['endpoint']} on attempt "
+                    f"{attempt}: {call_error}"
+                ) from exc
+
+            validation_error: str | None = None
+            try:
+                _validate_health_payload(ctx, payload, endpoint_region=probe["region"])
+            except RuntimeError as exc:
+                validation_error = _bounded_topology_evidence(str(exc))
+            sample = {
+                **probe,
+                "attempt": attempt,
+                "timestamp": utc_now(),
+                "latency_seconds": round(max(0.0, time.monotonic() - started), 6),
+                "payload": to_jsonable(payload),
+                "error": validation_error,
+                "status_code": 200,
+                "retryable": False,
+            }
+            samples.append(sample)
+            history.append(sample)
+            ctx.persist()
+            if validation_error is not None:
+                raise RuntimeError(
+                    f"Malformed health warm-up response from {probe['endpoint']} on "
+                    f"attempt {attempt}: {validation_error}"
+                )
+            break
+    return samples
 
 
 def _health_stability_samples(

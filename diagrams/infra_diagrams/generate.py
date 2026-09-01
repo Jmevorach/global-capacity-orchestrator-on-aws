@@ -22,9 +22,10 @@ How it works
 ------------
 ``cdk-dia`` reads a *synthesized* cloud assembly (``cdk.out/tree.json``) — it
 does not run ``cdk synth`` itself. So this script synthesizes each diagram's
-stack set in-process to a temporary ``cdk.out`` (with the Docker image asset
-and helm-installer Lambda mocked, exactly like the unit tests, so no Docker
-daemon or live AWS access is required) and then invokes the locked ``cdk-dia``
+stack set in-process to a temporary ``cdk.out``. Only the Docker image asset is
+stubbed so no container daemon is required; Helm installer Lambda, Step
+Functions, custom-resource provider, IAM, and network constructs remain real
+in the synthesized topology. The script then invokes the locked ``cdk-dia``
 binary from the root npm graph against ``<cdk.out>/tree.json``.
 
 Per-stack diagrams synthesize just the target stack (passing placeholder
@@ -64,7 +65,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # Add project root to path. This script lives at
 # ``diagrams/infra_diagrams/generate.py`` so the project root is two parents
@@ -77,6 +78,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 import aws_cdk as cdk  # noqa: E402
 
 from cli.stacks import cdk_asset_consumer  # noqa: E402
+from diagrams.infra_diagrams._catalog import INFRA_DIAGRAM_NAMES  # noqa: E402
 from gco.config.config_loader import ConfigLoader  # noqa: E402
 from gco.stacks.analytics_stack import GCOAnalyticsStack  # noqa: E402
 from gco.stacks.api_gateway_global_stack import (  # noqa: E402
@@ -108,27 +110,14 @@ Builder = Callable[[cdk.App, ConfigLoader], "list[str] | None"]
 
 @contextlib.contextmanager
 def _mocked_regional_assets() -> Iterator[None]:
-    """Mock the Docker image asset + helm-installer Lambda during synth.
+    """Stub only Docker image assets while retaining the CDK topology.
 
-    Diagram generation only needs the CloudFormation topology, not real
-    container images, so we stub the Docker asset (no daemon required) and the
-    helm-installer custom resource the same way the unit tests do.
+    Lambda, Step Functions, providers, IAM, and network constructs remain real
+    so regional and aggregate diagrams do not silently omit Helm convergence.
+    Docker image publication is the only boundary the offline renderer does
+    not need to model.
     """
-
-    def _mock_helm_installer(stack: Any) -> None:
-        stack.helm_installer_lambda = MagicMock()
-        stack.helm_installer_provider = MagicMock()
-        stack.helm_installer_provider.service_token = (
-            "arn:aws:lambda:us-east-1:123456789012:function:mock"  # nosec B106
-        )
-        stack.helm_installer_lambda_function_name = (
-            f"gco-helm-{getattr(stack, 'deployment_region', 'us-east-1')}"
-        )
-
-    with (
-        patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker,
-        patch.object(GCORegionalStack, "_create_helm_installer_lambda", _mock_helm_installer),
-    ):
+    with patch("gco.stacks.regional_stack.ecr_assets.DockerImageAsset") as mock_docker:
         mock_docker.return_value.image_uri = (
             "123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest"
         )
@@ -445,6 +434,16 @@ def main() -> None:
             collapse=False,
             context=_ANALYTICS_CONTEXT,
         )
+
+    if args.stack == "all":
+        expected = {f"{name}.png" for name in INFRA_DIAGRAM_NAMES}
+        for artifact in output_dir.glob("*.png"):
+            if artifact.name not in expected:
+                artifact.unlink()
+                print(f"   🧹 Removed obsolete {artifact.name}")
+        for sidecar in output_dir.glob("*.dot"):
+            sidecar.unlink()
+            print(f"   🧹 Removed transient {sidecar.name}")
 
     print("\n" + "=" * 50)
     print("✅ Diagram generation complete!")

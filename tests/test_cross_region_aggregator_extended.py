@@ -555,3 +555,124 @@ class TestAggregateMetricsEdgeCases:
 
             assert result["regions_successful"] == 0
             assert result["errors"] is not None
+
+
+class TestDeterministicRegionalOrdering:
+    """Parallel completion order must not leak into public JSON arrays."""
+
+    def test_all_aggregate_surfaces_sort_regions_and_job_ties(self):
+        handler._cached_endpoints = {
+            "us-west-2": "https://west.example/prod",
+            "us-east-1": "https://east.example/prod",
+        }
+
+        def query(region, _endpoint, path, method="GET", *_args, **_kwargs):
+            if path == "/api/v1/jobs" and method == "GET":
+                return {
+                    "_status": "success",
+                    "jobs": [
+                        {
+                            "metadata": {
+                                "name": "same-name",
+                                "namespace": "default",
+                                "uid": f"uid-{region}",
+                                "creationTimestamp": "2026-01-01T00:00:00Z",
+                            }
+                        }
+                    ],
+                    "count": 1,
+                    "total": 1,
+                }
+            if path == "/api/v1/status":
+                return {"_status": "success", "cluster_id": region}
+            if path == "/api/v1/health":
+                return {"_status": "success", "status": "healthy", "cluster_id": region}
+            return {
+                "_status": "success",
+                "total_matched": 1,
+                "deleted_count": 1,
+                "failed_count": 0,
+            }
+
+        with patch.object(handler, "query_region", side_effect=query):
+            jobs = handler.aggregate_jobs()
+            metrics = handler.aggregate_metrics()
+            health = handler.aggregate_health()
+            deleted = handler.bulk_delete_jobs(dry_run=False)
+
+        assert [item["region"] for item in jobs["region_summaries"]] == [
+            "us-east-1",
+            "us-west-2",
+        ]
+        assert [item["_source_region"] for item in jobs["jobs"]] == [
+            "us-east-1",
+            "us-west-2",
+        ]
+        assert [item["region"] for item in metrics["regions"]] == [
+            "us-east-1",
+            "us-west-2",
+        ]
+        assert [item["region"] for item in health["regions"]] == [
+            "us-east-1",
+            "us-west-2",
+        ]
+        assert [item["region"] for item in deleted["region_results"]] == [
+            "us-east-1",
+            "us-west-2",
+        ]
+
+    def test_error_arrays_are_sorted_by_region(self):
+        handler._cached_endpoints = {
+            "us-west-2": "https://west.example/prod",
+            "us-east-1": "https://east.example/prod",
+        }
+
+        def query(region, _endpoint, _path, *_args, **_kwargs):
+            return {"_status": "error", "_error": f"failed-{region}"}
+
+        with patch.object(handler, "query_region", side_effect=query):
+            jobs = handler.aggregate_jobs()
+            metrics = handler.aggregate_metrics()
+            health = handler.aggregate_health()
+            deleted = handler.bulk_delete_jobs(dry_run=False)
+
+        expected = ["us-east-1", "us-west-2"]
+        assert [item["region"] for item in jobs["errors"]] == expected
+        assert [item["region"] for item in metrics["errors"]] == expected
+        assert [item["region"] for item in health["regions"]] == expected
+        assert [item["region"] for item in deleted["errors"]] == expected
+
+    def test_null_job_metadata_fields_have_total_deterministic_order(self):
+        handler._cached_endpoints = {
+            "us-west-2": "https://west.example/prod",
+            "us-east-1": "https://east.example/prod",
+        }
+
+        def query(_region, _endpoint, _path, *_args, **_kwargs):
+            return {
+                "_status": "success",
+                "jobs": [
+                    {"metadata": None},
+                    {
+                        "metadata": {
+                            "name": None,
+                            "namespace": None,
+                            "uid": None,
+                            "creationTimestamp": None,
+                        }
+                    },
+                ],
+                "count": 2,
+                "total": 2,
+            }
+
+        with patch.object(handler, "query_region", side_effect=query):
+            jobs = handler.aggregate_jobs()
+
+        assert jobs["count"] == 4
+        assert [item["_source_region"] for item in jobs["jobs"]] == [
+            "us-east-1",
+            "us-east-1",
+            "us-west-2",
+            "us-west-2",
+        ]

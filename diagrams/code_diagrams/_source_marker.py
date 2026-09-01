@@ -80,7 +80,7 @@ def _ruff_format(paths: list[Path], *, project_root: Path) -> None:
     subprocess.run(  # noqa: S603 — args are fully-known paths we just generated
         [sys.executable, "-m", "ruff", "format", "--quiet", *rels],
         cwd=str(project_root),
-        check=False,
+        check=True,
     )
 
 
@@ -194,7 +194,12 @@ def _format_block(
     statement).
     """
     lines = ["", f"# <{SENTINEL}> BEGIN - auto-inserted, do not edit"]
+    source_commits = {result.source_commit for result in results}
+    if len(source_commits) != 1:
+        raise ValueError("source marker results must share one Git source commit")
+    source_commit = next(iter(source_commits))
     lines.append(f"# Generated at (UTC): {results[0].generated_at}")
+    lines.append(f"# Generated from Git commit: {source_commit}")
     lines.append("# Flowchart(s) generated from this file:")
     for result in results:
         html_rel = result.html_path.relative_to(project_root)
@@ -203,7 +208,9 @@ def _format_block(
             png_rel = result.png_path.relative_to(project_root)
             lines.append(f"#     (PNG: ``{png_rel}``)")
     lines.append(
-        "# Regenerate with ``python diagrams/code_diagrams/generate.py``.",
+        "# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> "
+        "GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> "
+        "python diagrams/generate.py --code-only``.",
     )
     lines.append(f"# <{SENTINEL}> END")
     # Trailing "" plus the final "\n" from ``join`` ensures the block

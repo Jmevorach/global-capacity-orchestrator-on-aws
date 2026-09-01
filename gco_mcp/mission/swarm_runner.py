@@ -51,6 +51,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
+# Flowchart(s) generated from this file:
+#   * ``SwarmRunner.run_to_completion`` -> ``diagrams/code_diagrams/gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.html``
+#     (PNG: ``diagrams/code_diagrams/gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
+
 # Match the package's path-injection pattern (see _engine_factory.py):
 # gco_mcp/ modules import each other with gco_mcp/ itself on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -610,8 +620,8 @@ class SwarmRunner:
             writer.finish(state="cancelled")
             raise
         except Exception as exc:  # noqa: BLE001 — a driver bug must not kill the swarm
-            current = self._backend.load_session(child_id)
-            consumed = len(current.get("iterations", [])) if current is not None else 0
+            # Persist the standard abort transition before settling the slot.
+            consumed = self._terminate_child_session(child_id)
             self._settle_slot(slot, consumed=consumed, status="failed")
             writer.finish(state="failed", error=str(exc))
 

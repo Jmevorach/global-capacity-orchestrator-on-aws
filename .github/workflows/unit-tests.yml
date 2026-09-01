@@ -7,21 +7,22 @@
 # Triggers: push: main, pull_request, workflow_dispatch.
 #
 # Jobs (alphabetical by display name):
+#   - changes                       — PR dependency-path filter for lock/install jobs
 #   - unit:bats:shell               — BATS shell tests
-#   - unit:cdk:config-matrix        — tests/test_cdk_synthesis_matrix.py (in-process, -n auto)
+#   - unit:cdk:config-matrix        — serial in-process config synthesis matrix
 #   - unit:cdk:nag-compliance       — cdk-nag compliance across full config matrix
-#   - unit:cdk:project-name-scoping — #139: per-project_name name-collision + gco backward-compat synth checks
+#   - unit:cdk:nag-compliance:list  — emits the dynamic cdk-nag matrix
+#   - unit:cdk:project-name-scoping — #139 name-collision + backward-compat synth checks
 #   - unit:cdk:synth                — cdk synth of the default config
+#   - unit:cli:autopilot            — both-engine plans, configs, imports, and pinned CLIs
 #   - unit:cli:smoke                — gco --help and all subcommand help pages
 #   - unit:cli:smoke:windows        — native Windows cli.stacks/app import + file-lock smoke
 #   - unit:fresh-install            — pip install from scratch, verify imports
 #   - unit:lockfile:freshness       — requirements-lock.txt matches pyproject.toml
 #   - unit:mcp:install              — uv-installs gco-mcp from source, then launches the server
-#   - unit:pytest:core              — combines shard coverage, enforces the 90% floor, publishes the coverage artifact
-#   - unit:pytest:core (shard N/M)  — one balanced slice of the core suite; shard
-#                                     count is set by matrix.shard on
-#                                     unit-pytest-core-shard and the slices are
-#                                     computed at run time by scripts/split_tests.py
+#   - unit:pytest:core              — combines shard coverage and enforces the 90% floor
+#   - unit:pytest:core (shard N/M)  — one dynamic balanced slice of the core suite
+#   - unit:recorder:macos-bash32    — recorder syntax and redaction under system Bash 3.2
 #   - unit:workload:imports         — K8s service import + circular-import detection
 #
 # The HTML coverage report is published to GitHub Pages by a separate
@@ -97,7 +98,7 @@ jobs:
   # the whole codebase rather than against a fraction of it.
   #
   # TO CHANGE THE SHARD COUNT, edit `matrix.shard` below and nothing else:
-  # adding `3` to the list produces three shards. `--of` is derived from
+  # append or remove the next contiguous integer. `--of` is derived from
   # `strategy.job-total`, the shard list is computed at run time by
   # scripts/split_tests.py, and tests/test_split_tests.py asserts the matrix and
   # the script agree — so a half-finished change fails CI instead of silently
@@ -112,7 +113,7 @@ jobs:
       # failures in the suite rather than only those in the first shard to break.
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     # Several tests import Lambda handler modules that construct boto3
     # clients at module scope (lambda/api-gateway-proxy/proxy_utils.py,
     # lambda/cross-region-aggregator/handler.py). boto3 requires a region
@@ -122,7 +123,13 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
       AWS_REGION: us-east-1
     steps:
+      # Diagram provenance tests resolve the exact source commit recorded in
+      # generated markers/artifacts. The default depth-1 checkout contains only
+      # the PR head and cannot prove an older source commit, so this test job
+      # intentionally fetches complete history.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
       # Reclaim ~20-30 GB before the coverage run. Without this the runner's
       # ~14 GB root volume can fill mid-test, and coverage.py's SQLite flush
       # then raises "database or disk is full", which xdist reports as an
@@ -136,9 +143,10 @@ jobs:
           python-version-file: ".python-version"
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
-      - name: Install dependencies
+      - name: Install locked dependencies
         run: |
-          pip install -e ".[dev,mcp]"
+          pip install -r requirements-lock.txt
+          pip install -e . --no-deps
       - uses: ./.github/actions/build-lambda-package
       - name: Validate accelerator catalog and NodePools
         # Deterministic and credential-free: the mutable EC2 catalog is checked
@@ -577,7 +585,8 @@ jobs:
       - name: Install locked CDK + Python dependencies
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
-          pip install -e ".[cdk]"
+          pip install -r requirements-lock.txt
+          pip install -e . --no-deps
       - uses: ./.github/actions/build-lambda-package
       - name: Verify synth and diff repair the real inference streaming bundle
         run: python .github/scripts/verify_inference_streaming_bundle_freshness.py
@@ -611,8 +620,10 @@ jobs:
           python-version-file: ".python-version"
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
-      - name: Install CDK + test dependencies
-        run: pip install -e ".[cdk,test]"
+      - name: Install locked CDK + test dependencies
+        run: |
+          pip install -r requirements-lock.txt
+          pip install -e . --no-deps
       - uses: ./.github/actions/build-lambda-package
       - name: Run config matrix
         # tests/test_cdk_synthesis_matrix.py parametrizes across every
@@ -664,8 +675,10 @@ jobs:
           python-version-file: ".python-version"
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
-      - name: Install CDK + test dependencies
-        run: pip install -e ".[cdk,test]"
+      - name: Install locked CDK + test dependencies
+        run: |
+          pip install -r requirements-lock.txt
+          pip install -e . --no-deps
       - uses: ./.github/actions/build-lambda-package
       - name: Verify project_name scoping (#139)
         # Runs serially (no ``-n auto``) for the same reason as
@@ -742,8 +755,10 @@ jobs:
           python-version-file: ".python-version"
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
-      - name: Install dependencies
-        run: pip install -e ".[dev,mcp]"
+      - name: Install locked dependencies
+        run: |
+          pip install -r requirements-lock.txt
+          pip install -e . --no-deps
       - uses: ./.github/actions/build-lambda-package
       - name: Run cdk-nag compliance for ${{ matrix.config }}
         # Select the exact parametrized test case by test ID. The
@@ -785,9 +800,16 @@ jobs:
           python-version-file: ".python-version"
           cache: "pip"
           cache-dependency-path: "requirements-lock.txt"
-      - name: Install pip-tools
+      - name: Install the locked pip-tools version
         run: |
-          pip install pip-tools
+          set -euo pipefail
+          # pip-tools 7.6.1 imports a pip internal removed after 25.0.1.
+          # Keep this throwaway resolver environment on the documented
+          # compatibility version, and derive pip-tools from the committed lock.
+          python -m pip install "pip==25.0.1"
+          pin="$(grep -E '^pip-tools==' requirements-lock.txt)"
+          test -n "$pin"
+          python -m pip install "$pin"
       - name: Verify lockfile is up to date
         # Pre-seed the candidate lockfile with the committed one so pip-compile
         # treats the existing pins as the current resolution state. Without
@@ -795,7 +817,7 @@ jobs:
         # and the CI run would falsely flag drift.
         #
         # ``--all-extras`` pins every optional-dependency group (dev, test,
-        # cdk, mcp, typecheck, lint, security, and all five image groups). Without
+        # cdk, mcp, typecheck, lint, security, and all six image groups). Without
         # it, only the runtime ``dependencies`` list gets resolved and CI's
         # own toolchain (pytest, pytest-xdist, moto, ruff, mypy, aws-cdk-lib,
         # etc.) installs against live PyPI on every run. That means a

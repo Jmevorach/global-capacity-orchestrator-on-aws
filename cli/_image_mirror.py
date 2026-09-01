@@ -73,13 +73,14 @@ import yaml
 from ._image_uri import ecr_registry_host
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
 # Flowchart(s) generated from this file:
 #   * ``read_mirror_config`` -> ``diagrams/code_diagrams/cli/_image_mirror.read_mirror_config.html``
 #     (PNG: ``diagrams/code_diagrams/cli/_image_mirror.read_mirror_config.png``)
 #   * ``mirror_images`` -> ``diagrams/code_diagrams/cli/_image_mirror.mirror_images.html``
 #     (PNG: ``diagrams/code_diagrams/cli/_image_mirror.mirror_images.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

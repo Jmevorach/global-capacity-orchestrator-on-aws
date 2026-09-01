@@ -1,7 +1,9 @@
 # GCO Code Flowcharts
 
-<!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
-*Generated at (UTC): `2026-08-14T03:46:22Z`.*
+<!-- Generated at (UTC): 2026-08-31T15:58:29Z -->
+<!-- Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1 -->
+*Generated at (UTC): `2026-08-31T15:58:29Z`.*
+*Generated from Git commit: `d5eebeaf363afd3a3979dfa66723d298eb5f54d1`.*
 
 This directory holds auto-generated control-flow diagrams for the
 Python source files listed below. Each target produces an interactive
@@ -20,21 +22,30 @@ Playwright is available) a rendered PNG.
 
 ## Regeneration
 
-```bash
-# All targets
-python diagrams/code_diagrams/generate.py
+Use the aggregate driver for canonical committed output:
 
-# A single target
+```bash
+# Full code + infrastructure catalogues at the reviewed timestamp
+SOURCE_DATE_EPOCH=1788091200 GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py
+
+# Read-only artifact/index/marker/PNG contract
+python diagrams/generate.py --check
+
+# One catalogue only
+SOURCE_DATE_EPOCH=1788091200 GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only
+python diagrams/generate.py --infra-only
+
+# A single target for local diagnosis
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
 python diagrams/code_diagrams/generate.py \
     --target lambda/analytics-presigned-url/handler.py:lambda_handler
 
 # HTML only (skip Playwright and remove older PNGs for selected targets)
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
 python diagrams/code_diagrams/generate.py --skip-png
 
-# Make every HTML + PNG artifact byte-reproducible by fixing its timestamp
-SOURCE_DATE_EPOCH=1784203200 python diagrams/code_diagrams/generate.py
-
 # Don't insert/refresh the ``# Flowchart:`` markers in source files
+GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> \
 python diagrams/code_diagrams/generate.py --skip-marker
 
 # Remove every existing marker from the source tree and exit
@@ -56,13 +67,23 @@ pip install -e '.[diagrams]'
 playwright install chromium
 ```
 
-Without Playwright's browser, the generator still writes HTML and removes any
-older PNG for the selected targets so mixed generation times are impossible.
-Every full run records one UTC timestamp in the HTML, PNG, catalogue, and source
-marker. Without ``SOURCE_DATE_EPOCH``, a normal run intentionally records its
-wall-clock invocation time and can change committed metadata even when source
-code is unchanged. Set ``SOURCE_DATE_EPOCH`` to fixed integer Unix seconds when
-byte-reproducible output is required.
+Without Playwright's browser, direct code-generator runs still write HTML and
+remove any older PNG for the selected targets so mixed generation times are
+impossible. Canonical aggregate generation requires ``SOURCE_DATE_EPOCH`` and
+``GCO_DIAGRAM_SOURCE_COMMIT``. Commit substantive source changes first, then
+supply that clean source commit while generating and commit the derived
+artifacts separately; this avoids an impossible self-referential commit SHA.
+The generator verifies every marker-stripped charted source against the supplied
+commit. It records one UTC timestamp and source commit in HTML, PNG pixels, the
+catalogue, and source markers. Each HTML/PNG pair also displays a deterministic
+digest of the pre-annotation flow HTML, so source-flow changes remain visible
+even when flowchart.js collapses them into the same SVG shape. Fixing the
+timestamp prevents metadata-only churn; none of these mechanisms promises
+byte-identical Chromium or Graphviz rasterization across toolchain versions or
+platforms.
+``python diagrams/generate.py --check`` enforces structural
+contracts; ``tests/test_diagram_artifact_contract.py`` also verifies every PNG
+with Pillow.
 
 ## Flowchart index
 
@@ -95,6 +116,9 @@ has multiple charted entry points.
   - gco stacks deploy — pre-deploy image mirror gate (regional-only, #139) &mdash; `cli/stacks.py::StackManager._mirror_images_if_enabled` &mdash; [HTML](./cli/stacks.StackManager__mirror_images_if_enabled.html) · [PNG](./cli/stacks.StackManager__mirror_images_if_enabled.png)
   - gco jobs logs — TrainJob rank resolution and CloudWatch fallback chain &mdash; `cli/jobs.py::JobManager.get_job_logs` &mdash; [HTML](./cli/jobs.JobManager_get_job_logs.html) · [PNG](./cli/jobs.JobManager_get_job_logs.png)
 
+- **`cli/commands/`**
+  - Autopilot launch planner (engine, model, MCP, imports, resume) &mdash; `cli/commands/autopilot_cmd.py::_plan` &mdash; [HTML](./cli/commands/autopilot_cmd._plan.html) · [PNG](./cli/commands/autopilot_cmd._plan.png)
+
 ### `gco/`
 
 - **`gco/services/`**
@@ -105,9 +129,14 @@ has multiple charted entry points.
   - Global queue fenced claim (conditional write + monotonic generation) &mdash; `gco/services/template_store.py::JobStore.claim_job` &mdash; [HTML](./gco/services/template_store.JobStore_claim_job.html) · [PNG](./gco/services/template_store.JobStore_claim_job.png)
   - Global queue lifecycle transition (lease, status, and Kubernetes UID fencing) &mdash; `gco/services/template_store.py::JobStore.transition_job` &mdash; [HTML](./gco/services/template_store.JobStore_transition_job.html) · [PNG](./gco/services/template_store.JobStore_transition_job.png)
   - Deterministic queued Job create-or-adopt path &mdash; `gco/services/manifest_processor.py::ManifestProcessor.apply_queued_job` &mdash; [HTML](./gco/services/manifest_processor.ManifestProcessor_apply_queued_job.html) · [PNG](./gco/services/manifest_processor.ManifestProcessor_apply_queued_job.png)
-  - Inference endpoint desired-state reconciliation &mdash; `gco/services/inference_monitor.py::InferenceMonitor._reconcile_endpoint` &mdash; [HTML](./gco/services/inference_monitor.InferenceMonitor__reconcile_endpoint.html) · [PNG](./gco/services/inference_monitor.InferenceMonitor__reconcile_endpoint.png)
+  - Inference endpoint authorized desired-state reconciliation &mdash; `gco/services/inference_monitor.py::InferenceMonitor._reconcile_endpoint_authorized` &mdash; [HTML](./gco/services/inference_monitor.InferenceMonitor__reconcile_endpoint_authorized.html) · [PNG](./gco/services/inference_monitor.InferenceMonitor__reconcile_endpoint_authorized.png)
   - SQS job prevalidation (kinds, TrainJob decomposition, security, weighted caps) &mdash; `gco/services/queue_processor.py::validate_manifest` &mdash; [HTML](./gco/services/queue_processor.validate_manifest.html) · [PNG](./gco/services/queue_processor.validate_manifest.png)
   - REST manifest validation pipeline (structure, kinds, limits, tolerations, images) &mdash; `gco/services/manifest_processor.py::ManifestProcessor.validate_manifest` &mdash; [HTML](./gco/services/manifest_processor.ManifestProcessor_validate_manifest.html) · [PNG](./gco/services/manifest_processor.ManifestProcessor_validate_manifest.png)
+  - Spot price gate (unknown/malformed/above-cap dispatch policy) &mdash; `gco/services/spot_price_gate.py::SpotPriceGate.evaluate` &mdash; [HTML](./gco/services/spot_price_gate.SpotPriceGate_evaluate.html) · [PNG](./gco/services/spot_price_gate.SpotPriceGate_evaluate.png)
+  - Request-size trust boundary (declared/streamed limits and exact replay) &mdash; `gco/services/request_size_middleware.py::RequestSizeLimitMiddleware.__call__` &mdash; [HTML](./gco/services/request_size_middleware.RequestSizeLimitMiddleware___call__.html) · [PNG](./gco/services/request_size_middleware.RequestSizeLimitMiddleware___call__.png)
+  - Webhook delivery boundary (DNS pinning, HMAC, retries, redacted accounting) &mdash; `gco/services/webhook_dispatcher.py::WebhookDispatcher._deliver_webhook` &mdash; [HTML](./gco/services/webhook_dispatcher.WebhookDispatcher__deliver_webhook.html) · [PNG](./gco/services/webhook_dispatcher.WebhookDispatcher__deliver_webhook.png)
+  - Mooncake prefill/decode dispatch (admin gate, KV handoff, streaming decode) &mdash; `gco/services/mooncake_pd_proxy.py::_dispatch` &mdash; [HTML](./gco/services/mooncake_pd_proxy._dispatch.html) · [PNG](./gco/services/mooncake_pd_proxy._dispatch.png)
+  - Health status policy (thresholds, violations, collection failure) &mdash; `gco/services/health_monitor.py::HealthMonitor.get_health_status` &mdash; [HTML](./gco/services/health_monitor.HealthMonitor_get_health_status.html) · [PNG](./gco/services/health_monitor.HealthMonitor_get_health_status.png)
 
 - **`gco/services/api_routes/`**
   - Authenticated inference target resolution (region, readiness, namespace, canary) &mdash; `gco/services/api_routes/inference_proxy.py::_resolve_upstream` &mdash; [HTML](./gco/services/api_routes/inference_proxy._resolve_upstream.html) · [PNG](./gco/services/api_routes/inference_proxy._resolve_upstream.png)
@@ -137,6 +166,7 @@ has multiple charted entry points.
   - Mission script AST validator (parse-time allowlist enforcement) &mdash; `gco_mcp/mission/sandbox.py::validate_script_ast` &mdash; [HTML](./gco_mcp/mission/sandbox.validate_script_ast.html) · [PNG](./gco_mcp/mission/sandbox.validate_script_ast.png)
   - Mission criteria scaffolder (Bedrock sampling + retry + autofix pipeline) &mdash; `gco_mcp/mission/criteria_scaffold.py::generate_sampled_criteria` &mdash; [HTML](./gco_mcp/mission/criteria_scaffold.generate_sampled_criteria.html) · [PNG](./gco_mcp/mission/criteria_scaffold.generate_sampled_criteria.png)
   - Mission engine factory (live vs stub dispatcher, sampling, sandbox wiring) &mdash; `gco_mcp/mission/_engine_factory.py::build_engine_dependencies` &mdash; [HTML](./gco_mcp/mission/_engine_factory.build_engine_dependencies.html) · [PNG](./gco_mcp/mission/_engine_factory.build_engine_dependencies.png)
+  - Swarm runner lifecycle (fleet guard, respawn, settlement, cascade shutdown) &mdash; `gco_mcp/mission/swarm_runner.py::SwarmRunner.run_to_completion` &mdash; [HTML](./gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.html) · [PNG](./gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.png)
 
 - **`gco_mcp/tools/`**
   - MCP long-task runner (drain, progress, cancel + SIGTERM/SIGKILL) &mdash; `gco_mcp/tools/_long_task.py::_run_long_task` &mdash; [HTML](./gco_mcp/tools/_long_task._run_long_task.html) · [PNG](./gco_mcp/tools/_long_task._run_long_task.png)
@@ -151,6 +181,9 @@ has multiple charted entry points.
 
 - **`lambda/api-gateway-proxy/`**
   - API Gateway Proxy Lambda &mdash; `lambda/api-gateway-proxy/handler.py::lambda_handler` &mdash; [HTML](./lambda/api-gateway-proxy/handler.lambda_handler.html) · [PNG](./lambda/api-gateway-proxy/handler.lambda_handler.png)
+
+- **`lambda/capacity-poller/`**
+  - Capacity snapshot poller (Region truth, pooled scores, bounded retries, writes) &mdash; `lambda/capacity-poller/handler.py::lambda_handler` &mdash; [HTML](./lambda/capacity-poller/handler.lambda_handler.html) · [PNG](./lambda/capacity-poller/handler.lambda_handler.png)
 
 - **`lambda/cross-region-aggregator/`**
   - Cross-Region Aggregator Lambda &mdash; `lambda/cross-region-aggregator/handler.py::lambda_handler` &mdash; [HTML](./lambda/cross-region-aggregator/handler.lambda_handler.html) · [PNG](./lambda/cross-region-aggregator/handler.lambda_handler.png)
@@ -167,6 +200,9 @@ has multiple charted entry points.
   - Helm teardown completion poll (continued fencing + terminal status) &mdash; `lambda/helm-installer/teardown_provider.py::is_complete` &mdash; [HTML](./lambda/helm-installer/teardown_provider.is_complete.html) · [PNG](./lambda/helm-installer/teardown_provider.is_complete.png)
   - Helm convergence per-chart decision (EnabledCharts authority: install vs uninstall) &mdash; `lambda/helm-installer/handler.py::handle_task` &mdash; [HTML](./lambda/helm-installer/handler.handle_task.html) · [PNG](./lambda/helm-installer/handler.handle_task.png)
   - Helm release-set validation (charts.yaml expected set, deployed vs absent) &mdash; `lambda/helm-installer/handler.py::validate_releases` &mdash; [HTML](./lambda/helm-installer/handler.validate_releases.html) · [PNG](./lambda/helm-installer/handler.validate_releases.png)
+
+- **`lambda/helm-orchestrator/`**
+  - Helm convergence orchestrator (start/adopt, replay identity, rollback fencing) &mdash; `lambda/helm-orchestrator/handler.py::on_event` &mdash; [HTML](./lambda/helm-orchestrator/handler.on_event.html) · [PNG](./lambda/helm-orchestrator/handler.on_event.png)
 
 - **`lambda/image-lookup/`**
   - Image-lookup-or-create custom resource Lambda &mdash; `lambda/image-lookup/handler.py::lambda_handler` &mdash; [HTML](./lambda/image-lookup/handler.lambda_handler.html) · [PNG](./lambda/image-lookup/handler.lambda_handler.png)
@@ -188,6 +224,9 @@ has multiple charted entry points.
 
 - **`lambda/tls-shared/`**
   - Private-root backend TLS trust refresh and verified connection pool &mdash; `lambda/tls-shared/backend_tls.py::get_backend_http_pool` &mdash; [HTML](./lambda/tls-shared/backend_tls.get_backend_http_pool.html) · [PNG](./lambda/tls-shared/backend_tls.get_backend_http_pool.png)
+
+- **`lambda/traffic-dial-controller/`**
+  - Traffic dial controller (health evidence, step limits, last-Region safety) &mdash; `lambda/traffic-dial-controller/handler.py::lambda_handler` &mdash; [HTML](./lambda/traffic-dial-controller/handler.lambda_handler.html) · [PNG](./lambda/traffic-dial-controller/handler.lambda_handler.png)
 
 - **`lambda/vector-ingest/`**
   - Vector-store corpus ingest (S3 notification -> chunk, embed, write items) &mdash; `lambda/vector-ingest/handler.py::lambda_handler` &mdash; [HTML](./lambda/vector-ingest/handler.lambda_handler.html) · [PNG](./lambda/vector-ingest/handler.lambda_handler.png)

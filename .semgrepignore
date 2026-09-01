@@ -84,5 +84,5 @@ demo/*.cast
 # documentation artifacts users open in a checkout — so the
 # ``missing-integrity`` (no SRI hash on CDN scripts) and
 # ``plaintext-http-link`` findings have no runtime impact here.
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 diagrams/code_diagrams/**/*.html

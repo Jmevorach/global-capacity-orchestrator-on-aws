@@ -38,6 +38,7 @@ from .scanners import (
     _list_project_tagged_resources,
     _list_secrets,
     _list_sqs_queues,
+    _list_target_groups,
 )
 from .stacks import (
     collect_project_stacks,
@@ -164,6 +165,7 @@ def collect_project_resources(
         ("sqs_queues", "sqs", "sqs_queues", _list_sqs_queues),
         ("dynamodb_tables", "dynamodb", "dynamodb_tables", _list_dynamodb_tables),
         ("load_balancers", "elbv2", "load_balancers", _list_load_balancers),
+        ("target_groups", "elbv2", "target_groups", _list_target_groups),
         ("ec2_instances", "ec2", "instances", _list_instances),
         (
             "ecr_repositories",

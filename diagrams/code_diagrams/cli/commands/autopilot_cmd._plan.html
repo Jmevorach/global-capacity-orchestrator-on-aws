@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="gco-generated-at" content="2026-08-31T15:58:29Z">
+        <meta name="gco-source-commit" content="d5eebeaf363afd3a3979dfa66723d298eb5f54d1">
+        <meta name="gco-flow-digest" content="412f96a126ce3905">
+        <title>Autopilot launch planner (engine, model, MCP, imports, resume)</title>
+        <style type="text/css">
+          .end-element { fill : #FFCCFF; }
+        </style>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/raphael/2.3.0/raphael.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/flowchart/1.17.1/flowchart.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.1/js/bootstrap.bundle.min.js"></script>
+        <!-- <script src="../release/flowchart.min.js"></script> -->
+        <script>
+
+            window.onload = function () {
+                var btn = document.getElementById("run"),
+                    cd = document.getElementById("code"),
+                    chart;
+
+                (btn.onclick = function () {
+                    var code = cd.value;
+
+                    if (chart) {
+                      chart.clean();
+                    }
+
+                    chart = flowchart.parse(code);
+                    chart.drawSVG('canvas', {
+                      'x': 0,
+                      'y': 0,
+                      'line-width': 3,
+                      //'maxWidth': 15,//ensures the flowcharts fits within a certain width
+                      'line-length': 50,
+                      'text-margin': 10,
+                      'font-size': 14,
+                      'font': 'normal',
+                      'font-family': 'Helvetica',
+                      'font-weight': 'normal',
+                      'font-color': 'black',
+                      'line-color': 'black',
+                      'element-color': 'black',
+                      'fill': 'white',
+                      'yes-text': 'yes',
+                      'no-text': 'no',
+                      'arrow-end': 'block',
+                      'scale': 1,
+                      'symbols': {
+                        'start': {
+                          'font-size': 14,
+                          'font-color': 'yellow',
+                          'element-color': 'blue',
+                          'fill': 'green',
+                          'class': 'start-element'
+                        },
+                        'inputoutput': {
+                          'font-color': 'black',
+                          'element-color': 'black',
+                          'fill': 'bisque'
+                        },
+                        'operation': {
+                          'font-color': 'black',
+                          'element-color': 'black',
+                          'fill': 'linen'
+                        },
+                        'subroutine': {
+                          'font-color': 'black',
+                          'element-color': 'blue',
+                          'fill': 'lightgreen'
+                        },
+                        'condition': {
+                          'font-color': 'red',
+                          'element-color': 'black',
+                          'fill': 'yellow'
+                        },
+                        'end':{
+                          'font-size': 20,
+                          'class': 'end-element'
+                        }
+                      },
+                      'flowstate' : {
+                        //'past' : { 'fill' : '#CCCCCC', 'font-size' : 12},
+                        //'current' : {'fill' : 'yellow', 'font-color' : 'red', 'font-weight' : 'bold'},
+                        //'future' : { 'fill' : '#FFFF99'},
+                        'request' : { 'fill' : 'blue'},
+                        'invalid': {'fill' : '#444444'},
+                        'approved' : { 'fill' : '#58C4A3', 'font-size' : 12, 'yes-text' : 'APPROVED', 'no-text' : 'n/a' },
+                        'rejected' : { 'fill' : '#C45879', 'font-size' : 12, 'yes-text' : 'n/a', 'no-text' : 'REJECTED' }
+                      }
+                    });
+                    //create base64 encoding of SVG to generate download link for title(without html or htm).SVG
+                    var currentCanvasDIV = document.getElementById('canvas')
+                    var currentDrawSVG = currentCanvasDIV.innerHTML.replaceAll('ë','e');
+
+                    const OUTsvgBASE64 = btoa(currentDrawSVG)
+                    doctitle = document.title.replace('.html','');
+                    doctitle = doctitle.replace('.htm','');
+
+
+                    var currentCanvasDIV = document.getElementById('canvas')
+                    var currentDrawSVG = currentCanvasDIV.innerHTML.replaceAll('ë','e');
+                    svgSource = currentDrawSVG
+                    svgXML = currentDrawSVG;
+                    // Use SVG Height and Width from the SVG XML to set canvas size
+                    svgXMLsubstringHeight = svgXML.substring(svgXML.indexOf('height='), svgXML.indexOf('version='));
+                    svgXMLsubstringWidth = svgXML.substring(svgXML.indexOf('width='), svgXML.indexOf('xmlns='));
+                    HeightValue = svgXMLsubstringHeight.substring(svgXMLsubstringHeight.indexOf('"')+1,svgXMLsubstringHeight.lastIndexOf('"'));
+                    WidthValue = svgXMLsubstringWidth.substring(svgXMLsubstringWidth.indexOf('"')+1,svgXMLsubstringWidth.lastIndexOf('"'));
+                    HeightValueInt = Math.round(HeightValue)
+                    WidthValueInt = Math.round(WidthValue)
+                    // setup input for base64SvgToBase64Png
+                    let svgSrc = "data:image/svg+xml;base64,"+OUTsvgBASE64;
+                    var pngBase
+                    imageUtil.base64SvgToBase64Png(svgSrc, WidthValueInt, HeightValueInt).then(pngSrc => {
+                    pngBase = pngSrc
+                    // output download link for base64 PNG converted on download from base64
+                    var pngOutHtml = `<a href="${pngBase}" download="${doctitle}.png">PNG - Click here to download current rendered flowchart as ${doctitle}.png</a>`
+                    document.getElementById("pngbase64").innerHTML=pngOutHtml;
+                    });
+                    // output download link for base64 SVG converted on download from base64
+                    var svgOutHtml = `<a href="data:image/svg+xml;base64,${OUTsvgBASE64}" download=${doctitle}.svg>SVG - Click here to download current rendered flowchart as ${doctitle}.svg</a> `
+                        document.getElementById("svgbase64").innerHTML=svgOutHtml;
+                    })();
+
+                            };
+
+
+// derived from https://stackoverflow.com/a/64800570
+// we need to use web browser canvas to generate a image. In this case png
+let imageUtil = {};
+/**
+ * converts a base64 encoded data url SVG image to a PNG image
+ * @param originalBase64 data url of svg image
+ * @param width target width in pixel of PNG image
+ * @param secondTry used internally to prevent endless recursion
+ * @return {Promise<unknown>} resolves to png data url of the image
+ */
+imageUtil.base64SvgToBase64Png = function (originalBase64, width, height, secondTry) {
+    return new Promise(resolve => {
+        let img = document.createElement('img');
+        img.onload = function () {
+            if (!secondTry && (img.naturalWidth === 0 || img.naturalHeight === 0)) {
+                let svgDoc = base64ToSvgDocument(originalBase64);
+                let fixedDoc = fixSvgDocumentFF(svgDoc);
+                return imageUtil.base64SvgToBase64Png(svgDocumentToBase64(fixedDoc), width, height, true).then(result => {
+                    resolve(result);
+                });
+            }
+            //document.body.appendChild(img);
+            let canvas2 = document.createElement("canvas");
+            //document.body.removeChild(img);
+            canvas2.width = width;
+            canvas2.height = height;
+            let ctx = canvas2.getContext("2d");
+            ctx.drawImage(img, 0, 0, canvas2.width, canvas2.height);
+            try {
+                let data = canvas2.toDataURL('image/png');
+                resolve(data);
+            } catch (e) {
+                resolve(null);
+            }
+        };
+        img.src = originalBase64;
+    });
+}
+
+//needed because Firefox doesn't correctly handle SVG with size = 0, see https://bugzilla.mozilla.org/show_bug.cgi?id=700533
+function fixSvgDocumentFF(svgDocument) {
+    try {
+        let widthInt = parseInt(svgDocument.documentElement.width.baseVal.value) || 500;
+        let heightInt = parseInt(svgDocument.documentElement.height.baseVal.value) || 500;
+        svgDocument.documentElement.width.baseVal.newValueSpecifiedUnits(SVGLength.SVG_LENGTHTYPE_PX, widthInt);
+        svgDocument.documentElement.height.baseVal.newValueSpecifiedUnits(SVGLength.SVG_LENGTHTYPE_PX, heightInt);
+        return svgDocument;
+    } catch (e) {
+        return svgDocument;
+    }
+}
+
+function svgDocumentToBase64(svgDocument) {
+    try {
+        let base64EncodedSVG = btoa(new XMLSerializer().serializeToString(svgDocument));
+        return 'data:image/svg+xml;base64,' + base64EncodedSVG;
+    } catch (e) {
+        return null;
+    }
+}
+
+function base64ToSvgDocument(base64) {
+    let svg = atob(base64.substring(base64.indexOf('base64,') + 7));
+    svg = svg.substring(svg.indexOf('<svg'));
+    let parser = new DOMParser();
+    return parser.parseFromString(svg, "image/svg+xml");
+}
+        </script>
+
+        <script>
+            function HelpText() {
+              var x = document.getElementById("HelpTextBlock");
+              if (x.style.display === "none") {
+                x.style.display = "block";
+              } else {
+                x.style.display = "none";
+              }
+            }
+        </script>
+    </head>
+    <body>
+        <div><textarea id="code" style="width: 100%;" rows="11">op8237=>operation: 'Resolve an engine launch plan without installing or writing files.'
+op8239=>operation: resolved_engine = resolve_engine(engine)
+op8241=>operation: gco_mcp_env = resolve_mcp_flags(enable)
+sub8243=>subroutine: gco_mcp_env.update(_parse_mcp_env(mcp_env))
+op8245=>operation: workspace = Path.cwd()
+op8247=>operation: mcp_config = build_mcp_config(workspace, include_companions=companions, gco_mcp_env=gco_mcp_env)
+op8249=>operation: resolved_region = effective_aws_region(config.default_region)
+cond8252=>condition: if resolved_engine is AutopilotEngine.CODEX
+op8256=>operation: resolved_small = resolve_small_fast_model(small_fast_model)
+cond8259=>operation: raise ValueError('--small-fast-model and GCO_AUTOPILOT_SMALL_FAST_MODEL are supported only by the claude-code engine') if  resolved_small is not None
+cond8270=>operation: raise ValueError('--plugin and GCO_AUTOPILOT_PLUGIN_DIRS are Claude Code plugin inputs and are not supported by the codex engine') if  plugin_paths_requested(plugins)
+op8280=>operation: plugin_paths: list[Path] = []
+cond8283=>operation: raise ValueError('--agents imports Claude Code agent files and is not supported by the codex engine') if  agents
+sub8293=>subroutine: validate_imports(skills, ())
+op8295=>operation: resolved_model, warnings = resolve_codex_model(model)
+op8297=>operation: reasoning_effort = resolve_codex_reasoning_effort(model)
+op8299=>operation: codex_config = build_codex_config_toml(mcp_config, model=resolved_model, region=resolved_region, reasoning_effort=reasoning_effort)
+op8301=>operation: binary = find_codex_binary()
+op8303=>operation: pin = f'{CODEX_PACKAGE}@{CODEX_VERSION}'
+op8305=>operation: install_command = codex_install_command()
+op8307=>operation: config_file = codex_config_path()
+op8309=>operation: display_name = 'Codex'
+op8311=>operation: resumable = False
+op8340=>operation: plan = {'engine': resolved_engine.value, 'engine_display_name': display_name, 'engine_binary': binary, 'engine_pin': pin, 'model': resolved_model, 'small_fast_model': resolved_small, 'reasoning_effort': reasoning_effort, 'region': resolved_region, 'workspace': str(workspace), 'mcp_config_path': str(config_file), 'mcp_servers': sorted(mcp_config['mcpServers']), 'gco_mcp_env': dict(sorted(gco_mcp_env.items())), 'plugins': [str(path) for path in plugin_paths], 'import_skills': [str(Path(item).expanduser()) for item in skills], 'import_agents': [str(Path(item).expanduser()) for item in agents], 'claude_binary': binary if resolved_engine is AutopilotEngine.CLAUDE_CODE else None, 'claude_code_pin': pin if resolved_engine is AutopilotEngine.CLAUDE_CODE else None, 'codex_binary': binary if resolved_engine is AutopilotEngine.CODEX else None, 'codex_pin': pin if resolved_engine is AutopilotEngine.CODEX else None, 'install_command': ' '.join(install_command), 'resumable_session': resumable, 'mcp_config': mcp_config, 'codex_config': codex_config}
+io8345=>inputoutput: output: (plan, warnings)
+e8343=>end: end function return
+op8315=>operation: resolved_model, warnings = resolve_model(model)
+op8317=>operation: resolved_small = resolve_small_fast_model(small_fast_model)
+op8319=>operation: plugin_paths = resolve_plugin_paths(plugins)
+sub8321=>subroutine: validate_imports(skills, agents)
+op8323=>operation: reasoning_effort = None
+op8325=>operation: codex_config = None
+op8327=>operation: binary = find_claude_binary()
+op8329=>operation: pin = f'{CLAUDE_CODE_PACKAGE}@{CLAUDE_CODE_VERSION}'
+op8331=>operation: install_command = claude_install_command()
+op8333=>operation: config_file = config_path()
+op8335=>operation: display_name = 'Claude Code'
+op8337=>operation: resumable = has_resumable_session(workspace)
+
+op8237->op8239
+op8239->op8241
+op8241->sub8243
+sub8243->op8245
+op8245->op8247
+op8247->op8249
+op8249->cond8252
+cond8252(yes)->op8256
+op8256->cond8259
+cond8259->cond8270
+cond8270->op8280
+op8280->cond8283
+cond8283->sub8293
+sub8293->op8295
+op8295->op8297
+op8297->op8299
+op8299->op8301
+op8301->op8303
+op8303->op8305
+op8305->op8307
+op8307->op8309
+op8309->op8311
+op8311->op8340
+op8340->io8345
+io8345->e8343
+cond8252(no)->op8315
+op8315->op8317
+op8317->op8319
+op8319->sub8321
+sub8321->op8323
+op8323->op8325
+op8325->op8327
+op8327->op8329
+op8329->op8331
+op8331->op8333
+op8333->op8335
+op8335->op8337
+op8337->op8340
+</textarea></div>
+        <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
+        <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
+... and the other symbols too... like sub1(right)<br/>
+You can also tweak the <b>diagram.drawSVG('diagram', {});</b> script in this file for more changes<br/>
+This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on github</a> and <a href="http://flowchart.js.org">http://flowchart.js.org</a> more documentation can be found over there.
+</div><br/><div id="svgbase64"></div>
+        <div id="pngbase64"></div>
+
+        <!-- Generated at (UTC): 2026-08-31T15:58:29Z -->
+        <!-- Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1 -->
+        <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
+          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-08-31T15:58:29Z">2026-08-31T15:58:29Z</time>
+          </p>
+          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
+            Source commit: <code>d5eebeaf363afd3a3979dfa66723d298eb5f54d1</code>
+          </p>
+          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
+            Flow content SHA-256: <code>412f96a126ce3905</code>
+          </p>
+          <div id="canvas"></div>
+        </div>
+    </body>
+</html>

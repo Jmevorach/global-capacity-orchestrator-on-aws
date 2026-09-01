@@ -141,13 +141,14 @@ from gco.stacks.constants import (
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
 # Flowchart(s) generated from this file:
 #   * ``GCORegionalStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack___init__.png``)
 #   * ``GCORegionalStack._get_volcano_image_mirror_config`` -> ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack__get_volcano_image_mirror_config.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/regional_stack.GCORegionalStack__get_volcano_image_mirror_config.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 
@@ -319,6 +320,27 @@ def _service_image_asset_excludes(*included_paths: str) -> list[str]:
 #: scheduler ahead of a config change. Overrides can only ENABLE — a chart
 #: disabled by an operator stays disabled unless named here.
 _HELM_OVERRIDE_CONTEXT_KEY = "helm_enabled_overrides"
+
+#: Live-validation-only context that prevents AWS-managed EFS automatic backups
+#: from outliving a disposable stack for the service's fixed retention window.
+#: Normal deployments omit this key and preserve automatic backups.
+_LIVE_VALIDATION_DISABLE_EFS_BACKUPS_CONTEXT = "gco_live_validation_disable_efs_automatic_backups"
+
+
+def _explicit_context_bool(raw: object, *, key: str) -> bool:
+    """Parse an optional CDK context boolean without truthy-string ambiguity."""
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"{key} must be true or false")
+
 
 #: Every cdk.json helm-block key _get_enabled_charts understands. Kept in
 #: lockstep with its chart_map so an override typo fails the synth loudly
@@ -724,6 +746,10 @@ class GCORegionalStack(Stack):
         self.deployment_region = region
         self.auth_secret_arn = auth_secret_arn
         self.alb_arn: str | None = None
+        self.disable_efs_automatic_backups = _explicit_context_bool(
+            self.node.try_get_context(_LIVE_VALIDATION_DISABLE_EFS_BACKUPS_CONTEXT),
+            key=_LIVE_VALIDATION_DISABLE_EFS_BACKUPS_CONTEXT,
+        )
         retain_provider_logs = self.node.try_get_context(_LIVE_VALIDATION_PROVIDER_LOG_CONTEXT)
         self.provider_log_group_removal_policy = (
             RemovalPolicy.RETAIN
@@ -5406,7 +5432,7 @@ class GCORegionalStack(Stack):
         allowing pods to share data and persist outputs. The EFS is configured
         with:
         - Encryption at rest
-        - Automatic backups
+        - Automatic backups (disabled only for disposable live validation)
         - General Purpose performance mode (suitable for most workloads)
         - Bursting throughput mode
 
@@ -5443,8 +5469,15 @@ class GCORegionalStack(Stack):
             performance_mode=efs.PerformanceMode.GENERAL_PURPOSE,
             throughput_mode=efs.ThroughputMode.BURSTING,
             removal_policy=RemovalPolicy.DESTROY,  # For dev/test; use RETAIN for production
-            enable_automatic_backups=True,
+            enable_automatic_backups=not self.disable_efs_automatic_backups,
         )
+        if self.disable_efs_automatic_backups:
+            cfn_file_system = self.efs_file_system.node.default_child
+            if not isinstance(cfn_file_system, efs.CfnFileSystem):
+                raise TypeError("GCOEfs default child must be AWS::EFS::FileSystem")
+            cfn_file_system.backup_policy = efs.CfnFileSystem.BackupPolicyProperty(
+                status="DISABLED"
+            )
 
         # Add file system policy to allow mounting without IAM authorization
         # This allows any client that can reach the mount target to mount the file system

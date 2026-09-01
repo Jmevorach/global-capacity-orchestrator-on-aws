@@ -2,7 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-31T15:58:29Z">
+        <meta name="gco-source-commit" content="d5eebeaf363afd3a3979dfa66723d298eb5f54d1">
+        <meta name="gco-flow-digest" content="5a17727f2f6e2896">
         <title>gco inference canary — weighted canary rollout</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,42 +208,46 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op2484=>operation: 'Start a canary deployment for an existing classic endpoint.\n\n        Creates a canary variant with the new image receiving ``weight``%\n        of traffic. Mooncake endpoints are excluded because their split-role\n        topology cannot be represented by the classic canary Deployment.\n\n        Args:\n            endpoint_name: Existing endpoint to canary\n            image: New container image for the canary\n            weight: Percentage of traffic to route to canary (1-99)\n            replicas: Positive number of canary replicas\n\n        Returns:\n            Updated endpoint record, or None if endpoint not found\n        '
-cond2487=>operation: raise ValueError('Canary image must be a non-empty string') if  not isinstance(image, str) or not image.strip()
-cond2498=>operation: raise ValueError('Canary weight must be an integer between 1 and 99') if  not _is_plain_int(weight) or not 1 <= weight <= 99
-cond2509=>operation: raise ValueError('Canary replicas must be a positive integer') if  not _is_plain_int(replicas) or replicas < 1
-op2519=>operation: store = self._get_store()
-op2521=>operation: endpoint = store.get_endpoint(endpoint_name)
-cond2524=>condition: if not endpoint
-io2531=>inputoutput: output: None
-e2529=>end: end function return
-cond2538=>operation: raise ValueError(f"Cannot canary an endpoint in '{endpoint.get('desired_state')}' state. Endpoint must be running or deploying.") if  endpoint.get('desired_state') not in ('running', 'deploying')
-op2548=>operation: raw_spec = endpoint.get('spec')
-cond2551=>operation: raise ValueError(f"Endpoint '{endpoint_name}' has an invalid spec") if  not isinstance(raw_spec, dict)
-cond2562=>operation: raise ValueError('Canary deployments are not supported for Mooncake endpoints') if  'mooncake' in raw_spec
-op2572=>operation: spec = deepcopy(raw_spec)
-op2574=>operation: spec['canary'] = {'image': image.strip(), 'weight': weight, 'replicas': replicas}
-op2576=>operation: result: dict[str, Any] | None = store.update_spec(endpoint_name, spec)
-io2581=>inputoutput: output: result
-e2579=>end: end function return
+        <div><textarea id="code" style="width: 100%;" rows="11">op2549=>operation: 'Start a canary deployment for an existing classic endpoint.\n\n        Creates a canary variant with the new image receiving ``weight``%\n        of traffic. Mooncake endpoints are excluded because their split-role\n        topology cannot be represented by the classic canary Deployment.\n\n        Args:\n            endpoint_name: Existing endpoint to canary\n            image: New container image for the canary\n            weight: Percentage of traffic to route to canary (1-99)\n            replicas: Positive number of canary replicas\n\n        Returns:\n            Updated endpoint record, or None if endpoint not found\n        '
+cond2552=>operation: raise ValueError('Canary image must be a non-empty string') if  not isinstance(image, str) or not image.strip()
+cond2563=>operation: raise ValueError('Canary weight must be an integer between 1 and 99') if  not _is_plain_int(weight) or not 1 <= weight <= 99
+cond2574=>operation: raise ValueError('Canary replicas must be a positive integer') if  not _is_plain_int(replicas) or replicas < 1
+op2584=>operation: store = self._get_store()
+op2586=>operation: loaded = self._load_mutable_endpoint(store, endpoint_name, 'updated')
+cond2589=>condition: if loaded is None
+io2596=>inputoutput: output: None
+e2594=>end: end function return
+op2602=>operation: endpoint, lifecycle_id, updated_at = loaded
+cond2605=>operation: raise ValueError(f"Cannot canary an endpoint in '{endpoint.get('desired_state')}' state. Endpoint must be running or deploying.") if  endpoint.get('desired_state') not in ('running', 'deploying')
+op2615=>operation: raw_spec = endpoint.get('spec')
+cond2618=>operation: raise ValueError(f"Endpoint '{endpoint_name}' has an invalid spec") if  not isinstance(raw_spec, dict)
+cond2629=>operation: raise ValueError('Canary deployments are not supported for Mooncake endpoints') if  'mooncake' in raw_spec
+op2639=>operation: spec = deepcopy(raw_spec)
+op2641=>operation: spec['canary'] = {'image': image.strip(), 'weight': weight, 'replicas': replicas}
+op2643=>operation: result: dict[str, Any] | None = store.update_spec(endpoint_name, spec, expected_lifecycle_id=lifecycle_id, expected_updated_at=updated_at)
+cond2646=>operation: self._raise_write_conflict(endpoint_name, 'updated') if  result is None
+io2659=>inputoutput: output: result
+e2657=>end: end function return
 
-op2484->cond2487
-cond2487->cond2498
-cond2498->cond2509
-cond2509->op2519
-op2519->op2521
-op2521->cond2524
-cond2524(yes)->io2531
-io2531->e2529
-cond2524(no)->cond2538
-cond2538->op2548
-op2548->cond2551
-cond2551->cond2562
-cond2562->op2572
-op2572->op2574
-op2574->op2576
-op2576->io2581
-io2581->e2579
+op2549->cond2552
+cond2552->cond2563
+cond2563->cond2574
+cond2574->op2584
+op2584->op2586
+op2586->cond2589
+cond2589(yes)->io2596
+io2596->e2594
+cond2589(no)->op2602
+op2602->cond2605
+cond2605->op2615
+op2615->cond2618
+cond2618->cond2629
+cond2629->op2639
+op2639->op2641
+op2641->op2643
+op2643->cond2646
+cond2646->io2659
+io2659->e2657
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -251,10 +257,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-31T15:58:29Z -->
+        <!-- Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1 -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
-          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-08-31T15:58:29Z">2026-08-31T15:58:29Z</time>
+          </p>
+          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
+            Source commit: <code>d5eebeaf363afd3a3979dfa66723d298eb5f54d1</code>
+          </p>
+          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
+            Flow content SHA-256: <code>5a17727f2f6e2896</code>
           </p>
           <div id="canvas"></div>
         </div>

@@ -49,7 +49,8 @@ from ._image_uri import (
 from .config import GCOConfig, _load_cdk_json, get_config
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
 # Flowchart(s) generated from this file:
 #   * ``ImageManager.build`` -> ``diagrams/code_diagrams/cli/images.ImageManager_build.html``
 #     (PNG: ``diagrams/code_diagrams/cli/images.ImageManager_build.png``)
@@ -57,7 +58,7 @@ from .config import GCOConfig, _load_cdk_json, get_config
 #     (PNG: ``diagrams/code_diagrams/cli/images.ImageManager_push.png``)
 #   * ``ImageManager.cleanup`` -> ``diagrams/code_diagrams/cli/images.ImageManager_cleanup.html``
 #     (PNG: ``diagrams/code_diagrams/cli/images.ImageManager_cleanup.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 
@@ -410,8 +411,8 @@ class ImageManager:
         df_path = (ctx / dockerfile).resolve()
         if not df_path.exists() or not df_path.is_file():
             raise FileNotFoundError(f"Dockerfile not found: {df_path} (relative to {ctx})")
-        # Confine the Dockerfile to the build context.
-        if not str(df_path).startswith(str(ctx)):
+        # Use path components: /tmp/app-evil has the string prefix /tmp/app.
+        if not df_path.is_relative_to(ctx):
             raise ValueError(f"Dockerfile must live inside the build context: {df_path}")
 
         runtime = self._runtime_or_error()

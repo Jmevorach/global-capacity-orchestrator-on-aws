@@ -23,13 +23,14 @@ from gco.services.structured_logging import sanitize_log_value
 from gco.services.template_store import JobStatus, JobStore
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
 # Flowchart(s) generated from this file:
 #   * ``process_queued_jobs_once`` -> ``diagrams/code_diagrams/gco/services/central_queue_worker.process_queued_jobs_once.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/central_queue_worker.process_queued_jobs_once.png``)
 #   * ``reconcile_active_jobs_once`` -> ``diagrams/code_diagrams/gco/services/central_queue_worker.reconcile_active_jobs_once.html``
 #     (PNG: ``diagrams/code_diagrams/gco/services/central_queue_worker.reconcile_active_jobs_once.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 

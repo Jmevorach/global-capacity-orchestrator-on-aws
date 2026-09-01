@@ -358,6 +358,11 @@ class TestSpotPriceSummary:
         assert price == 1.5
         assert az_count == 2
 
+    def test_probe_failure_is_absent_not_zero(self, handler):
+        ec2 = _fake_ec2()
+        ec2.describe_spot_price_history.side_effect = RuntimeError("unavailable")
+        assert handler._spot_price_summary(ec2, "g5.xlarge") == (None, None)
+
 
 class TestCapacityBlockSummary:
     def test_offering_and_instance_counts(self, handler):
@@ -377,6 +382,11 @@ class TestCapacityBlockSummary:
         handler._capacity_block_summary(ec2, "p5.48xlarge")
         kwargs = ec2.describe_capacity_block_offerings.call_args.kwargs
         assert kwargs["CapacityDurationHours"] == handler.DEFAULT_BLOCK_DURATION_HOURS == 24
+
+    def test_probe_failure_is_absent_not_zero(self, handler):
+        ec2 = _fake_ec2()
+        ec2.describe_capacity_block_offerings.side_effect = RuntimeError("unavailable")
+        assert handler._capacity_block_summary(ec2, "g5.xlarge") == (None, None)
 
 
 class TestLambdaHandler:
@@ -410,6 +420,40 @@ class TestLambdaHandler:
         }
         assert durations == {24, handler.DEFAULT_LONG_BLOCK_DURATION_HOURS}
         assert isinstance(item["ttl"], int)
+
+    def test_successful_empty_capacity_block_response_writes_real_zeros(self, handler, monkeypatch):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+        ec2.describe_capacity_block_offerings.return_value = {"CapacityBlockOfferings": []}
+        with patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)):
+            result = handler.lambda_handler({}, None)
+
+        assert result["written"] == 1
+        assert result["errors"] == 0
+        item = mock_table.put_item.call_args.kwargs["Item"]
+        assert item["capacity_blocks_available"] == 0
+        assert item["capacity_blocks_total"] == 0
+        assert item["capacity_blocks_long_available"] == 0
+        assert item["capacity_blocks_long_total"] == 0
+
+    def test_successful_empty_spot_history_writes_zero_az_signal(self, handler, monkeypatch):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+        ec2.get_spot_placement_scores.side_effect = RuntimeError("scores unavailable")
+        ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": []}
+        ec2.describe_capacity_block_offerings.side_effect = RuntimeError("blocks unavailable")
+        with patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)):
+            result = handler.lambda_handler({}, None)
+
+        assert result["written"] == 1
+        assert result["errors"] == 0
+        item = mock_table.put_item.call_args.kwargs["Item"]
+        assert item["az_count"] == 0
+        assert "spot_price" not in item
+        assert "capacity_blocks_available" not in item
+        assert "capacity_blocks_total" not in item
 
     def test_multi_capacity_scores_land_in_their_fields(self, handler, monkeypatch):
         _set_env(monkeypatch)
@@ -471,9 +515,9 @@ class TestLambdaHandler:
         ec2 = _fake_ec2()
 
         def probe(**kwargs):
-            if kwargs.get("RegionNames") == ["eu-bad-1"]:
-                raise Exception("AuthFailure: not opted in")
-            return {"Regions": [{"RegionName": kwargs["RegionNames"][0]}]}
+            region = kwargs["RegionNames"][0]
+            status = "not-opted-in" if region == "eu-bad-1" else "opted-in"
+            return {"Regions": [{"RegionName": region, "OptInStatus": status}]}
 
         ec2.describe_regions.side_effect = probe
         with patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)):
@@ -481,6 +525,7 @@ class TestLambdaHandler:
 
         assert result["regions_polled"] == ["us-east-1"]
         assert result["regions_skipped_not_enabled"] == ["eu-bad-1"]
+        assert result["regions_enablement_unknown"] == []
         # No snapshot was written for the skipped region and SPS never
         # requested it.
         written_pks = [c.kwargs["Item"]["pk"] for c in mock_table.put_item.call_args_list]
@@ -510,8 +555,102 @@ class TestLambdaHandler:
 
         assert result["regions_polled"] == ["us-east-1"]
         assert result["regions_skipped_not_enabled"] == []
+        assert result["regions_enablement_unknown"] == ["us-east-1"]
         assert result["written"] == 1
         assert any("ec2:DescribeRegions" in record.message for record in caplog.records)
+
+    def test_transient_probe_failure_is_unknown_and_still_polled(
+        self, handler, monkeypatch, caplog
+    ):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+
+        class _Throttled(Exception):
+            response = {"Error": {"Code": "ThrottlingException"}}
+
+        ec2.describe_regions.side_effect = _Throttled("retry later")
+        with (
+            caplog.at_level("WARNING"),
+            patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)),
+        ):
+            result = handler.lambda_handler({}, None)
+
+        assert result["regions_polled"] == ["us-east-1"]
+        assert result["regions_skipped_not_enabled"] == []
+        assert result["regions_enablement_unknown"] == ["us-east-1"]
+        assert result["written"] == 1
+        assert any("ThrottlingException" in record.message for record in caplog.records)
+
+    def test_unknown_region_all_signal_failures_skip_history_write(
+        self, handler, monkeypatch, caplog
+    ):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+
+        class _Throttled(Exception):
+            response = {"Error": {"Code": "ThrottlingException"}}
+
+        ec2.describe_regions.side_effect = _Throttled("discovery unavailable")
+        ec2.get_spot_placement_scores.side_effect = RuntimeError("scores unavailable")
+        ec2.describe_spot_price_history.side_effect = RuntimeError("prices unavailable")
+        ec2.describe_capacity_block_offerings.side_effect = RuntimeError("blocks unavailable")
+        with (
+            caplog.at_level("WARNING"),
+            patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)),
+        ):
+            result = handler.lambda_handler({}, None)
+
+        assert result["regions_enablement_unknown"] == ["us-east-1"]
+        assert result["written"] == 0
+        assert result["errors"] == 1
+        mock_table.put_item.assert_not_called()
+        assert any("skipping history write" in record.message for record in caplog.records)
+
+    def test_unknown_region_partial_success_omits_failed_capacity_metrics(
+        self, handler, monkeypatch
+    ):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+
+        class _Throttled(Exception):
+            response = {"Error": {"Code": "ThrottlingException"}}
+
+        ec2.describe_regions.side_effect = _Throttled("discovery unavailable")
+        ec2.get_spot_placement_scores.side_effect = RuntimeError("scores unavailable")
+        ec2.describe_capacity_block_offerings.side_effect = RuntimeError("blocks unavailable")
+        with patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)):
+            result = handler.lambda_handler({}, None)
+
+        assert result["written"] == 1
+        assert result["errors"] == 0
+        item = mock_table.put_item.call_args.kwargs["Item"]
+        assert item["spot_price"] == Decimal("1.5")
+        assert item["az_count"] == 2
+        assert "capacity_blocks_available" not in item
+        assert "capacity_blocks_total" not in item
+        assert "capacity_blocks_long_available" not in item
+        assert "capacity_blocks_long_total" not in item
+
+    def test_missing_opt_in_status_is_unknown_and_still_polled(self, handler, monkeypatch, caplog):
+        _set_env(monkeypatch)
+        mock_table = MagicMock()
+        ec2 = _fake_ec2()
+        ec2.describe_regions.return_value = {"Regions": [{"RegionName": "us-east-1"}]}
+
+        with (
+            caplog.at_level("WARNING"),
+            patch.object(handler, "boto3", _fake_boto3(mock_table, ec2)),
+        ):
+            result = handler.lambda_handler({}, None)
+
+        assert result["regions_polled"] == ["us-east-1"]
+        assert result["regions_skipped_not_enabled"] == []
+        assert result["regions_enablement_unknown"] == ["us-east-1"]
+        assert result["written"] == 1
+        assert any("unknown OptInStatus None" in record.message for record in caplog.records)
 
     def test_structured_summary_reports_sps_counters(self, handler, monkeypatch):
         _set_env(monkeypatch)

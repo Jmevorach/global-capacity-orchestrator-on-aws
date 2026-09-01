@@ -631,34 +631,6 @@ class ManagedInferenceLifecycle(InferenceInventoryMixin, InferenceRuntimeMixin):
             raise _CommandFailure(f"{stage} exited nonzero")
         return result.stdout
 
-    def _wait_for_owned_record(
-        self,
-        plan: EndpointPlan,
-        record: dict[str, Any],
-    ) -> dict[str, Any]:
-        deadline = time.monotonic() + self.settings.readiness_timeout_seconds
-        while True:
-            item = self._strong_get(record)
-            if item is not None:
-                if not self._is_owned(item):
-                    raise ManagedInferenceValidationError(
-                        "managed inference endpoint collision detected; refusing ownership"
-                    )
-                self._verify_item_contract(plan, item, record)
-                record["owned"] = True
-                self._set_phase(record, "ownership-confirmed")
-                return item
-            if time.monotonic() >= deadline:
-                raise ManagedInferenceValidationError(
-                    "managed inference endpoint ownership did not appear before timeout"
-                )
-            time.sleep(
-                min(
-                    float(self.settings.poll_interval_seconds),
-                    max(0.0, deadline - time.monotonic()),
-                )
-            )
-
     def ensure_owned_endpoint(
         self,
         plan: EndpointPlan,

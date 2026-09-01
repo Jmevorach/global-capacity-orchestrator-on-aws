@@ -95,6 +95,39 @@ def _list_load_balancers(session: Any, region: str, project_name: str) -> list[s
     return sorted(set(owned))
 
 
+def _list_target_groups(session: Any, region: str, project_name: str) -> list[str]:
+    """Return ELBv2 target groups owned by a project or its EKS controller."""
+    client = session.client("elbv2", region_name=region)
+    target_groups: list[dict[str, Any]] = []
+    for page in client.get_paginator("describe_target_groups").paginate():
+        target_groups.extend(page.get("TargetGroups", []))
+
+    owned: set[str] = set()
+    for start in range(0, len(target_groups), 20):
+        batch = target_groups[start : start + 20]
+        arns = [str(item.get("TargetGroupArn") or "") for item in batch]
+        if any(not arn for arn in arns):
+            raise RuntimeError(f"ELBv2 returned a target group without an ARN in {region}")
+        tags_by_arn = {
+            str(item["ResourceArn"]): _tags_to_dict(item.get("Tags", []))
+            for item in client.describe_tags(ResourceArns=arns).get("TagDescriptions", [])
+        }
+        for target_group, arn in zip(batch, arns, strict=True):
+            tags = tags_by_arn.get(arn, {})
+            cluster_names = {
+                tags.get("elbv2.k8s.aws/cluster", ""),
+                tags.get("eks:eks-cluster-name", ""),
+            }
+            name = str(target_group.get("TargetGroupName") or "")
+            if (
+                _project_owned_name(name, project_name)
+                or _tags_are_project_owned(tags, project_name)
+                or any(_project_owned_name(cluster, project_name) for cluster in cluster_names)
+            ):
+                owned.add(arn)
+    return sorted(owned)
+
+
 def _list_instance_inventory(
     session: Any,
     region: str,

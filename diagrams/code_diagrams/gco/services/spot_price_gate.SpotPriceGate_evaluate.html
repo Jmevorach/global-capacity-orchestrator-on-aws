@@ -2,8 +2,10 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
-        <title>Inference endpoint desired-state reconciliation</title>
+        <meta name="gco-generated-at" content="2026-08-31T15:58:29Z">
+        <meta name="gco-source-commit" content="d5eebeaf363afd3a3979dfa66723d298eb5f54d1">
+        <meta name="gco-flow-digest" content="410bcd6ed308fe9b">
+        <title>Spot price gate (unknown/malformed/above-cap dispatch policy)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
         </style>
@@ -206,77 +208,52 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op4386=>operation: 'Reconcile a single endpoint.'
-op4388=>operation: name = endpoint['endpoint_name']
-op4390=>operation: desired_state = endpoint.get('desired_state', 'deploying')
-op4392=>operation: target_regions = endpoint.get('target_regions', [])
-op4394=>operation: spec = endpoint.get('spec', {})
-op4396=>operation: ns = endpoint.get('namespace', self.namespace)
-cond4399=>condition: if self.region not in target_regions
-op4403=>operation: deployment_names = (name, f'{name}-prefill', f'{name}-decode', f'{name}-proxy')
-cond4406=>condition: if any((self._deployment_exists(d, ns) for d in deployment_names))
-sub4410=>subroutine: logger.info('Endpoint %s no longer targets %s, cleaning up', name, self.region)
-sub4412=>subroutine: self._delete_resources(name, ns, spec if isinstance(spec, dict) else None)
-sub4414=>subroutine: self.store.update_region_status(name, self.region, 'deleted')
-io4419=>inputoutput: output: {'action': 'cleanup', 'endpoint': name, 'reason': 'region_removed'}
-e4417=>end: end function return
-io4428=>inputoutput: output: None
-e4426=>end: end function return
-cond4435=>condition: if desired_state in ('deploying', 'running')
-cond4440=>condition: if not isinstance(spec, dict)
-op4444=>operation: error = 'endpoint spec must be a mapping'
-sub4465=>subroutine: logger.error('Rejecting invalid endpoint %s: %s', name, error)
-sub4467=>subroutine: self.store.update_region_status(name, self.region, 'failed', error=error)
-io4472=>inputoutput: output: {'action': 'reject', 'endpoint': name, 'reason': 'invalid_spec'}
-e4470=>end: end function return
-cond4449=>condition: if 'mooncake' in spec and 'canary' in spec
-op4453=>operation: error = "endpoint spec cannot combine 'mooncake' and 'canary' blocks"
-io4460=>inputoutput: output: await self._reconcile_running(name, ns, spec, endpoint)
-e4458=>end: end function return
-cond4479=>condition: if desired_state == 'stopped'
-io4486=>inputoutput: output: self._reconcile_stopped(name, ns)
-e4484=>end: end function return
-cond4493=>condition: if desired_state == 'deleted'
-io4500=>inputoutput: output: self._reconcile_deleted(name, ns, spec if isinstance(spec, dict) else None)
-e4498=>end: end function return
-io4509=>inputoutput: output: None
-e4507=>end: end function return
+        <div><textarea id="code" style="width: 100%;" rows="11">op8151=>operation: "Evaluate one queue record's gate; ``None`` means the job is ungated.\n\n        Malformed gate fields on a stored record gate the job closed (with a\n        descriptive reason) rather than dispatching a job whose cap cannot be\n        honored.\n        "
+op8153=>operation: raw_price = job.get('spot_max_price')
+op8155=>operation: instance_type = job.get('spot_instance_type')
+cond8158=>condition: if raw_price is None and instance_type is None
+io8165=>inputoutput: output: None
+e8163=>end: end function return
+op8174=>operation: max_price = float(str(raw_price))
+cond8171=>condition: exception raised?
+cond8176=>condition: except (TypeError, ValueError)
+op8180=>operation: max_price = float('nan')
+cond8186=>condition: if not isinstance(instance_type, str) or not instance_type or (not math.isfinite(max_price))
+io8193=>inputoutput: output: SpotGateDecision(gated=True, instance_type=str(instance_type or ''), max_price=0.0, observed_price=None, reason='spot gate fields are malformed; refusing to dispatch')
+e8191=>end: end function return
+op8199=>operation: observed = self.current_min_spot_price(instance_type)
+cond8202=>condition: if observed is None
+io8209=>inputoutput: output: SpotGateDecision(gated=True, instance_type=instance_type, max_price=max_price, observed_price=None, reason=f'current spot price for {instance_type} in {self.region} is unavailable; deferring')
+e8207=>end: end function return
+cond8216=>condition: if observed > max_price
+io8223=>inputoutput: output: SpotGateDecision(gated=True, instance_type=instance_type, max_price=max_price, observed_price=observed, reason=f'spot price {observed:.4f} USD/h for {instance_type} in {self.region} is above the {max_price:.4f} USD/h cap')
+e8221=>end: end function return
+io8232=>inputoutput: output: SpotGateDecision(gated=False, instance_type=instance_type, max_price=max_price, observed_price=observed, reason=f'spot price {observed:.4f} USD/h for {instance_type} in {self.region} clears the {max_price:.4f} USD/h cap')
+e8230=>end: end function return
 
-op4386->op4388
-op4388->op4390
-op4390->op4392
-op4392->op4394
-op4394->op4396
-op4396->cond4399
-cond4399(yes)->op4403
-op4403->cond4406
-cond4406(yes)->sub4410
-sub4410->sub4412
-sub4412->sub4414
-sub4414->io4419
-io4419->e4417
-cond4406(no)->io4428
-io4428->e4426
-cond4399(no)->cond4435
-cond4435(yes)->cond4440
-cond4440(yes)->op4444
-op4444->sub4465
-sub4465->sub4467
-sub4467->io4472
-io4472->e4470
-cond4440(no)->cond4449
-cond4449(yes)->op4453
-op4453->sub4465
-cond4449(no)->io4460
-io4460->e4458
-cond4435(no)->cond4479
-cond4479(yes)->io4486
-io4486->e4484
-cond4479(no)->cond4493
-cond4493(yes)->io4500
-io4500->e4498
-cond4493(no)->io4509
-io4509->e4507
+op8151->op8153
+op8153->op8155
+op8155->cond8158
+cond8158(yes)->io8165
+io8165->e8163
+cond8158(no)->op8174
+op8174->cond8171
+cond8171(yes)->cond8176
+cond8176(yes)->op8180
+op8180->cond8186
+cond8186(yes)->io8193
+io8193->e8191
+cond8186(no)->op8199
+op8199->cond8202
+cond8202(yes)->io8209
+io8209->e8207
+cond8202(no)->cond8216
+cond8216(yes)->io8223
+io8223->e8221
+cond8216(no)->io8232
+io8232->e8230
+cond8176(no)->cond8186
+cond8171(no)->cond8186
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -286,10 +263,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-31T15:58:29Z -->
+        <!-- Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1 -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
-          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-08-31T15:58:29Z">2026-08-31T15:58:29Z</time>
+          </p>
+          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
+            Source commit: <code>d5eebeaf363afd3a3979dfa66723d298eb5f54d1</code>
+          </p>
+          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
+            Flow content SHA-256: <code>410bcd6ed308fe9b</code>
           </p>
           <div id="canvas"></div>
         </div>

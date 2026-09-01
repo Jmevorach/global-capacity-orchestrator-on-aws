@@ -28,8 +28,12 @@ covered by the pyflowchart import in the renderer's unit tests below.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import importlib.util
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,14 +76,19 @@ timestamp_mod = _load("_cd_timestamp", _CD_DIR / "_timestamp.py")
 Target = targets_mod.Target
 TARGETS = targets_mod.TARGETS
 _output_stem_for = renderer_mod._output_stem_for
+_annotate_generated_html = renderer_mod._annotate_generated_html
 _render_one = renderer_mod._render_one
+_screenshot_scale = renderer_mod._screenshot_scale
 RenderedTarget = renderer_mod.RenderedTarget
 SENTINEL = source_marker_mod.SENTINEL
 upsert_markers = source_marker_mod.upsert_markers
 strip_markers_from = source_marker_mod.strip_markers_from
 strip_all_markers = source_marker_mod.strip_all_markers
+_ruff_format = source_marker_mod._ruff_format
+_update_marker_file = source_marker_mod._update_file
 render_readme = readme_mod.render_readme
 generation_timestamp_utc = timestamp_mod.generation_timestamp_utc
+generation_source_commit = timestamp_mod.generation_source_commit
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +134,39 @@ class TestTargetsCatalogue:
                 "plain identifiers and dotted ``Class.method`` paths."
             )
 
+    def test_every_selector_resolves_to_a_function_or_method(self) -> None:
+        missing: list[str] = []
+        for target in TARGETS:
+            tree = ast.parse((ROOT / target.source).read_text(encoding="utf-8"))
+            parts = target.function.split(".")
+            nodes: list[ast.stmt] = tree.body
+            for index, part in enumerate(parts):
+                match = next(
+                    (
+                        node
+                        for node in nodes
+                        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+                        and node.name == part
+                    ),
+                    None,
+                )
+                if match is None or (
+                    index < len(parts) - 1 and not isinstance(match, ast.ClassDef)
+                ):
+                    missing.append(f"{target.source}:{target.function}")
+                    break
+                nodes = match.body if isinstance(match, ast.ClassDef) else []
+        assert not missing, f"diagram selectors do not resolve: {missing}"
+
+    def test_targets_and_output_stems_are_unique(self) -> None:
+        identities = [(target.source, target.function) for target in TARGETS]
+        stems = [
+            _output_stem_for(target, output_dir=ROOT / "diagrams" / "code_diagrams")
+            for target in TARGETS
+        ]
+        assert len(identities) == len(set(identities)), "duplicate diagram target"
+        assert len(stems) == len(set(stems)), "diagram targets collide on an output stem"
+
 
 # ---------------------------------------------------------------------------
 # Renderer path math
@@ -162,6 +204,20 @@ class TestOutputStemFor:
         assert html_path.name == "handler.lambda_handler.html"
 
 
+class TestScreenshotScale:
+    def test_small_diagram_is_not_resized(self) -> None:
+        assert _screenshot_scale(2_000, 1_000) == 1.0
+
+    def test_area_cap_applies_even_below_legacy_dimension_threshold(self) -> None:
+        scale = _screenshot_scale(14_000, 14_000)
+        assert 0 < scale < 1
+        assert (14_000 * scale) * (14_000 * scale) <= 20_000_000
+
+    def test_dimension_cap_applies_to_extremely_wide_diagrams(self) -> None:
+        scale = _screenshot_scale(20_000, 1_000)
+        assert 20_000 * scale <= 8_000
+
+
 class TestGenerationTimestamp:
     """One validated timestamp must propagate without mixed-age PNG output."""
 
@@ -173,6 +229,18 @@ class TestGenerationTimestamp:
         monkeypatch.setenv("SOURCE_DATE_EPOCH", "not-an-integer")
         with pytest.raises(ValueError, match="integer Unix timestamp"):
             generation_timestamp_utc()
+
+    def test_source_commit_is_exact_and_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GCO_DIAGRAM_SOURCE_COMMIT", "A" * 40)
+        assert generation_source_commit() == "a" * 40
+
+    @pytest.mark.parametrize("value", ("", "abc", "g" * 40, "a" * 39))
+    def test_invalid_source_commit_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("GCO_DIAGRAM_SOURCE_COMMIT", value)
+        with pytest.raises(ValueError, match="exact 40-character Git commit SHA"):
+            generation_source_commit()
 
     def test_html_only_render_removes_stale_png_and_stamps_html(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -209,6 +277,7 @@ class TestGenerationTimestamp:
         monkeypatch.setattr(pyflowchart, "Flowchart", FakeFlowchart)
         monkeypatch.setattr(pyflowchart, "output_html", fake_output_html)
         generated_at = "2026-07-16T12:00:00Z"
+        source_commit = "a" * 40
 
         result = _render_one(
             target=target,
@@ -216,6 +285,7 @@ class TestGenerationTimestamp:
             output_dir=output_dir,
             renderer=None,
             generated_at=generated_at,
+            source_commit=source_commit,
         )
 
         assert result.png_path is None
@@ -224,6 +294,38 @@ class TestGenerationTimestamp:
         assert f'<meta name="gco-generated-at" content="{generated_at}">' in html
         assert f"<!-- Generated at (UTC): {generated_at} -->" in html
         assert f'<time datetime="{generated_at}">{generated_at}</time>' in html
+        assert f'<meta name="gco-source-commit" content="{source_commit}">' in html
+        assert f"Generated from Git commit: {source_commit}" in html
+        assert f"Source commit: <code>{source_commit}</code>" in html
+        assert result.source_commit == source_commit
+        assert '<meta name="gco-flow-digest" content="' in html
+        assert "Flow content SHA-256: <code>" in html
+
+    def test_visible_flow_digest_changes_with_pre_annotation_content(self) -> None:
+        template = (
+            '<html>\n<head>\n        <meta charset="utf-8">\n</head>\n'
+            '<body>FLOW\n        <div id="canvas"></div>\n</body>\n</html>\n'
+        )
+        generated_at = "2026-07-16T12:00:00Z"
+        first_input = template.replace("FLOW", "first flow")
+        second_input = template.replace("FLOW", "second flow")
+        source_commit = "b" * 40
+        first = _annotate_generated_html(
+            first_input,
+            generated_at=generated_at,
+            source_commit=source_commit,
+        )
+        second = _annotate_generated_html(
+            second_input,
+            generated_at=generated_at,
+            source_commit=source_commit,
+        )
+        first_digest = hashlib.sha256(first_input.encode()).hexdigest()[:16]
+        second_digest = hashlib.sha256(second_input.encode()).hexdigest()[:16]
+        assert first_digest != second_digest
+        assert f'<meta name="gco-flow-digest" content="{first_digest}">' in first
+        assert f"Flow content SHA-256: <code>{first_digest}</code>" in first
+        assert f'<meta name="gco-flow-digest" content="{second_digest}">' in second
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +354,27 @@ def _make_rendered(
         html_path=html,
         png_path=png,
         generated_at="2026-07-16T12:00:00Z",
+        source_commit="a" * 40,
     )
 
 
 class TestUpsertMarkers:
-    """Insert once, then run again — the second pass must replace (not
-    duplicate) the marker block."""
+    """Insert once, then run again — the second pass must replace (not duplicate)."""
+
+    def test_ruff_format_failure_is_not_reported_as_generation_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "example.py"
+        source.write_text("def example():\n    return True\n", encoding="utf-8")
+        monkeypatch.setattr(
+            source_marker_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                subprocess.CalledProcessError(2, args[0])
+            ),
+        )
+        with pytest.raises(subprocess.CalledProcessError):
+            _ruff_format([source], project_root=tmp_path)
 
     def _write_source(self, path: Path, body: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,6 +397,7 @@ class TestUpsertMarkers:
         updated = src_path.read_text(encoding="utf-8")
         assert SENTINEL in updated, "Expected marker sentinel to be inserted"
         assert "# Generated at (UTC): 2026-07-16T12:00:00Z" in updated
+        assert f"# Generated from Git commit: {'a' * 40}" in updated
         # Marker must sit *below* the docstring + imports and *above*
         # the first real statement (``def f``).
         docstring_end = updated.index('"""Handler docstring."""') + len('"""Handler docstring."""')
@@ -504,6 +622,8 @@ class TestRenderReadme:
         rendered = render_readme(results, output_dir=output_dir)
         assert "<!-- Generated at (UTC): 2026-07-16T12:00:00Z -->" in rendered
         assert "*Generated at (UTC): `2026-07-16T12:00:00Z`.*" in rendered
+        assert f"<!-- Generated from Git commit: {'a' * 40} -->" in rendered
+        assert f"*Generated from Git commit: `{'a' * 40}`.*" in rendered
 
         # Top-level groups are alphabetized, which places ``cli/`` before
         # ``lambda/`` — deterministic ordering matters for stable diffs.
@@ -550,6 +670,116 @@ class TestRenderReadme:
 
 generate_mod = _load("_cd_generate", _CD_DIR / "generate.py")
 _sync_shared_lambda_copies = generate_mod._sync_shared_lambda_copies
+_verify_targets_match_source_commit = generate_mod._verify_targets_match_source_commit
+_without_generated_marker = generate_mod._without_generated_marker
+
+
+class TestSourceCommitVerification:
+    @staticmethod
+    def _fake_git_run(committed: bytes, *, object_type: bytes = b"commit") -> object:
+        def run(args, **_kwargs):
+            if args[1:3] == ["cat-file", "-t"]:
+                return SimpleNamespace(returncode=0, stdout=object_type + b"\n", stderr=b"")
+            assert args[1] == "show"
+            return SimpleNamespace(returncode=0, stdout=committed, stderr=b"")
+
+        return run
+
+    def test_markerless_source_round_trips_byte_for_byte(self, tmp_path: Path) -> None:
+        original = b"import os\n\n\ndef f():\n    return True\n"
+        source = tmp_path / "example.py"
+        source.write_bytes(original)
+        stem = tmp_path / "diagrams" / "code_diagrams" / "example.f"
+        rendered = RenderedTarget(
+            target=Target(source="example.py", function="f"),
+            html_path=stem.with_suffix(".html"),
+            png_path=stem.with_suffix(".png"),
+            generated_at="2026-08-30T12:00:00Z",
+            source_commit="a" * 40,
+        )
+
+        assert _update_marker_file(
+            source_path=source,
+            results=[rendered],
+            project_root=tmp_path,
+        )
+        assert _without_generated_marker(source.read_bytes()) == original
+
+    def test_generated_markers_do_not_change_source_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        committed = "# café\ndef f():\n    return True\n".encode()
+        source = tmp_path / "example.py"
+        source.write_bytes(
+            b"# <pyflowchart-code-diagram> BEGIN - generated\n"
+            b"# metadata\n"
+            b"# <pyflowchart-code-diagram> END\n\n" + committed
+        )
+        monkeypatch.setattr(
+            generate_mod.subprocess,
+            "run",
+            self._fake_git_run(committed),
+        )
+
+        _verify_targets_match_source_commit(
+            project_root=tmp_path,
+            targets=[Target(source="example.py", function="f")],
+            source_commit="a" * 40,
+        )
+
+    @pytest.mark.parametrize(
+        ("committed", "working"),
+        (
+            (
+                b"def f():\n    return True\n\ndef g():\n    return True\n",
+                b"def f():\n    return True\n\n\ndef g():\n    return True\n",
+            ),
+            (
+                b"def f():\n    return True\n",
+                b"def f():\r\n    return True\r\n",
+            ),
+            (
+                b"def f():\n    return True\n",
+                b"def f():\n    return False\n",
+            ),
+        ),
+    )
+    def test_any_uncommitted_source_byte_is_rejected(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        committed: bytes,
+        working: bytes,
+    ) -> None:
+        source = tmp_path / "example.py"
+        source.write_bytes(working)
+        monkeypatch.setattr(
+            generate_mod.subprocess,
+            "run",
+            self._fake_git_run(committed),
+        )
+
+        with pytest.raises(RuntimeError, match="Commit substantive source changes first"):
+            _verify_targets_match_source_commit(
+                project_root=tmp_path,
+                targets=[Target(source="example.py", function="f")],
+                source_commit="a" * 40,
+            )
+
+    def test_non_commit_git_object_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            generate_mod.subprocess,
+            "run",
+            self._fake_git_run(b"", object_type=b"tree"),
+        )
+        with pytest.raises(RuntimeError, match="is a tree, not a commit"):
+            _verify_targets_match_source_commit(
+                project_root=tmp_path,
+                targets=[Target(source="example.py", function="f")],
+                source_commit="a" * 40,
+            )
 
 
 class TestSyncSharedLambdaCopies:
@@ -560,13 +790,13 @@ class TestSyncSharedLambdaCopies:
     checked-in copies one header behind — the exact drift
     ``tests/test_lambda_shared_sources.py`` rejects. These tests build a fake
     project tree so they exercise the sync against the real
-    ``cli.stacks.LAMBDA_SHARED_SOURCE_TARGETS`` map without touching the
+    ``gco.lambda_shared_sources.LAMBDA_SHARED_SOURCE_TARGETS`` map without touching the
     checkout.
     """
 
     @staticmethod
     def _tree(tmp_path: Path) -> Path:
-        from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS
+        from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
         for source_rel, target_rels in LAMBDA_SHARED_SOURCE_TARGETS.items():
             source = tmp_path / source_rel
@@ -579,7 +809,7 @@ class TestSyncSharedLambdaCopies:
         return tmp_path
 
     def test_drifted_copies_are_rewritten_to_canonical_bytes(self, tmp_path: Path) -> None:
-        from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS
+        from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
         root = self._tree(tmp_path)
         _sync_shared_lambda_copies(root)
@@ -589,7 +819,7 @@ class TestSyncSharedLambdaCopies:
                 assert (root / target_rel).read_bytes() == expected, target_rel
 
     def test_identical_copies_are_left_untouched(self, tmp_path: Path) -> None:
-        from cli.stacks import LAMBDA_SHARED_SOURCE_TARGETS
+        from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 
         root = self._tree(tmp_path)
         _sync_shared_lambda_copies(root)

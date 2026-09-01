@@ -96,6 +96,7 @@ class TestDerivedOverrides:
         assert settings.optional_schedulers == ("slurm",)
         assert settings.feature_overrides == ("valkey",)
         context = settings.extra_cdk_context()
+        assert context["gco_live_validation_disable_efs_automatic_backups"] == "true"
         assert context["helm_enabled_overrides"] == "slurm"
         assert context["feature_enabled_overrides"] == "valkey"
 
@@ -104,6 +105,9 @@ class TestDerivedOverrides:
         identity = settings.identity()
         assert identity["selected_examples"] == ["simple-job"]
         assert identity["feature_overrides"] == []
+        assert identity["extra_cdk_context"] == {
+            "gco_live_validation_disable_efs_automatic_backups": "true"
+        }
 
     def test_unknown_example_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="Unknown example name"):

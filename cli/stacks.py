@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypedDict
 
 from botocore.exceptions import ClientError
 
+from gco.lambda_shared_sources import LAMBDA_SHARED_SOURCE_TARGETS
 from gco.stacks.constants import (
     known_cloudformation_regions,
     validated_deployment_partition,
@@ -69,7 +70,8 @@ from gco.stacks.constants import (
 )
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-14T03:46:22Z
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
 # Flowchart(s) generated from this file:
 #   * ``StackManager.deploy_orchestrated`` -> ``diagrams/code_diagrams/cli/stacks.StackManager_deploy_orchestrated.html``
 #     (PNG: ``diagrams/code_diagrams/cli/stacks.StackManager_deploy_orchestrated.png``)
@@ -77,7 +79,7 @@ from gco.stacks.constants import (
 #     (PNG: ``diagrams/code_diagrams/cli/stacks.StackManager_destroy_orchestrated.png``)
 #   * ``StackManager._mirror_images_if_enabled`` -> ``diagrams/code_diagrams/cli/stacks.StackManager__mirror_images_if_enabled.html``
 #     (PNG: ``diagrams/code_diagrams/cli/stacks.StackManager__mirror_images_if_enabled.png``)
-# Regenerate with ``python diagrams/code_diagrams/generate.py``.
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
 # <pyflowchart-code-diagram> END
 
 
@@ -127,27 +129,20 @@ _CDK_ASSET_CONSUMER_MAX_ATTEMPTS = 3
 _CLOUDFORMATION_DELETE_TIMEOUT_SECONDS = 7200.0
 _CLOUDFORMATION_DELETE_POLL_SECONDS = 15.0
 _CLOUDFORMATION_DELETE_HEARTBEAT_SECONDS = 60.0
+_CLOUDFORMATION_SETTLE_UNKNOWN_TIMEOUT_SECONDS = 60.0
+_CLOUDFORMATION_SETTLE_UNKNOWN_POLL_SECONDS = 5.0
 _BOOTSTRAP_HEALTHY_STATUSES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE"})
+# CDK's ``prepare-change-set`` mode can return before a fresh CREATE change set
+# is visible through CloudFormation's read path. Poll only that authoritative
+# fresh-create absence window; every access, identity, tag, and ownership error
+# still fails immediately. Sixteen reads at two-second intervals bound the
+# eventual-consistency allowance to 30 seconds after the first attempt.
+_STRICT_CHANGE_SET_INSPECTION_ATTEMPTS = 16
+_STRICT_CHANGE_SET_INSPECTION_RETRY_SECONDS = 2.0
 _LIVE_VALIDATION_PROVIDER_LOG_CONTEXT = "gco_live_validation_retain_provider_log_groups"
 
-# Canonical shared Lambda sources and the checked-in copies that must mirror
-# them, as POSIX paths relative to the project root. This is the single map
-# behind StackManager._sync_lambda_sources (deploy-time enforcement) and
-# tests/test_lambda_shared_sources.py (commit-time enforcement): the copies
-# exist so each Lambda's build directory is self-contained, and they must stay
-# byte-identical to their canonical source or a deploy rewrites tracked files
-# and dirties the worktree mid-run.
-LAMBDA_SHARED_SOURCE_TARGETS: dict[str, tuple[str, ...]] = {
-    "lambda/proxy-shared/proxy_utils.py": (
-        "lambda/api-gateway-proxy/proxy_utils.py",
-        "lambda/regional-api-proxy/proxy_utils.py",
-    ),
-    "lambda/tls-shared/backend_tls.py": (
-        "lambda/proxy-shared/backend_tls.py",
-        "lambda/api-gateway-proxy/backend_tls.py",
-        "lambda/regional-api-proxy/backend_tls.py",
-    ),
-}
+# LAMBDA_SHARED_SOURCE_TARGETS is imported from the dependency-light inventory
+# shared by deploy packaging, diagram reconciliation, and commit-time guards.
 StackAuthorizationCallback = Callable[[str, str, str], None]
 CleanupOutcomeCallback = Callable[[str, dict[str, Any]], None]
 ChangeSetPreparedCallback = Callable[[str, str, str, str, str], None]
@@ -1255,9 +1250,9 @@ class StackManager:
         Checked-in copies keep raw CDK evaluation deterministic. Deploy updates
         those copies before generated assets are checked, and never mutates a
         generated final build tree in place. The source->targets mapping lives
-        in the module-level ``LAMBDA_SHARED_SOURCE_TARGETS`` so
-        ``tests/test_lambda_shared_sources.py`` can hold the checked-in copies
-        byte-identical to their canonical sources without restating the map.
+        in ``gco.lambda_shared_sources`` so deploy packaging, diagram
+        reconciliation, and commit-time identity tests consume one
+        dependency-light inventory.
         """
         if getattr(self, "_lambda_sources_synced", False):
             return
@@ -2651,35 +2646,40 @@ class StackManager:
         timeout: float | None = None,
         stack_identifier: str | None = None,
     ) -> str | None:
-        """Poll CloudFormation until ``stack_name`` leaves a ``*_IN_PROGRESS`` state.
-
-        When ``cdk deploy`` dies on a transient client-side error (e.g. a
-        ``read EADDRNOTAVAIL`` socket failure) the CloudFormation operation it
-        started usually keeps running server-side. ``deploy()`` reconciles
-        against CloudFormation, but a single status read taken the instant cdk
-        exits can catch the stack mid-flight (``CREATE_IN_PROGRESS``) and give
-        up only seconds before it would have reached ``CREATE_COMPLETE``. This
-        helper waits out the in-progress window so the reconcile judges the
-        *terminal* state instead of a transient one.
-
-        Returns the terminal status string, the last status seen on timeout, or
-        ``None`` if the status could not be read (so callers treat the unknown
-        case as 'cdk's verdict stands').
-        """
+        """Poll CloudFormation until a stack settles, retrying transient unknown reads."""
         import time
 
         if timeout is None:
             timeout = float(os.environ.get("GCO_CDK_SETTLE_TIMEOUT_SECONDS", "1200"))
         deadline = time.monotonic() + timeout
+        unknown_started: float | None = None
         status = self._get_stack_status(stack_name, stack_identifier)
-        while status is not None and status.endswith("_IN_PROGRESS"):
+        while True:
+            now = time.monotonic()
             if self._cdk_cancel_event.is_set():
                 return status
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(15.0)
+            if status is None:
+                if unknown_started is None:
+                    unknown_started = now
+                unknown_deadline = min(
+                    deadline,
+                    unknown_started + _CLOUDFORMATION_SETTLE_UNKNOWN_TIMEOUT_SECONDS,
+                )
+                if now >= unknown_deadline:
+                    return None
+                time.sleep(
+                    min(
+                        _CLOUDFORMATION_SETTLE_UNKNOWN_POLL_SECONDS,
+                        unknown_deadline - now,
+                    )
+                )
+                status = self._get_stack_status(stack_name, stack_identifier)
+                continue
+            unknown_started = None
+            if not status.endswith("_IN_PROGRESS") or now >= deadline:
+                return status
+            time.sleep(min(15.0, deadline - now))
             status = self._get_stack_status(stack_name, stack_identifier)
-        return status
 
     def _get_latest_stack_event(
         self,
@@ -3467,35 +3467,55 @@ class StackManager:
         if not region:
             raise RuntimeError(f"Could not resolve deploy Region for {stack_name}")
         cfn = boto3.client("cloudformation", region_name=region)
-        try:
-            change_set = cfn.describe_change_set(
-                ChangeSetName=change_set_name,
-                StackName=stack_name,
-            )
-        except ClientError as exc:
-            if not self._change_set_missing(exc):
-                raise RuntimeError(
-                    f"Could not inspect strict change set {change_set_name} for {stack_name}"
-                ) from exc
-            if allow_noop and expected_stack_id:
-                target = self._describe_stack_target(
-                    stack_name,
-                    expected_stack_id=expected_stack_id,
-                    require_expected_identity=True,
+        change_set: dict[str, Any] = {}
+        inspection_attempts = (
+            _STRICT_CHANGE_SET_INSPECTION_ATTEMPTS
+            if expected_stack_id is None and not prepared_change_sets
+            else 1
+        )
+        for inspection_attempt in range(inspection_attempts):
+            try:
+                change_set = cfn.describe_change_set(
+                    ChangeSetName=change_set_name,
+                    StackName=stack_name,
                 )
-                if target is not None:
-                    stack = target[2]
-                    status = str(stack.get("StackStatus") or "")
-                    if status in _BOOTSTRAP_HEALTHY_STATUSES:
-                        if authorize_stack is None:
-                            raise RuntimeError(
-                                f"Strict no-op for {stack_name} lacks exact authorization"
-                            ) from exc
-                        authorize_stack(stack_name, region, expected_stack_id)
-                        return True
-            raise RuntimeError(
-                f"CDK did not create the strict change set {change_set_name} for {stack_name}"
-            ) from exc
+                break
+            except ClientError as exc:
+                fresh_create_not_visible = bool(
+                    expected_stack_id is None
+                    and not prepared_change_sets
+                    and (self._change_set_missing(exc) or self._stack_missing(exc))
+                )
+                if fresh_create_not_visible and inspection_attempt + 1 < inspection_attempts:
+                    if self._cdk_cancel_event.is_set():
+                        raise RuntimeError(
+                            "Strict change-set inspection cancelled before ownership checkpoint"
+                        ) from exc
+                    time.sleep(_STRICT_CHANGE_SET_INSPECTION_RETRY_SECONDS)
+                    continue
+                if not self._change_set_missing(exc) and not fresh_create_not_visible:
+                    raise RuntimeError(
+                        f"Could not inspect strict change set {change_set_name} for {stack_name}"
+                    ) from exc
+                if allow_noop and expected_stack_id:
+                    target = self._describe_stack_target(
+                        stack_name,
+                        expected_stack_id=expected_stack_id,
+                        require_expected_identity=True,
+                    )
+                    if target is not None:
+                        stack = target[2]
+                        status = str(stack.get("StackStatus") or "")
+                        if status in _BOOTSTRAP_HEALTHY_STATUSES:
+                            if authorize_stack is None:
+                                raise RuntimeError(
+                                    f"Strict no-op for {stack_name} lacks exact authorization"
+                                ) from exc
+                            authorize_stack(stack_name, region, expected_stack_id)
+                            return True
+                raise RuntimeError(
+                    f"CDK did not create the strict change set {change_set_name} for {stack_name}"
+                ) from exc
 
         change_set_id = str(change_set.get("ChangeSetId") or "")
         observed_change_set_name = str(change_set.get("ChangeSetName") or "")

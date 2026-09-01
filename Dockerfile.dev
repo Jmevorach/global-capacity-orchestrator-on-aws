@@ -222,11 +222,22 @@ RUN GNU_ARCH=$(cat /tmp/gnu_arch) \
 # publishes per-arch release binaries selected by ${TARGETARCH}; the
 # plugin lives in a system cli-plugins path so the root user's docker
 # CLI discovers it. Pinned for reproducibility — bump in lockstep with
-# the deps-scan report. https://github.com/docker/buildx/releases
+# the deps-scan report.
+#
+# Keep the per-architecture checksums as literal, non-overridable trust
+# anchors from the release's checksums.txt. Overriding BUILDX_VERSION alone
+# must fail closed until these reviewed hashes are updated too.
+# https://github.com/docker/buildx/releases/tag/v0.36.1
 ARG BUILDX_VERSION=v0.36.1
-RUN mkdir -p /usr/local/lib/docker/cli-plugins \
+RUN case "${TARGETARCH}" in \
+        amd64) BUILDX_SHA256="48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778" ;; \
+        arm64) BUILDX_SHA256="5d0cafd9d16afe1a0f0d9529885344ace2cc99efdd531b6c783c5455a6001569" ;; \
+        *)     echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && mkdir -p /usr/local/lib/docker/cli-plugins \
     && curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${TARGETARCH}" \
       -o /usr/local/lib/docker/cli-plugins/docker-buildx \
+    && echo "${BUILDX_SHA256}  /usr/local/lib/docker/cli-plugins/docker-buildx" | sha256sum -c - \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx \
     && docker buildx version
 

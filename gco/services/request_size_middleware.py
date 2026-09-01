@@ -7,6 +7,16 @@ from collections import deque
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
+# Flowchart(s) generated from this file:
+#   * ``RequestSizeLimitMiddleware.__call__`` -> ``diagrams/code_diagrams/gco/services/request_size_middleware.RequestSizeLimitMiddleware___call__.html``
+#     (PNG: ``diagrams/code_diagrams/gco/services/request_size_middleware.RequestSizeLimitMiddleware___call__.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
+
 DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576
 
 

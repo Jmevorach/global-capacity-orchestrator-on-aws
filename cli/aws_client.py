@@ -29,6 +29,14 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 1.0  # seconds
 
 
+class APIRequestError(RuntimeError):
+    """HTTP API failure that preserves status for policy-aware callers."""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(f"API request failed: {message}")
+        self.status_code = status_code
+
+
 def _validate_max_attempts(max_attempts: int | None) -> None:
     """Validate an explicitly supplied request-attempt limit."""
     if max_attempts is not None and (
@@ -373,7 +381,7 @@ class GCOAWSClient:
                     error_msg = error_data["detail"]
             except json.JSONDecodeError, KeyError:
                 error_msg = response.text or error_msg
-            raise RuntimeError(f"API request failed: {error_msg}")
+            raise APIRequestError(response.status_code, str(error_msg))
 
         result: dict[str, Any] = response.json()
         return result

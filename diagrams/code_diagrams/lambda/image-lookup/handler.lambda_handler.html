@@ -2,7 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-31T15:58:29Z">
+        <meta name="gco-source-commit" content="d5eebeaf363afd3a3979dfa66723d298eb5f54d1">
+        <meta name="gco-flow-digest" content="48a42036c900b90d">
         <title>Image-lookup-or-create custom resource Lambda</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,32 +208,32 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">op5495=>operation: 'Lookup-or-create custom resource handler for ECR repositories.\n\n    Dispatches on ``event["RequestType"]`` and returns the standard\n    CloudFormation custom resource response shape. The CDK Provider\n    framework wraps this dict into the protocol-required envelope.\n    '
-op5497=>operation: request_type = event.get('RequestType', '')
-op5499=>operation: properties = event.get('ResourceProperties', {}) or {}
-op5501=>operation: physical_id = event.get('PhysicalResourceId', '')
-sub5503=>subroutine: logger.info('Image-Lookup CR event: %s for %s', request_type, properties.get('RepositoryName'))
-op5505=>operation: ecr = _ecr_client()
-cond5508=>condition: if request_type in ('Create', 'Update')
-io5515=>inputoutput: output: _handle_create_or_update(ecr, properties)
-e5513=>end: end function return
-cond5522=>condition: if request_type == 'Delete'
-io5529=>inputoutput: output: _handle_delete(ecr, properties, physical_id)
-e5527=>end: end function return
-sub5535=>subroutine: raise ValueError(f'Unsupported RequestType: {request_type!r}')
+        <div><textarea id="code" style="width: 100%;" rows="11">op5652=>operation: 'Lookup-or-create custom resource handler for ECR repositories.\n\n    Dispatches on ``event["RequestType"]`` and returns the standard\n    CloudFormation custom resource response shape. The CDK Provider\n    framework wraps this dict into the protocol-required envelope.\n    '
+op5654=>operation: request_type = event.get('RequestType', '')
+op5656=>operation: properties = event.get('ResourceProperties', {}) or {}
+op5658=>operation: physical_id = event.get('PhysicalResourceId', '')
+sub5660=>subroutine: logger.info('Image-Lookup CR event: %s for %s', request_type, properties.get('RepositoryName'))
+op5662=>operation: ecr = _ecr_client()
+cond5665=>condition: if request_type in ('Create', 'Update')
+io5672=>inputoutput: output: _handle_create_or_update(ecr, properties)
+e5670=>end: end function return
+cond5679=>condition: if request_type == 'Delete'
+io5686=>inputoutput: output: _handle_delete(ecr, properties, physical_id)
+e5684=>end: end function return
+sub5692=>subroutine: raise ValueError(f'Unsupported RequestType: {request_type!r}')
 
-op5495->op5497
-op5497->op5499
-op5499->op5501
-op5501->sub5503
-sub5503->op5505
-op5505->cond5508
-cond5508(yes)->io5515
-io5515->e5513
-cond5508(no)->cond5522
-cond5522(yes)->io5529
-io5529->e5527
-cond5522(no)->sub5535
+op5652->op5654
+op5654->op5656
+op5656->op5658
+op5658->sub5660
+sub5660->op5662
+op5662->cond5665
+cond5665(yes)->io5672
+io5672->e5670
+cond5665(no)->cond5679
+cond5679(yes)->io5686
+io5686->e5684
+cond5679(no)->sub5692
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -241,10 +243,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-31T15:58:29Z -->
+        <!-- Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1 -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
-          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-08-31T15:58:29Z">2026-08-31T15:58:29Z</time>
+          </p>
+          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
+            Source commit: <code>d5eebeaf363afd3a3979dfa66723d298eb5f54d1</code>
+          </p>
+          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
+            Flow content SHA-256: <code>48a42036c900b90d</code>
           </p>
           <div id="canvas"></div>
         </div>

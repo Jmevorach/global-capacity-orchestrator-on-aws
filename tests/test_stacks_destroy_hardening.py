@@ -199,16 +199,107 @@ class TestWaitForStackSettle:
             assert manager._wait_for_stack_settle("gco-monitoring") == "CREATE_COMPLETE"
             assert mock_sleep.call_count == 2
 
-    def test_none_status_returns_none_without_sleeping(self):
+    def test_transient_none_status_retries_until_visible(self):
         from cli.stacks import StackManager
 
         manager = self._manager()
         with (
-            patch.object(StackManager, "_get_stack_status", return_value=None),
+            patch.object(
+                StackManager,
+                "_get_stack_status",
+                side_effect=[None, "CREATE_IN_PROGRESS", "CREATE_COMPLETE"],
+            ) as status,
             patch("time.sleep") as mock_sleep,
         ):
-            assert manager._wait_for_stack_settle("gco-monitoring") is None
+            assert manager._wait_for_stack_settle("gco-monitoring") == "CREATE_COMPLETE"
+            assert status.call_count == 3
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [5.0, 15.0]
+
+    def test_persistent_none_status_respects_zero_timeout(self):
+        from cli.stacks import StackManager
+
+        manager = self._manager()
+        with (
+            patch.object(StackManager, "_get_stack_status", return_value=None) as status,
+            patch("time.sleep") as mock_sleep,
+        ):
+            assert manager._wait_for_stack_settle("gco-monitoring", timeout=0) is None
+            status.assert_called_once()
             mock_sleep.assert_not_called()
+
+    def test_persistent_none_status_is_bounded_to_sixty_seconds(self):
+        from cli.stacks import StackManager
+
+        manager = self._manager()
+        clock = {"now": 0.0}
+
+        def advance(seconds):
+            clock["now"] += float(seconds)
+
+        with (
+            patch.object(StackManager, "_get_stack_status", return_value=None) as status,
+            patch("time.monotonic", side_effect=lambda: clock["now"]),
+            patch("time.sleep", side_effect=advance) as sleep,
+        ):
+            assert manager._wait_for_stack_settle("gco-monitoring", timeout=120) is None
+
+        assert clock["now"] == 60.0
+        assert status.call_count == 13
+        assert [call.args[0] for call in sleep.call_args_list] == [5.0] * 12
+
+    def test_unknown_status_never_outlives_shorter_overall_deadline(self):
+        from cli.stacks import StackManager
+
+        manager = self._manager()
+        clock = {"now": 0.0}
+
+        def advance(seconds):
+            clock["now"] += float(seconds)
+
+        with (
+            patch.object(StackManager, "_get_stack_status", return_value=None),
+            patch("time.monotonic", side_effect=lambda: clock["now"]),
+            patch("time.sleep", side_effect=advance) as sleep,
+        ):
+            assert manager._wait_for_stack_settle("gco-monitoring", timeout=12) is None
+
+        assert clock["now"] == 12.0
+        assert [call.args[0] for call in sleep.call_args_list] == [5.0, 5.0, 2.0]
+
+    def test_known_status_resets_a_later_unknown_window(self):
+        from cli.stacks import StackManager
+
+        manager = self._manager()
+        clock = {"now": 0.0}
+        statuses = [None, "CREATE_IN_PROGRESS", None, "CREATE_COMPLETE"]
+
+        def advance(seconds):
+            clock["now"] += float(seconds)
+
+        with (
+            patch.object(StackManager, "_get_stack_status", side_effect=statuses),
+            patch("time.monotonic", side_effect=lambda: clock["now"]),
+            patch("time.sleep", side_effect=advance) as sleep,
+        ):
+            assert manager._wait_for_stack_settle("gco-monitoring", timeout=120) == (
+                "CREATE_COMPLETE"
+            )
+
+        assert [call.args[0] for call in sleep.call_args_list] == [5.0, 15.0, 5.0]
+
+    def test_cancellation_during_unknown_status_does_not_retry(self):
+        from cli.stacks import StackManager
+
+        manager = self._manager()
+        manager._cdk_cancel_event.set()
+        with (
+            patch.object(StackManager, "_get_stack_status", return_value=None) as status,
+            patch("time.sleep") as sleep,
+        ):
+            assert manager._wait_for_stack_settle("gco-monitoring", timeout=120) is None
+
+        status.assert_called_once()
+        sleep.assert_not_called()
 
     def test_timeout_gives_up_and_returns_last_status(self):
         from cli.stacks import StackManager

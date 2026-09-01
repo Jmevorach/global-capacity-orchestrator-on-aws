@@ -2,7 +2,9 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <meta name="gco-generated-at" content="2026-08-14T03:46:22Z">
+        <meta name="gco-generated-at" content="2026-08-31T15:58:29Z">
+        <meta name="gco-source-commit" content="d5eebeaf363afd3a3979dfa66723d298eb5f54d1">
+        <meta name="gco-flow-digest" content="05cc59a5e34cac1a">
         <title>Monitoring stack constructor (CloudWatch + alarms + SNS)</title>
         <style type="text/css">
           .end-element { fill : #FFCCFF; }
@@ -206,43 +208,43 @@ function base64ToSvgDocument(base64) {
         </script>
     </head>
     <body>
-        <div><textarea id="code" style="width: 100%;" rows="11">sub2876=>subroutine: kwargs.setdefault('cross_region_references', True)
-sub2878=>subroutine: super().__init__(scope, construct_id, **kwargs)
-op2880=>operation: self.config = config
-op2882=>operation: self.global_stack = global_stack
-op2884=>operation: self.regional_stacks = regional_stacks
-op2886=>operation: self.api_gateway_stack = api_gateway_stack
-op2888=>operation: self.project_name = config.get_project_name()
-op2890=>operation: self.regions = config.get_regions()
-op2892=>operation: self.alert_topic = self._create_alert_topic()
-cond2895=>condition: if self.config.get_cost_monitoring_enabled()
-sub2899=>subroutine: self._create_cost_report_storage()
-sub2901=>subroutine: self._create_cost_analytics()
-op2906=>operation: self.dashboard = self._create_dashboard()
-sub2908=>subroutine: self._create_alarms()
-sub2910=>subroutine: self._create_composite_alarms()
-sub2912=>subroutine: self._create_custom_metrics()
-sub2914=>subroutine: self._create_outputs()
-sub2916=>subroutine: self._apply_nag_suppressions()
+        <div><textarea id="code" style="width: 100%;" rows="11">sub2969=>subroutine: kwargs.setdefault('cross_region_references', True)
+sub2971=>subroutine: super().__init__(scope, construct_id, **kwargs)
+op2973=>operation: self.config = config
+op2975=>operation: self.global_stack = global_stack
+op2977=>operation: self.regional_stacks = regional_stacks
+op2979=>operation: self.api_gateway_stack = api_gateway_stack
+op2981=>operation: self.project_name = config.get_project_name()
+op2983=>operation: self.regions = config.get_regions()
+op2985=>operation: self.alert_topic = self._create_alert_topic()
+cond2988=>condition: if self.config.get_cost_monitoring_enabled()
+sub2992=>subroutine: self._create_cost_report_storage()
+sub2994=>subroutine: self._create_cost_analytics()
+op2999=>operation: self.dashboard = self._create_dashboard()
+sub3001=>subroutine: self._create_alarms()
+sub3003=>subroutine: self._create_composite_alarms()
+sub3005=>subroutine: self._create_custom_metrics()
+sub3007=>subroutine: self._create_outputs()
+sub3009=>subroutine: self._apply_nag_suppressions()
 
-sub2876->sub2878
-sub2878->op2880
-op2880->op2882
-op2882->op2884
-op2884->op2886
-op2886->op2888
-op2888->op2890
-op2890->op2892
-op2892->cond2895
-cond2895(yes)->sub2899
-sub2899->sub2901
-sub2901->op2906
-op2906->sub2908
-sub2908->sub2910
-sub2910->sub2912
-sub2912->sub2914
-sub2914->sub2916
-cond2895(no)->op2906
+sub2969->sub2971
+sub2971->op2973
+op2973->op2975
+op2975->op2977
+op2977->op2979
+op2979->op2981
+op2981->op2983
+op2983->op2985
+op2985->cond2988
+cond2988(yes)->sub2992
+sub2992->sub2994
+sub2994->op2999
+op2999->sub3001
+sub3001->sub3003
+sub3003->sub3005
+sub3005->sub3007
+sub3007->sub3009
+cond2988(no)->op2999
 </textarea></div>
         <div><button id="run" type="button">Run</button> <button onclick="HelpText()">Format Help</button></div>
         <div id="HelpTextBlock" style="display:none"><br/>Conditions can also be redirected like cond(yes, bottom) or cond(yes, right)
@@ -252,10 +254,17 @@ This is based on <a href="https://github.com/adrai/flowchart.js">flowchart.js on
 </div><br/><div id="svgbase64"></div>
         <div id="pngbase64"></div>
 
-        <!-- Generated at (UTC): 2026-08-14T03:46:22Z -->
+        <!-- Generated at (UTC): 2026-08-31T15:58:29Z -->
+        <!-- Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1 -->
         <div id="generated-artifact" style="display: inline-block; padding: 12px; background: #fff;">
-          <p style="margin: 0 0 10px; color: #444; font: 14px Helvetica, sans-serif;">
-            Generated at (UTC): <time datetime="2026-08-14T03:46:22Z">2026-08-14T03:46:22Z</time>
+          <p style="margin: 0 0 6px; color: #444; font: 14px Helvetica, sans-serif;">
+            Generated at (UTC): <time datetime="2026-08-31T15:58:29Z">2026-08-31T15:58:29Z</time>
+          </p>
+          <p style="margin: 0 0 6px; color: #555; font: 12px Helvetica, sans-serif;">
+            Source commit: <code>d5eebeaf363afd3a3979dfa66723d298eb5f54d1</code>
+          </p>
+          <p style="margin: 0 0 10px; color: #666; font: 12px Helvetica, sans-serif;">
+            Flow content SHA-256: <code>05cc59a5e34cac1a</code>
           </p>
           <div id="canvas"></div>
         </div>

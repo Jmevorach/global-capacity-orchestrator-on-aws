@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -51,7 +52,8 @@ from pathlib import Path
 
 import pytest
 
-_GCO_MCP_DIR = Path(__file__).resolve().parent.parent / "gco_mcp"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_GCO_MCP_DIR = _PROJECT_ROOT / "gco_mcp"
 
 # Ensure gco_mcp/ is importable in THIS process only for feature_flags —
 # a plain constants module whose import has no registration side effects.
@@ -213,3 +215,21 @@ class TestGatingTableConsistency:
             if flag not in known
         )
         assert not unknown, f"gating-table entries reference unknown flags: {unknown!r}"
+
+    def test_mission_readme_inventory_matches_gating_table(self, snapshots: _Snapshots):
+        readme = (_PROJECT_ROOT / "gco_mcp" / "README.md").read_text(encoding="utf-8")
+        prefix = f"| `{feature_flags.FLAG_MISSION}` |"
+        rows = [line for line in readme.splitlines() if line.startswith(prefix)]
+        assert len(rows) == 1, f"expected one {feature_flags.FLAG_MISSION} README row"
+        tools_cell = rows[0].split("|")[3]
+        documented = set(re.findall(r"`([a-z][a-z0-9_]*)`", tools_cell))
+        expected = {
+            tool
+            for tool, flag in snapshots.gating_table.items()
+            if flag == feature_flags.FLAG_MISSION
+        }
+        assert documented == expected, (
+            f"{feature_flags.FLAG_MISSION} README inventory drifted; "
+            f"missing={sorted(expected - documented)!r}, "
+            f"extra={sorted(documented - expected)!r}"
+        )

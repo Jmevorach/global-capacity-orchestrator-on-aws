@@ -25,6 +25,9 @@ from ..ownership.ecr import (
     _strip_baseline_ecr,
     _strip_expected_retained_ecr,
 )
+from ..ownership.efs_automatic_backups import (
+    _strip_accepted_efs_automatic_backup_recovery_points,
+)
 from ..ownership.kms import (
     _strip_expected_pending_kms,
 )
@@ -73,6 +76,9 @@ def action_final_inventory(ctx: RunContext) -> dict[str, Any]:
         ctx,
         residual_inventory,
     )
+    residual_inventory, accepted_efs_backups = _strip_accepted_efs_automatic_backup_recovery_points(
+        ctx, residual_inventory
+    )
     residual_inventory, accepted_expired_streams = _strip_expired_table_streams(
         ctx,
         residual_inventory,
@@ -87,6 +93,7 @@ def action_final_inventory(ctx: RunContext) -> dict[str, Any]:
         "accepted_retained_ecr": accepted_retained_ecr,
         "project_resources": project_inventory,
         "accepted_pending_kms_keys": accepted_pending_kms,
+        "accepted_efs_automatic_backup_recovery_points": accepted_efs_backups,
         "accepted_expired_dynamodb_streams": accepted_expired_streams,
         "residual_project_resources": residual_inventory,
     }

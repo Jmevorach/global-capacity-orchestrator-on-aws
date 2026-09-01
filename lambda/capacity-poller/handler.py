@@ -11,13 +11,14 @@ back.
 
 Control flow is phased because the signals have different shapes:
 
-    Phase 0 — region enablement. Each configured region is probed with a
-        single-region ``describe_regions`` call (the same technique as
-        ``ConfigLoader.validate_region_availability``, replicated inline
-        because this module must not import ``gco``/``cli``). A region that is
-        not enabled for the account is logged as a distinct condition, counted
-        in the return payload, and written no snapshots — its API failures
-        must never masquerade as absent capacity.
+    Phase 0 — region enablement. A client in the Lambda's default Region calls
+        ``DescribeRegions(AllRegions=True, RegionNames=[region])`` for each
+        configured Region. Only the authoritative ``not-opted-in`` state is
+        skipped. Missing/malformed responses, permission failures, throttling,
+        and transport errors remain ``unknown`` and fail open to polling so an
+        operational probe failure can never masquerade as deliberately absent
+        capacity. Explicitly not-enabled Regions are counted in the return
+        payload and receive no snapshots.
     Phase 1 — Spot Placement Scores. AWS documents that
         ``GetSpotPlacementScores`` needs at least three instance types for a
         meaningful answer, so scores are requested per *instance pool* (a
@@ -32,9 +33,9 @@ Control flow is phased because the signals have different shapes:
         for at most ``SPS_MAX_ATTEMPTS`` total passes so a persistent refusal
         can never run the function toward its timeout.
     Phase 3 — per-region metrics and write. Spot price, AZ count, and
-        Capacity Block offerings are inherently per-region and unchanged from
-        the pre-pool poller: one EC2 client per region, one DynamoDB item per
-        watched (instance_type, region) pair.
+        Capacity Block offerings are inherently per-region. Failed probes stay
+        absent rather than becoming zero; when every signal for a pair fails,
+        no history item is written and the summary records an error.
 
 ``MaxConfigLimitExceeded`` (the account has asked SPS about too many distinct
 configurations in the rolling window) is detected by error code, logged at
@@ -88,9 +89,19 @@ import statistics
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import batched
-from typing import Any
+from typing import Any, Literal
 
 import boto3
+
+# <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
+# Generated at (UTC): 2026-08-31T15:58:29Z
+# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
+# Flowchart(s) generated from this file:
+#   * ``lambda_handler`` -> ``diagrams/code_diagrams/lambda/capacity-poller/handler.lambda_handler.html``
+#     (PNG: ``diagrams/code_diagrams/lambda/capacity-poller/handler.lambda_handler.png``)
+# Regenerate with ``SOURCE_DATE_EPOCH=<unix-seconds> GCO_DIAGRAM_SOURCE_COMMIT=<40-char-sha> python diagrams/generate.py --code-only``.
+# <pyflowchart-code-diagram> END
+
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -244,42 +255,51 @@ def _pool_for_instance_type(
     return None
 
 
-def _region_is_enabled(region: str) -> bool:
-    """Probe whether a region is enabled for this account.
+def _region_enablement_status(region: str) -> Literal["enabled", "not-enabled", "unknown"]:
+    """Classify account opt-in state without contacting the target endpoint.
 
-    Same underlying technique as ConfigLoader.validate_region_availability
-    (gco/config/config_loader.py), replicated inline because this module must
-    not import gco/cli: a describe_regions call naming the single region
-    succeeds only when the region is enabled.
-
-    ``UnauthorizedOperation`` is deliberately treated as *enabled*: it means
-    the regional endpoint accepted the credentials (a not-enabled region
-    rejects the token before authorization) but the role lacks
-    ``ec2:DescribeRegions``. Skipping in that case would silently turn one
-    missing IAM grant into zero snapshots account-wide — observed live on
-    first deploy — so the probe fails open with a distinct warning and lets
-    the per-call error isolation surface any real regional failures.
+    ``DescribeRegions(AllRegions=True)`` is authoritative for explicit
+    ``not-opted-in`` state. Permission, throttling, transport, and malformed
+    responses remain unknown and are polled so operational failure cannot be
+    reported as intentionally absent capacity.
     """
     try:
-        ec2 = boto3.client("ec2", region_name=region)
-        ec2.describe_regions(RegionNames=[region])
-        return True
-    except Exception as exc:
-        if _error_code(exc) == "UnauthorizedOperation":
+        ec2 = boto3.client("ec2")
+        response = ec2.describe_regions(AllRegions=True, RegionNames=[region])
+        rows = response.get("Regions", [])
+        match = next((row for row in rows if row.get("RegionName") == region), None)
+        if match is None:
             logger.warning(
-                "region-enablement probe for %s is not permitted (the poller role lacks "
-                "ec2:DescribeRegions); treating the region as enabled and polling it — "
-                "grant ec2:DescribeRegions to restore the pre-check",
+                "region-enablement probe for %s returned no matching region; polling it as unknown",
                 region,
             )
-            return True
+            return "unknown"
+        opt_in_status = match.get("OptInStatus")
+        if opt_in_status == "not-opted-in":
+            logger.info("region %s is explicitly not opted in; skipping it", region)
+            return "not-enabled"
+        if opt_in_status in {"opt-in-not-required", "opted-in"}:
+            return "enabled"
         logger.warning(
-            "region %s is not enabled for this account (describe_regions probe failed: %s); "
-            "skipping it — no snapshots will be written for this region",
+            "region-enablement probe for %s returned unknown OptInStatus %r; polling it",
             region,
-            exc,
+            opt_in_status,
         )
-        return False
+        return "unknown"
+    except Exception as exc:
+        code = _error_code(exc)
+        logger.warning(
+            "region-enablement ec2:DescribeRegions probe for %s failed (%s); polling it as "
+            "unknown so the per-region calls expose any real operational failure",
+            region,
+            code or type(exc).__name__,
+        )
+        return "unknown"
+
+
+def _region_is_enabled(region: str) -> bool:
+    """Compatibility predicate: only explicit not-opted-in evidence skips."""
+    return _region_enablement_status(region) != "not-enabled"
 
 
 def _regional_scores_from_response(response: dict[str, Any], regions: set[str]) -> dict[str, int]:
@@ -403,8 +423,8 @@ def _collect_spot_placement_scores(
     return scores, counters
 
 
-def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int]:
-    """Return (mean latest price across AZs, AZ count) from recent spot history."""
+def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int | None]:
+    """Return (mean latest price, AZ count), preserving probe failure as None."""
     end = datetime.now(UTC)
     start = end - timedelta(days=SPOT_PRICE_LOOKBACK_DAYS)
     try:
@@ -416,7 +436,7 @@ def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int
         )
     except Exception as exc:
         logger.warning("spot price history failed for %s: %s", instance_type, exc)
-        return None, 0
+        return None, None
     latest_by_az: dict[str, float] = {}
     for item in resp.get("SpotPriceHistory", []):
         az = item.get("AvailabilityZone")
@@ -429,11 +449,13 @@ def _spot_price_summary(ec2: Any, instance_type: str) -> tuple[float | None, int
 
 def _capacity_block_summary(
     ec2: Any, instance_type: str, duration_hours: int = DEFAULT_BLOCK_DURATION_HOURS
-) -> tuple[int, int]:
-    """Return (offering count, total instance count) for available capacity blocks.
+) -> tuple[int | None, int | None]:
+    """Return offering/instance counts, or ``(None, None)`` on probe failure.
 
     ``duration_hours`` is the Capacity Block duration to probe; the poller calls
-    this once for the short tier and once for the long tier.
+    this once for the short tier and once for the long tier. A successful empty
+    response is ``(0, 0)``; failure stays absent so it cannot become false
+    zero-capacity history.
     """
     try:
         resp = ec2.describe_capacity_block_offerings(
@@ -448,7 +470,7 @@ def _capacity_block_summary(
             duration_hours,
             exc,
         )
-        return 0, 0
+        return None, None
     offerings = resp.get("CapacityBlockOfferings", [])
     total = sum(int(o.get("InstanceCount", 0)) for o in offerings)
     return len(offerings), total
@@ -462,9 +484,9 @@ def _build_item(
     spot_scores: dict[str, int],
     spot_pool: str | None,
     spot_price: float | None,
-    az_count: int,
-    blocks_available: int,
-    blocks_total: int,
+    az_count: int | None,
+    blocks_available: int | None,
+    blocks_total: int | None,
     long_blocks_available: int | None = None,
     long_blocks_total: int | None = None,
 ) -> dict[str, Any]:
@@ -474,7 +496,9 @@ def _build_item(
     the pooled score value; ``spot_pool`` names the pool those scores were
     requested for and is recorded only when at least one score was obtained,
     so refused or unpooled snapshots carry neither the fields nor a dangling
-    attribution.
+    attribution. Per-Region probe values remain optional: ``None`` means the
+    API call failed and the field is omitted, while a successful empty
+    Capacity Block response is recorded as a real zero.
     """
     ts = now.isoformat()
     item: dict[str, Any] = {
@@ -491,10 +515,12 @@ def _build_item(
         item["spot_pool"] = spot_pool
     if spot_price is not None:
         item["spot_price"] = _to_decimal(spot_price)
-    if az_count:
+    if az_count is not None:
         item["az_count"] = az_count
-    item["capacity_blocks_available"] = blocks_available
-    item["capacity_blocks_total"] = blocks_total
+    if blocks_available is not None:
+        item["capacity_blocks_available"] = blocks_available
+    if blocks_total is not None:
+        item["capacity_blocks_total"] = blocks_total
     # Long-duration tier is omitted entirely when the long probe is disabled
     # (CAPACITY_BLOCK_LONG_DURATION_HOURS=0), so the store treats it as absent
     # rather than recording a misleading zero.
@@ -541,11 +567,15 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # poller must not produce.
     regions: list[str] = []
     regions_skipped_not_enabled: list[str] = []
+    regions_enablement_unknown: list[str] = []
     for region in configured_regions:
-        if _region_is_enabled(region):
-            regions.append(region)
-        else:
+        enablement = _region_enablement_status(region)
+        if enablement == "not-enabled":
             regions_skipped_not_enabled.append(region)
+            continue
+        regions.append(region)
+        if enablement == "unknown":
+            regions_enablement_unknown.append(region)
 
     # Phase 1 + 2 — pooled, batched, multi-capacity SPS with bounded
     # completeness retry. Only pools containing at least one watched type are
@@ -606,6 +636,26 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                         long_available, long_total = _capacity_block_summary(
                             ec2, instance_type, long_block_duration_hours
                         )
+                signal_obtained = bool(spot_scores) or any(
+                    value is not None
+                    for value in (
+                        spot_price,
+                        az_count,
+                        blocks_available,
+                        blocks_total,
+                        long_available,
+                        long_total,
+                    )
+                )
+                if not signal_obtained:
+                    errors += 1
+                    logger.warning(
+                        "all capacity probes failed for %s/%s; skipping history write "
+                        "rather than recording false zero capacity",
+                        instance_type,
+                        region,
+                    )
+                    continue
                 item = _build_item(
                     instance_type,
                     region,
@@ -632,6 +682,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "timestamp": now.isoformat(),
         "regions_polled": regions,
         "regions_skipped_not_enabled": regions_skipped_not_enabled,
+        "regions_enablement_unknown": regions_enablement_unknown,
         "sps": {
             **sps_counters,
             "pools": len(relevant_pools),
@@ -641,7 +692,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     }
     logger.info(
         "capacity poll complete: written=%d errors=%d sps_requests=%d sps_received=%d/%d "
-        "sps_missing=%d config_limit_refusals=%d regions_skipped=%d",
+        "sps_missing=%d config_limit_refusals=%d regions_skipped=%d "
+        "regions_enablement_unknown=%d",
         written,
         errors,
         summary["sps"]["requests_issued"],
@@ -650,5 +702,6 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         summary["sps"]["combinations_missing_after_retry"],
         summary["sps"]["config_limit_refusals"],
         len(regions_skipped_not_enabled),
+        len(regions_enablement_unknown),
     )
     return summary

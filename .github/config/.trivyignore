@@ -19,29 +19,18 @@
 #   CVE-XXXX-XXXXX exp:YYYY-MM-DD
 # =============================================================================
 
-# CVE-2026-34040 — github.com/docker/docker v28.5.2 (Moby authorization
-# bypass), statically linked into the docker-buildx CLI plugin that
-# Dockerfile.dev installs (ARG BUILDX_VERSION). Surfaced by
-# security:trivy:container-scan on the GCO dev image — the only scanned image
-# that carries the Buildx plugin. Fixed in docker/docker 29.3.1.
-#
-# Not yet clearable by a pin bump: re-checked 2026-07-30 against buildx
-# v0.36.0 (now the pinned release) — its go.mod still requires docker/docker
-# v28.5.2. The same v0.36.0 bump did clear the four suppressions that used to
-# sit beside this one: the containerd trio CVE-2026-53488/-53489/-53492
-# (v0.36.0 pins containerd v2.3.3, past the 2.3.2 fix), the Go-toolchain
-# CVE-2026-39822 (the v0.36.0 release binary reports go1.26.5), and the
-# gRPC-Go GHSA-hrxh-6v49-42gf (v0.36.0 pins grpc v1.82.1, the fixed version).
-#
-# Low runtime risk: buildx is a build-time CLI plugin, not a running moby
-# daemon, so the daemon authorization-bypass CVE is off the path buildx
-# exercises (registry-to-registry image copy and BuildKit builds). The dev
-# image is a contributor/CI tool that is never deployed to a cluster.
-#
-# Clears when a buildx release ships rebuilt against docker/docker >= 29.3.1:
-# bump BUILDX_VERSION in Dockerfile.dev (the monthly deps-scan tracks it) and
-# drop this entry. Advisory: https://avd.aquasec.com/nvd/cve-2026-34040
-CVE-2026-34040 exp:2026-09-22
+# CVE-2026-56854 — golang.org/x/crypto/ssh authentication bypass caused by
+# unenforced source-address restrictions, fixed in x/crypto v0.55.0. The
+# latest stable Buildx v0.36.1 and Helm v4.2.4 binaries both embed v0.54.0.
+# Official release candidates contain the fix, but this release deliberately
+# consumes stable tooling only; no fixed stable wrapper release exists as of
+# 2026-09-01. Neither binary exposes an SSH server: Buildx is contributor/CI
+# build tooling and Helm is a deploy-time chart client, so the vulnerable
+# server-side authentication path is not reachable. This new suppression has
+# a 30-day review window and can be removed only after stable Buildx and Helm
+# releases both embed x/crypto >= v0.55.0.
+# Advisory: https://avd.aquasec.com/nvd/cve-2026-56854
+CVE-2026-56854 exp:2026-10-01
 
 # CVE-2026-17106 (GHSA-hfg8-hc9c-6c3h) — github.com/moby/go-archive v0.2.1: a
 # crafted tar archive can write outside the extraction directory during
@@ -55,11 +44,10 @@ CVE-2026-34040 exp:2026-09-22
 # Security workflow was green on main at eeeab67 (2026-08-18T20:50Z), 27
 # minutes before publication, so this appeared on an unchanged buildx binary.
 #
-# Not clearable by a pin bump: checked 2026-08-19 — v0.36.1 (the release this
-# ARG already pins) is the latest buildx on any dist-tag, and its go.mod
-# requires moby/go-archive v0.2.1. buildx master is on v0.2.0, older still, so
-# the bump to >= 0.3.0 has not landed upstream at all yet — there is no
-# release or branch to move to.
+# Not clearable by a stable pin bump: re-checked 2026-09-01 — v0.36.1 is
+# the latest stable Buildx release and requires moby/go-archive v0.2.1. The
+# available v0.37.0 release candidate still uses v0.2.0, so even accepting a
+# prerelease would not clear this finding; no upstream branch uses >= v0.3.0.
 #
 # Low runtime risk: the flagged path is tar extraction. buildx is a
 # build-time CLI plugin that extracts contexts and cache artifacts authored by
@@ -70,7 +58,7 @@ CVE-2026-34040 exp:2026-09-22
 # Clears when a buildx release ships requiring moby/go-archive >= 0.3.0: bump
 # BUILDX_VERSION in Dockerfile.dev (the monthly deps-scan tracks it) and drop
 # this entry. Advisory: https://avd.aquasec.com/nvd/cve-2026-17106
-CVE-2026-17106 exp:2026-10-15
+CVE-2026-17106 exp:2026-11-14
 
 # CVE-2026-14257 (GHSA-mh99-v99m-4gvg) — brace-expansion denial of service via
 # unbounded expansion length, causing an out-of-memory process crash. Present in
@@ -83,7 +71,7 @@ CVE-2026-17106 exp:2026-10-15
 # and reached the Trivy DB after the last green main run, so it appeared on an
 # unchanged dev image.
 #
-# Not clearable by a pin bump: re-checked 2026-07-30 against npm 12.0.2 (the
+# Not clearable by a pin bump: re-checked 2026-09-01 against npm 12.0.2 (the
 # release this ARG now pins) — it still bundles brace-expansion 5.0.7,
 # verified in the installed tree
 # (node_modules/npm/node_modules/brace-expansion/package.json). The bundled
@@ -99,23 +87,21 @@ CVE-2026-17106 exp:2026-10-15
 # bump ARG NPM_VERSION in Dockerfile.dev (plus the packageManager pins the
 # consistency check holds in lockstep) and drop this entry.
 # Advisory: https://avd.aquasec.com/nvd/cve-2026-14257
-CVE-2026-14257 exp:2026-09-22
+CVE-2026-14257 exp:2026-10-22
 
 # CVE-2026-69152 (GHSA-rgw5-rvv9-x895) — brace-expansion denial of service via
 # unbounded intermediate arrays, bypassing the CVE-2026-14257 mitigation
 # suppressed above. Published 2026-08-01, fixed upstream in brace-expansion
 # 5.0.9. Same vendored copy as CVE-2026-14257: npm ships brace-expansion 5.0.7
 # inside its own node_modules in the dev image, surfaced by
-# security:trivy:container-scan on Dockerfile.dev. The aws-cdk-lib bundled
-# copy in the root package-lock.json (5.0.8 after the 2.263.0 bump) is also
-# in the affected range; npm-audit tracks that one via the matching
-# GHSA-rgw5-rvv9-x895 entry in .npm-audit-ignore.
+# security:trivy:container-scan on Dockerfile.dev. The separate root graph is
+# now clear: aws-cdk-lib 2.267.0 bundles brace-expansion 5.0.9, so the lockfile
+# refresh removes the matching .npm-audit-ignore entry.
 #
-# Not clearable by a pin bump: checked 2026-08-04 — npm 12.0.2 (ARG
-# NPM_VERSION in Dockerfile.dev) is the latest npm release on any dist-tag
-# and still bundles brace-expansion 5.0.7; no aws-cdk-lib release bundles
-# 5.0.9 yet. Both copies live inside published tarballs where neither
-# `npm audit fix` nor an `overrides` entry can reach them.
+# This image finding is not clearable by a pin bump: re-checked 2026-09-01 —
+# npm 12.0.2 is still the latest npm release and still bundles 5.0.7 in its
+# immutable published tarball, beyond the reach of `npm audit fix` or an
+# `overrides` entry.
 #
 # Low runtime risk: same exposure profile as CVE-2026-14257 above — the
 # expansion path is driven by contributor/CI-authored brace globs, not
@@ -123,10 +109,9 @@ CVE-2026-14257 exp:2026-09-22
 #
 # Clears when npm ships a release that re-vendors brace-expansion >= 5.0.9:
 # bump ARG NPM_VERSION in Dockerfile.dev (plus the packageManager pins the
-# consistency check holds in lockstep) and drop this entry, along with the
-# matching .npm-audit-ignore entry once aws-cdk-lib re-bundles too.
+# consistency check holds in lockstep) and drop this entry.
 # Advisory: https://avd.aquasec.com/nvd/cve-2026-69152
-CVE-2026-69152 exp:2026-09-22
+CVE-2026-69152 exp:2026-10-22
 
 # CVE-2026-69192 (GHSA-mwp4-54f8-5fhr) — ip-address parses leading-zero IPv4
 # octets as decimal while OS resolvers treat them as octal, enabling
@@ -136,7 +121,7 @@ CVE-2026-69152 exp:2026-09-22
 # (socks-proxy-agent -> socks -> ip-address) in the dev image, surfaced by
 # security:trivy:container-scan on Dockerfile.dev.
 #
-# Not clearable by a pin bump: checked 2026-08-04 — npm 12.0.2 (ARG
+# Not clearable by a pin bump: checked 2026-09-01 — npm 12.0.2 (ARG
 # NPM_VERSION in Dockerfile.dev) is the latest npm release on any dist-tag
 # and still bundles ip-address 10.2.0 inside its published tarball, out of
 # reach of `npm audit fix` and `overrides`.
@@ -150,7 +135,7 @@ CVE-2026-69152 exp:2026-09-22
 # ARG NPM_VERSION in Dockerfile.dev (plus the packageManager pins the
 # consistency check holds in lockstep) and drop this entry.
 # Advisory: https://avd.aquasec.com/nvd/cve-2026-69192
-CVE-2026-69192 exp:2026-09-22
+CVE-2026-69192 exp:2026-10-22
 
 # CVE-2026-73566 — node-tar denial of service: a crafted GNU L / PAX x
 # long-path header with thousands of slash-separated segments drives the
@@ -162,7 +147,7 @@ CVE-2026-69192 exp:2026-09-22
 # Dockerfile.dev. Neither repository-owned npm graph (root or
 # lambda/inference-streaming-proxy) depends on tar at all.
 #
-# Not clearable by a pin bump: checked 2026-08-23 — npm 12.0.2 (ARG
+# Not clearable by a pin bump: checked 2026-09-01 — npm 12.0.2 (ARG
 # NPM_VERSION in Dockerfile.dev) is the latest npm release on any dist-tag
 # and declares tar ^7.5.19, shipping 7.5.19 inside its published tarball,
 # out of reach of `npm audit fix` and `overrides`. Vendored-tar refresh is
@@ -180,7 +165,7 @@ CVE-2026-69192 exp:2026-09-22
 # ARG NPM_VERSION in Dockerfile.dev (plus the packageManager pins the
 # consistency check holds in lockstep) and drop this entry.
 # Advisory: https://avd.aquasec.com/nvd/cve-2026-73566
-CVE-2026-73566 exp:2026-10-15
+CVE-2026-73566 exp:2026-11-14
 
 # CVE-2026-50163 (GHSA-77gc-fj98-665h) — oras.land/oras-go/v2 v2.6.1
 # information disclosure / arbitrary file access via crafted tarball
@@ -192,26 +177,24 @@ CVE-2026-73566 exp:2026-10-15
 # Not introduced by any change of ours: the advisory reached the Trivy DB
 # after the last green main run and appeared on an unchanged helm binary.
 #
-# Not yet clearable by a pin bump: re-checked 2026-08-21 — v4.2.4 (the
-# release this branch now pins) is the latest helm on both active lines
-# and `go version -m` on its release binary still reports oras-go v2.6.1;
-# the bump to v2.6.2 is merged on helm master only, so it lands in a
-# future helm patch release.
+# Not clearable by a stable pin bump: re-checked 2026-09-01 — v4.2.4 is
+# the latest stable Helm release and its binary still reports oras-go v2.6.1.
+# v4.3.0-rc.1 contains v2.6.2, but this release deliberately excludes
+# prerelease tooling; remove this suppression when a stable Helm build carries
+# the fix.
 #
 # Low runtime risk: the flagged path is OCI-registry chart *pull*
-# extraction. The helm-installer Lambda pulls exactly the four
-# version-pinned charts in charts.yaml from operator-configured
-# registries (public.ecr.aws, ghcr.io/slinkyproject) during stack
-# deploys — not untrusted, attacker-supplied artifacts — and the Lambda
+# extraction. The helm-installer Lambda pulls only the version-pinned charts
+# in charts.yaml from operator-configured registries during stack deploys — not untrusted, attacker-supplied artifacts — and the Lambda
 # runs only at deploy time, not as a long-lived network service.
 #
-# Clears when a helm release ships with oras-go >= v2.6.2: bump the helm
-# pin + SHA256 trust anchor in lambda/helm-installer/Dockerfile, the
-# HELM_VERSION/HELM_SHA256 env pairs in integration-tests.yml and
-# deps-scan.yml, and the expected pins in tests/test_supply_chain_integrity.py,
-# then drop this entry.
+# Clears when a stable Helm release ships with oras-go >= v2.6.2: bump the
+# authenticated Helm URL and SHA256 trust anchor in
+# lambda/helm-installer/Dockerfile (workflows derive both pins from there),
+# update the expected pins in tests/test_supply_chain_integrity.py, then drop
+# this entry.
 # Advisory: https://avd.aquasec.com/nvd/cve-2026-50163
-CVE-2026-50163 exp:2026-09-22
+CVE-2026-50163 exp:2026-10-22
 
 # CVE-2025-47273 (setuptools 70.3.0, fixed 78.1.1) and GHSA-6v7p-g79w-8964
 # (msgpack 1.1.2, fixed 1.2.1) — both live only inside the AWS CLI v2
@@ -219,18 +202,15 @@ CVE-2026-50163 exp:2026-09-22
 # not in our resolvable dependency tree (msgpack appears nowhere in
 # requirements-lock.txt, and site-packages setuptools is current).
 #
-# Re-confirmed 2026-08-21 by the pinned CI scanner after a trial removal:
-# the 2.36.19 -> 2.36.26 bump did NOT clear them — the dev-image scan
-# (Trivy v0.74.0) still reports both against the vendored bundle. Note for
-# the next sweep: the finding does not reproduce from the release zip's
-# dist/ tree with an older local Trivy (0.69.3 finds no python-pkg
-# metadata there); only the CI-pinned scanner against the built image is
-# authoritative, per rule 5 above.
+# Re-confirmed 2026-09-01 by a pinned-Trivy 0.74.0 scan of a full dev-image
+# trial build with latest AWS CLI 2.36.36: both findings remain against the
+# vendored bundle. Scanning only the release zip is insufficient; the built
+# image is authoritative per rule 5 above.
 #
-# Not clearable by a pin bump: 2.36.26 is the newest AWS CLI v2 release
-# (checked 2026-08-21); the vendored versions are chosen by the AWS CLI's
-# own build. Clears when a newer AWS CLI release rebuilds its bundle with
-# patched deps — bump AWSCLI_VERSION in Dockerfile.dev and re-check.
+# Not clearable by a pin bump: 2.36.36 is the newest AWS CLI v2 release and
+# still vendors the affected versions. Clears when a newer AWS CLI release
+# rebuilds its bundle with patched deps — bump AWSCLI_VERSION in
+# Dockerfile.dev and re-check.
 #
 # Low runtime risk: the dev image is a contributor/CI tool that is never
 # deployed; the flagged code paths run only inside `aws` CLI invocations
@@ -238,8 +218,8 @@ CVE-2026-50163 exp:2026-09-22
 #
 # Advisories: https://nvd.nist.gov/vuln/detail/CVE-2025-47273
 #             https://github.com/advisories/GHSA-6v7p-g79w-8964
-CVE-2025-47273 exp:2026-10-15
-GHSA-6v7p-g79w-8964 exp:2026-10-15
+CVE-2025-47273 exp:2026-11-14
+GHSA-6v7p-g79w-8964 exp:2026-11-14
 
 # -----------------------------------------------------------------------------
 # CVE-2026-33818 (encoding/asn1 DoS), CVE-2026-56853 (net/http unencrypted
@@ -260,27 +240,21 @@ GHSA-6v7p-g79w-8964 exp:2026-10-15
 # these images' contents. The Go advisories landed in the Trivy DB in that
 # window, so they appeared on unchanged binaries.
 #
-# Flagged in every scanned image that carries a Go binary:
+# Flagged in the scanned stable-tool images:
 #   dev (Dockerfile.dev)                    docker, docker-buildx, kubectl
-#   helm-installer                          helm, kubectl, aws-lambda-rie
-#   tls-certificate-manager                 aws-lambda-rie
+#   helm-installer                          helm, kubectl
+# A fresh 2026-09-01 pull of the AWS Lambda Python 3.14 base scans clean for
+# aws-lambda-rie, so the remaining occurrences are all in pins we track.
 #
-# Not clearable by a pin bump — each upstream checked 2026-08-15:
-#   kubectl        v1.36.4 (the release this branch now pins) IS stable and
-#                  stable-1.36 (https://dl.k8s.io/release/stable.txt), and
-#                  `go version -m` on it reports go1.26.5, so there is no
-#                  newer release to move to.
-#   helm           v4.2.4 (the release this branch now pins) is the newest
-#                  upstream and its release binary likewise reports go1.26.5
-#                  (re-checked 2026-08-21). Deferred to the next helm release
-#                  that is actually rebuilt on a patched Go.
-#   docker         29.7.2 is the newest static build on
-#                  download.docker.com/linux/static/stable.
-#   docker-buildx  v0.36.1 is the latest release.
-#   aws-lambda-rie not a pin we own: it ships inside
-#                  public.ecr.aws/lambda/python:3.14, the AWS-managed base
-#                  image both Lambda images build on. It clears when AWS
-#                  republishes that base on a patched Go.
+# Not clearable by an allowed pin bump — upstream re-checked 2026-09-01:
+#   kubectl        v1.36.4 is latest stable-1.36 and reports go1.26.5. Both
+#                  shipped kubectl pins match and CI enforces the supported
+#                  ±1 minor skew against cdk.json::kubernetes_version.
+#   helm           v4.2.4 is the latest stable release and reports go1.26.5;
+#                  only a prerelease currently carries patched Go.
+#   docker         29.7.2 is the newest static stable build.
+#   docker-buildx  v0.36.1 is the latest stable release; only a prerelease
+#                  currently carries patched Go.
 #
 # Low runtime risk. Every flagged binary is a short-lived CLI/tooling client,
 # never a long-lived network service:
@@ -291,28 +265,22 @@ GHSA-6v7p-g79w-8964 exp:2026-10-15
 #     endpoint and the version-pinned chart registries in charts.yaml, reached
 #     over VPC endpoints — and encoding/asn1 is certificate parsing against
 #     those same endpoints.
-#   * aws-lambda-rie is the local Runtime Interface Emulator. Deployed Lambda
-#     functions get their runtime API from the platform, so the RIE binary is
-#     not on the production invocation path; it exists for local invocation.
 #   * the dev image is contributor/CI tooling and is never deployed.
 #
-# Clears per binary as upstream ships rebuilds on Go >= 1.26.6: bump
-# KUBECTL_VERSION in Dockerfile.dev plus the kubectl pin in
-# lambda/helm-installer/Dockerfile, the helm pin + SHA256 there (in lockstep
-# with the HELM_VERSION/HELM_SHA256 pairs in integration-tests.yml and
-# deps-scan.yml and the expected pins in tests/test_supply_chain_integrity.py),
-# ARG DOCKER_VERSION / ARG BUILDX_VERSION in Dockerfile.dev, and the Lambda
-# base image tag; then drop the ids that no longer appear.
+# Clears per binary as stable upstreams ship rebuilds on Go >= 1.26.6: update
+# the matching authenticated pin/checksum, keep both kubectl copies identical
+# and within the CI-enforced ±1 minor skew, then remove IDs only after
+# no-ignore scans show no remaining occurrence.
 # Advisories: https://avd.aquasec.com/nvd/cve-2026-33818 (and the matching
 #             nvd/cve-2026-XXXXX page for each id below)
-CVE-2026-33818 exp:2026-10-15
-CVE-2026-56853 exp:2026-10-15
-CVE-2026-56858 exp:2026-10-15
-CVE-2026-56859 exp:2026-10-15
-CVE-2026-56860 exp:2026-10-15
-CVE-2026-56862 exp:2026-10-15
-CVE-2026-39821 exp:2026-10-15
-CVE-2026-46600 exp:2026-10-15
+CVE-2026-33818 exp:2026-11-14
+CVE-2026-56853 exp:2026-11-14
+CVE-2026-56858 exp:2026-11-14
+CVE-2026-56859 exp:2026-11-14
+CVE-2026-56860 exp:2026-11-14
+CVE-2026-56862 exp:2026-11-14
+CVE-2026-39821 exp:2026-11-14
+CVE-2026-46600 exp:2026-11-14
 # -----------------------------------------------------------------------------
 # CVE-2026-56864 (a malicious GOSUMDB could serve arbitrary module content) and
 # CVE-2026-56865 (a malicious GOPROXY could forge sumdb responses) —
@@ -328,12 +296,10 @@ CVE-2026-46600 exp:2026-10-15
 # advisories landed in the Trivy DB in that window, so they appeared on an
 # unchanged buildx binary — main goes red on its next scan for the same reason.
 #
-# Not clearable by a pin bump — upstream checked 2026-08-19:
-#   docker-buildx  v0.36.1 (published 2026-08-04) IS the latest release; no
-#                  v0.37.x exists, and its go.mod requires exactly the flagged
-#                  golang.org/x/mod v0.38.0. buildx `master` still requires
-#                  v0.38.0 too, so there is no released *or* unreleased build
-#                  to move to.
+# Not clearable by a stable pin bump — upstream re-checked 2026-09-01:
+# Buildx v0.36.1 requires the flagged x/mod v0.38.0. v0.37.0-rc1 carries
+# v0.40.0, but this release deliberately excludes prerelease tooling; remove
+# these entries when a stable Buildx release carries the fix.
 #
 # Low runtime risk: both flaws sit in the Go module download and verification
 # path — they need a hostile GOSUMDB or GOPROXY serving forged module content
@@ -347,5 +313,5 @@ CVE-2026-46600 exp:2026-10-15
 # drop these entries.
 # Advisories: https://avd.aquasec.com/nvd/cve-2026-56864
 #             https://avd.aquasec.com/nvd/cve-2026-56865
-CVE-2026-56864 exp:2026-10-15
-CVE-2026-56865 exp:2026-10-15
+CVE-2026-56864 exp:2026-11-14
+CVE-2026-56865 exp:2026-11-14

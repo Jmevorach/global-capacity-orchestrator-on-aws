@@ -213,6 +213,9 @@ test = [
     # the same version the metrics-parquet extra already locks), so its unit
     # tests can execute the real writer instead of mocking serialization.
     "pyarrow==25.0.1",
+    # Structural diagram tests verify every committed PNG can be parsed in a
+    # targeted ``.[test]`` environment; keep this aligned with ``security``.
+    "pillow==12.3.0",
 ]
 security = [
     "bandit==1.9.4",
