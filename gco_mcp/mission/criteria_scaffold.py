@@ -41,8 +41,8 @@ from .predicate import PredicateRejected, parse_predicate
 from .validation import MissionValidationError
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-08-31T15:58:29Z
-# Generated from Git commit: 614edab7df2577751b831babdd4d6acf7d83a43d
+# Generated at (UTC): 2026-09-01T13:22:56Z
+# Generated from Git commit: ed395032d46063f44b638deb85ae2a6dbf98e7f4
 # Flowchart(s) generated from this file:
 #   * ``generate_sampled_criteria`` -> ``diagrams/code_diagrams/gco_mcp/mission/criteria_scaffold.generate_sampled_criteria.html``
 #     (PNG: ``diagrams/code_diagrams/gco_mcp/mission/criteria_scaffold.generate_sampled_criteria.png``)
@@ -824,9 +824,9 @@ async def _call_backend(backend: SamplingBackend, prompt_str: str) -> str:
     # uses a thin adapter that overrides ``assemble`` so the existing
     # backend implementations call ``assemble()`` and get the prompt.
     prompt_obj = _PromptAdapter(prompt_str)
-    # Backends accept any object with an ``assemble`` method. Both
-    # MCPSamplingBackend and BedrockSamplingBackend call
-    # ``prompt.assemble()`` to get the rendered string.
+    # Backends accept any object with an ``assemble`` method —
+    # BedrockSamplingBackend calls ``prompt.assemble()`` to get the
+    # rendered string.
     del SamplingPrompt  # imported only for documentation linkage
     return await backend.sample(prompt_obj)  # type: ignore[arg-type]
 
