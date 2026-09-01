@@ -614,17 +614,37 @@ def test_actionlint_download_uses_the_published_amd64_asset() -> None:
     assert "actionlint_${ACTIONLINT_VERSION}_linux_x86_64.tar.gz" not in workflow
 
 
-def test_helm_installer_checksums_are_non_overridable_trust_anchors() -> None:
-    dockerfile = _read("lambda/helm-installer/Dockerfile")
-    helm_section = dockerfile[
-        dockerfile.index("# Install Helm") : dockerfile.index("# Install kubectl")
+def test_container_tool_checksums_are_non_overridable_trust_anchors() -> None:
+    dev_dockerfile = _read("Dockerfile.dev")
+    buildx_section = dev_dockerfile[
+        dev_dockerfile.index("# Install the Docker Buildx CLI plugin")
+        : dev_dockerfile.index("# Install uv")
     ]
-    kubectl_section = dockerfile[
-        dockerfile.index("# Install kubectl") : dockerfile.index("# Install Python dependencies")
+    installer_dockerfile = _read("lambda/helm-installer/Dockerfile")
+    helm_section = installer_dockerfile[
+        installer_dockerfile.index("# Install Helm")
+        : installer_dockerfile.index("# Install kubectl")
+    ]
+    kubectl_section = installer_dockerfile[
+        installer_dockerfile.index("# Install kubectl")
+        : installer_dockerfile.index("# Install Python dependencies")
     ]
 
-    assert "ARG HELM_SHA256" not in dockerfile
-    assert "ARG KUBECTL_SHA256" not in dockerfile
+    assert "ARG BUILDX_SHA256" not in dev_dockerfile
+    assert "ARG BUILDX_VERSION=v0.36.1" in buildx_section
+    assert "buildx-${BUILDX_VERSION}.linux-${TARGETARCH}" in buildx_section
+    assert (
+        'amd64) BUILDX_SHA256="48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778"'
+    ) in buildx_section
+    assert (
+        'arm64) BUILDX_SHA256="5d0cafd9d16afe1a0f0d9529885344ace2cc99efdd531b6c783c5455a6001569"'
+    ) in buildx_section
+    assert (
+        'echo "${BUILDX_SHA256}  /usr/local/lib/docker/cli-plugins/docker-buildx" | sha256sum -c -'
+    ) in buildx_section
+
+    assert "ARG HELM_SHA256" not in installer_dockerfile
+    assert "ARG KUBECTL_SHA256" not in installer_dockerfile
     assert "helm-v4.2.4-linux-amd64.tar.gz" in helm_section
     assert (
         "c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3  /tmp/helm.tar.gz"

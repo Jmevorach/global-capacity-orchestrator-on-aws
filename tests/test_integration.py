@@ -1367,27 +1367,41 @@ class TestDependencyVersionConsistency:
             "Lambda requirements.txt versions don't match pyproject.toml:\n" + "\n".join(mismatches)
         )
 
-    def test_kubectl_version_matches_eks_version(self):
-        """kubectl version in helm-installer Dockerfile should match EKS version in cdk.json."""
+    def test_kubectl_versions_follow_eks_skew_policy(self):
+        """Both kubectl binaries must match and stay within ±1 minor of EKS."""
         import json
         import re
 
-        # Get EKS version from cdk.json
         with open(PROJECT_ROOT / "cdk.json", encoding="utf-8") as f:
             cdk_config = json.load(f)
         eks_version = cdk_config["context"]["kubernetes_version"]
+        eks_major, eks_minor = (int(part) for part in eks_version.split("."))
 
-        # Get kubectl version from helm-installer Dockerfile
-        dockerfile = PROJECT_ROOT / "lambda" / "helm-installer" / "Dockerfile"
-        content = dockerfile.read_text()
-        kubectl_match = re.search(r"dl\.k8s\.io/release/v([\d.]+)/", content)
-        assert kubectl_match, "Could not find kubectl version in helm-installer Dockerfile"
-        kubectl_version = kubectl_match.group(1)
+        pin_sources = {
+            "Dockerfile.dev": (
+                PROJECT_ROOT / "Dockerfile.dev",
+                r"^ARG KUBECTL_VERSION=v(\d+\.\d+\.\d+)$",
+            ),
+            "lambda/helm-installer/Dockerfile": (
+                PROJECT_ROOT / "lambda" / "helm-installer" / "Dockerfile",
+                r"dl\.k8s\.io/release/v(\d+\.\d+\.\d+)/",
+            ),
+        }
+        kubectl_versions: dict[str, str] = {}
+        for label, (path, pattern) in pin_sources.items():
+            match = re.search(pattern, path.read_text(encoding="utf-8"), re.MULTILINE)
+            assert match, f"Could not find kubectl version in {label}"
+            version = match.group(1)
+            kubectl_versions[label] = version
+            kubectl_major, kubectl_minor = (int(part) for part in version.split(".")[:2])
+            assert kubectl_major == eks_major and abs(kubectl_minor - eks_minor) <= 1, (
+                f"kubectl {version} in {label} is outside the supported ±1 minor skew "
+                f"for Kubernetes {eks_version}"
+            )
 
-        # kubectl version should start with the EKS version (e.g., 1.36.x matches 1.36)
-        assert kubectl_version.startswith(eks_version), (
-            f"kubectl version {kubectl_version} in helm-installer Dockerfile "
-            f"doesn't match EKS version {eks_version} in cdk.json"
+        assert len(set(kubectl_versions.values())) == 1, (
+            "kubectl pins must match across shipped images: "
+            + ", ".join(f"{path}={version}" for path, version in kubectl_versions.items())
         )
 
     def test_kubernetes_python_client_matches_eks_version(self):

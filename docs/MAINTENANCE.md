@@ -251,13 +251,13 @@ done
 
 ### Version-skew rules
 
-- **kubectl** must stay within ±1 minor of the cluster (the standard Kubernetes
-  skew policy — see the comment on `ARG KUBECTL_VERSION` in `Dockerfile.dev`).
+- **kubectl** pins in `Dockerfile.dev` and the helm-installer image must match
+  each other and stay within ±1 minor of the cluster (the standard Kubernetes
+  skew policy). Enforced by
+  `tests/test_integration.py::test_kubectl_versions_follow_eks_skew_policy`.
 - **kubernetes Python client**: its major must equal the cluster minor
   (`kubernetes==36.x` ↔ EKS `1.36`). Enforced by
   `tests/test_integration.py::test_kubernetes_python_client_matches_eks_version`.
-- **kubectl in the helm-installer image** must match `cdk.json`. Enforced by
-  `tests/test_integration.py::test_kubectl_version_matches_eks_version`.
 
 ### Deploy and verify
 
