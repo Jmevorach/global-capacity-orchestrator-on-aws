@@ -63,7 +63,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -596,6 +598,32 @@ class VectorStoreClient:
                 return count
 
 
+def _is_gco_checkout_root(root: Path) -> bool:
+    """Return whether *root* is the top level of a GCO Git checkout."""
+    file_markers = (root / "cdk.json", root / "app.py", root / "pyproject.toml")
+    if not (root / ".git").exists() or not all(marker.is_file() for marker in file_markers):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    top_level = result.stdout.strip()
+    if result.returncode != 0 or not top_level or Path(top_level).resolve() != root:
+        return False
+    try:
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    except OSError, UnicodeDecodeError, tomllib.TOMLDecodeError:
+        return False
+    project_metadata = project.get("project")
+    return isinstance(project_metadata, dict) and project_metadata.get("name") == "gco-cli"
+
+
 def demo_corpus_paths() -> list[Path]:
     """Return the checkout's ``docs/*.md`` as a self-contained demo corpus.
 
@@ -603,16 +631,20 @@ def demo_corpus_paths() -> list[Path]:
     documentation — always present in a source checkout, meaningful to
     search ("how does capacity history work?"), and free of licensing
     questions. Installed (pip/uvx) distributions do not carry ``docs/``,
-    so the demo requires a checkout.
+    so the demo requires a checkout as the process working directory.
     """
-    docs_dir = Path(__file__).resolve().parent.parent / "docs"
-    markers = (docs_dir.parent / "app.py", docs_dir.parent / "pyproject.toml")
-    if not docs_dir.is_dir() or not all(marker.is_file() for marker in markers):
+    root = Path.cwd().resolve()
+    docs_dir = root / "docs"
+    if not _is_gco_checkout_root(root) or not docs_dir.is_dir():
         raise VectorStoreError(
             "the demo corpus is the checkout's docs/*.md — run from a GCO "
             "source checkout, or pass explicit files to ingest instead"
         )
     paths = sorted(docs_dir.glob("*.md"))
+    if docs_dir.is_symlink() or any(path.is_symlink() or not path.is_file() for path in paths):
+        raise VectorStoreError(
+            "the demo corpus must contain only regular docs/*.md files inside the GCO checkout"
+        )
     if not paths:
         raise VectorStoreError(f"no *.md files found under {docs_dir}")
     return paths

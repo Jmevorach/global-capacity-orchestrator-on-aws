@@ -82,7 +82,7 @@ from gco.stacks.constants import (
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-31T15:58:29Z
-# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
+# Generated from Git commit: 614edab7df2577751b831babdd4d6acf7d83a43d
 # Flowchart(s) generated from this file:
 #   * ``GCOApiGatewayGlobalStack.__init__`` -> ``diagrams/code_diagrams/gco/stacks/api_gateway_global_stack.GCOApiGatewayGlobalStack___init__.html``
 #     (PNG: ``diagrams/code_diagrams/gco/stacks/api_gateway_global_stack.GCOApiGatewayGlobalStack___init__.png``)

@@ -763,10 +763,12 @@ class TestVectorDemoCorpusDriver:
     def test_create_runs_the_documented_command_and_records_keys(self, monkeypatch) -> None:
         import json as _json
 
-        seen: dict[str, list[str]] = {}
+        seen: dict[str, object] = {}
 
-        def fake_run_cli(args, _repo_root, timeout=600):
+        def fake_run_cli(args, repo_root, timeout=600):
             seen["args"] = args
+            seen["repo_root"] = repo_root
+            seen["timeout"] = timeout
             return (
                 0,
                 _json.dumps(
@@ -792,6 +794,8 @@ class TestVectorDemoCorpusDriver:
             "--output",
             "json",
         ]
+        assert seen["repo_root"] == REPO_ROOT
+        assert seen["timeout"] == 900
         assert driver.bucket == "gco-cluster-shared-x"
         assert driver.uploaded == ["vector-corpus/a.md", "vector-corpus/b.md"]
         assert evidence["command"] == "gco vector ingest --demo --wait"

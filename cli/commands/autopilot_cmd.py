@@ -54,7 +54,7 @@ from ..output import get_output_formatter
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
 # Generated at (UTC): 2026-08-31T15:58:29Z
-# Generated from Git commit: d5eebeaf363afd3a3979dfa66723d298eb5f54d1
+# Generated from Git commit: 614edab7df2577751b831babdd4d6acf7d83a43d
 # Flowchart(s) generated from this file:
 #   * ``_plan`` -> ``diagrams/code_diagrams/cli/commands/autopilot_cmd._plan.html``
 #     (PNG: ``diagrams/code_diagrams/cli/commands/autopilot_cmd._plan.png``)
