@@ -617,17 +617,20 @@ def test_actionlint_download_uses_the_published_amd64_asset() -> None:
 def test_container_tool_checksums_are_non_overridable_trust_anchors() -> None:
     dev_dockerfile = _read("Dockerfile.dev")
     buildx_section = dev_dockerfile[
-        dev_dockerfile.index("# Install the Docker Buildx CLI plugin")
-        : dev_dockerfile.index("# Install uv")
+        dev_dockerfile.index("# Install the Docker Buildx CLI plugin") : dev_dockerfile.index(
+            "# Install uv"
+        )
     ]
     installer_dockerfile = _read("lambda/helm-installer/Dockerfile")
     helm_section = installer_dockerfile[
-        installer_dockerfile.index("# Install Helm")
-        : installer_dockerfile.index("# Install kubectl")
+        installer_dockerfile.index("# Install Helm") : installer_dockerfile.index(
+            "# Install kubectl"
+        )
     ]
     kubectl_section = installer_dockerfile[
-        installer_dockerfile.index("# Install kubectl")
-        : installer_dockerfile.index("# Install Python dependencies")
+        installer_dockerfile.index("# Install kubectl") : installer_dockerfile.index(
+            "# Install Python dependencies"
+        )
     ]
 
     assert "ARG BUILDX_SHA256" not in dev_dockerfile
