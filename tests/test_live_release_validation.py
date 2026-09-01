@@ -3292,6 +3292,28 @@ class TestProtectedBaselineIdentity:
             {"arn": nearby_ecr_arn, "tags": {}}
         ]
 
+    def test_filter_removes_only_exact_protected_target_group(self) -> None:
+        target_group_arn = (
+            "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/protected/abc123"
+        )
+        baseline = self._baseline()
+        baseline["protected_stacks"][self._REGION][0]["physical_resources"].append(
+            {
+                "logical_id": "ProtectedTargetGroup",
+                "resource_type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+                "physical_id": target_group_arn,
+            }
+        )
+        project_inventory = {
+            "regional": {
+                self._REGION: {"target_groups": [target_group_arn, f"{target_group_arn}-other"]}
+            }
+        }
+
+        filtered = ownership_ecr._strip_baseline_ecr(project_inventory, baseline)
+
+        assert filtered["regional"][self._REGION]["target_groups"] == [f"{target_group_arn}-other"]
+
     def test_filter_requires_complete_protected_resource_authority(self) -> None:
         baseline = self._baseline()
         del baseline["protected_stacks"][self._REGION][0]["physical_resources"]
@@ -5723,6 +5745,127 @@ class TestStripExpiredTableStreams:
         snapshot = json.loads(json.dumps(inventory))
         ownership_streams._strip_expired_table_streams(ctx, inventory)
         assert inventory == snapshot
+
+
+class TestProjectTargetGroupScanner:
+    def test_controller_cluster_tag_owns_orphan_target_group(self):
+        client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "TargetGroups": [
+                    {
+                        "TargetGroupName": "k8s-gco-live-old",
+                        "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/mine/1",
+                    },
+                    {
+                        "TargetGroupName": "k8s-other-old",
+                        "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/other/2",
+                    },
+                ]
+            }
+        ]
+        client.get_paginator.return_value = paginator
+        client.describe_tags.return_value = {
+            "TagDescriptions": [
+                {
+                    "ResourceArn": (
+                        "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/mine/1"
+                    ),
+                    "Tags": [{"Key": "elbv2.k8s.aws/cluster", "Value": "gco-live-us-east-1"}],
+                },
+                {
+                    "ResourceArn": (
+                        "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/other/2"
+                    ),
+                    "Tags": [{"Key": "elbv2.k8s.aws/cluster", "Value": "other-us-east-1"}],
+                },
+            ]
+        }
+        session = MagicMock()
+        session.client.return_value = client
+
+        result = inventory_scanners._list_target_groups(session, "us-east-1", "gco-live")
+
+        assert result == ["arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/mine/1"]
+        client.describe_tags.assert_called_once()
+
+    def test_pagination_batching_and_all_ownership_signals(self):
+        client = MagicMock()
+        target_groups = [
+            {
+                "TargetGroupName": (
+                    "gco-live-explicit" if index == 0 else f"k8s-generated-{index}"
+                ),
+                "TargetGroupArn": (
+                    f"arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/group-{index}/id"
+                ),
+            }
+            for index in range(23)
+        ]
+        client.get_paginator.return_value.paginate.return_value = [
+            {"TargetGroups": target_groups[:11]},
+            {"TargetGroups": target_groups[11:]},
+        ]
+        tags_by_index = {
+            1: [{"Key": "gco:project", "Value": "gco-live"}],
+            2: [{"Key": "elbv2.k8s.aws/cluster", "Value": "gco-live-us-east-1"}],
+            3: [{"Key": "eks:eks-cluster-name", "Value": "gco-live-us-east-1"}],
+        }
+
+        def describe_tags(*, ResourceArns):
+            descriptions = []
+            for arn in ResourceArns:
+                index = int(arn.split("group-")[1].split("/")[0])
+                descriptions.append({"ResourceArn": arn, "Tags": tags_by_index.get(index, [])})
+            return {"TagDescriptions": descriptions}
+
+        client.describe_tags.side_effect = describe_tags
+        session = MagicMock()
+        session.client.return_value = client
+
+        result = inventory_scanners._list_target_groups(session, "us-east-1", "gco-live")
+
+        assert result == sorted(item["TargetGroupArn"] for item in target_groups[:4])
+        assert [
+            len(call.kwargs["ResourceArns"]) for call in client.describe_tags.call_args_list
+        ] == [20, 3]
+
+    def test_target_groups_participate_in_all_zero_gate(self):
+        from scripts.live_release_validation.inventory import project as inventory_project
+
+        resources = dict.fromkeys(inventory_project._REGIONAL_PROJECT_RESOURCE_CATEGORIES, [])
+        resources["target_groups"] = [
+            "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/orphan/id"
+        ]
+        inventory_value = {
+            "coverage": {
+                "complete": True,
+                "required_scanners": list(inventory_project._PROJECT_RESOURCE_SCANNERS),
+                "completed_scanners": list(inventory_project._PROJECT_RESOURCE_SCANNERS),
+                "resource_categories": list(inventory_project._PROJECT_RESOURCE_CATEGORIES),
+            },
+            "cloudformation_stacks": {},
+            "regional": {"us-east-1": resources},
+            **{category: [] for category in inventory_project._GLOBAL_PROJECT_RESOURCE_CATEGORIES},
+        }
+
+        assert inventory_project.project_resources_are_absent(inventory_value) is False
+        resources["target_groups"] = []
+        assert inventory_project.project_resources_are_absent(inventory_value) is True
+
+    def test_missing_target_group_arn_fails_closed(self):
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.return_value = [
+            {"TargetGroups": [{"TargetGroupName": "k8s-gco-live-old"}]}
+        ]
+        session = MagicMock()
+        session.client.return_value = client
+
+        with pytest.raises(RuntimeError, match="without an ARN"):
+            inventory_scanners._list_target_groups(session, "us-east-1", "gco-live")
+
+        client.describe_tags.assert_not_called()
 
 
 class TestAcceptedEfsAutomaticBackupRecoveryPoints:

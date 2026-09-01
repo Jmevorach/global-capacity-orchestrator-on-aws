@@ -25,6 +25,7 @@ _PROTECTED_REGIONAL_RESOURCE_CATEGORIES = {
     "AWS::ECR::Repository": "ecr_repositories",
     "AWS::EKS::Cluster": "eks_clusters",
     "AWS::ElasticLoadBalancingV2::LoadBalancer": "load_balancers",
+    "AWS::ElasticLoadBalancingV2::TargetGroup": "target_groups",
     "AWS::KMS::Key": "kms_keys",
     "AWS::Lambda::Function": "lambda_functions",
     "AWS::Logs::LogGroup": "cloudwatch_log_groups",
