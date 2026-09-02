@@ -33,6 +33,7 @@ Complete command-line interface documentation for GCO (Global Capacity Orchestra
   - [vector](#vector-commands)
   - [release](#release-commands)
   - [examples](#examples-commands)
+  - [deps](#deps-commands)
 - [Configuration](#configuration)
 - [Environment Variables](#environment-variables)
 - [Examples](#examples)
@@ -2851,9 +2852,9 @@ gco inference deploy ENDPOINT_NAME [OPTIONS]
 **Example:**
 
 ```bash
-gco inference deploy my-llm -i vllm/vllm-openai:v0.27.1
+gco inference deploy my-llm -i vllm/vllm-openai:v0.28.0
 gco inference deploy llama3-70b \
-  -i vllm/vllm-openai:v0.27.1 \
+  -i vllm/vllm-openai:v0.28.0 \
   -r us-east-1 -r eu-west-1 \
   --replicas 2 --gpu-count 4 \
   --model-source s3://bucket/models/llama3-70b \
@@ -2861,7 +2862,7 @@ gco inference deploy llama3-70b \
 
 # Deploy with autoscaling (creates a Kubernetes HPA)
 gco inference deploy my-llm \
-  -i vllm/vllm-openai:v0.27.1 \
+  -i vllm/vllm-openai:v0.28.0 \
   --replicas 2 --gpu-count 1 \
   --min-replicas 1 --max-replicas 8 \
   --autoscale-metric cpu:70 --autoscale-metric memory:80
@@ -2995,7 +2996,7 @@ gco inference update-image ENDPOINT_NAME [OPTIONS]
 **Example:**
 
 ```bash
-gco inference update-image my-llm -i vllm/vllm-openai:v0.27.1
+gco inference update-image my-llm -i vllm/vllm-openai:v0.28.0
 ```
 
 #### `gco inference invoke`
@@ -3125,10 +3126,10 @@ gco inference canary ENDPOINT_NAME [OPTIONS]
 
 ```bash
 # 10% traffic to new version
-gco inference canary my-llm -i vllm/vllm-openai:v0.27.1
+gco inference canary my-llm -i vllm/vllm-openai:v0.28.0
 
 # 25% traffic with 2 canary replicas
-gco inference canary my-llm -i vllm/vllm-openai:v0.27.1 -w 25 -r 2
+gco inference canary my-llm -i vllm/vllm-openai:v0.28.0 -w 25 -r 2
 ```
 
 #### `gco inference promote`
@@ -5426,6 +5427,62 @@ gco examples validate --examples gpu-job --expected-account 123456789012 \
 | `--resume` | Resume an interrupted run; requires the original `--run-id` and `--report-dir`. |
 | `--protected-stack` | Additional non-project CloudFormation stack to preserve exactly (repeatable). |
 
+---
+
+### Deps Commands
+
+Dependency maintenance: reproduce the monthly `deps-scan` workflow's update
+list on demand.
+
+<details>
+<summary>All <code>gco deps</code> commands (1) — click to expand</summary>
+
+| Command | Description |
+| --- | --- |
+| [`gco deps scan`](#gco-deps-scan) | Generate the dependency update list the monthly deps-scan produces. |
+
+</details>
+
+#### `gco deps scan`
+
+Run the repository's dependency scanner (`.github/scripts/dependency-scan.sh`
+— the script behind the rolling "[Automated] Dependency updates available"
+issue) and print its Markdown report. Surfaces that need AWS credentials or
+missing host tools (`skopeo`, `helm`, `aws`, …) are skipped and flagged as
+incomplete rather than failing, exactly as in CI. Requires a GCO checkout.
+
+Heads-up: the full scan's Python surface runs `pip install -e ".[<extras>]"`
+into the active environment (that is how it asks pip for outdated direct
+pins). Run it from the dev container or a dedicated venv if that matters.
+
+```bash
+gco deps scan [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--nodepools-only` | Run only the accelerator-catalog / Karpenter NodePool freshness check (offline policy validation always; live EC2 catalog comparison when AWS credentials resolve). Fast, and the only network it may touch is EC2. |
+| `--report FILE` | Write the Markdown report to `FILE` instead of stdout. |
+
+**Examples:**
+
+```bash
+# Full scan; report to stdout, progress to stderr
+gco deps scan
+
+# Just the accelerator/NodePool registry freshness check
+gco deps scan --nodepools-only
+
+# Machine-readable envelope (has_drift, scan_complete, report_markdown) —
+# the same shape the MCP deps_scan tool returns
+gco -o json deps scan
+
+# Save the report for a PR description
+gco deps scan --report /tmp/dependency-report.md
+```
+
 ## Configuration
 
 ### Config File
@@ -5533,7 +5590,7 @@ gco models upload ./llama3-weights/ --name llama3-8b
 
 # 2. Deploy inference endpoint
 gco inference deploy my-llm \
-  -i vllm/vllm-openai:v0.27.1 \
+  -i vllm/vllm-openai:v0.28.0 \
   --gpu-count 1 \
   --model-source $(gco models uri llama3-8b) \
   -e MODEL=/models/my-llm \
@@ -5547,13 +5604,13 @@ gco inference scale my-llm --replicas 3
 
 # Or enable autoscaling
 gco inference deploy my-llm \
-  -i vllm/vllm-openai:v0.27.1 \
+  -i vllm/vllm-openai:v0.28.0 \
   --replicas 2 --gpu-count 1 \
   --min-replicas 1 --max-replicas 8 \
   --autoscale-metric cpu:70
 
 # 5. Rolling update
-gco inference update-image my-llm -i vllm/vllm-openai:v0.27.1
+gco inference update-image my-llm -i vllm/vllm-openai:v0.28.0
 
 # 6. Cleanup
 gco inference delete my-llm -y

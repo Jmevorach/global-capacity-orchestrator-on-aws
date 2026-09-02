@@ -3,6 +3,7 @@
 import ast
 import re
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -92,8 +93,8 @@ def test_lockfile_check_uses_its_pinned_resolver_toolchain() -> None:
         ),
         (
             ".github/workflows/integration-tests.yml",
-            "v3.32.1",
-            "a1df919d9721cf667accdc3e72848911b0cb25cfab7d2478ad0c996302c95744",
+            "v3.32.2",
+            "a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02",
         ),
         (
             ".github/workflows/integration-tests.yml",
@@ -164,8 +165,8 @@ def test_downloaded_release_assets_have_committed_checksums(
         (
             ".github/workflows/integration-tests.yml",
             "Install Calico for NetworkPolicy enforcement",
-            'CALICO_VERSION: "v3.32.1"',
-            'CALICO_SHA256: "a1df919d9721cf667accdc3e72848911b0cb25cfab7d2478ad0c996302c95744"',
+            'CALICO_VERSION: "v3.32.2"',
+            'CALICO_SHA256: "a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02"',
             "projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml",
             'echo "${CALICO_SHA256}  ${calico_manifest}" | sha256sum -c -',
         ),
@@ -246,6 +247,77 @@ def test_helm_and_kubectl_pins_live_only_in_the_installer_dockerfile() -> None:
         assert "extract_helm_installer_pins" in _read(workflow), (
             f"{workflow} no longer derives its Helm/kubectl pins from the installer Dockerfile"
         )
+
+
+def test_workflows_never_pip_install_a_package_pyproject_declares() -> None:
+    """CI installs the project, never a distribution pyproject already declares.
+
+    Naming a declared package in a workflow creates a second copy of its
+    version with nothing reconciling the two. That drifted for real: the moto
+    server step pinned 5.2.2 while pyproject moved to 5.2.3 and, because the
+    step also constrained against requirements-lock.txt, pip refused to resolve
+    at all. Deriving the version would have fixed the symptom and left the
+    second copy in place, so the packages are not named at all any more — jobs
+    install ``.``/``.[extra]`` or the lock, and the queue-processor job gets its
+    SQS wire API from the same digest-pinned emulator floci-tests.yml uses.
+
+    Targets that are not a declared distribution stay legal: ``pip==25.0.1``
+    (the installer bootstrapping a throwaway resolver env), ``uv``, and
+    lock-derived ``"$pin"`` installs. ``deps-scan.yml`` is exempt outright —
+    resolving packages against *latest* is that workflow's entire purpose.
+    """
+    pyproject = tomllib.loads(_read("pyproject.toml"))
+    project = pyproject.get("project", {})
+    specs = list(project.get("dependencies", []) or [])
+    for group in (project.get("optional-dependencies", {}) or {}).values():
+        specs.extend(group or [])
+
+    def normalize(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    declared = {normalize(re.split(r"[\[=!<>;~ ]", spec, maxsplit=1)[0]) for spec in specs}
+    declared.discard("gco-cli")
+
+    def named_packages(command: str) -> list[str]:
+        """Distribution names a ``pip install`` command installs by name."""
+        found = []
+        for invocation in re.findall(r"pip install([^\n|;&]*)", command):
+            for raw in invocation.split():
+                token = raw.strip("\"'")
+                if not token:
+                    continue
+                # Flags, requirement/constraint files, the project itself, and
+                # wholly shell-interpolated targets (``"$pin"`` read out of the
+                # lock) are all legitimate. A token that merely *contains* a
+                # variable is not exempt: ``pyyaml==${v}`` still names the
+                # package, which is the copy this guard exists to prevent.
+                if (
+                    token.startswith("-")
+                    or token.startswith(".")
+                    or token.startswith("$")
+                    or "/" in token
+                    or token.endswith(".txt")
+                ):
+                    continue
+                name = normalize(re.split(r"[\[=!<>;~]", token, maxsplit=1)[0])
+                if name in declared:
+                    found.append(token)
+        return found
+
+    offenders: dict[str, list[str]] = {}
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        if path.name == "deps-scan.yml":
+            continue
+        hits = named_packages(path.read_text(encoding="utf-8"))
+        if hits:
+            offenders[path.name] = hits
+
+    assert not offenders, (
+        "workflow steps pip-install a distribution pyproject.toml already declares, "
+        "creating a second copy of its version; install the project "
+        '(``pip install -e .`` / ``-e ".[extra]"``) or requirements-lock.txt instead: '
+        f"{offenders}"
+    )
 
 
 def test_workflows_do_not_execute_mutable_remote_installers() -> None:

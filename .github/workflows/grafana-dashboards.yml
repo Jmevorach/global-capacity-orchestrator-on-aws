@@ -63,8 +63,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install pinned PyYAML
-        run: python3 -m pip install --user "pyyaml==6.0.3"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version-file: ".python-version"
+          cache: "pip"
+          cache-dependency-path: "requirements-lock.txt"
+
+      - name: Install project (provides PyYAML for the validator)
+        # validate_grafana_dashboards.py imports yaml and nothing else outside
+        # the stdlib, and pyyaml is a base project dependency — so installing
+        # the project covers it without naming a third-party package here.
+        run: pip install -e .
 
       - name: Extract dashboards from the applier manifests
         run: |

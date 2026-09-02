@@ -70,7 +70,7 @@ An MCP (Model Context Protocol) server that exposes the Global Capacity Orchestr
 
 ## Overview
 
-The MCP server exposes 138 tools by default (up to 194 with all flags enabled) across the full lifecycle of accelerated-workload management:
+The MCP server exposes 139 tools by default (up to 195 with all flags enabled) across the full lifecycle of accelerated-workload management:
 
 - Submit and monitor jobs across regions
 - Deploy and manage inference endpoints with canary deployments
@@ -996,6 +996,21 @@ Task artifacts are written with private directory/file permissions. Status
 messages, command metadata, individual log records, total log bytes, and tail
 reads are all bounded; symlinks, hard links, special files, traversal IDs, and
 oversized status records fail closed.
+
+### Dependency Maintenance
+
+| Tool | Description | Risk Tier | Gated By |
+|------|-------------|-----------|----------|
+| `deps_scan` | Generate the monthly dependency-update report on demand (`gco deps scan`); `nodepools_only=true` runs just the accelerator-catalog / Karpenter NodePool freshness check | safe | — |
+
+The full scan mirrors the `deps-scan` GitHub Actions workflow: it sweeps
+PyPI, npm, container registries, Helm repos, GitHub, and (when the server's
+AWS credentials resolve) the EKS / Aurora / EMR / Bedrock / EC2-accelerator
+surfaces, returning the same Markdown report the rolling
+"[Automated] Dependency updates available" issue carries. It requires a GCO
+checkout, typically takes several minutes, and its Python surface
+pip-installs the project's extras into the server's active environment —
+exactly how CI runs it.
 
 ### Live State
 

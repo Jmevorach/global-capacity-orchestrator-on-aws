@@ -1141,6 +1141,230 @@ EOF
     rm -f "$tmpfile"
 }
 
+# ── check_lambda_requirements_pins ──────────────────────────────────────────
+
+# Builds a synthetic repository whose central pins are boto3 1.43.85 /
+# urllib3 2.7.0 (base), kubernetes 36.0.3 (optional group), and cryptography
+# 50.0.0 (lock-only transitive), so each resolution tier can be exercised.
+_write_pin_fixture() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/pyproject.toml" <<'EOF'
+[project]
+name = "fixture"
+dependencies = ["boto3==1.43.85", "urllib3==2.7.0"]
+
+[project.optional-dependencies]
+runtime = ["kubernetes==36.0.3"]
+EOF
+    printf 'boto3==1.43.85\ncryptography==50.0.0\n    # via a-transitive\n' \
+        > "$dir/requirements-lock.txt"
+}
+
+@test "check_lambda_requirements_pins: the committed repository is in lockstep" {
+    # Policy lock: every Lambda copy of a centrally pinned package must equal
+    # the central version. This is the check whose absence let a boto3 bump
+    # land in pyproject and the lock while six Lambda copies stayed behind.
+    run check_lambda_requirements_pins . pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "check_lambda_requirements_pins: reports a stale pin against pyproject" {
+    tmpdir="$(mktemp -d)"
+    _write_pin_fixture "$tmpdir"
+    mkdir -p "$tmpdir/lambda/secret-rotation"
+    printf 'boto3==1.43.74\n' > "$tmpdir/lambda/secret-rotation/requirements.txt"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ "$output" = "lambda/secret-rotation/requirements.txt|boto3==1.43.74 must match pyproject.toml 1.43.85" ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_lambda_requirements_pins: resolves optional groups and lock-only transitives" {
+    # A Lambda may pin a package that pyproject only names inside an optional
+    # group, or one that no pyproject entry names at all but the lock resolves
+    # exactly (cryptography). Both must still be held to the central version.
+    tmpdir="$(mktemp -d)"
+    _write_pin_fixture "$tmpdir"
+    mkdir -p "$tmpdir/lambda/tls-certificate-manager"
+    printf 'kubernetes==35.0.0\ncryptography==49.0.0\n' \
+        > "$tmpdir/lambda/tls-certificate-manager/requirements.txt"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"kubernetes==35.0.0 must match pyproject.toml optional groups 36.0.3"* ]]
+    [[ "$output" == *"cryptography==49.0.0 must match requirements-lock.txt 50.0.0"* ]]
+    [ "$(printf '%s\n' "$output" | grep -c .)" -eq 2 ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_lambda_requirements_pins: agreeing, undeclared, and comment-only files are silent" {
+    # Three tracked requirements files only document that the Lambda runtime
+    # supplies boto3, and some Lambdas pin their own dependencies that have no
+    # central copy — neither may become a permanent finding.
+    tmpdir="$(mktemp -d)"
+    _write_pin_fixture "$tmpdir"
+    mkdir -p "$tmpdir/lambda/agrees" "$tmpdir/lambda/runtime-only" "$tmpdir/lambda/own-dep"
+    printf 'boto3==1.43.85\nurllib3==2.7.0\n' > "$tmpdir/lambda/agrees/requirements.txt"
+    printf '# boto3 and botocore are provided by the Lambda runtime.\n' \
+        > "$tmpdir/lambda/runtime-only/requirements.txt"
+    printf 'some-lambda-only-package==9.9.9\n' > "$tmpdir/lambda/own-dep/requirements.txt"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_lambda_requirements_pins: skips the generated -build staging bundles" {
+    # The packaged bundles copy requirements.txt from the source directory, so
+    # including them would double-report every finding when they happen to
+    # exist locally and report nothing in CI, where they do not.
+    tmpdir="$(mktemp -d)"
+    _write_pin_fixture "$tmpdir"
+    mkdir -p "$tmpdir/lambda/helm-installer-build"
+    printf 'boto3==1.43.74\n' > "$tmpdir/lambda/helm-installer-build/requirements.txt"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_lambda_requirements_pins: an unreadable pyproject is a finding, not a pass" {
+    # pyproject.toml always exists here, so nothing coming back must surface
+    # rather than silently downgrading the check to a pass.
+    tmpdir="$(mktemp -d)"
+    mkdir -p "$tmpdir/lambda/secret-rotation"
+    printf 'boto3==1.43.74\n' > "$tmpdir/lambda/secret-rotation/requirements.txt"
+    printf '[[[not toml\n' > "$tmpdir/pyproject.toml"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ "$output" = "pyproject.toml|missing or unparseable, cannot verify Lambda pins" ]
+
+    rm -f "$tmpdir/pyproject.toml"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ "$output" = "pyproject.toml|missing or unparseable, cannot verify Lambda pins" ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_lambda_requirements_pins: a missing lockfile still checks pyproject pins" {
+    # The lock is the last resolution tier; losing it must narrow coverage to
+    # the pyproject tiers rather than abandoning the check.
+    tmpdir="$(mktemp -d)"
+    _write_pin_fixture "$tmpdir"
+    rm -f "$tmpdir/requirements-lock.txt"
+    mkdir -p "$tmpdir/lambda/secret-rotation"
+    printf 'boto3==1.43.74\ncryptography==49.0.0\n' \
+        > "$tmpdir/lambda/secret-rotation/requirements.txt"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ "$output" = "lambda/secret-rotation/requirements.txt|boto3==1.43.74 must match pyproject.toml 1.43.85" ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_lambda_requirements_pins: normalises names and ignores inline comments" {
+    # ``PyYAML`` and ``pyyaml`` are the same distribution under PEP 503, and a
+    # trailing comment must not become part of the version.
+    tmpdir="$(mktemp -d)"
+    _write_pin_fixture "$tmpdir"
+    mkdir -p "$tmpdir/lambda/kubectl-applier-simple"
+    printf 'Kubernetes==35.0.0  # pinned for the applier\n' \
+        > "$tmpdir/lambda/kubectl-applier-simple/requirements.txt"
+    run check_lambda_requirements_pins "$tmpdir" pyproject.toml requirements-lock.txt
+    [ "$status" -eq 0 ]
+    [ "$output" = "lambda/kubectl-applier-simple/requirements.txt|kubernetes==35.0.0 must match pyproject.toml optional groups 36.0.3" ]
+    rm -rf "$tmpdir"
+}
+
+# ── check_image_digest_consistency ──────────────────────────────────────────
+
+@test "check_image_digest_consistency: the committed tree pins every digest once" {
+    # Policy lock: an upstream tag re-push must be applied to every copy. The
+    # python-slim digest moved in a smoke manifest while a test kept the old
+    # one, and only the CI shard holding that test noticed.
+    run check_image_digest_consistency .
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "check_image_digest_consistency: two digests under one tag are reported with both files" {
+    tmpdir="$(mktemp -d)"
+    mkdir -p "$tmpdir/manifests" "$tmpdir/tests"
+    printf 'image: docker.io/library/python:3.14.7-slim@sha256:%s\n' "$(printf 'a%.0s' {1..64})" \
+        > "$tmpdir/manifests/job.yaml"
+    printf 'PINNED = "docker.io/library/python:3.14.7-slim@sha256:%s"\n' "$(printf 'b%.0s' {1..64})" \
+        > "$tmpdir/tests/test_pins.py"
+    run check_image_digest_consistency "$tmpdir"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"docker.io/library/python|tag 3.14.7-slim has 2 digests"* ]]
+    # Both sides must be named, or the reader cannot tell which to change.
+    [[ "$output" == *"manifests/job.yaml"* ]]
+    [[ "$output" == *"tests/test_pins.py"* ]]
+    rm -rf "$tmpdir"
+}
+
+@test "check_image_digest_consistency: a reference split across string literals still counts" {
+    # The stale copy that caused the incident was written as two adjacent Python
+    # literals, so a line-at-a-time matcher saw no pin at all and passed.
+    tmpdir="$(mktemp -d)"
+    mkdir -p "$tmpdir/tests"
+    printf 'image: docker.io/library/python:3.14.7-slim@sha256:%s\n' "$(printf 'a%.0s' {1..64})" \
+        > "$tmpdir/job.yaml"
+    cat > "$tmpdir/tests/test_pins.py" <<EOF
+_PINNED = (
+    "docker.io/library/python:3.14.7-slim@"
+    "sha256:$(printf 'b%.0s' {1..64})",
+)
+EOF
+    run check_image_digest_consistency "$tmpdir"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"has 2 digests"* ]]
+    rm -rf "$tmpdir"
+}
+
+@test "check_image_digest_consistency: agreeing copies and distinct tags stay silent" {
+    tmpdir="$(mktemp -d)"
+    same="$(printf 'c%.0s' {1..64})"
+    printf 'image: repo/app:1.0.0@sha256:%s\n' "$same" > "$tmpdir/a.yaml"
+    printf 'image: repo/app:1.0.0@sha256:%s\n' "$same" > "$tmpdir/b.yaml"
+    # A different tag legitimately has a different digest.
+    printf 'image: repo/app:2.0.0@sha256:%s\n' "$(printf 'd%.0s' {1..64})" > "$tmpdir/c.yaml"
+    # Bare tags are not compared at all — fixtures and prose use them freely.
+    printf 'image: repo/app:9.9.9\n' > "$tmpdir/d.yaml"
+    run check_image_digest_consistency "$tmpdir"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_image_digest_consistency: generated trees and worktrees are excluded" {
+    # Sibling git worktrees and build output hold whole copies of the tree at
+    # older commits; treating those as pins would report every image forever.
+    tmpdir="$(mktemp -d)"
+    mkdir -p "$tmpdir/.worktrees/other" "$tmpdir/cdk.out" "$tmpdir/lambda/thing-build"
+    printf 'image: repo/app:1.0.0@sha256:%s\n' "$(printf 'a%.0s' {1..64})" > "$tmpdir/a.yaml"
+    for stale in .worktrees/other/a.yaml cdk.out/a.yaml lambda/thing-build/a.yaml; do
+        printf 'image: repo/app:1.0.0@sha256:%s\n' "$(printf 'b%.0s' {1..64})" \
+            > "$tmpdir/$stale"
+    done
+    run check_image_digest_consistency "$tmpdir"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -rf "$tmpdir"
+}
+
+@test "check_image_digest_consistency: URLs and host:port pairs are not images" {
+    tmpdir="$(mktemp -d)"
+    cat > "$tmpdir/notes.md" <<'EOF'
+Reach the emulator at http://127.0.0.1:4566 and the dashboard at
+https://grafana.example.com/d/abc:1.2 — neither is an image reference.
+EOF
+    run check_image_digest_consistency "$tmpdir"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    rm -rf "$tmpdir"
+}
+
 # ── extract_constant_value ──────────────────────────────────────────────────
 
 @test "extract_constant_value: reads LAMBDA_PYTHON_RUNTIME from real constants.py" {
