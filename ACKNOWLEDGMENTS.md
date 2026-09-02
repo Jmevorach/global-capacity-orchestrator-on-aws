@@ -28,6 +28,8 @@ This project would not have been possible without the support of some incredible
 
 **Ernst Schmid** — For early support, feedback, and belief in the project.
 
+**Mike Nichols** — For early support, feedback, and belief in the project.
+
 **John Dzialo** — For being an early tester and adopter of the project.
 
 **Mark Vinciguerra** — For being an early tester and adopter of the project.
@@ -35,5 +37,7 @@ This project would not have been possible without the support of some incredible
 **Pascal Dao** — For being an early tester and adopter of the project.
 
 **Sagar Dubey** — For being an early tester and adopter of the project.
+
+**Steve Fu** — For being an early tester and adopter of the project.
 
 And to the countless other AWS colleagues who contributed feedback, tested early versions, and helped navigate the open-source process — thank you.
