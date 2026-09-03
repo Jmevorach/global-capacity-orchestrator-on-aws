@@ -540,6 +540,10 @@ if _IS_RELOAD and _feature_flags.is_enabled(_feature_flags.FLAG_MISSION):
     from tools import mission as _mission_tools_mod  # noqa: E402
 
     _importlib.reload(_mission_tools_mod)
+    # Unlike the images/models/storage reload blocks above, every name here is
+    # defined under the exact same `is_enabled(FLAG_MISSION)` gate this block
+    # is itself conditioned on, so a `hasattr` guard would never see a miss —
+    # it is a straight rebind.
     for _name in (
         "mission_start",
         "mission_status",
@@ -552,13 +556,14 @@ if _IS_RELOAD and _feature_flags.is_enabled(_feature_flags.FLAG_MISSION):
         "mission_list",
         "mission_memory_search",
     ):
-        if hasattr(_mission_tools_mod, _name):
-            globals()[_name] = getattr(_mission_tools_mod, _name)
+        globals()[_name] = getattr(_mission_tools_mod, _name)
 
 if _IS_RELOAD and _feature_flags.is_enabled(_feature_flags.FLAG_SWARM):
     from tools import swarm as _swarm_tools_mod  # noqa: E402
 
     _importlib.reload(_swarm_tools_mod)
+    # Same reasoning as the mission block above: every name is defined under
+    # this same `is_enabled(FLAG_SWARM)` gate, so `hasattr` cannot miss.
     for _name in (
         "swarm_start",
         "swarm_iterate",
@@ -567,8 +572,7 @@ if _IS_RELOAD and _feature_flags.is_enabled(_feature_flags.FLAG_SWARM):
         "swarm_list",
         "swarm_plan",
     ):
-        if hasattr(_swarm_tools_mod, _name):
-            globals()[_name] = getattr(_swarm_tools_mod, _name)
+        globals()[_name] = getattr(_swarm_tools_mod, _name)
 
 # --- Re-export resource directory constants for tests ---
 from resources.ci import (  # noqa: E402, F401

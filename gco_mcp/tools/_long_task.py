@@ -312,6 +312,12 @@ async def _run_long_task(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await coordination
 
+    async def _cancel_heartbeat_task(task: asyncio.Task[None]) -> None:
+        """Cancel one heartbeat task and await its cancellation."""
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
     try:
         if total_units is not None and total_units > 0:
             await _best_effort_client_call(progress, "set_total", int(total_units))
@@ -335,7 +341,12 @@ async def _run_long_task(
         coordination = asyncio.gather(wait_task, *drains)
         results = await asyncio.shield(coordination)
         return_code = int(results[0])
+        # Reached only on success, by which point heartbeat is always set:
+        # nothing between its creation above and this line can raise.
+        await _cancel_heartbeat_task(heartbeat)
     except asyncio.CancelledError:
+        if heartbeat is not None:
+            await _cancel_heartbeat_task(heartbeat)
         with contextlib.suppress(Exception):
             await _clean_process_tasks()
         status_writer.finish(
@@ -347,6 +358,8 @@ async def _run_long_task(
             raise asyncio.CancelledError(_PARTIAL_STATE_DISCLAIMER) from None
         raise
     except Exception as exc:
+        if heartbeat is not None:
+            await _cancel_heartbeat_task(heartbeat)
         with contextlib.suppress(Exception):
             await _clean_process_tasks()
         status_writer.finish(
@@ -358,11 +371,6 @@ async def _run_long_task(
             ),
         )
         raise
-    finally:
-        if heartbeat is not None:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await heartbeat
 
     duration = int(time.monotonic() - started)
     if return_code != 0:

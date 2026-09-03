@@ -642,3 +642,46 @@ class TestResidualCleanupBranches:
         assert process.stderr_stream.cancelled is True
         assert coordination.cancelled() is True
         assert process.terminate_calls == 1
+
+
+class TestCancellationBeforeHeartbeatExists:
+    """Cancellation raised before ``heartbeat`` is ever assigned.
+
+    ``heartbeat`` is created immediately before the process-wait/drain
+    coordination, with nothing awaited in between. The only way to observe
+    ``heartbeat is None`` inside the ``CancelledError`` handler is to cancel
+    while still inside (or before) ``asyncio.create_subprocess_exec`` itself.
+    """
+
+    async def test_cancellation_during_spawn_skips_heartbeat_cancel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spawn_started = asyncio.Event()
+
+        async def blocking_spawn(*_argv: str, **_kwargs: object) -> Any:
+            spawn_started.set()
+            await asyncio.Event().wait()  # Never resolves; cancellation interrupts this.
+
+        monkeypatch.setattr(long_task, "TaskStatusWriter", _WriterSpy)
+        monkeypatch.setattr(long_task, "_try_get_task_id", lambda _ctx: None)
+        monkeypatch.setattr(long_task, "make_task_id", lambda _tool: "pre-spawn-cancel")
+        monkeypatch.setattr(long_task.asyncio, "create_subprocess_exec", blocking_spawn)
+
+        runner = asyncio.create_task(
+            long_task._run_long_task(
+                ["command"],
+                ctx=_Context(),
+                progress=_Progress(),
+                is_stack_op=False,
+            )
+        )
+        await spawn_started.wait()
+        runner.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+
+        writer = _WriterSpy.latest
+        assert writer is not None
+        # process was never assigned, so exit_code is None and cleanup is a no-op.
+        assert writer.finishes == [{"state": "cancelled", "exit_code": None, "error": "cancelled"}]
