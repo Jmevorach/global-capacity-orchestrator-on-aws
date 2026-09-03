@@ -36,6 +36,8 @@ def _unlink_temp_ca_cert(path: str) -> None:
     try:
         os.unlink(path)
     except FileNotFoundError:
+        # Already gone (e.g. removed by another cleanup path) — the goal is an
+        # absent file, so this is success, not a failure to log or retry.
         pass
     except OSError as exc:
         logger.debug("Failed to remove temporary Kubernetes CA certificate %s: %s", path, exc)
