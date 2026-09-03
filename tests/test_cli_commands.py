@@ -156,6 +156,47 @@ class TestJobsCommands:
         # The old behavior collapsed this failure into "Job ... not found".
         assert "not found" not in result.output.lower()
 
+    def test_jobs_get_discovery_auth_errors_are_not_reported_as_missing_bridge(self):
+        """C10: failed discovery names the credentials and preserves the AWS error."""
+        from botocore.exceptions import ClientError
+
+        from cli.main import cli
+
+        role_arn = "arn:aws:iam::123456789012:role/ExampleOperatorRole"
+        cases = [
+            ("ExpiredToken", "The security token included in the request is expired"),
+            ("AccessDenied", "Not authorized to perform cloudformation:DescribeStacks"),
+        ]
+
+        for error_code, error_message in cases:
+            session = MagicMock()
+            session.profile_name = "temporary-admin"
+            cfn = MagicMock()
+            cfn.describe_stacks.side_effect = ClientError(
+                {"Error": {"Code": error_code, "Message": error_message}},
+                "DescribeStacks",
+            )
+            session.client.return_value = cfn
+
+            with (
+                patch("cli.aws_client.boto3.Session", return_value=session),
+                patch.dict("os.environ", {"AWS_ROLE_ARN": role_arn}),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(
+                    cli,
+                    ["jobs", "get", "gpu-test-job", "--region", "us-west-2"],
+                )
+
+            assert result.exit_code == 1
+            assert "Failed to get job:" in result.output
+            assert "Regional API endpoint discovery could not run" in result.output
+            assert "Credential context: session profile 'temporary-admin'" in result.output
+            assert f"AWS_ROLE_ARN is set to {role_arn!r}" in result.output
+            assert f"AWS error {error_code}: {error_message}" in result.output
+            assert "Regional API endpoint is not deployed" not in result.output
+            assert "Job gpu-test-job not found" not in result.output
+
     @patch("cli.commands.jobs_cmd.get_job_manager")
     @patch("cli.commands.jobs_cmd.get_output_formatter")
     def test_jobs_logs(self, mock_formatter, mock_manager):
