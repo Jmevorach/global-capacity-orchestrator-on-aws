@@ -245,9 +245,7 @@ def test_fsx_partial_regional_node_group_preserves_inherited_fields() -> None:
                         "labels": {"workload": "fsx"},
                     },
                 },
-                "fsx_lustre_regions": {
-                    "eu-west-1": {"node_group": {"max_size": 4}}
-                },
+                "fsx_lustre_regions": {"eu-west-1": {"node_group": {"max_size": 4}}},
             }
         )
     )
@@ -411,9 +409,7 @@ def test_nag_acknowledgment_expands_resolved_environment_variants() -> None:
         )
     metadata = scope.node.add_metadata.call_args.args[1]
     assert f"Rule[{detail}]" in metadata
-    assert (
-        "Rule[Resource::arn:aws:service:us-east-1:123456789012:thing]" in metadata
-    )
+    assert "Rule[Resource::arn:aws:service:us-east-1:123456789012:thing]" in metadata
 
 
 def test_empty_nag_acknowledgments_add_no_metadata() -> None:
@@ -571,9 +567,7 @@ def _isolated_mcp_stacks(*enabled_flags: str) -> Iterator[_LoadedMcpStacks]:
             get_context=Mock(side_effect=LookupError),
         ),
         "fastmcp.utilities": fastmcp_utilities,
-        "fastmcp.utilities.tasks": _stub_module(
-            "fastmcp.utilities.tasks", TaskConfig=_TaskConfig
-        ),
+        "fastmcp.utilities.tasks": _stub_module("fastmcp.utilities.tasks", TaskConfig=_TaskConfig),
         "feature_flags": feature_flags,
         "local_data": _stub_module(
             "local_data", resolve_local_path=Mock(), stage_upload_path=Mock()
@@ -1113,9 +1107,7 @@ def test_posix_lock_propagates_non_contention_error() -> None:
         patch("fcntl.flock", side_effect=OSError(errno.EBADF, "bad fd")),
         pytest.raises(OSError, match="bad fd"),
     ):
-        stacks._acquire_posix_flock(
-            1, lock_name="lock", exclusive=True, purpose="asset"
-        )
+        stacks._acquire_posix_flock(1, lock_name="lock", exclusive=True, purpose="asset")
 
 
 def test_posix_lock_contention_times_out(monkeypatch: Any) -> None:
@@ -1127,9 +1119,7 @@ def test_posix_lock_contention_times_out(monkeypatch: Any) -> None:
         patch.object(stacks.time, "monotonic", side_effect=[0.0, 1.0, 1.0]),
         pytest.raises(TimeoutError, match="Timed out"),
     ):
-        stacks._acquire_posix_flock(
-            1, lock_name="lock", exclusive=True, purpose="asset"
-        )
+        stacks._acquire_posix_flock(1, lock_name="lock", exclusive=True, purpose="asset")
 
 
 def test_release_file_lock_windows_and_posix() -> None:
@@ -1238,13 +1228,16 @@ def test_prepare_lambda_asset_rechecks_and_cleans_staging(tmp_path: Path) -> Non
     def builder(staging: Path) -> None:
         (staging / "handler.py").write_text("built", encoding="utf-8")
 
-    assert stacks._prepare_lambda_asset(
-        source,
-        build,
-        source_inputs=None,
-        display_name="demo",
-        builder=builder,
-    ) is True
+    assert (
+        stacks._prepare_lambda_asset(
+            source,
+            build,
+            source_inputs=None,
+            display_name="demo",
+            builder=builder,
+        )
+        is True
+    )
     assert (build / "handler.py").read_text(encoding="utf-8") == "built"
 
     with (
@@ -2050,9 +2043,7 @@ def test_windows_file_lock_retries_contention_then_acquires() -> None:
     msvcrt = SimpleNamespace(
         LK_NBLCK=1,
         LK_UNLCK=2,
-        locking=MagicMock(
-            side_effect=[BlockingIOError(errno.EAGAIN, "busy"), None]
-        ),
+        locking=MagicMock(side_effect=[BlockingIOError(errno.EAGAIN, "busy"), None]),
     )
     with (
         patch.object(stacks.os, "name", "nt"),
@@ -2129,9 +2120,7 @@ def test_prepare_lambda_asset_removes_failed_verification_staging(tmp_path: Path
             build,
             source_inputs=None,
             display_name="demo",
-            builder=lambda staging: (staging / "payload").write_text(
-                "built", encoding="utf-8"
-            ),
+            builder=lambda staging: (staging / "payload").write_text("built", encoding="utf-8"),
         )
 
     assert not list(build.parent.glob(".source-build.staging-*"))
@@ -2186,6 +2175,7 @@ def test_cdk_asset_consumer_fails_after_repeated_source_churn(tmp_path: Path) ->
         source_inputs=None,
         paths=lambda _root: (source, build),
     )
+
     @contextmanager
     def shared_lock(*_args: Any, **_kwargs: Any) -> Iterator[None]:
         yield
@@ -2610,15 +2600,11 @@ def test_deploy_reconciles_cdk_and_cloudformation_outcomes(
     if fresh == "fresh":
         from datetime import UTC, datetime
 
-        stack_manager._get_stack_last_update_time.return_value = datetime.max.replace(
-            tzinfo=UTC
-        )
+        stack_manager._get_stack_last_update_time.return_value = datetime.max.replace(tzinfo=UTC)
     elif fresh == "stale":
         from datetime import UTC, datetime
 
-        stack_manager._get_stack_last_update_time.return_value = datetime.min.replace(
-            tzinfo=UTC
-        )
+        stack_manager._get_stack_last_update_time.return_value = datetime.min.replace(tzinfo=UTC)
 
     with patch.object(stacks, "_detect_container_runtime", return_value="docker"):
         assert stack_manager.deploy(stack_name="gco-global") is expected
@@ -2705,9 +2691,7 @@ def test_strict_and_standard_analytics_deploy_refresh_routes(
     ):
         assert original(stack_manager, **_strict_deploy_kwargs()) is True
     assert recursive.call_args.kwargs["stack_name"] == "gco-api-gateway"
-    assert recursive.call_args.kwargs["strict_deployment_token"].endswith(
-        "-analytics-routes"
-    )
+    assert recursive.call_args.kwargs["strict_deployment_token"].endswith("-analytics-routes")
 
     _ready_deploy_manager(stack_manager)
     with (
@@ -2960,12 +2944,15 @@ def test_delete_convergence_stops_when_stack_leaves_delete_state(
     stack_manager._get_stack_status = MagicMock(return_value="UPDATE_COMPLETE")
     stack_manager._print_stack_delete_heartbeat = MagicMock()
     with patch("cli.stacks.time.sleep"):
-        assert stack_manager._wait_for_stack_delete_convergence(
-            "gco-global",
-            timeout=1,
-            poll_interval=0.01,
-            heartbeat_interval=0.01,
-        ) is False
+        assert (
+            stack_manager._wait_for_stack_delete_convergence(
+                "gco-global",
+                timeout=1,
+                poll_interval=0.01,
+                heartbeat_interval=0.01,
+            )
+            is False
+        )
     stack_manager._print_stack_delete_heartbeat.assert_called()
 
 
@@ -3040,30 +3027,20 @@ def test_orphan_regional_api_requires_absence_and_matching_partition(
     )
     with patch.object(stacks, "validated_deployment_partition", return_value="aws"):
         assert (
-            stack_manager._get_orphan_regional_api_region(
-                "gco-regional-api-us-west-2"
-            )
+            stack_manager._get_orphan_regional_api_region("gco-regional-api-us-west-2")
             == "us-west-2"
         )
     stack_manager._configured_regional_api_regions.return_value = (
         frozenset({"us-west-2"}),
         "aws",
     )
-    assert (
-        stack_manager._get_orphan_regional_api_region("gco-regional-api-us-west-2")
-        is None
-    )
+    assert stack_manager._get_orphan_regional_api_region("gco-regional-api-us-west-2") is None
     stack_manager._configured_regional_api_regions.return_value = (
         frozenset({"us-east-1"}),
         "aws",
     )
     with patch.object(stacks, "validated_deployment_partition", return_value="aws-us-gov"):
-        assert (
-            stack_manager._get_orphan_regional_api_region(
-                "gco-regional-api-us-west-2"
-            )
-            is None
-        )
+        assert stack_manager._get_orphan_regional_api_region("gco-regional-api-us-west-2") is None
 
 
 def test_analytics_dependency_fast_paths_and_failed_redeploy(
@@ -3106,9 +3083,7 @@ def test_analytics_dependency_strict_mode_requires_change_set_authority(
 
 
 def test_bootstrap_commands_cache_and_validation(stack_manager: Any) -> None:
-    stack_manager._run_cdk = MagicMock(
-        return_value=SimpleNamespace(returncode=0)
-    )
+    stack_manager._run_cdk = MagicMock(return_value=SimpleNamespace(returncode=0))
     assert stack_manager.bootstrap(account="123", region="us-east-1")
     assert stack_manager._run_cdk.call_args.args[0] == [
         "bootstrap",
@@ -3121,9 +3096,7 @@ def test_bootstrap_commands_cache_and_validation(stack_manager: Any) -> None:
     ]
 
     client = MagicMock()
-    client.describe_stacks.return_value = {
-        "Stacks": [{"StackStatus": "CREATE_COMPLETE"}]
-    }
+    client.describe_stacks.return_value = {"Stacks": [{"StackStatus": "CREATE_COMPLETE"}]}
     with patch("boto3.client", return_value=client):
         assert stack_manager.is_bootstrapped("us-east-1") is True
         assert stack_manager.is_bootstrapped("us-east-1") is True
@@ -3184,15 +3157,9 @@ def _strict_change_set_response(
     execution_status: str = "AVAILABLE",
 ) -> dict[str, Any]:
     return {
-        "ChangeSetId": (
-            "arn:aws:cloudformation:us-east-1:123456789012:"
-            "changeSet/change/11111111"
-        ),
+        "ChangeSetId": ("arn:aws:cloudformation:us-east-1:123456789012:changeSet/change/11111111"),
         "ChangeSetName": "change",
-        "StackId": (
-            "arn:aws:cloudformation:us-east-1:123456789012:"
-            "stack/gco-global/22222222"
-        ),
+        "StackId": ("arn:aws:cloudformation:us-east-1:123456789012:stack/gco-global/22222222"),
         "Status": status,
         "ExecutionStatus": execution_status,
         "Tags": [{"Key": "Project", "Value": "gco"}],
@@ -3243,22 +3210,23 @@ def test_change_set_execution_reports_unhealthy_settlement(
     client.describe_change_set.return_value = response
     callback = MagicMock()
     with patch("boto3.client", return_value=client):
-        assert stack_manager._execute_prepared_change_set(
-            stack_name="gco-global",
-            change_set_name="change",
-            expected_stack_id=None,
-            expected_tags={"Project": "gco"},
-            prepared_change_sets={},
-            preparation_succeeded=True,
-            authorize_stack=None,
-            on_change_set_prepared=callback,
-            allow_noop=False,
-            timeout=1,
-        ) is False
+        assert (
+            stack_manager._execute_prepared_change_set(
+                stack_name="gco-global",
+                change_set_name="change",
+                expected_stack_id=None,
+                expected_tags={"Project": "gco"},
+                prepared_change_sets={},
+                preparation_succeeded=True,
+                authorize_stack=None,
+                on_change_set_prepared=callback,
+                allow_noop=False,
+                timeout=1,
+            )
+            is False
+        )
     callback.assert_called_once()
-    client.execute_change_set.assert_called_once_with(
-        ChangeSetName=response["ChangeSetId"]
-    )
+    client.execute_change_set.assert_called_once_with(ChangeSetName=response["ChangeSetId"])
     stack_manager._wait_for_stack_settle.assert_called_once_with(
         "gco-global", timeout=1, stack_identifier=stack_id
     )
@@ -3330,11 +3298,10 @@ def test_deploy_orchestration_runs_all_sequential_phases_and_callbacks(
 
     assert result == (True, names, [])
     assert [item.args[0] for item in started.call_args_list] == names
-    assert [item.args for item in completed.call_args_list] == [
-        (name, True) for name in names
-    ]
+    assert [item.args for item in completed.call_args_list] == [(name, True) for name in names]
     regional_call = next(
-        item for item in stack_manager.deploy.call_args_list
+        item
+        for item in stack_manager.deploy.call_args_list
         if item.kwargs["stack_name"] == "gco-us-east-1"
     )
     assert regional_call.kwargs["exclusively"] is True
@@ -3781,12 +3748,7 @@ def test_regional_api_validation_fails_closed_on_metadata_errors(
         "_known_cloudformation_regions",
         side_effect=RuntimeError("metadata unavailable"),
     ):
-        assert (
-            stack_manager._validated_regional_api_region(
-                "gco-regional-api-us-east-1"
-            )
-            is None
-        )
+        assert stack_manager._validated_regional_api_region("gco-regional-api-us-east-1") is None
 
     stack_manager._validated_regional_api_region = MagicMock(return_value="us-west-2")
     stack_manager._configured_regional_api_regions = MagicMock(
@@ -3797,12 +3759,7 @@ def test_regional_api_validation_fails_closed_on_metadata_errors(
         "validated_deployment_partition",
         side_effect=ValueError("unknown region"),
     ):
-        assert (
-            stack_manager._get_orphan_regional_api_region(
-                "gco-regional-api-us-west-2"
-            )
-            is None
-        )
+        assert stack_manager._get_orphan_regional_api_region("gco-regional-api-us-west-2") is None
 
 
 def test_strict_analytics_dependency_requires_api_identity(stack_manager: Any) -> None:
@@ -3817,9 +3774,7 @@ def test_analytics_dependency_exception_rechecks_actual_imports(
     stack_manager: Any,
 ) -> None:
     stack_manager._stack_exists_in_cloudformation = MagicMock(return_value=True)
-    stack_manager._api_gateway_imports_from_analytics = MagicMock(
-        side_effect=[True, False]
-    )
+    stack_manager._api_gateway_imports_from_analytics = MagicMock(side_effect=[True, False])
     with patch("cli.stacks.get_analytics_config", side_effect=RuntimeError("bad config")):
         assert stack_manager._remove_api_gateway_analytics_dependency() is True
 
@@ -3860,18 +3815,21 @@ def test_change_set_inspection_retries_until_visible(stack_manager: Any) -> None
         patch("boto3.client", return_value=client),
         patch("cli.stacks.time.sleep") as sleep,
     ):
-        assert stack_manager._execute_prepared_change_set(
-            stack_name="gco-global",
-            change_set_name="change",
-            expected_stack_id=None,
-            expected_tags={"Project": "gco"},
-            prepared_change_sets={},
-            preparation_succeeded=True,
-            authorize_stack=None,
-            on_change_set_prepared=MagicMock(),
-            allow_noop=False,
-            timeout=1,
-        ) is True
+        assert (
+            stack_manager._execute_prepared_change_set(
+                stack_name="gco-global",
+                change_set_name="change",
+                expected_stack_id=None,
+                expected_tags={"Project": "gco"},
+                prepared_change_sets={},
+                preparation_succeeded=True,
+                authorize_stack=None,
+                on_change_set_prepared=MagicMock(),
+                allow_noop=False,
+                timeout=1,
+            )
+            is True
+        )
     sleep.assert_called_once()
     assert client.describe_change_set.call_count == 2
 
@@ -4031,9 +3989,7 @@ def test_backup_vault_cleanup_handles_absence_success_and_partial_failure(
     )
     backup = MagicMock()
     backup.describe_backup_vault.return_value = {
-        "BackupVaultArn": (
-            "arn:aws:backup:us-east-2:123456789012:backup-vault:gco-vault"
-        )
+        "BackupVaultArn": ("arn:aws:backup:us-east-2:123456789012:backup-vault:gco-vault")
     }
     recovery_paginator = MagicMock()
     recovery_paginator.paginate.return_value = [
@@ -4065,9 +4021,10 @@ def test_cleanup_orphaned_bastions_filters_stacks_and_parallelizes(
     stack_manager: Any,
 ) -> None:
     stack_manager._cleanup_orphaned_bastions = MagicMock(return_value=1)
-    assert stack_manager.cleanup_orphaned_bastions(
-        ["gco-global", "gco-us-east-1"], parallel=False
-    ) == 1
+    assert (
+        stack_manager.cleanup_orphaned_bastions(["gco-global", "gco-us-east-1"], parallel=False)
+        == 1
+    )
     stack_manager._cleanup_orphaned_bastions.assert_called_once_with(
         "gco-us-east-1",
         region=None,
@@ -4076,9 +4033,10 @@ def test_cleanup_orphaned_bastions_filters_stacks_and_parallelizes(
     )
 
     stack_manager._cleanup_orphaned_bastions.reset_mock()
-    assert stack_manager.cleanup_orphaned_bastions(
-        ["gco-us-east-1", "gco-us-west-2"], parallel=True
-    ) == 2
+    assert (
+        stack_manager.cleanup_orphaned_bastions(["gco-us-east-1", "gco-us-west-2"], parallel=True)
+        == 2
+    )
     assert stack_manager._cleanup_orphaned_bastions.call_count == 2
 
 
@@ -4088,9 +4046,7 @@ def test_orphaned_bastion_cleanup_terminates_owned_instances(
     from cli.stacks import StackManager
 
     stack_manager._get_deploy_region = MagicMock(return_value="us-east-1")
-    stack_manager._wait_for_bastion_network_interfaces = MagicMock(
-        return_value={"eni-1"}
-    )
+    stack_manager._wait_for_bastion_network_interfaces = MagicMock(return_value={"eni-1"})
     ec2 = MagicMock()
     ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
     ec2.describe_instances.return_value = {
@@ -4125,16 +4081,17 @@ def test_orphaned_bastion_cleanup_terminates_owned_instances(
     ec2.get_waiter.return_value = waiter
 
     with patch("boto3.client", return_value=ec2):
-        assert StackManager._cleanup_orphaned_bastions(
-            stack_manager,
-            "gco-us-east-1",
-        ) == 1
+        assert (
+            StackManager._cleanup_orphaned_bastions(
+                stack_manager,
+                "gco-us-east-1",
+            )
+            == 1
+        )
 
     ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-owned"])
     waiter.wait.assert_called_once()
-    stack_manager._wait_for_bastion_network_interfaces.assert_called_once_with(
-        ec2, ["eni-1"]
-    )
+    stack_manager._wait_for_bastion_network_interfaces.assert_called_once_with(ec2, ["eni-1"])
 
 
 def test_wait_for_bastion_network_interfaces_handles_absent_and_detached() -> None:
@@ -4149,15 +4106,16 @@ def test_wait_for_bastion_network_interfaces_handles_absent_and_detached() -> No
 
     ec2.describe_network_interfaces.side_effect = describe_network_interfaces
     with patch("cli.stacks.time.sleep"):
-        assert StackManager._wait_for_bastion_network_interfaces(
-            ec2,
-            ["eni-missing", "eni-detached"],
-            timeout_seconds=1,
-            poll_interval_seconds=0.01,
-        ) == set()
-    ec2.delete_network_interface.assert_called_once_with(
-        NetworkInterfaceId="eni-detached"
-    )
+        assert (
+            StackManager._wait_for_bastion_network_interfaces(
+                ec2,
+                ["eni-missing", "eni-detached"],
+                timeout_seconds=1,
+                poll_interval_seconds=0.01,
+            )
+            == set()
+        )
+    ec2.delete_network_interface.assert_called_once_with(NetworkInterfaceId="eni-detached")
 
 
 def test_implicit_log_group_collection_and_cleanup_cover_all_outcomes(
@@ -4384,11 +4342,7 @@ def test_volume_pricing_walks_products_terms_and_dimensions() -> None:
                         "OnDemand": {
                             "term-one": {"priceDimensions": {}},
                             "term-two": {
-                                "priceDimensions": {
-                                    "dimension": {
-                                        "pricePerUnit": {"USD": "0.08"}
-                                    }
-                                }
+                                "priceDimensions": {"dimension": {"pricePerUnit": {"USD": "0.08"}}}
                             },
                         }
                     }
@@ -4397,9 +4351,7 @@ def test_volume_pricing_walks_products_terms_and_dimensions() -> None:
         ]
     }
     with patch("boto3.client", return_value=pricing):
-        assert StackManager._volume_storage_price_per_gib_month(
-            "us-east-1", "gp3"
-        ) == 0.08
+        assert StackManager._volume_storage_price_per_gib_month("us-east-1", "gp3") == 0.08
 
 
 def test_surviving_volume_pricing_and_record_rendering(stack_manager: Any) -> None:
@@ -4415,9 +4367,7 @@ def test_surviving_volume_pricing_and_record_rendering(stack_manager: Any) -> No
     stack_manager._volume_storage_price_per_gib_month = MagicMock(return_value=0.08)
     stack_manager._price_surviving_volumes(outcome)
     assert outcome["monthly_cost_usd"] == 1.2
-    stack_manager._volume_storage_price_per_gib_month.assert_called_once_with(
-        "us-east-1", "gp3"
-    )
+    stack_manager._volume_storage_price_per_gib_month.assert_called_once_with("us-east-1", "gp3")
 
     volume = {
         "Tags": [
@@ -4427,15 +4377,18 @@ def test_surviving_volume_pricing_and_record_rendering(stack_manager: Any) -> No
     }
     assert stacks._volume_pvc_name(volume) == "pvc-one"
     assert stacks._volume_pvc_name({"Tags": []}) is None
-    assert stacks._describe_volume_record(
-        {
-            "volume_id": "vol-1",
-            "size_gib": None,
-            "volume_type": "gp3",
-            "availability_zone": "us-east-1a",
-            "pvc": "pvc-one",
-        }
-    ) == "vol-1 (unknown size gp3, us-east-1a, pvc=pvc-one)"
+    assert (
+        stacks._describe_volume_record(
+            {
+                "volume_id": "vol-1",
+                "size_gib": None,
+                "volume_type": "gp3",
+                "availability_zone": "us-east-1a",
+                "pvc": "pvc-one",
+            }
+        )
+        == "vol-1 (unknown size gp3, us-east-1a, pvc=pvc-one)"
+    )
 
 
 def test_feature_config_updates_global_and_regional_values_atomically(
@@ -4874,9 +4827,7 @@ def test_strict_resource_resolution_recovers_security_group_after_cluster_delete
     eks = MagicMock()
     eks.describe_cluster.side_effect = _client_error("ResourceNotFoundException")
     ec2 = MagicMock()
-    ec2.describe_security_groups.return_value = {
-        "SecurityGroups": [{"GroupId": "sg-recovered"}]
-    }
+    ec2.describe_security_groups.return_value = {"SecurityGroups": [{"GroupId": "sg-recovered"}]}
     with patch("boto3.client", side_effect=[eks, ec2]):
         resolved = stack_manager._resolve_strict_teardown_resources(
             stacks=["gco-us-east-1"],
@@ -4884,10 +4835,7 @@ def test_strict_resource_resolution_recovers_security_group_after_cluster_delete
             expected_stack_ids={"gco-us-east-1": "arn:regional"},
             authorize_stack=MagicMock(),
         )
-    assert (
-        resolved["gco-us-east-1"]["cluster_security_group_id"]
-        == "sg-recovered"
-    )
+    assert resolved["gco-us-east-1"]["cluster_security_group_id"] == "sg-recovered"
 
 
 def test_destroy_orchestration_blocks_on_remaining_regional_api_stack(
@@ -5014,9 +4962,7 @@ def test_backup_vault_cleanup_validates_service_arn_and_plain_name(
     )
     backup = MagicMock()
     backup.describe_backup_vault.return_value = {
-        "BackupVaultArn": (
-            "arn:aws:backup:us-east-2:123456789012:backup-vault:plain-vault"
-        )
+        "BackupVaultArn": ("arn:aws:backup:us-east-2:123456789012:backup-vault:plain-vault")
     }
     recovery = MagicMock()
     recovery.paginate.return_value = []
@@ -5038,13 +4984,14 @@ def test_cleanup_orphaned_bastions_default_strict_and_empty_inputs(
     assert stack_manager.cleanup_orphaned_bastions() == 0
 
     stack_manager._cleanup_orphaned_bastions = MagicMock(return_value=1)
-    targets = {
-        "gco-us-east-1": {"region": "us-east-1", "vpc_id": "vpc-1"}
-    }
-    assert stack_manager.cleanup_orphaned_bastions(
-        ["gco-us-east-1", "gco-us-west-2"],
-        resource_targets=targets,
-    ) == 1
+    targets = {"gco-us-east-1": {"region": "us-east-1", "vpc_id": "vpc-1"}}
+    assert (
+        stack_manager.cleanup_orphaned_bastions(
+            ["gco-us-east-1", "gco-us-west-2"],
+            resource_targets=targets,
+        )
+        == 1
+    )
     stack_manager._cleanup_orphaned_bastions.assert_called_once_with(
         "gco-us-east-1",
         region="us-east-1",
@@ -5073,9 +5020,7 @@ def test_eks_security_group_cleanup_rejects_identity_and_delete_errors(
 ) -> None:
     ec2 = MagicMock()
     ec2.describe_security_groups.return_value = {
-        "SecurityGroups": [
-            {"GroupId": "sg-other", "GroupName": "changed", "VpcId": "vpc-1"}
-        ]
+        "SecurityGroups": [{"GroupId": "sg-other", "GroupName": "changed", "VpcId": "vpc-1"}]
     }
     with patch("boto3.client", return_value=ec2):
         outcome = _REAL_CLEANUP_EKS_SECURITY_GROUPS(
@@ -5087,9 +5032,7 @@ def test_eks_security_group_cleanup_rejects_identity_and_delete_errors(
 
     ec2 = MagicMock()
     ec2.describe_security_groups.return_value = {
-        "SecurityGroups": [
-            {"GroupId": "sg-one", "GroupName": "one", "VpcId": "vpc-other"}
-        ]
+        "SecurityGroups": [{"GroupId": "sg-one", "GroupName": "one", "VpcId": "vpc-other"}]
     }
     with patch("boto3.client", return_value=ec2):
         outcome = _REAL_CLEANUP_EKS_SECURITY_GROUPS(
@@ -5101,9 +5044,7 @@ def test_eks_security_group_cleanup_rejects_identity_and_delete_errors(
 
     ec2 = MagicMock()
     ec2.describe_security_groups.return_value = {
-        "SecurityGroups": [
-            {"GroupId": "sg-one", "GroupName": "one", "VpcId": "vpc-1"}
-        ]
+        "SecurityGroups": [{"GroupId": "sg-one", "GroupName": "one", "VpcId": "vpc-1"}]
     }
     ec2.describe_network_interfaces.return_value = {"NetworkInterfaces": []}
     ec2.delete_security_group.side_effect = _client_error("AccessDeniedException")
@@ -5451,9 +5392,7 @@ def test_deploy_diagnostics_complete_without_actionable_stack_status(
     stack_manager._get_deploy_region = MagicMock(return_value="us-east-1")
     client = MagicMock()
     client.describe_stack_events.return_value = {"StackEvents": []}
-    client.describe_stacks.return_value = {
-        "Stacks": [{"StackStatus": "CREATE_COMPLETE"}]
-    }
+    client.describe_stacks.return_value = {"Stacks": [{"StackStatus": "CREATE_COMPLETE"}]}
     with patch("boto3.client", return_value=client):
         stack_manager._diagnose_deploy_failure("gco-global")
 
@@ -5469,9 +5408,7 @@ def test_sync_lambda_sources_walks_multiple_targets(
     targets = [tmp_path / "one" / "shared.py", tmp_path / "two" / "shared.py"]
     for target in targets:
         target.parent.mkdir()
-    mapping = {
-        "shared.py": tuple(str(target.relative_to(tmp_path)) for target in targets)
-    }
+    mapping = {"shared.py": tuple(str(target.relative_to(tmp_path)) for target in targets)}
     with patch.object(stacks, "LAMBDA_SHARED_SOURCE_TARGETS", mapping):
         stack_manager._sync_lambda_sources()
     assert [target.read_text(encoding="utf-8") for target in targets] == [
@@ -5502,12 +5439,15 @@ def test_wait_for_delete_convergence_times_out_after_confirmed_delete_start(
         patch("cli.stacks.time.monotonic", side_effect=[0.0, 0.0, 2.0]),
         patch("cli.stacks.time.sleep"),
     ):
-        assert stack_manager._wait_for_stack_delete_convergence(
-            "gco-global",
-            timeout=1,
-            poll_interval=0.1,
-            heartbeat_interval=0.1,
-        ) is False
+        assert (
+            stack_manager._wait_for_stack_delete_convergence(
+                "gco-global",
+                timeout=1,
+                poll_interval=0.1,
+                heartbeat_interval=0.1,
+            )
+            is False
+        )
 
 
 def test_strict_deploy_orchestration_walks_two_regions(
@@ -5589,9 +5529,10 @@ def test_volume_helpers_render_minimal_records() -> None:
     assert stacks._describe_volume_record({"volume_id": "vol-minimal"}) == (
         "vol-minimal (unknown size)"
     )
-    assert stacks._describe_volume_record(
-        {"volume_id": "vol-sized", "size_gib": 5}
-    ) == "vol-sized (5 GiB)"
+    assert (
+        stacks._describe_volume_record({"volume_id": "vol-sized", "size_gib": 5})
+        == "vol-sized (5 GiB)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5672,12 +5613,15 @@ def test_delete_convergence_skips_duplicate_heartbeat_before_cancellation(
         ),
         patch("cli.stacks.time.sleep"),
     ):
-        assert stack_manager._wait_for_stack_delete_convergence(
-            "gco-global",
-            timeout=10,
-            poll_interval=0.1,
-            heartbeat_interval=5,
-        ) is False
+        assert (
+            stack_manager._wait_for_stack_delete_convergence(
+                "gco-global",
+                timeout=10,
+                poll_interval=0.1,
+                heartbeat_interval=5,
+            )
+            is False
+        )
     stack_manager._cdk_cancel_event = original_event
     stack_manager._print_stack_delete_heartbeat.assert_called_once()
 
@@ -5731,9 +5675,7 @@ def test_strict_resource_resolution_walks_multiple_regional_candidates(
         clients[region] = cfn
         targets.append((region, cfn, {"StackId": f"arn:{index}"}))
     stack_manager._describe_stack_target = MagicMock(side_effect=targets)
-    stack_manager._get_deploy_region = MagicMock(
-        side_effect=lambda name: name.removeprefix("gco-")
-    )
+    stack_manager._get_deploy_region = MagicMock(side_effect=lambda name: name.removeprefix("gco-"))
     resolved = stack_manager._resolve_strict_teardown_resources(
         stacks=names,
         regional_stacks=names,
@@ -5814,10 +5756,13 @@ def test_bastion_cleanup_foreign_instance_continues_to_owned_instance(
     }
     ec2.get_waiter.return_value = MagicMock()
     with patch("boto3.client", return_value=ec2):
-        assert _StackManager._cleanup_orphaned_bastions(
-            stack_manager,
-            "gco-us-east-1",
-        ) == 1
+        assert (
+            _StackManager._cleanup_orphaned_bastions(
+                stack_manager,
+                "gco-us-east-1",
+            )
+            == 1
+        )
     ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-owned"])
 
 
@@ -5864,9 +5809,7 @@ def test_volume_pricing_returns_none_after_exhausting_unpriced_dimensions() -> N
         ]
     }
     with patch("boto3.client", return_value=pricing):
-        assert StackManager._volume_storage_price_per_gib_month(
-            "us-east-1", "gp3"
-        ) is None
+        assert StackManager._volume_storage_price_per_gib_month("us-east-1", "gp3") is None
 
 
 def test_feature_config_updates_existing_global_and_regional_blocks(
@@ -6050,10 +5993,13 @@ def test_bastion_owned_instance_without_id_and_interface_without_id_are_skipped(
     }
     ec2.get_waiter.return_value = MagicMock()
     with patch("boto3.client", return_value=ec2):
-        assert _StackManager._cleanup_orphaned_bastions(
-            stack_manager,
-            "gco-us-east-1",
-        ) == 1
+        assert (
+            _StackManager._cleanup_orphaned_bastions(
+                stack_manager,
+                "gco-us-east-1",
+            )
+            == 1
+        )
     stack_manager._wait_for_bastion_network_interfaces.assert_called_once_with(ec2, [])
 
 
