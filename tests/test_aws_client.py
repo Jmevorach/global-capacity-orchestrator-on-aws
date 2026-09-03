@@ -2249,10 +2249,10 @@ class TestGCOAWSClientOptimizedDiscovery:
 
 
 class TestGCOAWSClientGetRegionalApiEndpoint:
-    """Tests for get_regional_api_endpoint covering lines 117, 133, 145-146."""
+    """Tests for authoritative regional API endpoint discovery semantics."""
 
     def test_get_regional_api_endpoint_success(self):
-        """Test successful regional API endpoint discovery (line 117+)."""
+        """A stack output resolves to a normalized regional endpoint."""
         from cli.aws_client import GCOAWSClient
 
         with patch("cli.aws_client.get_config") as mock_config:
@@ -2288,7 +2288,7 @@ class TestGCOAWSClientGetRegionalApiEndpoint:
                 assert endpoint.api_id == "abc123"
 
     def test_get_regional_api_endpoint_cached(self):
-        """Test that cached regional endpoint is returned (line 117 cache hit)."""
+        """A fresh cached endpoint avoids another CloudFormation lookup."""
         from cli.aws_client import ApiEndpoint, GCOAWSClient
 
         with patch("cli.aws_client.get_config") as mock_config:
@@ -2312,9 +2312,9 @@ class TestGCOAWSClientGetRegionalApiEndpoint:
                 result = client.get_regional_api_endpoint("us-east-1")
                 assert result == cached_endpoint
 
-    def test_get_regional_api_endpoint_no_output(self):
-        """Test regional endpoint when stack has no RegionalApiEndpoint output (line 133)."""
-        from cli.aws_client import GCOAWSClient
+    def test_existing_stack_without_endpoint_is_not_reported_as_absent(self):
+        """A present but incomplete bridge stack is not a missing deployment."""
+        from cli.aws_client import GCOAWSClient, RegionalApiDiscoveryError
 
         with patch("cli.aws_client.get_config") as mock_config:
             mock_config.return_value = MagicMock(
@@ -2341,11 +2341,81 @@ class TestGCOAWSClientGetRegionalApiEndpoint:
                 mock_session.return_value.client.return_value = mock_cfn
 
                 client = GCOAWSClient()
-                result = client.get_regional_api_endpoint("us-east-1")
-                assert result is None
+                with pytest.raises(RegionalApiDiscoveryError) as exc_info:
+                    client.get_regional_api_endpoint("us-east-1")
 
-    def test_get_regional_api_endpoint_client_error(self):
-        """Test regional endpoint when stack doesn't exist (line 145)."""
+        message = str(exc_info.value)
+        assert "stack 'gco-regional-api-us-east-1' exists" in message
+        assert "does not publish a RegionalApiEndpoint" in message
+        assert "endpoint is not deployed" not in message
+
+    @pytest.mark.parametrize(
+        ("outputs", "expected_message"),
+        [
+            ({}, "malformed CloudFormation Outputs"),
+            ([None], "malformed CloudFormation Outputs"),
+            (
+                [{"OutputKey": 123, "OutputValue": "unexpected"}],
+                "malformed CloudFormation Outputs",
+            ),
+            (
+                [{"OutputKey": "RegionalApiEndpoint", "OutputValue": 123}],
+                "invalid RegionalApiEndpoint output",
+            ),
+            (
+                [{"OutputKey": "RegionalApiEndpoint", "OutputValue": "not-a-url"}],
+                "invalid RegionalApiEndpoint output",
+            ),
+            (
+                [
+                    {
+                        "OutputKey": "RegionalApiEndpoint",
+                        "OutputValue": "https://abc123.execute-api.us-east-1.evil.example/prod",
+                    }
+                ],
+                "invalid RegionalApiEndpoint output",
+            ),
+            (
+                [
+                    {
+                        "OutputKey": "RegionalApiEndpoint",
+                        "OutputValue": (
+                            "https://user:super-secret@abc123.execute-api.us-east-1."
+                            "amazonaws.com/prod"
+                        ),
+                    }
+                ],
+                "invalid RegionalApiEndpoint output",
+            ),
+        ],
+    )
+    def test_malformed_endpoint_outputs_fail_closed(self, outputs, expected_message):
+        """Malformed stack records never become trusted SigV4 request targets."""
+        from cli.aws_client import GCOAWSClient, RegionalApiDiscoveryError
+
+        with patch("cli.aws_client.get_config") as mock_config:
+            mock_config.return_value = MagicMock(
+                project_name="gco",
+                cache_ttl_seconds=300,
+            )
+            with patch("boto3.Session") as mock_session:
+                mock_cfn = MagicMock()
+                mock_cfn.describe_stacks.return_value = {
+                    "Stacks": [{"StackStatus": "CREATE_COMPLETE", "Outputs": outputs}]
+                }
+                mock_session.return_value.client.return_value = mock_cfn
+
+                client = GCOAWSClient()
+                with pytest.raises(RegionalApiDiscoveryError) as exc_info:
+                    client.get_regional_api_endpoint("us-east-1")
+
+        message = str(exc_info.value)
+        assert expected_message in message
+        assert "super-secret" not in message
+        assert "endpoint is not deployed" not in message
+
+    def test_only_confirmed_missing_stack_returns_none(self):
+        """CloudFormation's service-shaped missing-stack response means absence."""
         from botocore.exceptions import ClientError
 
         from cli.aws_client import GCOAWSClient
@@ -2359,21 +2429,74 @@ class TestGCOAWSClientGetRegionalApiEndpoint:
 
             with patch("boto3.Session") as mock_session:
                 mock_cfn = MagicMock()
-                mock_cfn.exceptions.ClientError = ClientError
                 mock_cfn.describe_stacks.side_effect = ClientError(
-                    {"Error": {"Code": "ValidationError", "Message": "Stack not found"}},
+                    {
+                        "Error": {
+                            "Code": "ValidationError",
+                            "Message": ("Stack with id gco-regional-api-us-east-1 does not exist"),
+                        }
+                    },
                     "DescribeStacks",
                 )
                 mock_session.return_value.client.return_value = mock_cfn
 
                 client = GCOAWSClient()
                 result = client.get_regional_api_endpoint("us-east-1")
-                assert result is None
 
-    def test_get_regional_api_endpoint_generic_exception(self):
-        """Test regional endpoint when unexpected error occurs (line 146)."""
-        from cli.aws_client import GCOAWSClient
+        assert result is None
 
+    @pytest.mark.parametrize(
+        ("error_code", "error_message"),
+        [
+            ("ExpiredToken", "The security token included in the request is expired"),
+            ("AccessDenied", "Not authorized to perform cloudformation:DescribeStacks"),
+            ("ValidationError", "DescribeStacks rejected the request"),
+        ],
+    )
+    def test_service_errors_surface_with_credential_context(self, error_code, error_message):
+        """Auth and unrelated validation failures never masquerade as absence."""
+        from botocore.exceptions import ClientError
+
+        from cli.aws_client import GCOAWSClient, RegionalApiDiscoveryError
+
+        role_arn = "arn:aws:iam::123456789012:role/ExampleOperatorRole"
+        with (
+            patch("cli.aws_client.get_config") as mock_config,
+            patch("boto3.Session") as mock_session,
+            patch.dict("os.environ", {"AWS_ROLE_ARN": role_arn}),
+        ):
+            mock_config.return_value = MagicMock(
+                regional_stack_prefix="gco",
+                project_name="gco",
+                cache_ttl_seconds=300,
+            )
+            mock_session.return_value.profile_name = "temporary-admin"
+            mock_cfn = MagicMock()
+            service_error = ClientError(
+                {"Error": {"Code": error_code, "Message": error_message}},
+                "DescribeStacks",
+            )
+            mock_cfn.describe_stacks.side_effect = service_error
+            mock_session.return_value.client.return_value = mock_cfn
+
+            client = GCOAWSClient()
+            with pytest.raises(RegionalApiDiscoveryError) as exc_info:
+                client.get_regional_api_endpoint("us-west-2")
+
+        message = str(exc_info.value)
+        assert "Regional API endpoint discovery could not run" in message
+        assert "gco-regional-api-us-west-2" in message
+        assert "Credential context: session profile 'temporary-admin'" in message
+        assert f"AWS_ROLE_ARN is set to {role_arn!r}" in message
+        assert f"AWS error {error_code}: {error_message}" in message
+        assert "endpoint is not deployed" not in message
+        assert exc_info.value.__cause__ is service_error
+
+    def test_unexpected_discovery_error_is_bounded_and_redacted(self):
+        """Transport failures remain distinct without exposing provider secrets."""
+        from cli.aws_client import GCOAWSClient, RegionalApiDiscoveryError
+
+        secret = "super-secret-provider-token"
         with patch("cli.aws_client.get_config") as mock_config:
             mock_config.return_value = MagicMock(
                 regional_stack_prefix="gco",
@@ -2382,14 +2505,27 @@ class TestGCOAWSClientGetRegionalApiEndpoint:
             )
 
             with patch("boto3.Session") as mock_session:
+                mock_session.return_value.profile_name = "temporary-admin"
                 mock_cfn = MagicMock()
-                mock_cfn.exceptions.ClientError = Exception
-                mock_cfn.describe_stacks.side_effect = RuntimeError("Unexpected error")
+                unexpected_error = RuntimeError(
+                    f"proxy=https://user:{secret}@proxy.example token={secret}"
+                )
+                mock_cfn.describe_stacks.side_effect = unexpected_error
                 mock_session.return_value.client.return_value = mock_cfn
 
                 client = GCOAWSClient()
-                result = client.get_regional_api_endpoint("us-east-1")
-                assert result is None
+                with pytest.raises(RegionalApiDiscoveryError) as exc_info:
+                    client.get_regional_api_endpoint("us-east-1")
+
+        message = str(exc_info.value)
+        assert "discovery could not run" in message
+        assert "Credential context: session profile 'temporary-admin'" in message
+        assert "Discovery failed with RuntimeError" in message
+        assert "check AWS credential and network configuration" in message
+        assert secret not in message
+        assert "proxy.example" not in message
+        assert "endpoint is not deployed" not in message
+        assert exc_info.value.__cause__ is unexpected_error
 
 
 class TestGCOAWSClientDiscoverRegionalStacksFallback:

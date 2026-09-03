@@ -795,17 +795,23 @@ class TestRegionalApiClientIntegration:
         assert client._use_regional_api is False
 
     def test_get_regional_api_endpoint_not_found(self):
-        """Test getting regional API endpoint when stack doesn't exist."""
+        """A confirmed missing regional API stack returns no endpoint."""
+        from botocore.exceptions import ClientError
+
         from cli.aws_client import GCOAWSClient
 
         client = GCOAWSClient()
 
         with patch.object(client, "_session") as mock_session:
             mock_cfn = MagicMock()
-            # Create a proper exception class for ClientError
-            mock_cfn.exceptions.ClientError = type("ClientError", (Exception,), {})
-            mock_cfn.describe_stacks.side_effect = mock_cfn.exceptions.ClientError(
-                "Stack not found"
+            mock_cfn.describe_stacks.side_effect = ClientError(
+                {
+                    "Error": {
+                        "Code": "ValidationError",
+                        "Message": ("Stack with id gco-regional-api-us-east-1 does not exist"),
+                    }
+                },
+                "DescribeStacks",
             )
             mock_session.client.return_value = mock_cfn
 

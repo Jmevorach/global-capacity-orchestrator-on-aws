@@ -8,16 +8,20 @@ stack discovery, and region management.
 import ast
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import boto3
 import requests
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
+from botocore.exceptions import ClientError
+from botocore.session import get_session as get_botocore_session
 
 from .config import GCOConfig, get_config
 
@@ -35,6 +39,84 @@ class APIRequestError(RuntimeError):
     def __init__(self, status_code: int, message: str):
         super().__init__(f"API request failed: {message}")
         self.status_code = status_code
+
+
+class RegionalApiDiscoveryError(RuntimeError):
+    """Regional endpoint discovery failed without confirming stack absence."""
+
+
+def _cloudformation_stack_missing(exc: ClientError) -> bool:
+    """Return whether CloudFormation authoritatively reports an absent stack."""
+    error = exc.response.get("Error", {})
+    return bool(
+        error.get("Code") == "ValidationError"
+        and "does not exist" in str(error.get("Message", "")).lower()
+    )
+
+
+def _aws_credential_context(session: Any) -> str:
+    """Describe configured profile/role hints without claiming provider selection."""
+    hints = []
+    profile_name = getattr(session, "profile_name", None)
+    if isinstance(profile_name, str) and profile_name.strip():
+        hints.append(f"session profile {profile_name.strip()[:128]!r}")
+
+    role_arn = os.getenv("AWS_ROLE_ARN", "").strip()
+    if role_arn:
+        hints.append(f"AWS_ROLE_ARN is set to {role_arn[:256]!r}")
+
+    return "; ".join(hints) or "no profile or role hint is available"
+
+
+def _safe_aws_error_message(error: dict[str, Any]) -> str:
+    """Return bounded service-provided detail without terminal control bytes."""
+    raw_message = error.get("Message")
+    if not isinstance(raw_message, str):
+        return "AWS did not return an error message"
+    printable = "".join(
+        character if character.isprintable() and character != "\x1b" else " "
+        for character in raw_message
+    )
+    normalized = " ".join(printable.split())
+    return normalized[:512] or "AWS did not return an error message"
+
+
+def _execute_api_service_hostname(region: str) -> str:
+    """Resolve the partition-correct execute-api hostname from botocore data."""
+    resolver = get_botocore_session().get_component("endpoint_resolver")
+    endpoint = resolver.construct_endpoint("execute-api", region)
+    hostname = endpoint.get("hostname") if isinstance(endpoint, dict) else None
+    if not isinstance(hostname, str):
+        raise ValueError("execute-api endpoint metadata is unavailable")
+    return hostname.lower()
+
+
+def _normalize_regional_api_endpoint(value: Any, region: str) -> tuple[str, str]:
+    """Validate a regional stack output as this region's execute-api prod URL."""
+    if not isinstance(value, str):
+        raise ValueError("regional endpoint output is not a string")
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("regional endpoint output is not a valid URL") from exc
+
+    host = (parsed.hostname or "").lower()
+    service_hostname = _execute_api_service_hostname(region)
+    host_suffix = f".{service_hostname}"
+    api_id = host[: -len(host_suffix)] if host.endswith(host_suffix) else ""
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or re.fullmatch(r"[a-z0-9]+", api_id) is None
+        or parsed.path.rstrip("/") != "/prod"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("regional endpoint output is not an execute-api prod URL")
+    return f"https://{host}/prod", api_id
 
 
 def _validate_max_attempts(max_attempts: int | None) -> None:
@@ -133,51 +215,110 @@ class GCOAWSClient:
     def get_regional_api_endpoint(
         self, region: str, force_refresh: bool = False
     ) -> ApiEndpoint | None:
-        """
-        Get the regional API Gateway endpoint for a specific region.
+        """Get the regional API Gateway endpoint for a specific region.
 
-        Regional APIs are used when public access is disabled and the ALB
-        is internal-only.
+        ``None`` is reserved for CloudFormation's authoritative confirmation
+        that the regional API stack does not exist. Credential, authorization,
+        transport, and malformed-response failures raise instead, so callers
+        never misreport an observation failure as missing infrastructure.
 
         Args:
             region: AWS region
             force_refresh: Force refresh from CloudFormation
 
         Returns:
-            ApiEndpoint with URL and metadata, or None if not found
+            ApiEndpoint with URL and metadata, or None when CloudFormation
+            confirms the regional API stack is absent
+
+        Raises:
+            RegionalApiDiscoveryError: If discovery cannot run or the existing
+                stack does not publish a usable endpoint
         """
         if not force_refresh and region in self._regional_api_cache and self._is_cache_valid():
             return self._regional_api_cache[region]
 
-        cfn = self._session.client("cloudformation", region_name=region)
         stack_name = f"{self.config.project_name}-regional-api-{region}"
+        credential_context = _aws_credential_context(self._session)
 
         try:
+            cfn = self._session.client("cloudformation", region_name=region)
             response = cfn.describe_stacks(StackName=stack_name)
-            stack = response["Stacks"][0]
-
-            api_url = None
-            for output in stack.get("Outputs", []):
-                if output["OutputKey"] == "RegionalApiEndpoint":
-                    api_url = output["OutputValue"].rstrip("/")
-                    break
-
-            if not api_url:
+        except ClientError as exc:
+            if _cloudformation_stack_missing(exc):
                 return None
+            error = exc.response.get("Error", {})
+            raw_error_code = error.get("Code")
+            error_code = (
+                raw_error_code
+                if isinstance(raw_error_code, str)
+                and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", raw_error_code)
+                else "ClientError"
+            )
+            error_message = _safe_aws_error_message(error)
+            raise RegionalApiDiscoveryError(
+                f"Regional API endpoint discovery could not run for stack '{stack_name}' "
+                f"in {region}. Credential context: {credential_context}. "
+                f"AWS error {error_code}: {error_message}"
+            ) from exc
+        except Exception as exc:
+            failure_type = re.sub(r"[^A-Za-z0-9_.-]", "", type(exc).__name__)[:128]
+            raise RegionalApiDiscoveryError(
+                f"Regional API endpoint discovery could not run for stack '{stack_name}' "
+                f"in {region}. Credential context: {credential_context}. Discovery failed "
+                f"with {failure_type or 'UnexpectedError'}; check AWS credential and network "
+                "configuration"
+            ) from exc
 
-            # Extract API ID from URL
-            api_id = api_url.split(".")[0].replace("https://", "")
+        if not isinstance(response, dict):
+            raise RegionalApiDiscoveryError(
+                f"Regional API endpoint discovery returned an invalid CloudFormation "
+                f"response for stack '{stack_name}' in {region}"
+            )
+        stacks = response.get("Stacks")
+        if not isinstance(stacks, list) or len(stacks) != 1 or not isinstance(stacks[0], dict):
+            raise RegionalApiDiscoveryError(
+                f"Regional API endpoint discovery returned no unique usable stack record for "
+                f"'{stack_name}' in {region}"
+            )
+        stack = stacks[0]
 
-            endpoint = ApiEndpoint(url=api_url, region=region, api_id=api_id, is_regional=True)
-            self._regional_api_cache[region] = endpoint
-            return endpoint
+        outputs = stack.get("Outputs", [])
+        if not isinstance(outputs, list):
+            raise RegionalApiDiscoveryError(
+                f"Regional API endpoint discovery returned malformed CloudFormation Outputs "
+                f"for stack '{stack_name}' in {region}"
+            )
 
-        except cfn.exceptions.ClientError:
-            # Stack doesn't exist
-            return None
-        except Exception as e:
-            logger.debug("Failed to get regional API endpoint for %s: %s", region, e)
-            return None
+        endpoint_output: Any = None
+        endpoint_output_found = False
+        for output in outputs:
+            if not isinstance(output, dict) or not isinstance(output.get("OutputKey"), str):
+                raise RegionalApiDiscoveryError(
+                    f"Regional API endpoint discovery returned malformed CloudFormation "
+                    f"Outputs for stack '{stack_name}' in {region}"
+                )
+            if output["OutputKey"] == "RegionalApiEndpoint":
+                endpoint_output_found = True
+                endpoint_output = output.get("OutputValue")
+                break
+
+        if not endpoint_output_found:
+            raise RegionalApiDiscoveryError(
+                f"Regional API stack '{stack_name}' exists in {region} but does not publish "
+                "a RegionalApiEndpoint output; the bridge deployment may be incomplete"
+            )
+
+        try:
+            api_url, api_id = _normalize_regional_api_endpoint(endpoint_output, region)
+        except Exception as exc:
+            raise RegionalApiDiscoveryError(
+                f"Regional API stack '{stack_name}' in {region} publishes an invalid "
+                "RegionalApiEndpoint output"
+            ) from exc
+
+        endpoint = ApiEndpoint(url=api_url, region=region, api_id=api_id, is_regional=True)
+        self._regional_api_cache[region] = endpoint
+        return endpoint
 
     def get_api_endpoint(self, force_refresh: bool = False) -> ApiEndpoint:
         """
