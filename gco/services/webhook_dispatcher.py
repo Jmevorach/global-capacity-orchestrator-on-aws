@@ -619,29 +619,28 @@ class WebhookDispatcher:
                 continue
             if isinstance(result, asyncio.CancelledError):
                 raise result
-            if isinstance(result, BaseException):
-                raw_webhook_id = webhook.get("id")
-                webhook_id = raw_webhook_id if isinstance(raw_webhook_id, str) else "<unknown>"
-                raw_url = webhook.get("url")
-                url = raw_url if isinstance(raw_url, str) else ""
-                logger.error(
-                    "Webhook delivery escaped boundary: webhook_id=%s error_type=%s",
-                    webhook_id,
-                    type(result).__name__,
+            raw_webhook_id = webhook.get("id")
+            webhook_id = raw_webhook_id if isinstance(raw_webhook_id, str) else "<unknown>"
+            raw_url = webhook.get("url")
+            url = raw_url if isinstance(raw_url, str) else ""
+            logger.error(
+                "Webhook delivery escaped boundary: webhook_id=%s error_type=%s",
+                webhook_id,
+                type(result).__name__,
+            )
+            self._deliveries_total += 1
+            self._deliveries_failed += 1
+            delivery_results.append(
+                WebhookDeliveryResult(
+                    webhook_id=webhook_id,
+                    url=url,
+                    event=event.value,
+                    success=False,
+                    error=f"Delivery failure: {type(result).__name__}",
+                    attempts=0,
+                    duration_ms=0.0,
                 )
-                self._deliveries_total += 1
-                self._deliveries_failed += 1
-                delivery_results.append(
-                    WebhookDeliveryResult(
-                        webhook_id=webhook_id,
-                        url=url,
-                        event=event.value,
-                        success=False,
-                        error=f"Delivery failure: {type(result).__name__}",
-                        attempts=0,
-                        duration_ms=0.0,
-                    )
-                )
+            )
 
         return delivery_results
 

@@ -3473,7 +3473,8 @@ class StackManager:
             if expected_stack_id is None and not prepared_change_sets
             else 1
         )
-        for inspection_attempt in range(inspection_attempts):
+        inspection_attempt = 0
+        while True:
             try:
                 change_set = cfn.describe_change_set(
                     ChangeSetName=change_set_name,
@@ -3492,6 +3493,7 @@ class StackManager:
                             "Strict change-set inspection cancelled before ownership checkpoint"
                         ) from exc
                     time.sleep(_STRICT_CHANGE_SET_INSPECTION_RETRY_SECONDS)
+                    inspection_attempt += 1
                     continue
                 if not self._change_set_missing(exc) and not fresh_create_not_visible:
                     raise RuntimeError(

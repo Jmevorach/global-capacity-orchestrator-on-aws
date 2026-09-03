@@ -443,12 +443,6 @@ async def reconcile_active_jobs_once(
         if observed == current:
             continue
         if observed not in {
-            JobStatus.PENDING.value,
-            JobStatus.RUNNING.value,
-            *_TERMINAL_STATUSES,
-        }:
-            continue
-        if observed not in {
             status.value
             for status in (
                 JobStatus.RUNNING,

@@ -1581,7 +1581,9 @@ class TestSourceResources:
         result = asyncio.run(run_mcp.mcp.read_resource("source://gco/index"))
         content = result.contents[0].content
         assert "source://gco/config/pyproject.toml" in content
-        assert "source://gco/config/.gitlab-ci.yml" in content
+        # A logical name whose real file lives under .github/config/ — the index
+        # advertises the stable URI, not the on-disk location.
+        assert "source://gco/config/.yamllint.yml" in content
         assert "source://gco/config/.pre-commit-config.yaml" in content
 
     def test_source_index_lists_files(self):
@@ -1593,11 +1595,6 @@ class TestSourceResources:
         result = asyncio.run(run_mcp.mcp.read_resource("source://gco/config/pyproject.toml"))
         content = result.contents[0].content
         assert "gco-cli" in content
-
-    def test_config_resource_reads_gitlab_ci(self):
-        result = asyncio.run(run_mcp.mcp.read_resource("source://gco/config/.gitlab-ci.yml"))
-        content = result.contents[0].content
-        assert len(content) > 10
 
     def test_config_resource_reads_pre_commit(self):
         result = asyncio.run(

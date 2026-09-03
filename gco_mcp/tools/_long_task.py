@@ -365,14 +365,6 @@ async def _run_long_task(
                 await heartbeat
 
     duration = int(time.monotonic() - started)
-    if return_code is None:
-        # Coordination only completes normally after process.wait(). Keep the
-        # guard explicit for unusual Process implementations and static safety.
-        return_code = process.returncode if process is not None else None
-    if return_code is None:
-        status_writer.finish(state="failed", error="subprocess return code unavailable")
-        raise RuntimeError("subprocess return code unavailable")
-
     if return_code != 0:
         payload: dict[str, Any] = {
             "error": f"exit_code={return_code}",

@@ -941,7 +941,7 @@ class MissionEngine:
                     ScriptRejected,
                 )
             except Exception:
-                raise
+                raise exc from None
             if isinstance(exc, ScriptRejected):
                 raise MissionEngineError("script_rejected") from exc
             if isinstance(exc, SandboxTerminated):

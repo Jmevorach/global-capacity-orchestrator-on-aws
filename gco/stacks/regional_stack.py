@@ -74,7 +74,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aws_cdk.aws_eks_v2 as eks
 import yaml
@@ -103,6 +103,7 @@ from aws_cdk import aws_kms as kms
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_secretsmanager as secretsmanager
 from aws_cdk import aws_sns as sns
 from aws_cdk import aws_sqs as sqs
 from aws_cdk import aws_ssm as ssm
@@ -3733,10 +3734,7 @@ class GCORegionalStack(Stack):
             image_replacements["{{AURORA_PGVECTOR_PORT}}"] = str(
                 self.aurora_cluster.cluster_endpoint.port
             )
-            if self.aurora_cluster.secret:
-                image_replacements["{{AURORA_PGVECTOR_SECRET_ARN}}"] = (
-                    self.aurora_cluster.secret.secret_arn
-                )
+            image_replacements["{{AURORA_PGVECTOR_SECRET_ARN}}"] = self.aurora_secret.secret_arn
 
         # Add vector-store discovery if enabled. Every value is deterministic
         # at synth time (the global stack names the table and index from the
@@ -3946,19 +3944,18 @@ class GCORegionalStack(Stack):
 
         # Retain the access entry so asynchronous convergence cannot start
         # until the endpoint publisher can read the exact Gateway object.
-        self.ga_registration_access_entry = None
-        if ga_registration_lambda.role is not None:
-            self.ga_registration_access_entry = eks.AccessEntry(
-                self,
-                "GaRegistrationLambdaAccessEntry",
-                cluster=self.cluster,  # type: ignore[arg-type]
-                principal=ga_registration_lambda.role.role_arn,
-                access_policies=[
-                    eks.AccessPolicy.from_access_policy_name(
-                        "AmazonEKSClusterAdminPolicy", access_scope_type=eks.AccessScopeType.CLUSTER
-                    )
-                ],
-            )
+        ga_registration_role = cast(iam.IRole, ga_registration_lambda.role)
+        self.ga_registration_access_entry = eks.AccessEntry(
+            self,
+            "GaRegistrationLambdaAccessEntry",
+            cluster=self.cluster,  # type: ignore[arg-type]
+            principal=ga_registration_role.role_arn,
+            access_policies=[
+                eks.AccessPolicy.from_access_policy_name(
+                    "AmazonEKSClusterAdminPolicy", access_scope_type=eks.AccessScopeType.CLUSTER
+                )
+            ],
+        )
 
         # Allow Lambda to access EKS API
         self.cluster.cluster_security_group.add_ingress_rule(
@@ -5864,6 +5861,7 @@ class GCORegionalStack(Stack):
             monitoring_interval=Duration.seconds(60),
             cluster_identifier=f"{project_name}-pgvector-{self.deployment_region}",
         )
+        self.aurora_secret = cast(secretsmanager.ISecret, self.aurora_cluster.secret)
         # The group must exist before the cluster starts exporting, and must
         # outlive it on delete (reverse order) so late writes cannot recreate
         # an unowned group.
@@ -5985,7 +5983,7 @@ class GCORegionalStack(Stack):
         CfnOutput(
             self,
             "AuroraPgvectorSecretArn",
-            value=self.aurora_cluster.secret.secret_arn if self.aurora_cluster.secret else "",
+            value=self.aurora_secret.secret_arn,
             description="Aurora pgvector credentials secret ARN",
         )
 
@@ -6000,8 +5998,7 @@ class GCORegionalStack(Stack):
 
         # Grant the ServiceAccountRole read access to the Aurora secret
         # so pods can retrieve credentials via the ConfigMap + Secrets Manager.
-        if self.aurora_cluster.secret:
-            self.aurora_cluster.secret.grant_read(self.service_account_role)
+        self.aurora_secret.grant_read(self.service_account_role)
 
     def _create_fsx_csi_driver_addon(self) -> None:
         """Create FSx CSI Driver add-on for Kubernetes integration.

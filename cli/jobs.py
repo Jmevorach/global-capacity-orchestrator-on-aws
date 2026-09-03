@@ -297,8 +297,6 @@ class JobManager:
         # Apply additional labels
         if labels:
             for manifest in manifest_list:
-                if "metadata" not in manifest:
-                    manifest["metadata"] = {}
                 if "labels" not in manifest["metadata"]:
                     manifest["metadata"]["labels"] = {}
                 manifest["metadata"]["labels"].update(labels)
@@ -360,8 +358,6 @@ class JobManager:
         # Apply additional labels
         if labels:
             for manifest in manifest_list:
-                if "metadata" not in manifest:
-                    manifest["metadata"] = {}
                 if "labels" not in manifest["metadata"]:
                     manifest["metadata"]["labels"] = {}
                 manifest["metadata"]["labels"].update(labels)
@@ -1016,7 +1012,8 @@ class JobManager:
                     raw = entry["value"].rstrip()
                     try:
                         parsed = _json.loads(raw)
-                        lines.append(parsed.get("log", raw).rstrip())
+                        message = parsed.get("log", raw) if isinstance(parsed, dict) else raw
+                        lines.append(message.rstrip() if isinstance(message, str) else raw)
                     except ValueError, TypeError:
                         lines.append(raw)
                     break

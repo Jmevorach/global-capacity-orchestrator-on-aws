@@ -463,7 +463,7 @@ def _build_final_lessons_callable(
         model_id=session.get("bedrock_model_id"),
     )
 
-    async def _final_lessons(*, session: dict[str, Any], ctx: Any | None) -> Any:
+    async def _final_lessons(*, session: dict[str, Any]) -> Any:
         return await mission_sampling.maybe_sample_final_lessons(
             backend=backend_obj,
             session=cast("SessionState", session),
