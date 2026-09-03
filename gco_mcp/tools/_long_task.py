@@ -28,8 +28,8 @@ from fastmcp.exceptions import ToolError
 from tools._task_status import TaskStatusWriter, is_valid_task_id, make_task_id
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-09-03T18:56:22Z
-# Generated from Git commit: 37fd4384775eeebf18fea3e5e085cef9645077be
+# Generated at (UTC): 2026-09-03T20:49:27Z
+# Generated from Git commit: c253a0ea3c715f5325d9e7549d2376f629f25c16
 # Flowchart(s) generated from this file:
 #   * ``_run_long_task`` -> ``diagrams/code_diagrams/gco_mcp/tools/_long_task._run_long_task.html``
 #     (PNG: ``diagrams/code_diagrams/gco_mcp/tools/_long_task._run_long_task.png``)
