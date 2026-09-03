@@ -52,8 +52,8 @@ from pathlib import Path
 from typing import Any, cast
 
 # <pyflowchart-code-diagram> BEGIN - auto-inserted, do not edit
-# Generated at (UTC): 2026-09-01T14:42:56Z
-# Generated from Git commit: 89b000378ed5a912a38c06f4feab2b029936ebcc
+# Generated at (UTC): 2026-09-03T18:56:22Z
+# Generated from Git commit: 37fd4384775eeebf18fea3e5e085cef9645077be
 # Flowchart(s) generated from this file:
 #   * ``SwarmRunner.run_to_completion`` -> ``diagrams/code_diagrams/gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.html``
 #     (PNG: ``diagrams/code_diagrams/gco_mcp/mission/swarm_runner.SwarmRunner_run_to_completion.png``)
